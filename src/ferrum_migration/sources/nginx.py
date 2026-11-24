@@ -365,23 +365,19 @@ class _Nginx:
                 "ref": f"nginx server '{safe_label(label, 64)}' (line {server.line})", "label": label}
 
     def _merge_shared_tls_sockets(self, infos: list[dict]) -> None:
-        """NGINX marks a shared (addr, port) listening socket as TLS if any server on that socket sets ``ssl``."""
+        """NGINX marks a shared (addr, port, transport) socket as TLS if any server on that exact socket sets ``ssl``."""
         tls_sockets = {
-            (listen["addr"], listen["port"])
+            (listen["addr"], listen["port"], bool(listen.get("http3")))
             for info in infos for listen in info["listens"]
             if not listen.get("invalid") and listen["ssl"]
         }
         if not tls_sockets:
             return
-        tls_wildcard_ports = {port for addr, port in tls_sockets if addr is None}
-        tls_any_ports = {port for _addr, port in tls_sockets}
         for info in infos:
             for listen in info["listens"]:
                 if listen.get("invalid") or listen["ssl"]:
                     continue
-                if (listen["addr"], listen["port"]) in tls_sockets \
-                        or listen["port"] in tls_wildcard_ports \
-                        or (listen["addr"] is None and listen["port"] in tls_any_ports):
+                if (listen["addr"], listen["port"], bool(listen.get("http3"))) in tls_sockets:
                     listen["ssl"] = True
 
     def _elect_ports(self, infos: list[dict]) -> None:

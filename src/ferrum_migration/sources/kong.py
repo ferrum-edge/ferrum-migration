@@ -87,8 +87,13 @@ class _Kong:
         self.plugins: list[_Plugin] = []
         self.plugins_by_owner: dict[tuple[str, str | None], list[_Plugin]] = {}
         self.consumer_quarantine: dict[str, list[str]] = {}
-        self.consumer_group_members: dict[str, set[str]] = {}
-        self.consumer_group_aliases: dict[str, set[str]] = {}
+        self.consumer_quarantine_by_idx: dict[int, list[str]] = {}
+        self.consumer_by_id: dict[str, list[int]] = {}
+        self.consumer_by_username: dict[str, list[int]] = {}
+        self.consumer_by_custom_id: dict[str, list[int]] = {}
+        self.group_by_id: dict[str, list[int]] = {}
+        self.group_by_name: dict[str, list[int]] = {}
+        self.group_members_by_idx: dict[int, set[int]] = {}
         self.unresolved_consumer_groups: list[str] = []
         self.top_acls_by_consumer: dict[int, list[str]] = {}
         self.unresolved_acls: list[str] = []
@@ -203,29 +208,83 @@ class _Kong:
             service_key = self.service_index.get(service_ref) if service_ref else None
             self._register_route(route, service_key)
 
-    def _group_members(self, gid: str) -> set[str]:
-        aliases = self.consumer_group_aliases.get(gid, {gid})
-        members: set[str] = set()
-        for alias in aliases:
-            members.update(self.consumer_group_members.get(alias, set()))
-        return members
+    def _resolve_consumer_ref(self, ref: Any) -> int | None:
+        """Resolve a Kong consumer reference to a unique declared consumer index, matching typed dict fields strictly."""
+        if isinstance(ref, dict):
+            tables = (("id", self.consumer_by_id), ("username", self.consumer_by_username),
+                      ("custom_id", self.consumer_by_custom_id))
+            matched: int | None = None
+            seen_field = False
+            for field, table in tables:
+                val = ref.get(field)
+                if val is None:
+                    continue
+                if not isinstance(val, str):
+                    return None
+                seen_field = True
+                indices = table.get(val, [])
+                if len(indices) != 1:
+                    return None
+                if matched is not None and matched != indices[0]:
+                    return None
+                matched = indices[0]
+            return matched if seen_field else None
+        if isinstance(ref, str):
+            matches = (set(self.consumer_by_id.get(ref, ()))
+                       | set(self.consumer_by_username.get(ref, ()))
+                       | set(self.consumer_by_custom_id.get(ref, ())))
+            return next(iter(matches)) if len(matches) == 1 else None
+        return None
+
+    def _resolve_group_ref(self, ref: Any) -> int | None:
+        """Resolve a Kong consumer_group reference to a unique declared group index."""
+        if isinstance(ref, dict):
+            tables = (("id", self.group_by_id), ("name", self.group_by_name))
+            matched: int | None = None
+            seen_field = False
+            for field, table in tables:
+                val = ref.get(field)
+                if val is None:
+                    continue
+                if not isinstance(val, str):
+                    return None
+                seen_field = True
+                indices = table.get(val, [])
+                if len(indices) != 1:
+                    return None
+                if matched is not None and matched != indices[0]:
+                    return None
+                matched = indices[0]
+            return matched if seen_field else None
+        if isinstance(ref, str):
+            matches = set(self.group_by_id.get(ref, ())) | set(self.group_by_name.get(ref, ()))
+            return next(iter(matches)) if len(matches) == 1 else None
+        return None
 
     def _register_plugin(self, raw: dict, level: str, owner: str | None) -> None:
-        consumer = _ref_key(raw.get("consumer"))
-        group = _ref_key(raw.get("consumer_group")) if raw.get("consumer_group") else None
-        if consumer or raw.get("consumer_group"):
+        raw_consumer = raw.get("consumer")
+        raw_group = raw.get("consumer_group")
+        if raw_consumer or raw_group:
             pname = safe_label(raw.get("name"), 40)
-            if consumer:
-                self.consumer_quarantine.setdefault(consumer, []).append(
-                    f"plugin {pname} is scoped to this consumer and has no Ferrum equivalent")
-            if raw.get("consumer_group"):
-                glabel = safe_label(group or "?", 40)
-                if not group:
-                    self.unresolved_consumer_groups.append(
-                        f"plugin {pname} references a consumer group whose identity cannot be resolved")
+            if raw_consumer:
+                cidx = self._resolve_consumer_ref(raw_consumer)
+                if cidx is not None:
+                    self.consumer_quarantine_by_idx.setdefault(cidx, []).append(
+                        f"plugin {pname} is scoped to this consumer and has no Ferrum equivalent")
                 else:
-                    for member in self._group_members(group):
-                        self.consumer_quarantine.setdefault(member, []).append(
+                    ckey = _ref_key(raw_consumer)
+                    if ckey:
+                        self.consumer_quarantine.setdefault(ckey, []).append(
+                            f"plugin {pname} is scoped to this consumer and has no Ferrum equivalent")
+            if raw_group:
+                gidx = self._resolve_group_ref(raw_group)
+                glabel = safe_label(_ref_key(raw_group) or "?", 40)
+                if gidx is None:
+                    self.unresolved_consumer_groups.append(
+                        f"plugin {pname} references an undeclared or ambiguous consumer group {glabel}")
+                else:
+                    for member_idx in self.group_members_by_idx.get(gidx, set()):
+                        self.consumer_quarantine_by_idx.setdefault(member_idx, []).append(
                             f"plugin {pname} is scoped to consumer group {glabel} and has no Ferrum equivalent")
                 self.report.error("kong-consumer-group", f"kong plugin {pname}",
                                   f"Plugin is scoped to consumer group {glabel}, which is not migrated; members "
@@ -262,22 +321,23 @@ class _Kong:
 
     def _index_consumers(self) -> list[dict]:
         consumers = []
-        consumer_ref_to_indices: dict[str, list[int]] = {}
         for index, consumer in enumerate(seq(self.root.get("consumers"))):
             if not isinstance(consumer, dict):
                 raise InputError("every Kong consumer must be a mapping")
             consumers.append(consumer)
-            for ident in (consumer.get("username"), consumer.get("custom_id"), consumer.get("id")):
-                if isinstance(ident, str):
-                    consumer_ref_to_indices.setdefault(ident, []).append(index)
+            if isinstance(consumer.get("id"), str):
+                self.consumer_by_id.setdefault(consumer["id"], []).append(index)
+            if isinstance(consumer.get("username"), str):
+                self.consumer_by_username.setdefault(consumer["username"], []).append(index)
+            if isinstance(consumer.get("custom_id"), str):
+                self.consumer_by_custom_id.setdefault(consumer["custom_id"], []).append(index)
             for plugin in seq(consumer.get("plugins")):
                 if isinstance(plugin, dict):
-                    key = consumer.get("username") or consumer.get("custom_id") or consumer.get("id") or str(index)
-                    self.consumer_quarantine.setdefault(str(key), []).append(
+                    self.consumer_quarantine_by_idx.setdefault(index, []).append(
                         f"plugin {safe_label(plugin.get('name'), 40)} is scoped to this consumer and has no Ferrum "
                         "equivalent")
-        # Top-level DB-less ACL records associate consumers with ACL groups; index them before emitting credentials
-        # so deny-list rules cannot be bypassed.
+        # Top-level DB-less ACL records associate consumers with ACL groups; resolve typed references strictly
+        # before emitting credentials so deny-lists cannot be bypassed and allow-lists cannot widen.
         raw_acls = self.root.get("acls")
         if raw_acls is not None and not isinstance(raw_acls, list):
             self.unresolved_acls.append("top-level acls is not a list")
@@ -290,57 +350,61 @@ class _Kong:
                                   "Top-level acls contains a malformed entry; affected consumers and ACL-protected "
                                   "routes are failed closed.")
                 continue
-            ckey = _ref_key(entry.get("consumer"))
+            cidx = self._resolve_consumer_ref(entry.get("consumer"))
             group = entry.get("group")
-            indices = consumer_ref_to_indices.get(ckey, []) if ckey else []
-            if not ckey or not isinstance(group, str) or not indices:
-                self.unresolved_acls.append("top-level acls entry cannot be resolved to a consumer and group")
+            if cidx is None or not isinstance(group, str):
+                self.unresolved_acls.append("top-level acls entry cannot be resolved uniquely to a consumer and group")
                 self.report.error("kong-acl-unresolved", "kong acls",
-                                  "A top-level ACL record could not be resolved to a declared consumer and group; "
-                                  "consumers are quarantined and ACL-protected routes are refused (fail closed).")
+                                  "A top-level ACL record could not be resolved uniquely to a declared consumer and "
+                                  "group; consumers are quarantined and ACL-protected routes are refused (fail closed).")
                 continue
-            for idx in indices:
-                self.top_acls_by_consumer.setdefault(idx, []).append(group)
-        groups_with_plugins: set[str] = set()
-        for group in seq(self.root.get("consumer_groups")):
+            self.top_acls_by_consumer.setdefault(cidx, []).append(group)
+        groups_with_plugins: set[int] = set()
+        raw_groups = self.root.get("consumer_groups")
+        if raw_groups is not None and not isinstance(raw_groups, list):
+            self.unresolved_consumer_groups.append("consumer_groups has unexpected shape")
+            self.report.error("kong-consumer-group", "kong consumer_groups",
+                              "consumer_groups is not a list; consumer-group policy cannot be resolved (fail closed).")
+        declared_groups: list[tuple[int, dict, str, bool]] = []
+        for gidx, group in enumerate(seq(raw_groups)):
             if not isinstance(group, dict):
                 self.unresolved_consumer_groups.append("consumer_groups contains a malformed entry")
                 continue
             name = safe_label(group.get("name") or group.get("id"))
-            group_ids = [ident for ident in (group.get("name"), group.get("id")) if isinstance(ident, str)]
-            for gid in group_ids:
-                self.consumer_group_aliases.setdefault(gid, set()).update(group_ids)
+            has_id = isinstance(group.get("id"), str)
+            has_name = isinstance(group.get("name"), str)
+            if has_id:
+                self.group_by_id.setdefault(group["id"], []).append(gidx)
+            if has_name:
+                self.group_by_name.setdefault(group["name"], []).append(gidx)
             has_nested_plugins = bool(group.get("plugins") or group.get("consumer_group_plugins"))
             if has_nested_plugins:
-                groups_with_plugins.update(group_ids)
-                if not group_ids:
+                groups_with_plugins.add(gidx)
+                if not (has_id or has_name):
                     self.unresolved_consumer_groups.append(
                         f"consumer group {name} carries plugin overrides without a resolvable group name/id")
+            declared_groups.append((gidx, group, name, has_nested_plugins))
+        for gidx, group, name, has_nested_plugins in declared_groups:
             for member in seq(group.get("consumers")):
-                key = _ref_key(member)
-                if key and key in consumer_ref_to_indices:
-                    for gid in group_ids:
-                        self.consumer_group_members.setdefault(gid, set()).add(key)
+                cidx = self._resolve_consumer_ref(member)
+                if cidx is not None:
+                    self.group_members_by_idx.setdefault(gidx, set()).add(cidx)
                     if has_nested_plugins:
-                        self.consumer_quarantine.setdefault(key, []).append(
+                        self.consumer_quarantine_by_idx.setdefault(cidx, []).append(
                             f"consumer group {name} carries plugin overrides")
                 elif member is not None:
                     self.unresolved_consumer_groups.append(
-                        f"consumer group {name} has an unresolvable member reference")
+                        f"consumer group {name} has an unresolvable or ambiguous member reference")
             self.report.error("kong-consumer-group", f"kong consumer_group {name}",
                               "Consumer groups are not migrated; members with group plugin overrides are "
                               "quarantined (credentials withheld).")
-        for consumer in consumers:
-            markers = [m for m in (consumer.get("username"), consumer.get("custom_id"), consumer.get("id"))
-                       if isinstance(m, str)]
+        for index, consumer in enumerate(consumers):
             for group in seq(consumer.get("groups")):
-                gid = _ref_key(group)
-                for marker in markers:
-                    if gid:
-                        for alias in self.consumer_group_aliases.get(gid, {gid}):
-                            self.consumer_group_members.setdefault(alias, set()).add(marker)
-                    self.consumer_quarantine.setdefault(marker, []).append(
-                        f"member of consumer group {safe_label(gid)}")
+                gidx = self._resolve_group_ref(group)
+                if gidx is not None:
+                    self.group_members_by_idx.setdefault(gidx, set()).add(index)
+                self.consumer_quarantine_by_idx.setdefault(index, []).append(
+                    f"member of consumer group {safe_label(_ref_key(group))}")
         raw_cgc = self.root.get("consumer_group_consumers")
         if raw_cgc is not None and not isinstance(raw_cgc, list):
             self.unresolved_consumer_groups.append("consumer_group_consumers has unexpected shape")
@@ -351,17 +415,16 @@ class _Kong:
             if not isinstance(entry, dict):
                 self.unresolved_consumer_groups.append("consumer_group_consumers contains a malformed entry")
                 continue
-            gid = _ref_key(entry.get("consumer_group"))
-            ckey = _ref_key(entry.get("consumer"))
-            if not gid or not ckey or ckey not in consumer_ref_to_indices:
-                self.unresolved_consumer_groups.append("consumer_group_consumers has an unresolvable membership entry")
+            gidx = self._resolve_group_ref(entry.get("consumer_group"))
+            cidx = self._resolve_consumer_ref(entry.get("consumer"))
+            if gidx is None or cidx is None:
+                self.unresolved_consumer_groups.append(
+                    "consumer_group_consumers has an undeclared or ambiguous membership entry")
                 continue
-            aliases = self.consumer_group_aliases.get(gid, {gid})
-            for alias in aliases:
-                self.consumer_group_members.setdefault(alias, set()).add(ckey)
-            if aliases & groups_with_plugins:
-                self.consumer_quarantine.setdefault(ckey, []).append(
-                    f"consumer group {safe_label(gid, 40)} carries plugin overrides")
+            self.group_members_by_idx.setdefault(gidx, set()).add(cidx)
+            if gidx in groups_with_plugins:
+                self.consumer_quarantine_by_idx.setdefault(cidx, []).append(
+                    f"consumer group {safe_label(_ref_key(entry.get('consumer_group')), 40)} carries plugin overrides")
         raw_cgp = self.root.get("consumer_group_plugins")
         if raw_cgp is not None and not isinstance(raw_cgp, list):
             self.unresolved_consumer_groups.append("consumer_group_plugins has unexpected shape")
@@ -373,17 +436,17 @@ class _Kong:
                 self.unresolved_consumer_groups.append("consumer_group_plugins contains a malformed entry")
                 continue
             pname = safe_label(entry.get("name"), 40)
-            gid = _ref_key(entry.get("consumer_group"))
-            if not gid:
+            gidx = self._resolve_group_ref(entry.get("consumer_group"))
+            glabel = safe_label(_ref_key(entry.get("consumer_group")) or "?", 40)
+            if gidx is None:
                 self.unresolved_consumer_groups.append(
-                    f"consumer_group_plugin {pname} has no resolvable consumer_group reference")
+                    f"consumer_group_plugin {pname} references an undeclared or ambiguous consumer_group {glabel}")
                 self.report.error("kong-consumer-group", f"kong consumer_group_plugin {pname}",
-                                  "Consumer group plugin has no resolvable consumer_group; affected consumers and "
-                                  "authenticated routes are failed closed.")
+                                  "Consumer group plugin references an undeclared or ambiguous consumer_group; "
+                                  "affected consumers and authenticated routes are failed closed.")
                 continue
-            glabel = safe_label(gid, 40)
-            for member in self._group_members(gid):
-                self.consumer_quarantine.setdefault(member, []).append(
+            for member_idx in self.group_members_by_idx.get(gidx, set()):
+                self.consumer_quarantine_by_idx.setdefault(member_idx, []).append(
                     f"consumer_group_plugin {pname} is scoped to consumer group {glabel} and has no Ferrum equivalent")
             self.report.error("kong-consumer-group", f"kong consumer_group_plugin {pname}",
                               f"Consumer group plugin is scoped to consumer group {glabel}, which is not migrated; "
@@ -425,6 +488,8 @@ class _Kong:
             for group in self.top_acls_by_consumer.get(index, []):
                 if group not in spec.acl_groups:
                     spec.acl_groups.append(group)
+            if index in self.consumer_quarantine_by_idx:
+                spec.quarantined.extend(self.consumer_quarantine_by_idx[index])
             for marker in (username, custom_id, consumer.get("id")):
                 if isinstance(marker, str) and marker in self.consumer_quarantine:
                     spec.quarantined.extend(self.consumer_quarantine[marker])
@@ -767,9 +832,9 @@ class _Kong:
                     "http_path": http_path,
                     "interval_seconds": max(1, min(interval, 3600)),
                     "timeout_ms": max(1, min(int(round(timeout_s * 1000)), util.MAX_TIMEOUT_MS)),
-                    "healthy_threshold": max(1, min(util.as_int(healthy.get("successes")) or 1, 1000)),
+                    "healthy_threshold": max(1, min(util.as_int(healthy.get("successes")) or 1, 10_000)),
                     "unhealthy_threshold": max(1, min(util.as_int(unhealthy.get("http_failures"))
-                                                      or util.as_int(unhealthy.get("tcp_failures")) or 1, 1000)),
+                                                      or util.as_int(unhealthy.get("tcp_failures")) or 1, 10_000)),
                     "probe_type": probe,
                 }
                 if str(active.get("type")) in ("https", "grpcs"):

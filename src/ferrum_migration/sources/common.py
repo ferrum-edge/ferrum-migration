@@ -220,12 +220,14 @@ def cors_config(origins: Any, methods: Any = None, headers: Any = None, exposed:
     clean: list[Any] = []
     for origin in origins:
         if isinstance(origin, str):
-            if not origin or len(origin) > 512 or not header_value_ok(origin):
+            if not origin or len(origin) > 512 or not header_value_ok(origin, nonempty=True, strict_ws=True):
                 return None, "an allowed origin is not representable"
             clean.append(origin)
         elif isinstance(origin, dict) and len(origin) == 1 and next(iter(origin)) in ("exact", "prefix", "regex"):
             kind, value = next(iter(origin.items()))
             if not isinstance(value, str) or not value or len(value) > 512:
+                return None, "an allowed origin matcher is not representable"
+            if kind in ("exact", "prefix") and not header_value_ok(value, nonempty=True, strict_ws=True):
                 return None, "an allowed origin matcher is not representable"
             if kind == "regex" and util.regex_problem(value):
                 return None, "an allowed origin regex is not representable"

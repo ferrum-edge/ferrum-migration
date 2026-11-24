@@ -812,15 +812,18 @@ def _resolve_conflicts(candidates: list[_Cand], report: Report) -> list[_Cand]:
                                             "cannot be split safely; the whole path slot was failed closed")
                         member.route.placeholder_emitted = True
                         replacement[id(member)] = []
+                    collapse_hosts = [] if any(not m.hosts for m in members) else list(
+                        dict.fromkeys(h for m in members for h in m.hosts)
+                    )
                     refused_outrank = 0
                     for other in candidates:
                         if other in members or other.placeholder:
                             continue
                         if not matching.ports_compatible(other.listen_port, port):
                             continue
-                        if not other.hosts or not matching.hosts_overlap(other.hosts, hosts):
+                        if not other.hosts or (collapse_hosts and not matching.hosts_overlap(other.hosts, collapse_hosts)):
                             continue
-                        if matching.route_overlaps(first.route, other.route):
+                        if any(matching.route_overlaps(m.route, other.route) for m in members):
                             _fail_close(other, "overlaps a >100-host path conflict that collapsed to a catch-all "
                                                "placeholder; its higher host tier would outrank the catch-all")
                             refused_outrank += 1
@@ -1136,6 +1139,61 @@ def _add_divergence_guards(plan: Plan, candidates: list[_Cand], report: Report) 
             fingerprints[id(item)] = _fingerprint(item)
         return fingerprints[id(item)]
 
+    def try_scoped_regex_guard(cand: _Cand, other: _Cand, pairs: set[tuple[int, int]], regex_other: bool) -> bool:
+        route = cand.route
+        prefix = route.path or "/"
+        guard_pattern = re.escape(prefix) + ".*"
+        guard_listen = "~" + guard_pattern
+        if not (
+            bool(cand.hosts)
+            and len(cand.hosts) <= util.MAX_HOSTS_PER_PROXY
+            and other.listen_port == cand.listen_port
+            and not regex_other
+            and not route.methods
+            and bool(pairs) and all(tb > ta for ta, tb in pairs)
+            and len(guard_listen.encode("utf-8")) <= util.MAX_LISTEN_PATH_LENGTH
+            and util.regex_problem(guard_pattern) is None
+        ):
+            return False
+        if any(
+            c.listen_port == cand.listen_port and c.listen_path == guard_listen
+            and matching.hosts_overlap(c.hosts, cand.hosts)
+            for c in candidates
+        ):
+            return False
+        if any(
+            not c.placeholder and matching.hosts_overlap(c.hosts, cand.hosts)
+            for c in regex_by_port.get(cand.listen_port, [])
+        ):
+            return False
+        # Avoid preempting another live lower-tier route (for example a catch-all /apix route) that sits under
+        # `prefix` as a string sibling.
+        for c in candidates:
+            if c is cand or c is other or c.placeholder:
+                continue
+            if not matching.ports_compatible(c.listen_port, cand.listen_port):
+                continue
+            if not matching.hosts_overlap(c.hosts, cand.hosts):
+                continue
+            c_path = c.route.path or ""
+            if c.route.kind in ("exact", "prefix") and c_path.startswith(prefix) \
+                    and c_path != prefix and not c_path.startswith(prefix + "/"):
+                c_pairs = matching.overlapping_tier_pairs(cand.hosts, c.hosts)
+                if any(tc > ta for ta, tc in c_pairs):
+                    return False
+        guard_key = (cand.listen_port, tuple(cand.hosts), guard_listen)
+        if guard_key not in scoped_guards_added:
+            scoped_guards_added.add(guard_key)
+            synthetic = RouteSpec(ref=route.ref, name=f"{route.name}-sibling-guard",
+                                  hosts=list(cand.hosts), kind="regex", path=guard_pattern)
+            guard_cand = _Cand(synthetic, True, list(cand.hosts), guard_listen, cand.listen_port,
+                               termination=NOT_FOUND_TERMINATION, kind_label="prefix-guard")
+            new_guard_cands.append(guard_cand)
+            report.info("prefix-divergence-guard", route.ref,
+                        f"Added a host-scoped regex 404 guard ({guard_listen}) so sibling paths like "
+                        f"{prefix}x cannot reach {other.route.ref} without affecting its other hosts.")
+        return True
+
     for cand in list(candidates):
         route = cand.route
         # A refused route's placeholder keeps its envelope too: the source sent its string-prefix siblings
@@ -1234,55 +1292,25 @@ def _add_divergence_guards(plan: Plan, candidates: list[_Cand], report: Report) 
                                 f"like {route.path}x, which the source routed to {route.ref}, cannot reach this "
                                 f"broader route under Ferrum's segment-based prefix matching.")
             elif refused:
-                # The guard cannot be scoped to the refused route's hosts. Letting its siblings reach this broader
-                # route would bypass the refused policy, so the guard is added anyway (fail closed) and the
-                # collateral 404s on the broader route's other hosts are a review error.
-                if route.path not in other.guards:
-                    other.guards.append(route.path or "/")
-                report.error("prefix-divergence-refused", route.ref,
-                             f"The source sent paths such as {route.path}x to this refused route. Ferrum would hand "
-                             f"them to the broader route {other_route.ref}, which serves more hosts or listeners, so a "
-                             f"request_termination guard (trigger.path_prefix {route.path}) was added to it for all "
-                             f"of its hosts: such paths now answer 404 there even on hosts the source forwarded "
-                             f"(fail closed).",
-                             "Recreate the refused route in Ferrum, then remove the guard only for hosts where the "
-                             "broader route should serve those paths.")
-            else:
-                # If this route is strictly in a more specific host tier than `other` on every overlapping host,
-                # emit a host-scoped regex 404 guard in this route's own tier so siblings like /apix are blocked on
-                # these hosts without returning 404 for `other`'s unrelated hosts.
-                guard_pattern = re.escape(route.path or "/") + ".*"
-                guard_listen = "~" + guard_pattern
-                can_scope_regex = (
-                    bool(cand.hosts)
-                    and len(cand.hosts) <= util.MAX_HOSTS_PER_PROXY
-                    and other.listen_port == cand.listen_port
-                    and not regex_other
-                    and bool(pairs) and all(tb > ta for ta, tb in pairs)
-                    and util.regex_problem(guard_pattern) is None
-                    and not any(
-                        c.listen_port == cand.listen_port and c.listen_path == guard_listen
-                        and matching.hosts_overlap(c.hosts, cand.hosts)
-                        for c in candidates
-                    )
-                    and not any(
-                        not c.placeholder and matching.hosts_overlap(c.hosts, cand.hosts)
-                        for c in regex_by_port.get(cand.listen_port, [])
-                    )
-                )
-                if can_scope_regex:
+                if try_scoped_regex_guard(cand, other, pairs, regex_other):
                     guarded = True
-                    guard_key = (cand.listen_port, tuple(cand.hosts), guard_listen)
-                    if guard_key not in scoped_guards_added:
-                        scoped_guards_added.add(guard_key)
-                        synthetic = RouteSpec(ref=route.ref, name=f"{route.name}-sibling-guard",
-                                              hosts=list(cand.hosts), kind="regex", path=guard_pattern)
-                        guard_cand = _Cand(synthetic, True, list(cand.hosts), guard_listen, cand.listen_port,
-                                           termination=NOT_FOUND_TERMINATION, kind_label="prefix-guard")
-                        new_guard_cands.append(guard_cand)
-                        report.info("prefix-divergence-guard", route.ref,
-                                    f"Added a host-scoped regex 404 guard ({guard_listen}) so sibling paths like "
-                                    f"{route.path}x cannot reach {other_route.ref} without affecting its other hosts.")
+                else:
+                    # The guard cannot be scoped to the refused route's hosts. Letting its siblings reach this broader
+                    # route would bypass the refused policy, so the guard is added anyway (fail closed) and the
+                    # collateral 404s on the broader route's other hosts are a review error.
+                    if route.path not in other.guards:
+                        other.guards.append(route.path or "/")
+                    report.error("prefix-divergence-refused", route.ref,
+                                 f"The source sent paths such as {route.path}x to this refused route. Ferrum would hand "
+                                 f"them to the broader route {other_route.ref}, which serves more hosts or listeners, so a "
+                                 f"request_termination guard (trigger.path_prefix {route.path}) was added to it for all "
+                                 f"of its hosts: such paths now answer 404 there even on hosts the source forwarded "
+                                 f"(fail closed).",
+                                 "Recreate the refused route in Ferrum, then remove the guard only for hosts where the "
+                                 "broader route should serve those paths.")
+            else:
+                if try_scoped_regex_guard(cand, other, pairs, regex_other):
+                    guarded = True
                 else:
                     # Cannot scope strictly to this route's hosts: guard `other` anyway (fail closed) and report
                     # the collateral 404s on the broader route's other hosts.

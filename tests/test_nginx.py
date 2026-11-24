@@ -677,6 +677,27 @@ class NginxFrontendScopeTest(unittest.TestCase):
         snis = {u["targets"][0]["host"]: u["backend_tls_sni"] for u in sep_res.config["upstreams"]}
         self.assertEqual(snis, {"10.0.0.5": "secure.internal.test", "10.0.0.6": "grpc.internal.test"})
 
+        # UDP QUIC on 443 must not turn a separate plaintext TCP listen 443 into HTTPS.
+        quic_conf = """
+        server {
+            listen 443 quic;
+            ssl_certificate /etc/synthetic/server.crt; ssl_certificate_key /etc/synthetic/server.key;
+            server_name h3.example.test;
+            location /h3/ { proxy_pass http://h3.internal:8080; }
+        }
+        server {
+            listen 443;
+            server_name plain.example.test;
+            location /plain/ { proxy_pass http://plain.internal:8080; }
+        }
+        """
+        q_res, _q_rep, q_plan = nginx(quic_conf)
+        assert_structurally_valid(self, q_res.config)
+        plain_routes = [r for r in q_plan.routes if r.path == "/plain"]
+        self.assertEqual(len(plain_routes), 1)
+        self.assertFalse(plain_routes[0].requires_tls)
+        self.assertEqual(plain_routes[0].protocols, frozenset({"http"}))
+
 
 if __name__ == "__main__":
     unittest.main()

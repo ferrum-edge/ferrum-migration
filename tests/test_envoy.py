@@ -497,6 +497,25 @@ class EnvoyHardeningTest(unittest.TestCase):
         r_uri, _rep_uri, _ = migrate("envoy", yaml.safe_dump(doc_uri))
         self.assertEqual(one_proxy(self, r_uri.config, "/api")["labels"]["ferrum-migration/status"], "refused")
 
+        # Protobuf final message type RawBuffer is classified as plaintext even if the URL prefix contains
+        # 'transport_sockets.tls'; active health thresholds up to 10_000 are preserved.
+        doc_rb = minimal_bootstrap({"path_separated_prefix": "/api"})
+        doc_rb["static_resources"]["clusters"][0]["transport_socket"] = {
+            "name": "custom",
+            "typed_config": {
+                "@type": "example.invalid/transport_sockets.tls/envoy.extensions.transport_sockets.raw_buffer.v3.RawBuffer"
+            },
+        }
+        doc_rb["static_resources"]["clusters"][0]["health_checks"] = [
+            {"interval": "10s", "timeout": "2s", "healthy_threshold": 2000, "unhealthy_threshold": 3000,
+             "http_health_check": {"path": "/healthz"}}
+        ]
+        r_rb, _rep_rb, _ = migrate("envoy", yaml.safe_dump(doc_rb))
+        self.assertEqual(one_proxy(self, r_rb.config, "/api")["backend_scheme"], "http")
+        hc = r_rb.config["upstreams"][0]["health_checks"]["active"]
+        self.assertEqual(hc["healthy_threshold"], 2000)
+        self.assertEqual(hc["unhealthy_threshold"], 3000)
+
         # Malformed require_client_certificate: "true" refuses TLS routes (never treated as absent).
         doc4 = minimal_bootstrap({"path_separated_prefix": "/api"})
         doc4["static_resources"]["listeners"][0]["filter_chains"][0]["transport_socket"] = {

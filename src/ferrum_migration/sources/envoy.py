@@ -653,24 +653,31 @@ class _Envoy:
         socket = mapping(raw.get("transport_socket"))
         if not socket:
             return TlsSpec(), "http", []
-        kind = _kind(socket)
-        if kind != "tls":
-            typed_cfg = mapping(socket.get("typed_config"))
-            if "@type" in typed_cfg:
-                type_url = typed_cfg.get("@type")
-                msg_type = type_url.rsplit("/", 1)[-1] if isinstance(type_url, str) and "/" in type_url else ""
-                is_raw_buffer = msg_type in (
-                    "envoy.extensions.transport_sockets.raw_buffer.v3.RawBuffer",
-                    "envoy.api.v2.core.RawBuffer",
-                )
-            else:
-                is_raw_buffer = str(socket.get("name", "")) in (
+        typed_cfg = mapping(socket.get("typed_config"))
+        if "@type" in typed_cfg:
+            type_url = typed_cfg.get("@type")
+            msg_type = type_url.rsplit("/", 1)[-1] if isinstance(type_url, str) and "/" in type_url else ""
+            if msg_type in (
+                "envoy.extensions.transport_sockets.raw_buffer.v3.RawBuffer",
+                "envoy.api.v2.core.RawBuffer",
+            ):
+                return TlsSpec(), "http", []
+            if msg_type not in (
+                "envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext",
+                "envoy.api.v2.auth.UpstreamTlsContext",
+            ):
+                return TlsSpec(), "http", [
+                    f"upstream transport_socket {safe_label(msg_type or type_url, 48)} is not supported"
+                ]
+        else:
+            kind = _kind(socket)
+            if kind != "tls":
+                if str(socket.get("name", "")) in (
                     "envoy.transport_sockets.raw_buffer",
                     "raw_buffer",
-                )
-            if is_raw_buffer:
-                return TlsSpec(), "http", []
-            return TlsSpec(), "http", [f"upstream transport_socket {safe_label(kind, 48)} is not supported"]
+                ):
+                    return TlsSpec(), "http", []
+                return TlsSpec(), "http", [f"upstream transport_socket {safe_label(kind, 48)} is not supported"]
         config = mapping(socket.get("typed_config"))
         common = mapping(config.get("common_tls_context"))
         problems: list[str] = []
@@ -773,8 +780,8 @@ class _Envoy:
             entry = {"http_path": path,
                      "interval_seconds": max(1, min((util.proto_duration_ms(check.get("interval")) or 10_000) // 1000, 3600)),
                      "timeout_ms": max(1, min(util.proto_duration_ms(check.get("timeout")) or 5_000, util.MAX_TIMEOUT_MS)),
-                     "healthy_threshold": max(1, min(util.as_int(check.get("healthy_threshold")) or 1, 1000)),
-                     "unhealthy_threshold": max(1, min(util.as_int(check.get("unhealthy_threshold")) or 1, 1000))}
+                     "healthy_threshold": max(1, min(util.as_int(check.get("healthy_threshold")) or 1, 10_000)),
+                     "unhealthy_threshold": max(1, min(util.as_int(check.get("unhealthy_threshold")) or 1, 10_000))}
             self.report.warning("envoy-health", ref, "Active health checks mapped approximately.")
             return {"active": entry}
         return None

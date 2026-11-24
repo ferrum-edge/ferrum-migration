@@ -702,6 +702,52 @@ class KongHardeningTest(unittest.TestCase):
         self.assertEqual(by_up["up1"]["health_checks"]["active"]["timeout_ms"], 86_400_000)
         self.assertNotIn("health_checks", by_up["up2"])
 
+        # Typed ACL {consumer: {id: id-a}} must NOT grant the group to another consumer whose custom_id == id-a,
+        # and undeclared consumer_group in consumer_group_plugins must fail closed on authenticated routes.
+        typed_acl = textwrap.dedent("""
+            _format_version: "3.0"
+            consumers:
+              - id: id-a
+                username: alice
+                keyauth_credentials: [{key: "alice-synthetic-key-16-chars"}]
+              - id: id-b
+                username: bob
+                custom_id: id-a
+                keyauth_credentials: [{key: "bob-synthetic-key-16-chars"}]
+            acls:
+              - consumer: {id: id-a}
+                group: vip
+            services:
+              - name: s
+                url: http://s.internal:8080
+                routes: [{name: r, paths: [/api/]}]
+        """)
+        t_res, _t_rep, _ = migrate("kong", typed_acl, include_secrets=True)
+        by_u = {c["username"]: c for c in t_res.config["consumers"]}
+        self.assertEqual(by_u["alice"].get("acl_groups"), ["vip"])
+        self.assertNotIn("acl_groups", by_u["bob"])
+
+        undeclared_grp = textwrap.dedent("""
+            _format_version: "3.0"
+            consumers:
+              - username: alice
+                keyauth_credentials: [{key: "alice-synthetic-key-16-chars"}]
+            consumer_group_plugins:
+              - name: rate-limiting
+                consumer_group: undeclared-group
+                config: {minute: 5}
+            plugins:
+              - name: key-auth
+                config: {}
+            services:
+              - name: s
+                url: http://s.internal:8080
+                routes: [{name: r, paths: [/api/]}]
+        """)
+        ug_res, _ug_rep, _ = migrate("kong", undeclared_grp, include_secrets=True)
+        self.assertEqual(one_proxy(self, ug_res.config, "/api")["labels"]["ferrum-migration/status"], "refused")
+        self.assertNotIn("credentials", ug_res.config["consumers"][0])
+
 
 if __name__ == "__main__":
     unittest.main()

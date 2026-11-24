@@ -494,24 +494,53 @@ class MatchingTest(unittest.TestCase):
 
     def test_oversized_conflict_collapse_also_refuses_outranking_higher_tier_live_route(self):
         # Sol P1 #1 + Opus P1 #1: when two conflicting routes at =/api form a >100-host ambiguous wildcard
-        # component and collapse to a catch-all 503 placeholder, an overlapping wildcard live route at / must
-        # also be failed closed so it cannot outrank the catch-all placeholder.
-        r_a = RouteSpec(ref="ra", name="ra",
-                        hosts=["*.example.test"] + [f"*.s{i}.example.test" for i in range(60)],
-                        kind="exact", path="/api", protocols=frozenset({"http"}),
-                        backend=BackendRef("http", "a.internal", 80))
-        r_b = RouteSpec(ref="rb", name="rb",
-                        hosts=[f"*.s{i}.example.test" for i in range(60, 120)],
-                        kind="exact", path="/api", protocols=frozenset({"http"}),
-                        backend=BackendRef("http", "b.internal", 80))
-        live = RouteSpec(ref="live", name="live", hosts=["*.s0.example.test"], kind="prefix", path="/",
-                         protocols=frozenset({"http"}), backend=BackendRef("http", "pub.internal", 80))
-        report = Report("test", "synthetic")
-        result = emit(Plan(platform="test", routes=[r_a, r_b, live]), EmitOptions(), report)
-        self.assertTrue(live.refusals)
-        self.assertIn("conflict-collapse", {c.code for c in report.caveats})
-        for proxy in result.config["proxies"]:
-            self.assertLessEqual(len(proxy.get("hosts", [])), util.MAX_HOSTS_PER_PROXY)
+        # component and collapse to a catch-all 503 placeholder, overlapping higher-tier live routes for ANY
+        # member of the collapsed group (regardless of order or component) must also be failed closed.
+        for reverse in (False, True):
+            with self.subTest(reverse=reverse):
+                r_a = RouteSpec(ref="ra", name="ra",
+                                hosts=["*.example.test"] + [f"*.s{i}.example.test" for i in range(60)],
+                                kind="exact", path="/api", protocols=frozenset({"http"}),
+                                backend=BackendRef("http", "a.internal", 80))
+                r_b = RouteSpec(ref="rb", name="rb",
+                                hosts=[f"*.s{i}.example.test" for i in range(60, 120)],
+                                kind="exact", path="/api", protocols=frozenset({"http"}),
+                                backend=BackendRef("http", "b.internal", 80))
+                r_c = RouteSpec(ref="rc", name="rc", hosts=["q.example.org"],
+                                kind="exact", path="/api", protocols=frozenset({"http"}),
+                                backend=BackendRef("http", "c.internal", 80))
+                live_wild = RouteSpec(ref="live-wild", name="live-wild", hosts=["*.s0.example.test"],
+                                      kind="prefix", path="/", protocols=frozenset({"http"}),
+                                      backend=BackendRef("http", "pub1.internal", 80))
+                live_exact = RouteSpec(ref="live-exact", name="live-exact", hosts=["q.example.org"],
+                                       kind="prefix", path="/", protocols=frozenset({"http"}),
+                                       backend=BackendRef("http", "pub2.internal", 80))
+                routes = [r_b, r_a, r_c, live_wild, live_exact] if reverse else [r_a, r_b, r_c, live_wild, live_exact]
+                report = Report("test", "synthetic")
+                result = emit(Plan(platform="test", routes=routes), EmitOptions(), report)
+                self.assertTrue(live_wild.refusals)
+                self.assertTrue(live_exact.refusals)
+                self.assertIn("conflict-collapse", {c.code for c in report.caveats})
+                for proxy in result.config["proxies"]:
+                    self.assertLessEqual(len(proxy.get("hosts", [])), util.MAX_HOSTS_PER_PROXY)
+
+    def test_500_byte_prefix_guard_falls_back_and_cors_rejects_padded_origin(self):
+        from ferrum_migration.sources.common import cors_config
+
+        long_prefix = "/" + "a" * 499  # 500 bytes: ~/aaa...* would be 503 bytes > 500
+        long_route = RouteSpec(ref="long", name="long", hosts=["a.example.test"], kind="prefix", path=long_prefix,
+                               protocols=frozenset({"http"}), backend=BackendRef("http", "a.internal", 80),
+                               report_prefix_siblings=True)
+        root = RouteSpec(ref="root", name="root", hosts=[], kind="prefix", path="/",
+                         protocols=frozenset({"http"}), backend=BackendRef("http", "b.internal", 80))
+        res = emit(Plan(platform="test", routes=[long_route, root]), EmitOptions(), Report("test", "synthetic"))
+        for proxy in res.config["proxies"]:
+            lp = proxy.get("listen_path")
+            if lp is not None:
+                self.assertLessEqual(len(lp.encode("utf-8")), util.MAX_LISTEN_PATH_LENGTH)
+        built, problem = cors_config([" https://example.test "])
+        self.assertIsNone(built)
+        self.assertIsNotNone(problem)
 
     def test_termination_validation_global_and_edge_cases(self):
         from ferrum_migration.model import PluginSpec
