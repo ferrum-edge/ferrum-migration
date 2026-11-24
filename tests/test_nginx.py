@@ -698,6 +698,27 @@ class NginxFrontendScopeTest(unittest.TestCase):
         self.assertFalse(plain_routes[0].requires_tls)
         self.assertEqual(plain_routes[0].protocols, frozenset({"http"}))
 
+        # IPv4 wildcard TLS listen 443 ssl must not turn a separate IPv6 wildcard plaintext listen [::]:443 into HTTPS.
+        v4v6_conf = """
+        server {
+            listen 443 ssl;
+            ssl_certificate /etc/synthetic/server.crt; ssl_certificate_key /etc/synthetic/server.key;
+            server_name tls.example.test;
+            location /tls/ { proxy_pass http://tls.internal:8080; }
+        }
+        server {
+            listen [::]:443;
+            server_name v6plain.example.test;
+            location /v6/ { proxy_pass http://v6.internal:8080; }
+        }
+        """
+        v_res, _v_rep, v_plan = nginx(v4v6_conf)
+        assert_structurally_valid(self, v_res.config)
+        v6_routes = [r for r in v_plan.routes if r.path == "/v6"]
+        self.assertEqual(len(v6_routes), 1)
+        self.assertFalse(v6_routes[0].requires_tls)
+        self.assertEqual(v6_routes[0].protocols, frozenset({"http"}))
+
 
 if __name__ == "__main__":
     unittest.main()

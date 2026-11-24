@@ -261,6 +261,21 @@ class _Kong:
             return next(iter(matches)) if len(matches) == 1 else None
         return None
 
+    def _matching_consumer_indices(self, ref: Any) -> set[int]:
+        """All declared consumer indices matching any field of ``ref`` (used to fail closed on ambiguous refs)."""
+        matches: set[int] = set()
+        if isinstance(ref, dict):
+            for field, table in (("id", self.consumer_by_id), ("username", self.consumer_by_username),
+                                 ("custom_id", self.consumer_by_custom_id)):
+                val = ref.get(field)
+                if isinstance(val, str):
+                    matches.update(table.get(val, ()))
+        elif isinstance(ref, str):
+            matches.update(self.consumer_by_id.get(ref, ()))
+            matches.update(self.consumer_by_username.get(ref, ()))
+            matches.update(self.consumer_by_custom_id.get(ref, ()))
+        return matches
+
     def _register_plugin(self, raw: dict, level: str, owner: str | None) -> None:
         raw_consumer = raw.get("consumer")
         raw_group = raw.get("consumer_group")
@@ -272,10 +287,15 @@ class _Kong:
                     self.consumer_quarantine_by_idx.setdefault(cidx, []).append(
                         f"plugin {pname} is scoped to this consumer and has no Ferrum equivalent")
                 else:
-                    ckey = _ref_key(raw_consumer)
-                    if ckey:
-                        self.consumer_quarantine.setdefault(ckey, []).append(
-                            f"plugin {pname} is scoped to this consumer and has no Ferrum equivalent")
+                    matched = self._matching_consumer_indices(raw_consumer)
+                    for idx in matched:
+                        self.consumer_quarantine_by_idx.setdefault(idx, []).append(
+                            f"plugin {pname} has an ambiguous or conflicting consumer reference")
+                    self.unresolved_consumer_groups.append(
+                        f"plugin {pname} references an ambiguous or undeclared consumer")
+                    self.report.error("kong-consumer-quarantined", f"kong plugin {pname}",
+                                      "Consumer-scoped plugin references an ambiguous or undeclared consumer; "
+                                      "matched consumers are quarantined and authenticated routes fail closed.")
             if raw_group:
                 gidx = self._resolve_group_ref(raw_group)
                 glabel = safe_label(_ref_key(raw_group) or "?", 40)

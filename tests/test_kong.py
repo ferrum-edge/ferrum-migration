@@ -748,6 +748,33 @@ class KongHardeningTest(unittest.TestCase):
         self.assertEqual(one_proxy(self, ug_res.config, "/api")["labels"]["ferrum-migration/status"], "refused")
         self.assertNotIn("credentials", ug_res.config["consumers"][0])
 
+        # Ambiguous/conflicting typed consumer ref ({id: id-a, username: bob}) on a plugin quarantines BOTH
+        # matched consumers and fails closed on authenticated routes.
+        ambig_plugin = textwrap.dedent("""
+            _format_version: "3.0"
+            consumers:
+              - id: id-a
+                username: alice
+                keyauth_credentials: [{key: "alice-synthetic-key-16-chars"}]
+              - id: id-b
+                username: bob
+                keyauth_credentials: [{key: "bob-synthetic-key-16-chars"}]
+            plugins:
+              - name: key-auth
+                config: {}
+              - name: rate-limiting
+                consumer: {id: id-a, username: bob}
+                config: {minute: 5}
+            services:
+              - name: s
+                url: http://s.internal:8080
+                routes: [{name: r, paths: [/api/]}]
+        """)
+        ap_res, _ap_rep, _ = migrate("kong", ambig_plugin, include_secrets=True)
+        self.assertEqual(one_proxy(self, ap_res.config, "/api")["labels"]["ferrum-migration/status"], "refused")
+        for c in ap_res.config["consumers"]:
+            self.assertNotIn("credentials", c)
+
 
 if __name__ == "__main__":
     unittest.main()

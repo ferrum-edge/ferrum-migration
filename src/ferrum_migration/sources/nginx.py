@@ -356,7 +356,7 @@ class _Nginx:
             elif directive.name == "ssl" and directive.args == ["on"]:
                 ssl_on = True
         if not listens:
-            listens = [{"addr": None, "port": 80, "ssl": False, "default": False, "flags": set()}]
+            listens = [{"addr": None, "port": 80, "family": "v4", "ssl": False, "default": False, "flags": set()}]
         if ssl_on:
             for listen in listens:
                 listen["ssl"] = True
@@ -365,9 +365,9 @@ class _Nginx:
                 "ref": f"nginx server '{safe_label(label, 64)}' (line {server.line})", "label": label}
 
     def _merge_shared_tls_sockets(self, infos: list[dict]) -> None:
-        """NGINX marks a shared (addr, port, transport) socket as TLS if any server on that exact socket sets ``ssl``."""
+        """NGINX marks a shared (addr, port, family, transport) socket as TLS if any server on that exact socket sets ``ssl``."""
         tls_sockets = {
-            (listen["addr"], listen["port"], bool(listen.get("http3")))
+            (listen["addr"], listen["port"], listen.get("family", "v4"), bool(listen.get("http3")))
             for info in infos for listen in info["listens"]
             if not listen.get("invalid") and listen["ssl"]
         }
@@ -377,7 +377,7 @@ class _Nginx:
             for listen in info["listens"]:
                 if listen.get("invalid") or listen["ssl"]:
                     continue
-                if (listen["addr"], listen["port"], bool(listen.get("http3"))) in tls_sockets:
+                if (listen["addr"], listen["port"], listen.get("family", "v4"), bool(listen.get("http3"))) in tls_sockets:
                     listen["ssl"] = True
 
     def _elect_ports(self, infos: list[dict]) -> None:
@@ -1069,9 +1069,10 @@ def _parse_listen(args: list[str]) -> dict | None:
         addr, port = target, 80
     if not 1 <= port <= 65535:
         return None
+    family = "v6" if target.startswith("[") else "v4"
     if addr in ("*", "0.0.0.0", "::", ""):
         addr = None
-    return {"addr": addr, "port": port, "ssl": "ssl" in flags or "quic" in flags,
+    return {"addr": addr, "port": port, "family": family, "ssl": "ssl" in flags or "quic" in flags,
             "default": "default_server" in flags or "default" in flags, "flags": flags,
             "http3": "quic" in flags, "proxy_protocol": "proxy_protocol" in flags}
 
