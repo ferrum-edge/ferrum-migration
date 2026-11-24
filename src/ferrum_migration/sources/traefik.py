@@ -34,6 +34,13 @@ translator reads the canonical spelling only. Any typed field at the structural 
 the whole input before any route or profile is built (``_canonical_schema_gate``). Keys that name resources
 (routers, services, middlewares, serversTransports, TLS options, certificate stores) are case-sensitive identifiers
 in Traefik and are never checked or folded.
+
+Router ``parentRefs`` (Traefik v3.6 multi-layer routing) is not translated. A router with parent references is a
+child: Traefik runs it inside its parents' muxer, after the parents' middlewares, under the parents' entryPoint and
+TLS constraints, so it is not an independent root route and must never be projected as one. Inherited routing is not
+reconstructed. A router whose ``parentRefs`` is absent or exactly an empty list is an ordinary root; any other value
+on any router of the input as written (a nonempty list, an explicit null, or any other shape) rejects the whole input
+before any route or profile is built, whatever the operator states (``_parent_refs_preflight``).
 """
 
 from __future__ import annotations
@@ -211,6 +218,37 @@ def typed_field_problems(value: Any, struct: str = "configuration", path: str = 
             for entry in seq(item):
                 problems.extend(typed_field_problems(entry, child[1], f"{where}[]"))
     return problems
+
+
+#: Canonical name of the router field that makes a router a child of other routers (Traefik v3.6).
+PARENT_REFS_FIELD = "parentRefs"
+
+
+def parent_refs_violations(root: Any) -> int:
+    """Number of routers in the original ``http.routers`` whose ``parentRefs`` is not absent or exactly ``[]``.
+
+    Read-only and value-free: only a count is returned. Every router mapping of the input as written is checked,
+    including routers that later translation would skip (no rule, unparseable or unsatisfiable rule, shadowed). A
+    nonempty list makes the router a child that Traefik runs inside its parents (after their middlewares, under their
+    entryPoint and TLS constraints); an explicit null or any other shape leaves its role unknown. Both count, so the
+    caller can refuse. The key is matched case-insensitively here as well, although the canonical schema gate already
+    rejects other spellings before this check runs. Router entries that are not mappings carry no readable field and
+    are refused by the translator itself (``traefik-router-invalid``).
+    """
+    http = root.get("http") if isinstance(root, dict) else None
+    routers = http.get("routers") if isinstance(http, dict) else None
+    if not isinstance(routers, dict):
+        return 0
+    folded = PARENT_REFS_FIELD.casefold()
+    count = 0
+    for router in routers.values():
+        if not isinstance(router, dict):
+            continue
+        for key, value in router.items():
+            if isinstance(key, str) and key.casefold() == folded and not (isinstance(value, list) and not value):
+                count += 1
+                break
+    return count
 
 
 class RuleError(Exception):
@@ -410,6 +448,8 @@ class _Traefik:
         # Before anything else: no section, route or profile setting is built from an input whose typed fields
         # Traefik would read differently from this translator.
         self._canonical_schema_gate()
+        # Then: no child router (parentRefs) is ever projected as an independent root route.
+        self._parent_refs_preflight()
         for key in self.root:
             if key in ("tcp", "udp"):
                 self.report.error("traefik-l4", f"traefik {key}", "TCP/UDP routers are not migrated (HTTP only).",
@@ -463,6 +503,33 @@ class _Traefik:
             "nothing was converted (fail closed). Spell each field exactly as Traefik documents it (for example "
             "'tls', 'options', 'clientAuth', 'middlewares') and convert again. Names of routers, services, "
             "middlewares, serversTransports, TLS options and stores are case-sensitive and are not affected.")
+
+    # ------------------------------------------------- multi-layer routing (parentRefs)
+
+    def _parent_refs_preflight(self) -> None:
+        """Reject the whole input when any router has ``parentRefs`` other than absent or ``[]`` (fail closed, exit 3).
+
+        Traefik v3.6 runs a router that names parent routers inside the parents' muxer: after the parents'
+        middlewares, and only for requests admitted by the parents' entryPoints and TLS settings. This translator
+        does not reconstruct that inheritance, and projecting the child as an independent root route would drop
+        the parents' controls (authentication or allow-list middlewares, TLS, entryPoint scope). The parents'
+        controls are stated in the input itself, so the operator statement does not lift this. An explicit null
+        or any other shape is refused too: the router's role cannot be read with certainty. Read-only: runs on the
+        input as written, after the canonical schema gate and before any section, route, report entry or profile
+        setting is built. The message carries the canonical field path and a count only, never input values or
+        router names.
+        """
+        count = parent_refs_violations(self.root)
+        if not count:
+            return
+        raise InputError(
+            f"Traefik router field http.routers.<name>.{PARENT_REFS_FIELD} is set to something other than an empty "
+            f"list on {count} router(s) (a nonempty list, an explicit null or another shape). A router with parent "
+            "references runs inside its parent routers in Traefik, after their middlewares and under their "
+            "entryPoint and TLS constraints, and this converter does not translate that inheritance, so it cannot "
+            "be migrated as an independent route; nothing was converted (fail closed), whatever "
+            f"{CONTROLS_ASSERTION_FLAG} states. Convert only routers without parent references (the field absent or "
+            "an empty list) and configure the multi-layer routes in Ferrum by hand.")
 
     # ------------------------------------------------- controls outside the input
 

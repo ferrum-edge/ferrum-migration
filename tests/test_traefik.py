@@ -8,8 +8,11 @@ from helpers import assert_structurally_valid, codes, live_routes, migrate, one_
     read_fixture, upstream_of
 
 from ferrum_migration.errors import InputError
-from ferrum_migration.sources.traefik import CONTROLS_ASSERTION_FLAG, RuleError, evaluate_term, rule_to_dnf, \
-    typed_field_problems
+from ferrum_migration.limits import Limits
+from ferrum_migration.report import Report
+from ferrum_migration.sources.common import SourceContext
+from ferrum_migration.sources.traefik import CONTROLS_ASSERTION_FLAG, RuleError, evaluate_term, \
+    parent_refs_violations, rule_to_dnf, translate, typed_field_problems
 
 
 def asserted(text, **kwargs):
@@ -920,6 +923,149 @@ class TraefikCanonicalSchemaTest(unittest.TestCase):
                 self.assertEqual(typed_field_problems(doc), [])
                 _result, _report, plan = asserted(yaml.safe_dump(doc))
                 self.assertEqual(plan.settings.frontend_cert_pairs, expected)
+
+
+class TraefikParentRefsTest(unittest.TestCase):
+    """Router ``parentRefs`` (Traefik v3.6 multi-layer routing) is never projected as an independent root route.
+
+    Absent or exactly ``[]``: an ordinary root router. Anything else on any router of the input as written (a nonempty
+    list, an explicit null, another shape) rejects the whole input (exit 3) before any route, report entry or profile
+    setting is built, with or without the operator's statement. Benign structural inputs only: plain routers and a
+    synthetic load balancer; no parent middleware or inherited routing is modelled.
+    """
+
+    SERVICE = {"svc-zq": {"loadBalancer": {"servers": [{"url": "http://s.internal:80"}]}}}
+    VALUES = ("parent-zq", "c.example.test", "s.internal", "svc-zq", "router-zq", "sibling-zq")
+
+    def _router(self, parent_refs=..., path="/c"):
+        router = {"rule": f"Host(`c.example.test`) && Path(`{path}`)", "service": "svc-zq"}
+        if parent_refs is not ...:
+            router["parentRefs"] = parent_refs
+        return router
+
+    def _doc(self, routers):
+        return {"http": {"routers": routers, "services": self.SERVICE}}
+
+    def _assert_rejected(self, doc, fmt="yaml", text=None):
+        text = text if text is not None else (json.dumps(doc) if fmt == "json" else yaml.safe_dump(doc))
+        for controls_asserted in (True, False):
+            with self.subTest(controls_asserted=controls_asserted):
+                report = Report("traefik", "test-input")
+                context = SourceContext(report=report, limits=Limits(),
+                                        traefik_controls_asserted=controls_asserted)
+                with self.assertRaises(InputError) as caught:
+                    translate(text, fmt, context)
+                message = str(caught.exception)
+                self.assertIn("http.routers.<name>.parentRefs", message)
+                for value in self.VALUES:
+                    self.assertNotIn(value, message)
+                # Preflight: nothing was built or reported before the rejection.
+                self.assertEqual(report.caveats, [])
+
+    def test_absent_and_empty_list_stay_ordinary_roots(self):
+        for label, parent_refs in (("absent", ...), ("empty list", [])):
+            with self.subTest(label):
+                doc = self._doc({"router-zq": self._router(parent_refs)})
+                self.assertEqual(parent_refs_violations(doc), 0)
+                self.assertEqual(typed_field_problems(doc), [])
+                result, report, _plan = asserted(yaml.safe_dump(doc))
+                proxy = one_proxy(self, result.config, "=/c", "c.example.test")
+                self.assertEqual(proxy["labels"]["ferrum-migration/status"], "migrated")
+                assert_structurally_valid(self, result.config)
+                self.assertIn("traefik-controls-asserted", codes(report, "warning"))
+
+    def test_empty_list_is_accepted_in_json_and_toml(self):
+        doc = self._doc({"router-zq": self._router([])})
+        toml_text = textwrap.dedent("""\
+            [http.routers.router-zq]
+            rule = "Host(`c.example.test`) && Path(`/c`)"
+            service = "svc-zq"
+            parentRefs = []
+
+            [[http.services.svc-zq.loadBalancer.servers]]
+            url = "http://s.internal:80"
+            """)
+        for fmt, text in (("json", json.dumps(doc)), ("toml", toml_text)):
+            with self.subTest(fmt=fmt):
+                result, _report, _plan = asserted(text, fmt=fmt)
+                self.assertEqual(live_routes(result.config), [("=/c", ["c.example.test"])])
+
+    def test_nonempty_parent_refs_reject_the_whole_input(self):
+        cases = {
+            "one parent": ["parent-zq"],
+            "several parents": ["parent-zq", "sibling-zq"],
+            "provider-qualified parent": ["parent-zq@file"],
+        }
+        for label, parent_refs in cases.items():
+            with self.subTest(label):
+                doc = self._doc({"router-zq": self._router(parent_refs),
+                                 "sibling-zq": self._router(path="/d")})
+                self.assertEqual(parent_refs_violations(doc), 1)
+                self._assert_rejected(doc)
+                self._assert_rejected(doc, fmt="json")
+
+    def test_nonempty_parent_refs_on_routers_that_would_be_skipped_still_reject(self):
+        # Checked on every router as written: no rule, unparseable or unsatisfiable rules do not hide it.
+        cases = {
+            "router without a rule": {"service": "svc-zq", "parentRefs": ["parent-zq"]},
+            "unparseable rule": {"rule": "Host(`c.example.test`", "service": "svc-zq", "parentRefs": ["parent-zq"]},
+            "unsatisfiable rule": {"rule": "Host(`c.example.test`) && Host(`d.example.test`)", "service": "svc-zq",
+                                   "parentRefs": ["parent-zq"]},
+        }
+        for label, router in cases.items():
+            with self.subTest(label):
+                self._assert_rejected(self._doc({"router-zq": self._router(), "sibling-zq": router}))
+
+    def test_null_and_malformed_parent_refs_reject_the_whole_input(self):
+        cases = {
+            "explicit null": None,
+            "bare string": "parent-zq",
+            "empty string": "",
+            "mapping": {"name": "parent-zq"},
+            "empty mapping": {},
+            "boolean": False,
+            "number": 0,
+            "list with an empty name": [""],
+            "list with a null": [None],
+            "list with a non-string": [1],
+            "nested list": [[]],
+        }
+        for label, parent_refs in cases.items():
+            with self.subTest(label):
+                doc = self._doc({"router-zq": self._router(parent_refs)})
+                self.assertEqual(parent_refs_violations(doc), 1)
+                self._assert_rejected(doc)
+
+    def test_rejection_precedes_every_other_section(self):
+        # A tcp section would normally add a report entry; the preflight runs first, so nothing is reported.
+        doc = self._doc({"router-zq": self._router(["parent-zq"])})
+        doc["tcp"] = {"routers": {}}
+        self._assert_rejected(doc)
+
+    def test_canonical_spelling_gate_still_covers_parent_refs_variants(self):
+        # Other letter cases are rejected by the canonical schema gate, even with an empty-list value.
+        for other in ("ParentRefs", "parentrefs", "PARENTREFS", "parentREFS"):
+            with self.subTest(other=other):
+                router = self._router()
+                router[other] = []
+                doc = self._doc({"router-zq": router})
+                self.assertIn("http.routers.<name>.parentRefs", typed_field_problems(doc))
+                for controls_asserted in (True, False):
+                    with self.assertRaises(InputError) as caught:
+                        migrate("traefik", yaml.safe_dump(doc), traefik_controls_asserted=controls_asserted)
+                    self.assertIn("http.routers.<name>.parentRefs", str(caught.exception))
+                    self.assertIn("letter case", str(caught.exception))
+        # Given twice in different letter case, both empty: still rejected by the gate.
+        router = self._router([])
+        router["ParentRefs"] = []
+        doc = self._doc({"router-zq": router})
+        self.assertIn("http.routers.<name>.parentRefs", typed_field_problems(doc))
+        with self.assertRaises(InputError):
+            asserted(yaml.safe_dump(doc))
+        # The helper folds the key too, in case it is ever called without the gate.
+        router = self._router()
+        router["ParentRefs"] = ["parent-zq"]
+        self.assertEqual(parent_refs_violations(self._doc({"router-zq": router})), 1)
 
 
 if __name__ == "__main__":

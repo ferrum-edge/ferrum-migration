@@ -141,6 +141,60 @@ class CliTest(unittest.TestCase):
                     self.assertNotIn(value, stderr)
         self.assertFalse(os.path.exists(out))
 
+    def _traefik_parent_refs_input(self, name, parent_refs=..., fmt="yaml"):
+        router = {"rule": "Host(`c.example.test`) && Path(`/c`)", "service": "svc-zq"}
+        if parent_refs is not ...:
+            router["parentRefs"] = parent_refs
+        doc = {"http": {"routers": {"router-zq": router},
+                        "services": {"svc-zq": {"loadBalancer": {"servers": [{"url": "http://s.internal:80"}]}}}}}
+        path = os.path.join(self.temp.name, name)
+        with open(path, "w", encoding="utf-8") as handle:
+            if fmt == "json":
+                json.dump(doc, handle)
+            else:
+                yaml.safe_dump(doc, handle)
+        return path
+
+    def test_traefik_parent_refs_child_router_writes_nothing(self):
+        # A router with parentRefs runs inside its parents in Traefik v3.6 (after their middlewares, under their
+        # entryPoint and TLS constraints); it is never migrated as an independent root route. A nonempty list, an
+        # explicit null or another shape rejects the input (exit 3) for convert and check, even with the operator
+        # statement, and the message never echoes input values.
+        cases = {
+            "nonempty yaml": ("child.yaml", ["parent-zq"], "yaml"),
+            "nonempty json": ("child.json", ["parent-zq"], "json"),
+            "explicit null": ("null.yaml", None, "yaml"),
+            "malformed string": ("string.yaml", "parent-zq", "yaml"),
+            "malformed mapping": ("mapping.json", {"name": "parent-zq"}, "json"),
+        }
+        for label, (name, parent_refs, fmt) in cases.items():
+            path = self._traefik_parent_refs_input(name, parent_refs, fmt)
+            out = self.out_dir(f"out-{fmt}-{label.replace(' ', '-')}")
+            for command in (("convert", path, "--from", "traefik", "--out", out),
+                            ("check", path, "--from", "traefik", "--json")):
+                for extra in ((TRAEFIK_ASSERTION,), ()):
+                    with self.subTest(label, command=command[0], asserted=bool(extra)):
+                        code, stdout, stderr = run_cli(*command, *extra)
+                        self.assertEqual(code, 3)
+                        self.assertEqual(stdout, "")
+                        self.assertIn("input rejected", stderr)
+                        self.assertIn("http.routers.<name>.parentRefs", stderr)
+                        for value in ("parent-zq", "router-zq", "svc-zq", "c.example.test", "s.internal"):
+                            self.assertNotIn(value, stderr)
+            self.assertFalse(os.path.exists(out))
+
+    def test_traefik_empty_parent_refs_stays_an_ordinary_root(self):
+        for label, parent_refs in (("absent", ...), ("empty list", [])):
+            with self.subTest(label):
+                path = self._traefik_parent_refs_input(f"root-{label.replace(' ', '-')}.yaml", parent_refs)
+                out = self.out_dir(f"root-{label.replace(' ', '-')}")
+                code, _stdout, stderr = run_cli("convert", path, "--from", "traefik", "--out", out, TRAEFIK_ASSERTION)
+                self.assertIn(code, (0, 4), stderr)
+                for name in OUTPUT_FILES:
+                    self.assertTrue(os.path.isfile(os.path.join(out, name)), name)
+                report = json.loads(self.read(out, "migration-report.json"))
+                self.assertEqual(report["summary"]["migrated_routes"], 1)
+
     def test_former_traefik_entrypoint_flag_is_not_accepted(self):
         # Renamed before release; the narrower statement is not kept as an alias.
         code, _stdout, _stderr = run_cli("check", fixture_path("traefik", "dynamic.toml"), "--from", "traefik",

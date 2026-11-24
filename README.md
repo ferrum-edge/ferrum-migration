@@ -78,7 +78,7 @@ is refused with exit code 2, and nothing is written.
 | 0 | Migrated; no error-level caveats (warnings allowed unless `--strict`). |
 | 1 | Internal error; nothing written. The exception text is never printed, because it could echo input. |
 | 2 | Usage error. |
-| 3 | Input rejected (syntax, duplicate keys, size/node/depth/alias limits, unsupported shape such as a Traefik typed field spelled other than canonically); nothing written. |
+| 3 | Input rejected (syntax, duplicate keys, size/node/depth/alias limits, unsupported shape such as a Traefik typed field spelled other than canonically, or a Traefik router whose `parentRefs` is set to anything but an empty list); nothing written. |
 | 4 | Output written, but it contains items that need review: refused or fail-closed routes, unmigrated credentials, or approximations that are less strict (also warnings with `--strict`). |
 | 5 | Output could not be written safely (existing files without `--force`, symlinked target, permissions). |
 
@@ -195,6 +195,14 @@ rather than opening routes or downgrading security:
   every middleware type the tool translates. The error names the canonical field path only. Names of routers,
   services, middlewares, `serversTransports`, TLS options and stores are case-sensitive identifiers in Traefik and
   are never folded: `Backend` and `backend` are two services, and `Default` is not the `default` TLS options.
+* **Traefik child routers are never migrated as root routes.** Traefik v3.6 runs a router whose `parentRefs` names
+  parent routers inside those parents: after the parents' middlewares, and under the parents' entryPoint and TLS
+  constraints. The tool does not translate this inheritance, and serving the child as an independent route would drop
+  the parents' controls. A router with `parentRefs` absent or exactly an empty list (`[]`) is an ordinary root router.
+  Any other value on any router of the input (a nonempty list, an explicit null, or any other shape) rejects the
+  whole input (exit 3, nothing written), with or without `--assert-traefik-input-includes-effective-controls`. The
+  error names the canonical field path and a router count only. Other spellings of `parentRefs` are rejected by the
+  canonical spelling check above.
 * **Each route is served only on the protocols the source used.** Ferrum serves every route on each
   listener its profile opens, whatever the host names, so host names that look disjoint, unknown hosts
   or a missing TLS setting prove nothing (Ferrum opens HTTPS on its default port as soon as a frontend
