@@ -93,6 +93,10 @@ rather than opening routes or downgrading security:
 * **Unrepresentable matches poison overlaps.** Routes that match on headers, queries, SNI,
   regex hosts or similar cannot be expressed in Ferrum. Every route Ferrum would prefer for the
   overlapping requests is refused too.
+* **Case-insensitive paths keep only their exact case.** Envoy `case_sensitive: false` and Istio
+  `ignoreUriCase` matches stay migrated for their exact-case path, because Ferrum matches paths
+  case-sensitively. Every other route that could receive their case variants (`/API` for `/api`) is
+  refused instead of forwarding them; overlap checks compare such paths case-folded.
 * **Precedence is checked, not assumed.** The tool checks first-match order (Envoy, Istio), router
   priorities (Traefik) and regex-versus-prefix precedence (NGINX, Kong) against Ferrum's specificity
   order. Unreachable routes are dropped and contradictory pairs are refused.
@@ -109,9 +113,8 @@ rather than opening routes or downgrading security:
   serves more hosts, the guard still applies to all of them and a `prefix-divergence-refused`
   error reports the extra 404s. Regex routes that the source's priority kept away from such
   siblings (an NGINX `^~` prefix, an earlier Envoy/Istio prefix) are guarded the same way when no
-  prefix route in the host tier catches the siblings first. A port-agnostic route that also serves
-  a port-scoped route's listener is included. For a refused route, or a competing regex route, a
-  guard that cannot be scoped exactly is still added (fail closed) and reported.
+  prefix route in the host tier catches the siblings first. For a refused route, or a competing
+  regex route, a guard that cannot be scoped exactly is still added (fail closed) and reported.
 * **No cross-host fallthrough.** An NGINX server, Envoy virtual host or Istio host never falls
   through to another host's routes. Ferrum can, so a host-only 404 route closes each such scope.
   When another host-only route overlaps a scope without closing exactly its host names, a regex
@@ -135,7 +138,8 @@ rather than opening routes or downgrading security:
   every alias of a consumer (username, id, custom_id) and accepts the consumer-wide secret, so
   the one-to-one binding between a key and its secret cannot be reproduced. The `jwt_auth`
   plugin, the consumer and its other credentials are still migrated, so JWT authentication fails
-  closed. Issue a new random secret per consumer in Ferrum, and keep the Kong credential until
+  closed. A route that combines JWT with another authentication method is refused outright
+  (`kong-auth-composition`), because the other method's credentials could still migrate. Issue a new random secret per consumer in Ferrum, and keep the Kong credential until
   clients have switched. No other source's credentials, and no other credential type, are portable.
   Password hashes (Kong basic-auth, htpasswd, Traefik `basicAuth`) cannot be converted.
   The matching auth plugin is emitted with no credentials, so nobody can authenticate until
@@ -164,13 +168,26 @@ rather than opening routes or downgrading security:
   server's client CA or refusal. A `match.port` route in such a shared projection is refused.
   When the two servers' host scopes overlap through different names (a wildcard and a host it
   covers) and the HTTPS server is stricter or routes depend on `match.port`, both projections are
-  refused (`istio-shared-host-scope`).
+  refused (`istio-shared-host-scope`). Separate Gateway bindings (other VirtualServices, or the same
+  one through another Gateway) are checked together on the final plan, refused projections included:
+  overlapping hosts served through different frontends (plaintext vs HTTPS, different client CA, or
+  a refused frontend) refuse every projection involved (`istio-frontend-scope-conflict`).
 * **Restricted listeners stay restricted.** NGINX `listen`, Envoy listener and Istio `Server.bind`
   addresses are reproduced only when every server shares one address (`FERRUM_PROXY_BIND_ADDRESS`).
   Otherwise the address-restricted servers (and Unix sockets) are skipped, never exposed on
   Ferrum's shared address.
+* **Extra listeners are not migrated.** Ferrum's router selects host and path before it compares
+  ports, and port-agnostic routes serve every HTTP listener, so a route scoped to an extra plaintext
+  port (`listen_port`) cannot be kept apart from the main routes. Servers, Envoy listeners and Istio
+  Gateway servers that only listen on another plaintext port get no proxy at all
+  (`extra-listener-refused`), so Ferrum does not serve that port. The output never contains
+  `listen_port`. A server that also listens on a main port is served on the main ports only.
 * **Auth is not silently skipped.** Auth plugins, middlewares, directives and HTTP filters the
-  tool cannot translate refuse their routes (see above). In addition, an Envoy route or virtual host whose
+  tool cannot translate refuse their routes (see above). A Kong route whose effective policy (global,
+  service and route plugins together) combines several authentication methods is refused
+  (`kong-auth-composition`): Kong's composition and the consumer it selects are not proven
+  equivalent in Ferrum, even when one method's credentials are withheld. One method per route is
+  migrated as before. In addition, an Envoy route or virtual host whose
   `typed_per_filter_config` could enable or change an HTTP filter is refused. An Istio
   `AuthorizationPolicy`/`RequestAuthentication`/`EnvoyFilter`/`WasmPlugin` refuses a Gateway's
   routes unless it provably does not apply to the gateway pods, whatever namespace it lives in

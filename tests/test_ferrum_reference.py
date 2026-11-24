@@ -224,6 +224,39 @@ class FerrumBinaryValidateTest(unittest.TestCase):
                 self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
                 self.assertIn("Validation passed", completed.stdout)
 
+    def test_repeated_source_names_pass_ferrum_validate(self):
+        """Admission regression: one route and one host scope projected twice must not repeat proxy names.
+
+        A normal synthetic Istio VirtualService bound through a plaintext and an HTTPS server with disjoint hosts
+        yields two direct-response proxies and two closures from the same source names (Ferrum v0.9.21 admits
+        neither duplicate proxy names nor duplicate ids). A plain emitter case with names that collide after
+        truncation or case folding is validated too. No traffic is sent.
+        """
+        binary = os.environ["FERRUM_EDGE_BIN"]
+        istio = (
+            "apiVersion: networking.istio.io/v1\nkind: Gateway\nmetadata: {name: gw, namespace: default}\nspec:\n"
+            "  servers:\n"
+            "    - port: {number: 80, name: http, protocol: HTTP}\n      hosts: [a.example.test]\n"
+            "    - port: {number: 443, name: https, protocol: HTTPS}\n      hosts: [b.example.test]\n"
+            "      tls: {mode: SIMPLE, serverCertificate: /etc/synthetic/server.crt, "
+            "privateKey: /etc/synthetic/server.key}\n"
+            "---\napiVersion: networking.istio.io/v1\nkind: VirtualService\n"
+            "metadata: {name: app, namespace: default}\nspec:\n  hosts: [a.example.test, b.example.test]\n"
+            "  gateways: [gw]\n  http:\n    - name: maintenance\n      match: [{uri: {exact: /maintenance}}]\n"
+            "      directResponse: {status: 503, body: {string: maintenance}}\n")
+        kong = (
+            "_format_version: \"3.0\"\nservices:\n  - name: s\n    url: http://s.internal:8080\n    routes:\n"
+            + "".join(f"      - {{name: {name}, paths: [/r{index}/]}}\n"
+                      for index, name in enumerate(["Api", "api", "x" * 300 + "a", "x" * 300 + "b"])))
+        for platform, text, tls_only in (("istio", istio, False), ("istio", istio, True), ("kong", kong, False)):
+            result, _report, _plan = migrate(platform, text, tls_only=tls_only)
+            names = [proxy["name"] for proxy in result.config["proxies"]]
+            with self.subTest(platform=platform, tls_only=tls_only), tempfile.TemporaryDirectory() as directory:
+                self.assertEqual(len(names), len(set(names)))
+                completed = self.validate(binary, directory, result.config, result.basic_auth_used)
+                self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+                self.assertIn("Validation passed", completed.stdout)
+
     def test_missing_operator_ca_is_rejected_not_ignored(self):
         """Evidence that the operator-CA reference is real: Ferrum refuses it while the file is absent."""
         binary = os.environ["FERRUM_EDGE_BIN"]

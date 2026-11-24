@@ -441,5 +441,266 @@ class IstioSecurityTest(unittest.TestCase):
             migrate("istio", "- just\n- a list\n")
 
 
+def routed_statuses(config):
+    return {p["labels"]["ferrum-migration/status"] for p in config["proxies"] if "listen_path" in p}
+
+
+class IstioFrontendScopeTest(unittest.TestCase):
+    # Synthetic hosts and file paths only; no certificate material is read or needed.
+    TWO_GATEWAYS = textwrap.dedent("""
+        apiVersion: networking.istio.io/v1
+        kind: Gateway
+        metadata: {name: gw-plain, namespace: default}
+        spec:
+          selector: {app: gw-plain}
+          servers:
+            - port: {number: 80, name: http, protocol: HTTP}
+              hosts: ["PLAIN_HOST"]
+        ---
+        apiVersion: networking.istio.io/v1
+        kind: Gateway
+        metadata: {name: gw-tls, namespace: default}
+        spec:
+          selector: {app: gw-tls}
+          servers:
+            - port: {number: 443, name: https, protocol: HTTPS}
+              hosts: ["TLS_HOST"]
+              tls:
+                mode: MUTUAL
+                serverCertificate: /etc/synthetic/server.crt
+                privateKey: /etc/synthetic/server.key
+                caCertificates: /etc/synthetic/client-ca.pem
+        ---
+        apiVersion: networking.istio.io/v1
+        kind: VirtualService
+        metadata: {name: plain-app, namespace: default}
+        spec:
+          hosts: ["PLAIN_HOST"]
+          gateways: [gw-plain]
+          http:
+            - name: public
+              match: [{uri: {exact: /public}}]
+              route: [{destination: {host: public, port: {number: 80}}}]
+        ---
+        apiVersion: networking.istio.io/v1
+        kind: VirtualService
+        metadata: {name: tls-app, namespace: default}
+        spec:
+          hosts: ["TLS_HOST"]
+          gateways: [gw-tls]
+          http:
+            - name: secure
+              route: [{destination: {host: secure, port: {number: 80}}}]
+    """)
+
+    def two_gateways(self, plain_host, tls_host, **kwargs):
+        text = self.TWO_GATEWAYS.replace("PLAIN_HOST", plain_host).replace("TLS_HOST", tls_host)
+        return migrate("istio", text, **kwargs)
+
+    def test_plaintext_and_mutual_bindings_on_overlapping_hosts_are_refused(self):
+        # Separate Gateway bindings: Ferrum would serve the plaintext binding's /public route on its HTTPS listener
+        # for a host whose HTTPS frontend required client certificates. Both projections are refused.
+        for plain_host, tls_host in (("app.example.test", "app.example.test"), ("app.example.test", "*.example.test")):
+            with self.subTest(plain=plain_host, tls=tls_host):
+                result, report, _plan = self.two_gateways(plain_host, tls_host, tls_only=True)
+                assert_structurally_valid(self, result.config)
+                self.assertEqual(routed_statuses(result.config), {"refused"})
+                conflicts = sorted(c.ref for c in report.caveats if c.code == "istio-frontend-scope-conflict")
+                self.assertEqual(len(conflicts), 2)
+
+    def test_disjoint_hosts_across_bindings_are_not_a_frontend_conflict(self):
+        result, report, _plan = self.two_gateways("www.example.test", "app.example.test", tls_only=True)
+        self.assertNotIn("istio-frontend-scope-conflict", codes(report))
+        self.assertEqual(one_proxy(self, result.config, "=/public", "www.example.test")["labels"]
+                         ["ferrum-migration/status"], "migrated")
+        self.assertEqual(one_proxy(self, result.config, "/", "app.example.test")["labels"]["ferrum-migration/status"],
+                         "migrated")
+
+    def test_same_frontend_bindings_on_one_host_stay_migrated(self):
+        # Two plaintext Gateways and two VirtualServices for one host: the same frontend, no trust to mix.
+        text = textwrap.dedent("""
+            apiVersion: networking.istio.io/v1
+            kind: Gateway
+            metadata: {name: gw-one, namespace: default}
+            spec:
+              servers: [{port: {number: 80, name: http, protocol: HTTP}, hosts: [app.example.test]}]
+            ---
+            apiVersion: networking.istio.io/v1
+            kind: Gateway
+            metadata: {name: gw-two, namespace: default}
+            spec:
+              servers: [{port: {number: 80, name: http, protocol: HTTP}, hosts: [app.example.test]}]
+            ---
+            apiVersion: networking.istio.io/v1
+            kind: VirtualService
+            metadata: {name: one, namespace: default}
+            spec:
+              hosts: [app.example.test]
+              gateways: [gw-one]
+              http: [{match: [{uri: {exact: /one}}], route: [{destination: {host: one, port: {number: 80}}}]}]
+            ---
+            apiVersion: networking.istio.io/v1
+            kind: VirtualService
+            metadata: {name: two, namespace: default}
+            spec:
+              hosts: [app.example.test]
+              gateways: [gw-two]
+              http: [{match: [{uri: {exact: /two}}], route: [{destination: {host: two, port: {number: 80}}}]}]
+        """)
+        result, report, _plan = migrate("istio", text)
+        assert_structurally_valid(self, result.config)
+        self.assertNotIn("istio-frontend-scope-conflict", codes(report))
+        for path in ("=/one", "=/two"):
+            self.assertEqual(one_proxy(self, result.config, path, "app.example.test")["labels"]
+                             ["ferrum-migration/status"], "migrated", path)
+
+    def test_refused_frontend_of_another_binding_refuses_overlapping_live_binding(self):
+        # Both bindings are HTTPS without client certificates; a policy selects only gw-tls's workloads, so its
+        # binding is refused. The other Gateway's live routes for an overlapping host would answer those requests
+        # in Ferrum, so they are refused as well (the refused candidate counts).
+        text = self.TWO_GATEWAYS.replace("PLAIN_HOST", "app.example.test").replace("TLS_HOST", "*.example.test")
+        text = text.replace("    - port: {number: 80, name: http, protocol: HTTP}\n",
+                            "    - port: {number: 443, name: https-other, protocol: HTTPS}\n"
+                            "      tls: {mode: SIMPLE, serverCertificate: /etc/synthetic/server.crt, "
+                            "privateKey: /etc/synthetic/server.key}\n")
+        text = text.replace("mode: MUTUAL", "mode: SIMPLE").replace(
+            "        caCertificates: /etc/synthetic/client-ca.pem\n", "")
+        self.assertNotIn("protocol: HTTP}", text)
+        self.assertNotIn("caCertificates", text)
+        text += textwrap.dedent("""
+            ---
+            apiVersion: security.istio.io/v1
+            kind: AuthorizationPolicy
+            metadata: {name: tls-only-policy, namespace: default}
+            spec:
+              selector:
+                matchLabels: {app: gw-tls}
+              action: ALLOW
+              rules: [{from: [{source: {ipBlocks: ["192.0.2.0/24"]}}]}]
+        """)
+        result, report, _plan = migrate("istio", text)
+        self.assertEqual(routed_statuses(result.config), {"refused"})
+        self.assertIn("istio-frontend-scope-conflict", codes(report, "error"))
+
+    def test_extra_plaintext_listener_is_not_emitted(self):
+        text = textwrap.dedent("""
+            apiVersion: networking.istio.io/v1
+            kind: Gateway
+            metadata: {name: gw, namespace: default}
+            spec:
+              servers:
+                - port: {number: 80, name: http, protocol: HTTP}
+                  hosts: [www.example.test]
+                - port: {number: 8080, name: http-ops, protocol: HTTP}
+                  hosts: [ops.example.test]
+            ---
+            apiVersion: networking.istio.io/v1
+            kind: VirtualService
+            metadata: {name: web, namespace: default}
+            spec:
+              hosts: [www.example.test]
+              gateways: [gw]
+              http: [{route: [{destination: {host: web, port: {number: 80}}}]}]
+            ---
+            apiVersion: networking.istio.io/v1
+            kind: VirtualService
+            metadata: {name: ops, namespace: default}
+            spec:
+              hosts: [ops.example.test]
+              gateways: [gw]
+              http: [{route: [{destination: {host: ops, port: {number: 80}}}]}]
+        """)
+        result, report, _plan = migrate("istio", text)
+        assert_structurally_valid(self, result.config)
+        self.assertEqual(proxies(result.config, host="ops.example.test"), [])
+        self.assertEqual(one_proxy(self, result.config, "/", "www.example.test")["labels"]["ferrum-migration/status"],
+                         "migrated")
+        self.assertIn("extra-listener-refused", codes(report, "error"))
+
+
+class IstioCaseAndNamesTest(unittest.TestCase):
+    IGNORE_CASE = textwrap.dedent("""
+        apiVersion: networking.istio.io/v1
+        kind: Gateway
+        metadata: {name: gw, namespace: default}
+        spec:
+          servers: [{port: {number: 80, name: http, protocol: HTTP}, hosts: [app.example.test]}]
+        ---
+        apiVersion: networking.istio.io/v1
+        kind: VirtualService
+        metadata: {name: app, namespace: default}
+        spec:
+          hosts: [app.example.test]
+          gateways: [gw]
+          http:
+            - name: admin
+              match: [{uri: {prefix: /admin/}IGNORE}]
+              route: [{destination: {host: admin, port: {number: 80}}}]
+            - name: status
+              match: [{uri: {exact: /status}}]
+              route: [{destination: {host: status, port: {number: 80}}}]
+            - name: web
+              route: [{destination: {host: web, port: {number: 80}}}]
+    """)
+
+    def status(self, result, path):
+        return one_proxy(self, result.config, path, "app.example.test")["labels"]["ferrum-migration/status"]
+
+    def test_ignore_uri_case_refuses_routes_that_would_receive_case_variants(self):
+        # Istio sent /ADMIN/x to the admin route; in Ferrum it would reach the "/" route instead. That route is
+        # refused (fail closed); admin keeps its exact-case path, and the unrelated exact /status route stays.
+        result, report, _plan = migrate("istio", self.IGNORE_CASE.replace("IGNORE", ", ignoreUriCase: true"))
+        assert_structurally_valid(self, result.config)
+        self.assertEqual(self.status(result, "/admin"), "migrated")
+        self.assertEqual(self.status(result, "=/status"), "migrated")
+        self.assertEqual(self.status(result, "/"), "refused")
+        self.assertIn("istio-ignore-case", codes(report, "warning"))
+        self.assertIn("route-refused", codes(report, "error"))
+
+    def test_case_sensitive_match_keeps_expected_behavior(self):
+        result, report, _plan = migrate("istio", self.IGNORE_CASE.replace("IGNORE", ""))
+        for path in ("/admin", "=/status", "/"):
+            self.assertEqual(self.status(result, path), "migrated", path)
+        self.assertNotIn("istio-ignore-case", codes(report))
+        self.assertNotIn("route-refused", codes(report))
+
+    def test_route_projected_through_two_servers_gets_unique_names(self):
+        # One direct-response route bound through a plaintext and an HTTPS server with disjoint hosts becomes two
+        # proxies (and two closures) from the same source names. Ferrum rejects duplicate proxy names.
+        text = textwrap.dedent("""
+            apiVersion: networking.istio.io/v1
+            kind: Gateway
+            metadata: {name: gw, namespace: default}
+            spec:
+              servers:
+                - port: {number: 80, name: http, protocol: HTTP}
+                  hosts: [a.example.test]
+                - port: {number: 443, name: https, protocol: HTTPS}
+                  hosts: [b.example.test]
+                  tls: {mode: SIMPLE, serverCertificate: /etc/synthetic/server.crt, privateKey: /etc/synthetic/server.key}
+            ---
+            apiVersion: networking.istio.io/v1
+            kind: VirtualService
+            metadata: {name: app, namespace: default}
+            spec:
+              hosts: [a.example.test, b.example.test]
+              gateways: [gw]
+              http:
+                - name: maintenance
+                  match: [{uri: {exact: /maintenance}}]
+                  directResponse: {status: 503, body: {string: maintenance}}
+        """)
+        for tls_only in (False, True):
+            with self.subTest(tls_only=tls_only):
+                result, _report, _plan = migrate("istio", text, tls_only=tls_only)
+                assert_structurally_valid(self, result.config)
+                names = [p["name"] for p in result.config["proxies"]]
+                self.assertEqual(len(names), len(set(names)))
+                self.assertEqual(len(result.config["proxies"]), 4)  # two routes, two closures
+                self.assertIn("maintenance", names)
+                again, _report, _plan = migrate("istio", text, tls_only=tls_only)
+                self.assertEqual(names, [p["name"] for p in again.config["proxies"]])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -183,6 +183,84 @@ class KongSecretsTest(unittest.TestCase):
         self.assertNotIn("test-only-jwt-secret-erin", json.dumps(result.config))
 
 
+class KongAuthCompositionTest(unittest.TestCase):
+    # Static conversion-policy checks only (which routes are emitted live, refused or unchanged); no traffic.
+    def test_service_and_route_auth_methods_together_are_refused(self):
+        # Kong requires both methods here and authenticates the consumer of the plugin that runs last; Ferrum's
+        # composition and principal selection differ, and withholding the JWT secret does not make the remaining
+        # key-auth path equivalent. The single-method route on the same service stays as before.
+        text = textwrap.dedent("""
+            _format_version: "3.0"
+            services:
+              - name: s
+                url: http://s.internal:8080
+                plugins:
+                  - name: key-auth
+                    config: {key_names: [apikey], key_in_query: false}
+                routes:
+                  - name: both
+                    paths: [/both]
+                    plugins:
+                      - name: jwt
+                        config: {claims_to_verify: [exp], uri_param_names: []}
+                  - name: key-only
+                    paths: [/key]
+        """)
+        result, report, _ = migrate("kong", text)
+        assert_structurally_valid(self, result.config)
+        both = one_proxy(self, result.config, "/both")
+        self.assertEqual(both["labels"]["ferrum-migration/status"], "refused")
+        self.assertEqual([p["plugin_name"] for p in plugins_of(result.config, both)], ["request_termination"])
+        key_only = one_proxy(self, result.config, "/key")
+        self.assertEqual(key_only["labels"]["ferrum-migration/status"], "migrated")
+        self.assertEqual(plugin(self, result.config, key_only, "key_auth")["scope"], "proxy_group")
+        composition = [c.ref for c in report.caveats if c.code == "kong-auth-composition"]
+        self.assertEqual(composition, ["kong route 'both'"])
+
+    def test_global_auth_combined_with_another_scoped_method_is_refused(self):
+        text = textwrap.dedent("""
+            _format_version: "3.0"
+            plugins:
+              - name: basic-auth
+            services:
+              - name: s
+                url: http://s.internal:8080
+                routes:
+                  - name: r
+                    paths: [/r]
+                    plugins:
+                      - name: key-auth
+                        config: {key_names: [apikey], key_in_query: false}
+        """)
+        result, report, _ = migrate("kong", text)
+        self.assertEqual(one_proxy(self, result.config, "/r")["labels"]["ferrum-migration/status"], "refused")
+        self.assertIn("kong-auth-composition", codes(report, "error"))
+
+    def test_scoped_plugin_replacing_global_plugin_of_same_method_stays_single_method(self):
+        # Kong's most specific key-auth wins, and Ferrum's proxy-scoped key_auth replaces the global key_auth of
+        # the same name: one method in both, so the route migrates as before.
+        text = textwrap.dedent("""
+            _format_version: "3.0"
+            plugins:
+              - name: key-auth
+                config: {key_names: [apikey]}
+            services:
+              - name: s
+                url: http://s.internal:8080
+                routes:
+                  - name: r
+                    paths: [/r]
+                    plugins:
+                      - name: key-auth
+                        config: {key_names: [x-key], key_in_query: false}
+        """)
+        result, report, _ = migrate("kong", text)
+        proxy = one_proxy(self, result.config, "/r")
+        self.assertEqual(proxy["labels"]["ferrum-migration/status"], "migrated")
+        self.assertEqual(plugin(self, result.config, proxy, "key_auth")["config"]["key_location"], "header:x-key")
+        self.assertNotIn("kong-auth-composition", codes(report))
+
+
 class KongFailClosedTest(unittest.TestCase):
     def test_header_matched_route_poisons_more_specific_overlaps(self):
         text = textwrap.dedent("""

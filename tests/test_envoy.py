@@ -162,6 +162,63 @@ class EnvoyClientCaTest(unittest.TestCase):
         self.assertEqual(plan.settings.client_ca_paths, [])
 
 
+def bootstrap_with_routes(routes, domains=("app.example.test",)):
+    doc = minimal_bootstrap({"prefix": "/"})
+    vhost = doc["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"][
+        "route_config"]["virtual_hosts"][0]
+    vhost["domains"] = list(domains)
+    vhost["routes"] = routes
+    return doc
+
+
+class EnvoyCaseSensitivityTest(unittest.TestCase):
+    def routes(self, case_sensitive):
+        admin_match = {"prefix": "/admin/"}
+        if case_sensitive is not None:
+            admin_match["case_sensitive"] = case_sensitive
+        return [{"name": "admin", "match": admin_match, "route": {"cluster": "c"}},
+                {"name": "status", "match": {"path": "/status"}, "route": {"cluster": "c"}},
+                {"name": "rest", "match": {"prefix": "/"}, "route": {"cluster": "c"}}]
+
+    def status(self, result, path):
+        return one_proxy(self, result.config, path, "app.example.test")["labels"]["ferrum-migration/status"]
+
+    def test_case_insensitive_prefix_refuses_routes_that_would_receive_case_variants(self):
+        # Envoy sent /ADMIN/x to the admin route; Ferrum would hand it to the broader "/" route. That route is
+        # refused (fail closed); admin keeps its exact-case path and the unrelated exact /status route stays.
+        for domains in (("app.example.test",), ("*",)):
+            with self.subTest(domains=domains):
+                result, report, _ = migrate("envoy", yaml.safe_dump(bootstrap_with_routes(self.routes(False), domains)))
+                assert_structurally_valid(self, result.config)
+                host = None if domains == ("*",) else "app.example.test"
+                by_path = {p["listen_path"]: p["labels"]["ferrum-migration/status"]
+                           for p in proxies(result.config, host=host) if "listen_path" in p}
+                self.assertEqual(by_path["/admin"], "migrated")
+                self.assertEqual(by_path["=/status"], "migrated")
+                self.assertEqual(by_path["/"], "refused")
+                self.assertIn("envoy-case-insensitive", codes(report, "warning"))
+
+    def test_case_sensitive_routes_keep_expected_behavior(self):
+        for case_sensitive in (None, True):
+            with self.subTest(case_sensitive=case_sensitive):
+                result, report, _ = migrate("envoy", yaml.safe_dump(bootstrap_with_routes(self.routes(case_sensitive))))
+                for path in ("/admin", "=/status", "/"):
+                    self.assertEqual(self.status(result, path), "migrated", path)
+                self.assertNotIn("envoy-case-insensitive", codes(report))
+                self.assertNotIn("route-refused", codes(report))
+
+    def test_segment_exact_disjointness_is_not_applied_across_case_semantics(self):
+        # A case-insensitive path_separated_prefix /api also matched /API first in Envoy, so a later exact /API is
+        # unreachable there; it must not become a live Ferrum route that receives /API.
+        routes = [{"name": "api", "match": {"path_separated_prefix": "/api", "case_sensitive": False},
+                   "route": {"cluster": "c"}},
+                  {"name": "upper", "match": {"path": "/API"}, "route": {"cluster": "c"}}]
+        result, report, _ = migrate("envoy", yaml.safe_dump(bootstrap_with_routes(routes)))
+        self.assertEqual(proxies(result.config, "=/API"), [])
+        self.assertIn("route-shadowed", codes(report, "warning"))
+        self.assertEqual(self.status(result, "/api"), "migrated")
+
+
 class EnvoyPrefixSemanticsTest(unittest.TestCase):
     def test_string_prefix_siblings_are_reported_not_widened(self):
         # match.prefix /api also matches /apix in Envoy; Ferrum's segment prefix does not.

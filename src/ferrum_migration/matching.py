@@ -148,19 +148,87 @@ def path_rank(kind: str, path: str | None) -> tuple[int, int]:
     return (3, 0)
 
 
+def _case_insensitive(route) -> bool:
+    return bool(getattr(route, "case_insensitive", False))
+
+
+def _fold(path):
+    """Case-fold a literal path. Emitted listen paths are ASCII (canonical-path check), so lower() keeps lengths.
+
+    Translators may compare paths before the emitter validated them; anything that is not a string is returned
+    unchanged (it is refused later as not representable).
+    """
+    return path.lower() if isinstance(path, str) else path
+
+
+def _fold_space(space: tuple[str, bool] | None) -> tuple[str, bool] | None:
+    return None if space is None else (_fold(space[0]), space[1])
+
+
+def _has_letters(text: str) -> bool:
+    return text.lower() != text.upper()
+
+
 def route_overlaps(a, b) -> bool:
-    """Whether two RouteSpecs could match one request (conservative)."""
+    """Whether two RouteSpecs could match one request (conservative).
+
+    When either side matched case-insensitively in the source, the comparison is made on case-folded paths
+    (a superset of both match sets) and the segment/exact disjointness proof is not applied: it was derived for
+    case-sensitive matching only.
+    """
     if not ports_compatible(a.listen_port, b.listen_port):
         return False
     if not hosts_overlap(a.hosts, b.hosts):
         return False
     if not methods_overlap(a.methods, b.methods):
         return False
-    if a.path_ok and b.path_ok and _segment_exact_disjoint(a, b):
+    folded = _case_insensitive(a) or _case_insensitive(b)
+    if a.path_ok and b.path_ok and not folded and _segment_exact_disjoint(a, b):
         return False
     space_a = None if not a.path_ok else path_space(a.kind, a.path)
     space_b = None if not b.path_ok else path_space(b.kind, b.path)
+    if folded:
+        space_a, space_b = _fold_space(space_a), _fold_space(space_b)
     return spaces_overlap(space_a, space_b)
+
+
+def receives_case_variants(source, other) -> bool:
+    """Whether ``other`` can match a request that only the case-insensitive ``source`` matched in the source.
+
+    Such a request is a case variant of ``source``'s literal path (``/API`` for ``/api``). Ferrum matches paths
+    case-sensitively, so the emitted ``source`` route never receives it, and any other route matching it would
+    forward traffic the source sent to ``source``. Definitive only where it answers False; every unknown shape
+    answers True (fail closed). Host tiers are not considered here.
+    """
+    if not ports_compatible(source.listen_port, other.listen_port):
+        return False
+    if not hosts_overlap(source.hosts, other.hosts) or not methods_overlap(source.methods, other.methods):
+        return False
+    if not source.path_ok or source.kind not in ("prefix", "exact") or not isinstance(source.path, str):
+        return True
+    p, p_exact = source.path, source.kind == "exact"
+    if not _has_letters(p):
+        return False  # a literal without letters has no case variants
+    if not other.path_ok or other.kind == "hostonly" or not isinstance(other.path, str):
+        return True
+    if other.kind == "regex":
+        # Every regex match starts with its literal prefix; the rest of the pattern may match any case.
+        q, q_exact = util.regex_literal_prefix(other.path), False
+    elif other.kind in ("prefix", "exact"):
+        q, q_exact = other.path, other.kind == "exact"
+    else:
+        return True
+    # String-prefix envelopes (a superset of segment semantics) on folded paths must intersect at all.
+    if not spaces_overlap((p.lower(), p_exact), (q.lower(), q_exact)):
+        return False
+    shared = min(len(p), len(q))
+    if p[:shared] != q[:shared]:
+        return True  # other's literal is itself a case variant within the shared part
+    if len(q) >= len(p):
+        return False  # everything other matches starts with source's exact-case literal: no variant
+    # other's literal is a proper literal prefix of source's: it matches source's variants when the rest of
+    # source's literal has letters whose case can differ.
+    return _has_letters(p[len(q):])
 
 
 def _segment_exact_disjoint(a, b) -> bool:
@@ -188,9 +256,18 @@ def route_covers(outer, inner) -> bool:
     if not ports_compatible(outer.listen_port, inner.listen_port) or (
             outer.listen_port is not None and outer.listen_port != inner.listen_port):
         return False
+    outer_path, inner_path = outer.path, inner.path
+    if _case_insensitive(inner) or _case_insensitive(outer):
+        if _case_insensitive(inner) and not _case_insensitive(outer):
+            # A case-sensitive route only matches every case variant of the inner route when its own literal
+            # has no letters (or it is host-only).
+            if outer.kind != "hostonly" and not (outer.kind == "prefix" and isinstance(outer_path, str)
+                                                  and not _has_letters(outer_path)):
+                return False
+        outer_path, inner_path = _fold(outer_path), _fold(inner_path)
     return (hosts_cover(outer.hosts, inner.hosts)
             and methods_cover(outer.methods, inner.methods)
-            and space_covers(outer.kind, outer.path, inner.kind, inner.path,
+            and space_covers(outer.kind, outer_path, inner.kind, inner_path,
                              outer_segment=getattr(outer, "prefix_semantics", "string") == "segment",
                              inner_segment=getattr(inner, "prefix_semantics", "string") == "segment"))
 

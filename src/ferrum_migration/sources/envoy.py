@@ -310,9 +310,15 @@ class _Envoy:
             spec.path_ok = False
             spec.extra_conditions = True
             spec.refuse("route match type is not supported")
-        if match.get("case_sensitive") is False:
-            self.report.warning("envoy-case-insensitive", ref, "Case-insensitive matching becomes case-sensitive "
-                                "(stricter).")
+        if match.get("case_sensitive") is False and spec.kind in ("prefix", "exact") and spec.path_ok:
+            # Envoy ignores case_sensitive for safe_regex. Ferrum matches literal paths case-sensitively: the route
+            # keeps its exact-case path and the emitter refuses every route that could receive the case variants
+            # (fail closed), instead of letting them reach an overlapping route with another policy.
+            spec.case_insensitive = True
+            self.report.warning("envoy-case-insensitive", ref,
+                                "case_sensitive: false: Ferrum matches this path case-sensitively. Only the "
+                                "exact-case path is routed here; other case variants answer 404 or a fail-closed "
+                                "response, and routes that could receive them were refused.")
         for key in ("headers", "query_parameters", "grpc", "runtime_fraction", "tls_context", "dynamic_metadata",
                     "filter_state", "cel_expr"):
             if match.get(key):

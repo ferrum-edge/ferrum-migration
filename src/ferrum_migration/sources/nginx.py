@@ -419,8 +419,9 @@ class _Nginx:
         elif plain_ports:
             listen_port = min(plain_ports)
             requires_tls = False
-            self.report.info("nginx-listen-port", ref, f"Served on its own plaintext port {listen_port} via the "
-                             "Ferrum listen_port field.")
+            self.report.info("nginx-listen-port", ref, f"The server listens only on plaintext port {listen_port}, not "
+                             "on the main ports. Ferrum cannot isolate a port-scoped route from the main routes, so "
+                             "its routes are not migrated (see extra-listener-refused).")
         else:
             self.report.error("nginx-tls-port", ref, "TLS on a non-main port cannot be scoped reliably in Ferrum file "
                               "mode; the server is skipped.", "Move it to the main TLS port or migrate it manually.")

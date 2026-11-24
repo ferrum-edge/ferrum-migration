@@ -13,6 +13,10 @@ constructors in `src/plugins/*.rs` (closed key sets), `src/consumer_index.rs`,
 | Fact | Source |
 |---|---|
 | Prefix `listen_path` matching walks the request path back through **segment boundaries**; `=` is exact, `~` is a fully anchored regex, and host-only proxies are the last fallback in each host tier. Host tiers: exact > wildcard > catch-all, falling through when a tier has no match. | `router_cache.rs`, `docs/routing.md` |
+| `listen_port` only ranks candidates that share a host/path slot: a port-agnostic proxy serves any HTTP frontend (losing only to a same-slot port-scoped sibling), and the reference source also remaps a single same-class listen port onto another frontend. The tool therefore never emits `listen_port` (see `extra-listener-refused`). | `router_cache.rs` (`port_match_priority`) |
+| Auth mode `single` (default) runs auth plugins in priority order and rejects on the first failure; `multi` stops at the first success. Principal state (claim headers, identity metadata) belongs to the first accepted attempt; later accepted instances cannot replace it. The tool never combines several auth methods on one proxy (Kong `kong-auth-composition`). | `docs/functional_testing_auth_acl.md`, `src/plugins/utils/auth_attempt.rs` |
+| Scoped (proxy/proxy_group) plugins replace global plugins of the same name. | `FEATURES.md` (plugin scopes) |
+| Literal listen paths are looked up as exact strings (hash-indexed by `listen_path`), so path matching is treated as case-sensitive. If Ferrum ever folded case, the tool's handling of case-insensitive source matches would only be stricter. | `router_cache.rs` (`IndexedPrefixRoutes`, `IndexedExactPathRoutes`) |
 | Literal listen paths must be canonical: no `%`, `\`, dot segments, empty segments, or `;` without `allow_path_parameters`. | `docs/request_path_canonicalization.md` |
 | `strip_listen_path` defaults to true; backends default to `https` when `backend_scheme` is omitted. The tool always sets both. | `types.rs` |
 | `request_termination` runs at priority 125 in `on_request_received`, before auth, and supports `trigger.path_prefix`. | `src/plugins/request_termination.rs` |
@@ -42,6 +46,7 @@ constructors in `src/plugins/*.rs` (closed key sets), `src/consumer_index.rs`,
 | `key-auth` (`key_names` × header/query) | `key_auth.key_location` (max 8) | `anonymous` and body keys are not supported (stricter) |
 | `basic-auth` | `basic_auth` without credentials (fail closed) | password hashes are not convertible |
 | `jwt` (HS*) | `jwt_auth` (`consumer_claim_field` = `key_claim_name`, algorithm pinned) | `maximum_expiration`, `secret_is_base64` refused; query/cookie tokens dropped (stricter) |
+| several of `key-auth`, `basic-auth`, `jwt` in one route's effective policy (global plugins not replaced by a same-name service/route plugin, plus service and route plugins) | **refused** (placeholder, error `kong-auth-composition`) | Kong requires all of them (or any one with `anonymous`) and authenticates the consumer of the plugin that runs last; Ferrum commits the first accepted principal. One method per route is migrated as before |
 | `acl` allow/deny | `access_control` allowed/disallowed groups | `include_consumer_groups` refused |
 | `rate-limiting` second/minute/hour, limit_by consumer/ip/service | `rate_limiting` presets | day/month/year and other `limit_by` refused; cluster/redis policy is reported as an error (per-node in Ferrum) |
 | `cors` | `cors` | regex origins → omitted (browsers block) |
@@ -83,7 +88,7 @@ proxies:
 | NGINX | Ferrum | Notes |
 |---|---|---|
 | `server` + `listen` + `server_name` | `hosts`; default server → catch-all | regex/trailing-wildcard names refused; `.example.com` → `example.com` + `*.example.com`. A default server whose own name another server on the same listener covers (same name or a wildcard) keeps its named hosts instead, because a catch-all would lose those names to the other server; unknown names are then not routed to it (error `nginx-default-server-named`). Default roles count only on the listeners Ferrum serves (not on dropped extra ports); default on only some of them → named hosts only (`nginx-default-server-listener`); different defaults on the main plaintext and TLS listeners → their catch-all routes refused (`nginx-default-server-conflict`). Nested wildcard servers → the broader server's routes refused (`nested-wildcard-scope`) |
-| main plaintext/TLS ports | `FERRUM_PROXY_HTTP(S)_PORT`; other plaintext ports → `listen_port` | other TLS ports and conflicting bind addresses skipped (error) |
+| main plaintext/TLS ports | `FERRUM_PROXY_HTTP(S)_PORT` | a server listening only on another plaintext port is **not migrated** (`extra-listener-refused`; a `listen_port` route cannot be isolated from the main routes); extra ports of a main-port server are dropped (stricter); other TLS ports and conflicting bind addresses skipped (error) |
 | HTTPS redirect server / `if ($scheme = http) { return 301 https://… }` | TLS-only profile | |
 | `location /p`, `^~ /p`, `= /p`, `~`/`~*` | prefix, prefix, exact, anchored regex (`(?i)`) | overlapping regex + non-`^~` prefix → whole server refused; `/p` is never widened, and when sibling paths such as `/px` (string-prefix matches) do not reach an equivalent route in Ferrum, the location gets a `prefix-string-siblings` error (exit 4). NGINX never sends `^~ /p` siblings (`/px.php`) to a regex location, so such a regex route gets a `trigger.path_prefix /p` guard |
 | `proxy_pass` with/without URI, `grpc_pass` | strip + `backend_path` / no strip | variables, unix sockets refused |
@@ -127,12 +132,13 @@ proxies:
 
 | Envoy | Ferrum | Notes |
 |---|---|---|
-| listener port, downstream TLS | main ports, TLS-only, frontend cert paths | inline/SDS material never copied |
+| listener port, downstream TLS | main ports, TLS-only, frontend cert paths | inline/SDS material never copied; a plaintext listener on another port is **not migrated** (`extra-listener-refused`) |
 | `require_client_certificate` with a file `trusted_ca` | frontend client CA | inline/SDS/missing CA or extra validation constraints (SAN/hash/SPKI pins, CRLs) → listener's routes refused (`envoy-client-ca`) |
 | HCM with inline `route_config` | routes | RDS/scoped routes/xDS not read |
 | virtual host `domains` | `hosts` (+ host-only 404 closure) | prefix wildcards refused |
 | route `prefix` / `path` / `safe_regex` / `path_separated_prefix` | prefix / exact / regex / prefix (segment, no guard) | header/query/grpc/runtime matchers refused + poisoning. `prefix` is a string prefix (`/api` also matched `/apix`): never widened, `prefix-string-siblings` error when such siblings do not reach an equivalent route |
-| ordered routes | first-match analysis | a `path_separated_prefix` only shadows later routes under its own segments (`/api`, `/api/...`), never `/apix`; it is also treated as disjoint from an exact `path` outside its segments (`/apix`). Other overlap checks stay conservative (string-prefix), so such a pair may be refused instead |
+| `case_sensitive: false` (prefix, path, path_separated_prefix) | exact-case path only | Ferrum matches paths case-sensitively; every route that could receive the case variants (`/API` for `/api`) is refused (route-refused). Overlap/coverage is compared case-folded |
+| ordered routes | first-match analysis | a `path_separated_prefix` only shadows later routes under its own segments (`/api`, `/api/...`), never `/apix`; it is also treated as disjoint from an exact `path` outside its segments (`/apix`) when both are case-sensitive. Other overlap checks stay conservative (string-prefix), so such a pair may be refused instead |
 | `cluster`, `weighted_clusters` | upstream / merged weighted upstream | EDS/original_dst refused; priority>0 endpoints dropped |
 | `prefix_rewrite`, `auto_host_rewrite`, default host pass-through | strip + `backend_path`, `preserve_host_header` | regex rewrites refused |
 | `timeout` (default 15s), `retry_policy` | `backend_read_timeout_ms`, `retry` | timeout approximate: Envoy's route timeout covers the complete response, Ferrum's value is not a total deadline |
@@ -152,10 +158,10 @@ not exercise it.
 
 | Istio | Ferrum | Notes |
 |---|---|---|
-| `Gateway` servers (HTTP, HTTPS SIMPLE/MUTUAL with file paths) | ports, TLS-only, frontend cert/client CA | `credentialName` Secrets are never read (warning). PASSTHROUGH/AUTO_PASSTHROUGH/ISTIO_MUTUAL, and MUTUAL without a `caCertificates` file path, cannot be projected: on the main TLS port the routes bound to such a server are refused (placeholders), elsewhere the server is skipped. MUTUAL servers with different `caCertificates` → affected routes refused (`frontend-client-ca-scope`), never concatenated. MUTUAL/OPTIONAL_MUTUAL with `subjectAltNames`, `verifyCertificateSpki`, `verifyCertificateHash` or `caCrl` → refused (`istio-client-ca`). A host bound by both a plaintext and an HTTPS server gets one route set that keeps the HTTPS server's client CA or refusal (`istio-shared-host-tls`); `match.port` routes in that shared set are refused. Host scopes that overlap through different names (a wildcard and a host it covers) with a stricter HTTPS server or `match.port` routes refuse both projections (`istio-shared-host-scope`) |
+| `Gateway` servers (HTTP, HTTPS SIMPLE/MUTUAL with file paths) | ports, TLS-only, frontend cert/client CA | `credentialName` Secrets are never read (warning). PASSTHROUGH/AUTO_PASSTHROUGH/ISTIO_MUTUAL, and MUTUAL without a `caCertificates` file path, cannot be projected: on the main TLS port the routes bound to such a server are refused (placeholders), elsewhere the server is skipped. MUTUAL servers with different `caCertificates` → affected routes refused (`frontend-client-ca-scope`), never concatenated. MUTUAL/OPTIONAL_MUTUAL with `subjectAltNames`, `verifyCertificateSpki`, `verifyCertificateHash` or `caCrl` → refused (`istio-client-ca`). A host bound by both a plaintext and an HTTPS server gets one route set that keeps the HTTPS server's client CA or refusal (`istio-shared-host-tls`); `match.port` routes in that shared set are refused. Host scopes that overlap through different names (a wildcard and a host it covers) with a stricter HTTPS server or `match.port` routes refuse both projections (`istio-shared-host-scope`). Across separate bindings (other VirtualServices or Gateways), overlapping hosts with a different frontend (plaintext vs HTTPS, client CA, refused frontend) refuse every projection involved (`istio-frontend-scope-conflict`). HTTP servers on a non-main port are **not migrated** (`extra-listener-refused`) |
 | `Server.bind` | `FERRUM_PROXY_BIND_ADDRESS` | only when every HTTP(S) server binds the same IP address; otherwise servers with a specific address or Unix socket are skipped (`istio-server-bind`), never exposed on Ferrum's shared address |
 | `VirtualService` bound to a Gateway; `gateways: [mesh]` | edge routes; mesh routes reported only | not translated |
-| `http[].match` uri exact/prefix/regex, method exact | exact/prefix/regex, `allowed_methods` | headers/query/authority/... refused + poisoning. A VirtualService `uri.prefix` is a string prefix (`/api` also matched `/apix`): never widened, `prefix-string-siblings` error when such siblings do not reach an equivalent route |
+| `http[].match` uri exact/prefix/regex, method exact | exact/prefix/regex, `allowed_methods` | headers/query/authority/... refused + poisoning. A VirtualService `uri.prefix` is a string prefix (`/api` also matched `/apix`): never widened, `prefix-string-siblings` error when such siblings do not reach an equivalent route. `ignoreUriCase` (exact/prefix) keeps the exact-case path only; routes that could receive the case variants are refused |
 | ordered `http[]` | first-match analysis | |
 | destinations, weights, ports | upstream / merged weighted upstream | subsets refused (need pod labels) |
 | `ServiceEntry` static endpoints | upstream targets | resolution NONE refused |
@@ -201,3 +207,7 @@ write one format next to an existing file of the other format. The report's next
   an unnecessary `prefix-string-siblings` error. That errs on the stricter side.
 * Behavior of the placeholder backend host `ferrum-migration-refused.invalid` during DNS/pool
   warm-up. Placeholders never dial, because termination runs first, but warm-up may log.
+* Whether Ferrum v0.9.21 normalizes proxy names (case, whitespace) before its duplicate-name check.
+  Emitted names are unique even after trimming and case folding, so either answer is safe.
+* Whether the reference source's single-listener `listen_port` remap exists in v0.9.21. The tool
+  emits no `listen_port`, so the answer does not change the output.

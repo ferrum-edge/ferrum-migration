@@ -45,6 +45,17 @@ Fail-closed rules applied here (see ``docs/design.md``):
    separate source servers/listeners are never merged (that would let clients
    trusted by one scope reach another): the affected routes are refused and a
    ``frontend-client-ca-scope`` error asks for separately configured frontends.
+9. Listener-scoped HTTP proxies (``listen_port``) are never emitted. Ferrum
+   ranks host and path before it compares ports, and port-agnostic routes serve
+   every HTTP frontend, so main-listener routes would answer on an extra
+   listener and the extra listener's routes cannot be isolated. Routes the
+   source served only on an extra plaintext listener are not migrated
+   (``extra-listener-refused``); a final output invariant enforces this.
+10. A route the source matched case-insensitively keeps only its exact-case
+   path in Ferrum; every other route that could receive its case variants is
+   refused (fail closed) instead of forwarding them.
+11. Emitted proxy and upstream names are unique (compared trimmed and
+   case-folded, within Ferrum's byte limit), deterministic and readable.
 """
 
 from __future__ import annotations
@@ -101,6 +112,7 @@ class _Cand:
 
 def emit(plan: Plan, options: EmitOptions, report: Report) -> EmitResult:
     routes = plan.routes
+    _refuse_extra_listeners(plan, routes, report)
     for reason in plan.global_refusals:
         for route in routes:
             if not route.skip:
@@ -109,6 +121,7 @@ def emit(plan: Plan, options: EmitOptions, report: Report) -> EmitResult:
         _validate_route(route, plan, options, report)
     tls_only = _decide_tls(routes, options, report)
     _poison(routes)
+    _poison_case_variants(plan, routes)
     _resolve_frontend_client_ca(plan, routes, report)
     candidates = _build_candidates(routes)
     candidates = _resolve_conflicts(candidates)
@@ -118,6 +131,8 @@ def emit(plan: Plan, options: EmitOptions, report: Report) -> EmitResult:
     builder = _Builder(plan, options, report)
     config = builder.build(candidates)
     _assert_backend_tls_verified(config)
+    _assert_no_listener_scoped_proxies(config)
+    _assert_unique_proxy_names(config)
     _report_routes(routes, report)
     _report_timeout_semantics(plan, routes, report)
     stats = builder.stats(routes, candidates)
@@ -136,6 +151,51 @@ def _assert_backend_tls_verified(config: dict[str, Any]) -> None:
         for item in config.get(kind, []):
             if item.get("backend_tls_verify_server_cert", True) is not True:
                 raise AssertionError("backend TLS verification must never be disabled in emitted output")
+
+
+def _assert_no_listener_scoped_proxies(config: dict[str, Any]) -> None:
+    """Hard invariant: no emitted proxy is scoped to an extra listener (see ``_refuse_extra_listeners``)."""
+    for item in config.get("proxies", []):
+        if item.get("listen_port") is not None:
+            raise AssertionError("listener-scoped HTTP proxies must never be emitted")
+
+
+def _assert_unique_proxy_names(config: dict[str, Any]) -> None:
+    """Hard invariant: Ferrum admits neither duplicate proxy ids nor duplicate proxy names."""
+    for kind in ("proxies", "upstreams"):
+        names = [_NameAllocator.key(item["name"]) for item in config.get(kind, []) if "name" in item]
+        ids = [item["id"] for item in config.get(kind, [])]
+        if len(names) != len(set(names)) or len(ids) != len(set(ids)):
+            raise AssertionError(f"emitted {kind} must have unique ids and names")
+
+
+def _refuse_extra_listeners(plan: Plan, routes: list[RouteSpec], report: Report) -> None:
+    """Never emit listener-scoped HTTP proxies; routes served only on an extra plaintext listener are not migrated.
+
+    A Ferrum proxy with ``listen_port`` is only one candidate inside a host/path slot: the router picks the host
+    tier and the longest path first and compares ports last, and a port-agnostic proxy serves every HTTP frontend.
+    Main-listener routes (which every source emits port-agnostic) would therefore answer requests on the extra
+    listener whenever their host/path is more specific, and the extra listener's own routes cannot be isolated
+    from them. No per-listener scoping in this output can express the source's separate listeners, so these
+    routes get no proxy at all (not even a placeholder, which would make Ferrum serve that port), their host scopes
+    get no closure, and Ferrum does not listen on that port.
+    """
+    plan.host_scopes = [scope for scope in plan.host_scopes if scope.listen_port is None]
+    for route in routes:
+        if route.skip or route.listen_port is None:
+            continue
+        port = route.listen_port
+        route.skip = True
+        route.skip_reason = f"served only on extra plaintext listener {port}"
+        report.error("extra-listener-refused", route.ref,
+                     f"The source served this route only on plaintext port {port}, not on the main listeners. A "
+                     "Ferrum route scoped to that port (listen_port) cannot be kept apart from the main routes: Ferrum "
+                     "selects host and path before it compares ports, and port-agnostic routes serve every HTTP "
+                     "listener, so the two listeners' routes would mix. The route was not migrated and no proxy is "
+                     "emitted for that port, so Ferrum does not serve it (fail closed).",
+                     "Serve that listener from a separately configured Ferrum instance whose main plaintext port is "
+                     "that port (convert a copy of the source that contains only those servers or listeners), and "
+                     "validate it separately.")
 
 
 # ------------------------------------------------------------------ validation
@@ -361,6 +421,35 @@ def _poison(routes: list[RouteSpec]) -> None:
                 if bad.kind == other.kind and bad.path == other.path and bad.listen_port == other.listen_port:
                     continue  # identical slot: conflict resolution merges them into one placeholder
             other.refuse(f"its match overlaps {bad.ref}, whose match conditions Ferrum cannot express")
+
+
+def _poison_case_variants(plan: Plan, routes: list[RouteSpec]) -> None:
+    """Refuse routes that could forward case variants of a path the source matched case-insensitively.
+
+    Ferrum matches literal paths case-sensitively, so a case-insensitive source route (Envoy
+    ``case_sensitive: false``, Istio ``ignoreUriCase``) only receives its exact-case path in Ferrum. A request such
+    as ``/API`` that the source sent to ``/api`` would otherwise reach whichever overlapping route matches it (often
+    a broader one with another policy). Every such route in the same or a more specific host tier is refused.
+    A route in a less specific tier (another scope's wildcard or the catch-all tier) is spared only when the source
+    route belongs to a closed host scope with exactly its host names: such a scope gets a host-only or regex 404, or
+    its fallthrough targets are refused (``scope-closure-skipped``), so the variants never fall through to it.
+    Without such a scope every overlapping route is refused. Unmatched variants answer 404.
+    """
+    scopes = [set(_scope_hosts(scope)) for scope in plan.host_scopes if scope.listen_port is None]
+    sources = [route for route in routes if not route.skip and route.case_insensitive]
+    for source in sources:
+        closed = bool(source.hosts) and set(source.hosts) in scopes
+        tier = matching.host_tier(source.hosts) if closed else None
+        for other in routes:
+            if other is source or other.skip:
+                continue
+            if tier is not None and other.hosts is not None and matching.host_tier(other.hosts) > tier:
+                continue
+            if not matching.receives_case_variants(source, other):
+                continue
+            other.refuse(f"it could receive case variants of the path of {source.ref} (for example different "
+                         "upper/lower case), which the source matched case-insensitively there; Ferrum matches "
+                         "paths case-sensitively, so they would reach this route instead")
 
 
 # ------------------------------------------------------------------ candidates
@@ -797,6 +886,43 @@ def _add_divergence_guards(candidates: list[_Cand], report: Report) -> None:
 
 # ------------------------------------------------------------------ building
 
+def _fit_bytes(text: str, limit: int) -> str:
+    """Truncate ``text`` to at most ``limit`` UTF-8 bytes on a character boundary (Ferrum limits are in bytes)."""
+    encoded = text.encode("utf-8")
+    if len(encoded) <= limit:
+        return text
+    return encoded[:limit].decode("utf-8", errors="ignore")
+
+
+class _NameAllocator:
+    """Deterministic, readable, unique resource names.
+
+    Ferrum rejects duplicate proxy names. Source names repeat legitimately (one Istio route projected through two
+    gateway servers, synthetic closures of one source scope, names that only differ beyond the length limit or in
+    case, several names redacted to the same label). The first holder keeps the readable name; later ones get
+    ``-2``, ``-3``... with the base shortened so the result stays within the byte limit. Uniqueness is decided on a
+    whitespace-collapsed, case-folded key, so names stay unique after any such normalization.
+    """
+
+    def __init__(self, limit: int = util.MAX_NAME_LENGTH) -> None:
+        self._limit = limit
+        self._used: set[str] = set()
+
+    @staticmethod
+    def key(name: str) -> str:
+        return " ".join(name.split()).casefold()
+
+    def take(self, raw: object, fallback: str) -> str:
+        base = _fit_bytes(safe_label(raw, self._limit).strip(), self._limit).strip() or fallback
+        candidate, counter = base, 2
+        while self.key(candidate) in self._used or not self.key(candidate):
+            suffix = f"-{counter}"
+            candidate = _fit_bytes(base, self._limit - len(suffix)).rstrip() + suffix
+            counter += 1
+        self._used.add(self.key(candidate))
+        return candidate
+
+
 class _Builder:
     def __init__(self, plan: Plan, options: EmitOptions, report: Report) -> None:
         self.plan = plan
@@ -806,6 +932,8 @@ class _Builder:
         self.plugin_ids = util.IdAllocator()
         self.upstream_ids = util.IdAllocator()
         self.consumer_ids = util.IdAllocator()
+        self.proxy_names = _NameAllocator()
+        self.upstream_names = _NameAllocator()
         self.plugin_configs: list[dict[str, Any]] = []
         self.group_ids: dict[str, str] = {}
         self.upstream_id_by_key: dict[str, str] = {}
@@ -876,7 +1004,7 @@ class _Builder:
             algorithm = "weighted_round_robin"
         entry: dict[str, Any] = {
             "id": uid,
-            "name": safe_label(spec.name, util.MAX_NAME_LENGTH),
+            "name": self.upstream_names.take(spec.name, uid),
             "labels": self.labels(spec.ref),
             "targets": [{"host": t.host, "port": int(t.port), "weight": int(t.weight)} for t in spec.targets],
             "algorithm": algorithm,
@@ -912,7 +1040,7 @@ class _Builder:
         proxy_id = self.proxy_ids.take(self.plan.platform, route.name, name_suffix)
         proxy: dict[str, Any] = {
             "id": proxy_id,
-            "name": safe_label(route.name, util.MAX_NAME_LENGTH),
+            "name": self.proxy_names.take(route.name, proxy_id),
             "labels": self.labels(route.ref, cand.kind_label),
         }
         if cand.hosts:

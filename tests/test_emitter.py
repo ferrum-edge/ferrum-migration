@@ -98,6 +98,37 @@ class EmitterTest(unittest.TestCase):
         result, _ = run(routes)
         assert_structurally_valid(self, result.config)
 
+    def test_proxy_names_are_unique_readable_and_stable(self):
+        # Ferrum admits neither duplicate proxy ids nor duplicate names. Names repeat after truncation, differ only
+        # in case, or exceed the byte limit with multi-byte characters; each must still be unique and readable.
+        same = BackendRef(scheme="http", host="names.internal", port=80)
+        raw = ["x" * 300 + "a", "x" * 300 + "b", "Api", "api", "é" * 200, "é" * 200]
+
+        def build():
+            result, _ = run([route(name, f"/r{index}", backend=BackendRef(scheme="http", host=same.host, port=same.port))
+                             for index, name in enumerate(raw)])
+            return result
+
+        result = build()
+        assert_structurally_valid(self, result.config)
+        names = [p["name"] for p in result.config["proxies"]]
+        self.assertEqual(len(names), len(raw))
+        self.assertEqual(names[2:4], ["Api", "api-2"])
+        self.assertTrue(names[1].endswith("-2") and names[5].endswith("-2"))
+        self.assertTrue(all(len(name.encode("utf-8")) <= util.MAX_NAME_LENGTH for name in names))
+        self.assertEqual(names, [p["name"] for p in build().config["proxies"]])
+
+    def test_extra_listener_routes_are_never_emitted(self):
+        # A listen_port route cannot be isolated from port-agnostic main routes in Ferrum's router, so neither a live
+        # route nor a placeholder is emitted for an extra listener; the main route is unchanged.
+        result, report = run([route("main", "/"), route("ops", "/ops", listen_port=8081),
+                              route("ops-refused", "/ops-admin", listen_port=8081, refusals=["synthetic"])])
+        assert_structurally_valid(self, result.config)
+        self.assertEqual([(p.get("listen_path"), p["labels"]["ferrum-migration/status"])
+                          for p in result.config["proxies"]], [("/", "migrated")])
+        self.assertEqual(sum(1 for c in report.caveats if c.code == "extra-listener-refused"), 2)
+        self.assertEqual(result.stats["skipped_source_routes"], 2)
+
     def test_timeouts_are_clamped(self):
         result, report = run([route("t", "/t", read_timeout_ms=util.MAX_TIMEOUT_MS * 2)])
         self.assertEqual(result.config["proxies"][0]["backend_read_timeout_ms"], util.MAX_TIMEOUT_MS)
@@ -212,6 +243,31 @@ class MatchingTest(unittest.TestCase):
         self.assertFalse(matching.route_covers(seg, sibling))
         string = RouteSpec(ref="string", name="string", kind="prefix", path="/api")
         self.assertTrue(matching.route_covers(string, sibling))
+
+    def test_case_insensitive_matching_is_folded_and_variants_detected(self):
+        ci = RouteSpec(ref="ci", name="ci", kind="prefix", path="/admin", case_insensitive=True)
+
+        def other(kind, path, **kwargs):
+            return RouteSpec(ref=f"other {path}", name="other", kind=kind, path=path, **kwargs)
+
+        # Routes that would match a case variant (/ADMIN...) of the case-insensitive route's path.
+        for kind, path in (("prefix", "/"), ("exact", "/ADMIN"), ("prefix", "/Adm"), ("regex", "(?i)/admin")):
+            self.assertTrue(matching.receives_case_variants(ci, other(kind, path)), path)
+        # Routes that only match its exact-case paths, or unrelated paths, receive no variants.
+        for kind, path in (("prefix", "/admin/v1"), ("exact", "/status"), ("prefix", "/other")):
+            self.assertFalse(matching.receives_case_variants(ci, other(kind, path)), path)
+        letterless = RouteSpec(ref="n", name="n", kind="prefix", path="/1/2", case_insensitive=True)
+        self.assertFalse(matching.receives_case_variants(letterless, other("prefix", "/")))
+        # The segment/exact disjointness proof is not applied across case semantics; it still holds without.
+        seg_ci = RouteSpec(ref="s", name="s", kind="prefix", path="/api", prefix_semantics="segment",
+                           case_insensitive=True)
+        self.assertTrue(matching.route_overlaps(seg_ci, other("exact", "/API")))
+        seg = RouteSpec(ref="s2", name="s2", kind="prefix", path="/api", prefix_semantics="segment")
+        self.assertFalse(matching.route_overlaps(seg, other("exact", "/apix")))
+        # A case-sensitive route covers a case-insensitive one only when its own literal has no letters.
+        self.assertFalse(matching.route_covers(other("prefix", "/admin"), RouteSpec(
+            ref="i", name="i", kind="prefix", path="/admin/x", case_insensitive=True)))
+        self.assertTrue(matching.route_covers(other("prefix", "/"), ci))
 
     def test_url_userinfo_refused(self):
         with self.assertRaises(util.UrlProblem):

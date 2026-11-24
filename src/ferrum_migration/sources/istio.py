@@ -51,6 +51,9 @@ class _Istio:
         self.policies: list[dict] = []
         self.no_dr_warned = False
         self.shared_bind: str | None = None
+        # One entry per emitted projection (VirtualService x Gateway binding x frontend group), checked together
+        # once every binding is known (see _check_frontend_scopes).
+        self.projections: list[dict] = []
         for obj in objects:
             self._classify(obj)
 
@@ -90,6 +93,7 @@ class _Istio:
                            self.ctx.limits)
         for vs in self.virtual_services:
             self._virtual_service(vs)
+        self._check_frontend_scopes()
         check_route_budget(len(self.plan.routes), self.ctx.limits)
         return self.plan
 
@@ -322,8 +326,59 @@ class _Istio:
                     route.refuse(reason)
             apply_first_match_order(routes, self.report)
             self.plan.routes.extend(routes)
+            self.projections.append({
+                "binding": (ref, gateway_ref), "ref": f"{ref} via {safe_label(gateway_ref)}",
+                "hosts": list(hosts), "listen_port": listen_port, "routes": routes,
+                # What a request for these hosts gets from the source frontend before any route matches: the
+                # protocol, the client-certificate trust, and whether the frontend itself is refused (TLS settings,
+                # shared-scope conflict, or a gateway policy). Refused projections count: they are part of the plan.
+                "frontend": (bool(requires_tls), tuple(sorted(group["client_cas"])),
+                             bool(group["refusals"] or refusals)),
+            })
             if hosts:
                 self.plan.host_scopes.append(HostScope(f"{ref} via {safe_label(gateway_ref)}", list(hosts), listen_port))
+
+    def _check_frontend_scopes(self) -> None:
+        """Refuse overlapping projections from different bindings whose source frontends differ.
+
+        ``_merge_shared_hosts`` reconciles the plaintext and HTTPS servers of one VirtualService-to-Gateway binding.
+        Separate bindings (another VirtualService, or the same one through another Gateway) are only compared here,
+        on the final set of projections, refused ones included. Ferrum serves every port-agnostic route on its
+        plaintext and its HTTPS listener and has one client CA bundle, so for an overlapping host it would answer
+        one binding's HTTPS (or plaintext) requests with another binding's routes: routes the source only exposed
+        over plaintext become reachable over HTTPS next to a stricter or refused HTTPS frontend, or a refused
+        frontend's hosts reach another binding's live routes. Equivalence of such mixed plans is not provable, so
+        every projection in a conflicting pair is refused (fail closed). Projections with the same frontend (same
+        protocol, client CA and refusal state) are left to the emitter's per-route checks; extra-listener
+        projections are never emitted (``extra-listener-refused``).
+        """
+        projections = [p for p in self.projections if p["listen_port"] is None]
+        conflicts: dict[int, list[str]] = {}
+        for i, first in enumerate(projections):
+            for j in range(i + 1, len(projections)):
+                second = projections[j]
+                if first["binding"] == second["binding"] or first["frontend"] == second["frontend"]:
+                    continue
+                if not matching.hosts_overlap(first["hosts"], second["hosts"]):
+                    continue
+                conflicts.setdefault(i, []).append(second["ref"])
+                conflicts.setdefault(j, []).append(first["ref"])
+        for index, others in conflicts.items():
+            projection = projections[index]
+            names = ", ".join(dict.fromkeys(others))[:400]
+            reason = (f"another Gateway binding with a different frontend ({names}) serves overlapping hosts; Ferrum "
+                      "serves port-agnostic routes on both its plaintext and HTTPS listeners, so the two frontends' "
+                      "protocol, client-certificate requirement or refusal cannot be kept apart")
+            for route in projection["routes"]:
+                route.refuse(reason)
+            self.report.error("istio-frontend-scope-conflict", projection["ref"],
+                              f"This projection and {len(dict.fromkeys(others))} projection(s) of other Gateway "
+                              "bindings serve overlapping hosts through different frontends (plaintext vs HTTPS, "
+                              "different client-certificate trust, or a refused frontend). Ferrum serves these "
+                              "routes on all of its listeners, so requests for one binding's frontend could reach "
+                              "the other binding's routes. Every route of this projection was refused (fail closed).",
+                              "Bind such hosts through one Gateway with the same servers, or serve each frontend "
+                              "from a separately configured Ferrum instance, then convert again.")
 
     def _merge_shared_hosts(self, groups: dict, ref: str, port_specific: bool) -> None:
         """Keep an HTTPS server's requirements for hosts a plaintext main-port server also binds.
@@ -453,8 +508,15 @@ class _Istio:
                 extra.append("uri matcher")
             else:
                 kind, path = "prefix", "/"
-            if match.get("ignoreUriCase"):
-                self.report.warning("istio-ignore-case", base_ref, "ignoreUriCase becomes case-sensitive (stricter).")
+            # ignoreUriCase applies to exact and prefix URI matches only. Ferrum matches paths case-sensitively:
+            # the route keeps its exact-case path and the emitter refuses every route that could receive the case
+            # variants (fail closed), instead of letting them reach an overlapping route.
+            ignore_case = bool(match.get("ignoreUriCase")) and kind in ("exact", "prefix")
+            if ignore_case:
+                self.report.warning("istio-ignore-case", base_ref,
+                                    "ignoreUriCase: Ferrum matches this path case-sensitively. Only the exact-case "
+                                    "path is routed here; other case variants answer 404 or a fail-closed response, "
+                                    "and routes that could receive them were refused.")
             method = mapping(match.get("method"))
             methods = None
             if method:
@@ -462,18 +524,19 @@ class _Istio:
                     methods = [str(method["exact"]).upper()]
                 else:
                     extra.append("non-exact method matcher")
-            key = (kind, path, tuple(extra))
+            key = (kind, path, tuple(extra), ignore_case)
             block = blocks.setdefault(key, {"methods": [], "all": False})
             if methods is None:
                 block["all"] = True
             else:
                 block["methods"].extend(m for m in methods if m not in block["methods"])
         routes = []
-        for number, ((kind, path, extra), block) in enumerate(blocks.items()):
+        for number, ((kind, path, extra, ignore_case), block) in enumerate(blocks.items()):
             spec = RouteSpec(ref=base_ref if len(blocks) == 1 else f"{base_ref} match #{number + 1}",
                              name=name if number == 0 else f"{name}-{number + 1}",
                              hosts=list(hosts), kind=kind, path=path, listen_port=listen_port,
                              requires_tls=requires_tls)
+            spec.case_insensitive = ignore_case
             spec.methods = None if block["all"] else list(block["methods"])
             spec.report_prefix_siblings = kind == "prefix"
             for condition in extra:

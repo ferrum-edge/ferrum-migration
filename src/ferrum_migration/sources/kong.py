@@ -40,6 +40,8 @@ KNOWN_TOP_LEVEL = {"_format_version", "_transform", "_info", "_workspace", "_kon
                    "consumer_groups"}
 _REGEX_HINT = re.compile(r"[\\^$*+?()\[\]{}|]")
 _KEY_NAME = re.compile(r"^[A-Za-z0-9!#$%&'*+.^_`|~-]+$")
+# Ferrum authentication plugins this translator can emit (from key-auth, basic-auth and jwt).
+AUTH_PLUGINS = frozenset({"key_auth", "basic_auth", "jwt_auth"})
 
 
 def translate(text: str, fmt: str, ctx: SourceContext) -> Plan:
@@ -460,6 +462,34 @@ class _Kong:
                 refusals.append(f"{level} plugin {safe_label(name, 40)}: {outcome[1]}")
         return plugins, termination, refusals
 
+    def _auth_composition(self, plugins: list[PluginSpec], ref: str) -> str | None:
+        """Refusal reason when a route's effective policy combines several authentication methods.
+
+        The effective Ferrum chain is the route/service plugins plus every global plugin whose name no scoped
+        plugin replaces (Ferrum: scoped plugins replace global plugins of the same name; Kong: the most specific
+        plugin of a name wins). One method is supported as before. Several methods are not: Kong requires all of
+        them (or accepts any one when ``anonymous`` is set) and authenticates the consumer of the plugin that runs
+        last, while Ferrum's default single auth mode commits the first accepted principal (and its multi mode is
+        first-success), so the consumer that later policy (ACL, consumer rate limits) sees, and which methods are
+        actually required, are not proven equivalent. Withholding one method's credentials does not make the
+        composition safe while another method still migrates, so the route is refused before it becomes live.
+        """
+        methods = sorted(({plugin.name for plugin in plugins} | {plugin.name for plugin in self.plan.global_plugins})
+                         & AUTH_PLUGINS)
+        if len(methods) < 2:
+            return None
+        self.report.error("kong-auth-composition", ref,
+                          f"The route's effective policy (global, service and route plugins together) combines "
+                          f"{len(methods)} authentication methods ({', '.join(methods)}). Kong requires every one of "
+                          "them (or any one when anonymous is configured) and identifies the consumer of the plugin "
+                          "that runs last, while Ferrum commits the first accepted principal, so the required methods "
+                          "and the consumer seen by later policy cannot be proven equivalent. The route was refused "
+                          "(fail closed).",
+                          "Recreate the route in Ferrum with one authentication method (or an explicitly reviewed "
+                          "auth_mode), then validate it before serving traffic.")
+        return ("the effective policy combines several authentication methods (" + ", ".join(methods) + "), whose "
+                "composition and consumer selection cannot be proven equivalent in Ferrum")
+
     # --------------------------------------------------------------- routes
 
     def _service_backend(self, service_key: str, ref: str) -> dict:
@@ -633,6 +663,7 @@ class _Kong:
             extra.append("hosts/methods/paths with unexpected types")
             hosts, methods, paths = hosts or [], methods or [], paths or []
         plugins, termination, plugin_refusals = self._effective_plugins(index, service_key)
+        auth_composition = None if termination is not None else self._auth_composition(plugins, ref)
         backend_info: dict[str, Any] = {"problems": []}
         if termination is None:
             if service_key is None:
@@ -684,6 +715,8 @@ class _Kong:
                 spec.extra_conditions = True
             for refusal in plugin_refusals:
                 spec.refuse(refusal)
+            if auth_composition:
+                spec.refuse(auth_composition)
             if termination is not None:
                 spec.termination = termination
                 if plugins:

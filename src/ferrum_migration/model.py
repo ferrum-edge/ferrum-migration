@@ -82,6 +82,14 @@ class RouteSpec:
     no client certificate required). Sources never configure the listener-wide
     bundle themselves: the emitter sets ``SettingsHints.client_ca_paths`` only
     when one bundle provably preserves every route's original trust scope.
+
+    ``case_insensitive`` records that the source matched this route's literal
+    (prefix or exact) path case-insensitively (Envoy ``case_sensitive: false``,
+    Istio ``ignoreUriCase``). Ferrum matches paths case-sensitively, so the
+    emitted route only receives the exact-case path; the emitter refuses every
+    other route that could receive the case variants the source sent here.
+    Overlap and coverage checks fold case for such routes and never apply the
+    segment/exact disjointness proof to them.
     """
 
     ref: str
@@ -107,6 +115,7 @@ class RouteSpec:
     refusals: list[str] = field(default_factory=list)
     extra_conditions: bool = False
     client_cas: list[str] = field(default_factory=list)
+    case_insensitive: bool = False
     skip: bool = False
     skip_reason: str = ""
     # Maintained by the emitter.

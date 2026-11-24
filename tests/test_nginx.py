@@ -268,14 +268,22 @@ class NginxSemanticsTest(unittest.TestCase):
         self.assertEqual(proxies(result.config, host="admin.local"), [])
         self.assertIn("nginx-bind-address", codes(report, "error"))
 
-    def test_extra_plaintext_port_uses_listen_port(self):
-        result, _report, _ = nginx("""
+    def test_extra_plaintext_listener_is_refused_not_port_scoped(self):
+        # Ferrum ranks host/path before ports and serves port-agnostic routes on every listener, so a listen_port
+        # route for 8081 could not be isolated from the main server's routes. The extra listener is not migrated
+        # at all (no proxy, not even a placeholder), while the main single-listener server stays as before.
+        result, report, _ = nginx("""
             server { listen 80; server_name www.example.com; location / { proxy_pass http://web.internal:8080; } }
             server { listen 8081; server_name ops.example.com; location / { proxy_pass http://ops.internal:8080; } }
         """)
-        scoped = [p for p in result.config["proxies"] if p.get("listen_port") == 8081]
-        self.assertEqual(len(scoped), 1)
-        self.assertEqual(scoped[0]["backend_host"], "ops.internal")
+        assert_structurally_valid(self, result.config)
+        self.assertEqual([p for p in result.config["proxies"] if "listen_port" in p], [])
+        self.assertEqual(proxies(result.config, host="ops.example.com"), [])
+        self.assertNotIn("ops.internal", json.dumps(result.config))
+        # www is the only (default) server on port 80: a catch-all route, migrated as before.
+        main = one_proxy(self, result.config, "/")
+        self.assertEqual((main["labels"]["ferrum-migration/status"], main["backend_host"]), ("migrated", "web.internal"))
+        self.assertIn("extra-listener-refused", codes(report, "error"))
 
     def test_access_rules_never_loosen(self):
         result, report, _ = nginx("""

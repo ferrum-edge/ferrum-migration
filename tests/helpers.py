@@ -88,12 +88,22 @@ def assert_structurally_valid(test, config: dict) -> None:
         for ident in ids:
             test.assertRegex(ident, ID_RE)
             test.assertLessEqual(len(ident), 254)
+    for kind in ("proxies", "upstreams"):
+        # Ferrum admits neither duplicate ids nor duplicate names; compare names normalized (trimmed, collapsed
+        # whitespace, case-folded) so they stay unique after any such normalization, within the byte limit.
+        names = [" ".join(item["name"].split()).casefold() for item in config[kind] if "name" in item]
+        test.assertEqual(len(names), len(set(names)), f"duplicate names in {kind}")
+        for item in config[kind]:
+            if "name" in item:
+                test.assertTrue(item["name"].strip(), item["id"])
+                test.assertLessEqual(len(item["name"].encode("utf-8")), 255, item["id"])
     plugin_ids = {p["id"] for p in config["plugin_configs"]}
     upstream_ids = {u["id"] for u in config["upstreams"]}
     proxy_ids = {p["id"] for p in config["proxies"]}
     slots = {}
     for proxy in config["proxies"]:
         test.assertTrue(proxy.get("hosts") or proxy.get("listen_path"), proxy["id"])
+        test.assertNotIn("listen_port", proxy, f"listener-scoped proxy emitted: {proxy['id']}")
         for ref in proxy.get("plugins", []):
             test.assertIn(ref["plugin_config_id"], plugin_ids)
         if "upstream_id" in proxy:
