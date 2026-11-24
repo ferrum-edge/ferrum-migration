@@ -239,7 +239,12 @@ in them is a fake test string. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Status and license
 
-Early public build-out (v0.1.0). No license has been selected by the repository owner yet,
-so until one is added, all rights are reserved. Ferrum Edge is licensed separately by its
-owners. Kong, NGINX, Traefik, Envoy and Istio are trademarks of their respective owners. This
+Early public build-out (v0.1.0).
+
+Ferrum Migration is licensed under the [PolyForm Noncommercial License 1.0.0](LICENSE).
+For commercial use, see [LICENSE-COMMERCIAL.md](LICENSE-COMMERCIAL.md).
+Ferrum Edge is a separate product governed by its own license; the terms here cover
+Ferrum Migration only.
+
+Kong, NGINX, Traefik, Envoy and Istio are trademarks of their respective owners. This
 project is not affiliated with them and contains no code from them.
