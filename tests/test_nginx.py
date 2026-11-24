@@ -6,8 +6,8 @@ import tempfile
 import textwrap
 import unittest
 
-from helpers import assert_structurally_valid, codes, migrate, one_proxy, plugin, plugins_of, proxies, read_fixture, \
-    upstream_of
+from helpers import assert_listener_contract, assert_structurally_valid, codes, live_routes, migrate, one_proxy, \
+    plugin, plugins_of, proxies, read_fixture, upstream_of
 
 from ferrum_migration.cli import main as cli_main
 from ferrum_migration.envprofile import render
@@ -483,10 +483,10 @@ class NginxFrontendScopeTest(unittest.TestCase):
     def status(self, result, path, host=None):
         return one_proxy(self, result.config, path, host)["labels"]["ferrum-migration/status"]
 
-    def test_plaintext_only_server_overlapping_https_server_is_refused(self):
-        # Ferrum serves port-agnostic routes on both listeners, so the plaintext-only server's routes would also
-        # answer HTTPS requests the source sent to the HTTPS server (with its client CA). Neither side is kept, the
-        # client CA is not configured from a partial plan, and --tls-only does not change that.
+    def test_plaintext_only_server_overlapping_https_server_never_shares_a_listener(self):
+        # Ferrum serves port-agnostic routes on every listener it opens, so the plaintext-only server's routes must
+        # never be live on an HTTPS listener (where the source required a client CA for this host), and the HTTPS
+        # server's routes never on the plaintext listener. The default server listens on both and stays live.
         plain = """
             server {
                 listen 80;
@@ -498,10 +498,27 @@ class NginxFrontendScopeTest(unittest.TestCase):
             with self.subTest(tls_only=tls_only):
                 result, report, plan = nginx(self.DEFAULT + plain + self.SECURE, tls_only=tls_only)
                 assert_structurally_valid(self, result.config)
-                self.assertEqual(self.status(result, "/plain", "app.example.test"), "refused")
-                self.assertEqual(self.status(result, "/secure", "app.example.test"), "refused")
-                self.assertIn("nginx-frontend-scope-conflict", codes(report, "error"))
-                self.assertEqual(plan.settings.client_ca_paths, [])
+                self.assertNotIn("nginx-frontend-scope-conflict", codes(report))
+                # return 444 on the default server (both listeners) becomes a live catch-all 403 termination.
+                self.assertEqual(self.status(result, "/"), "terminated")
+                if tls_only:
+                    self.assertEqual(self.status(result, "/plain", "app.example.test"), "refused")
+                    self.assertEqual(self.status(result, "/secure", "app.example.test"), "migrated")
+                    self.assertEqual(live_routes(result.config), [("/secure", ["app.example.test"])])
+                    self.assertIn("frontend-protocol-scope", codes(report, "error"))
+                    # The one client CA now also applies to the default server's 403 over HTTPS (stricter).
+                    self.assertEqual(plan.settings.client_ca_paths, [self.CA])
+                    self.assertIn("frontend-client-ca-shared", codes(report, "warning"))
+                    assert_listener_contract(self, plan, result, "https", http_port=0, https_port=443,
+                                             cert_pair=("/etc/synthetic/server.crt", "/etc/synthetic/server.key"),
+                                             client_ca=self.CA)
+                else:
+                    self.assertEqual(self.status(result, "/plain", "app.example.test"), "migrated")
+                    self.assertEqual(self.status(result, "/secure", "app.example.test"), "refused")
+                    self.assertEqual(live_routes(result.config), [("/plain", ["app.example.test"])])
+                    self.assertIn("frontend-https-disabled", codes(report, "error"))
+                    self.assertEqual(plan.settings.client_ca_paths, [])
+                    assert_listener_contract(self, plan, result, "http", http_port=80, https_port=0)
 
     def test_https_scopes_behind_a_redirect_keep_their_single_frontend(self):
         # The plaintext server only redirects (not emitted) and the default server serves both listeners, so no

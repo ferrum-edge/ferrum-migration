@@ -2,8 +2,8 @@ import json
 import textwrap
 import unittest
 
-from helpers import assert_structurally_valid, codes, migrate, one_proxy, plugin, plugins_of, proxies, read_fixture, \
-    upstream_of
+from helpers import assert_listener_contract, assert_structurally_valid, codes, live_routes, migrate, one_proxy, \
+    plugin, plugins_of, proxies, read_fixture, upstream_of
 
 from ferrum_migration.errors import InputError
 
@@ -497,24 +497,58 @@ class IstioFrontendScopeTest(unittest.TestCase):
         text = self.TWO_GATEWAYS.replace("PLAIN_HOST", plain_host).replace("TLS_HOST", tls_host)
         return migrate("istio", text, **kwargs)
 
+    CA = "/etc/synthetic/client-ca.pem"
+    CERT = ("/etc/synthetic/server.crt", "/etc/synthetic/server.key")
+
+    def status(self, result, path, host):
+        return one_proxy(self, result.config, path, host)["labels"]["ferrum-migration/status"]
+
     def test_plaintext_and_mutual_bindings_on_overlapping_hosts_are_refused(self):
         # Separate Gateway bindings: Ferrum would serve the plaintext binding's /public route on its HTTPS listener
-        # for a host whose HTTPS frontend required client certificates. Both projections are refused.
+        # for a host whose HTTPS frontend required client certificates. Both projections are refused in either mode,
+        # so no route is live and no client CA is configured from a partial plan.
         for plain_host, tls_host in (("app.example.test", "app.example.test"), ("app.example.test", "*.example.test")):
-            with self.subTest(plain=plain_host, tls=tls_host):
-                result, report, _plan = self.two_gateways(plain_host, tls_host, tls_only=True)
-                assert_structurally_valid(self, result.config)
-                self.assertEqual(routed_statuses(result.config), {"refused"})
-                conflicts = sorted(c.ref for c in report.caveats if c.code == "istio-frontend-scope-conflict")
-                self.assertEqual(len(conflicts), 2)
+            for tls_only in (False, True):
+                with self.subTest(plain=plain_host, tls=tls_host, tls_only=tls_only):
+                    result, report, plan = self.two_gateways(plain_host, tls_host, tls_only=tls_only)
+                    assert_structurally_valid(self, result.config)
+                    self.assertEqual(routed_statuses(result.config), {"refused"})
+                    self.assertEqual(live_routes(result.config), [])
+                    conflicts = sorted(c.ref for c in report.caveats if c.code == "istio-frontend-scope-conflict")
+                    self.assertEqual(len(conflicts), 2)
+                    self.assertEqual(plan.settings.client_ca_paths, [])
+                    # Only fail-closed placeholders exist, so the listeners serve 503/404 only: the source's two
+                    # listeners by default, HTTPS alone with --tls-only. No client CA bundle in either case.
+                    if tls_only:
+                        assert_listener_contract(self, plan, result, "https", http_port=0, https_port=443,
+                                                 cert_pair=self.CERT)
+                    else:
+                        assert_listener_contract(self, plan, result, "both", http_port=80, https_port=443,
+                                                 cert_pair=self.CERT)
 
-    def test_disjoint_hosts_across_bindings_are_not_a_frontend_conflict(self):
-        result, report, _plan = self.two_gateways("www.example.test", "app.example.test", tls_only=True)
-        self.assertNotIn("istio-frontend-scope-conflict", codes(report))
-        self.assertEqual(one_proxy(self, result.config, "=/public", "www.example.test")["labels"]
-                         ["ferrum-migration/status"], "migrated")
-        self.assertEqual(one_proxy(self, result.config, "/", "app.example.test")["labels"]["ferrum-migration/status"],
-                         "migrated")
+    def test_disjoint_hosts_across_bindings_never_share_a_listener(self):
+        # Disjoint hosts are not a cross-binding frontend conflict, but Ferrum still serves every route on each
+        # listener it opens: the plaintext binding's /public and the MUTUAL binding's / are never live together.
+        for tls_only in (False, True):
+            with self.subTest(tls_only=tls_only):
+                result, report, plan = self.two_gateways("www.example.test", "app.example.test", tls_only=tls_only)
+                assert_structurally_valid(self, result.config)
+                self.assertNotIn("istio-frontend-scope-conflict", codes(report))
+                if tls_only:
+                    self.assertEqual(self.status(result, "=/public", "www.example.test"), "refused")
+                    self.assertEqual(self.status(result, "/", "app.example.test"), "migrated")
+                    self.assertEqual(live_routes(result.config), [("/", ["app.example.test"])])
+                    self.assertIn("frontend-protocol-scope", codes(report, "error"))
+                    self.assertEqual(plan.settings.client_ca_paths, [self.CA])
+                    assert_listener_contract(self, plan, result, "https", http_port=0, https_port=443,
+                                             cert_pair=self.CERT, client_ca=self.CA)
+                else:
+                    self.assertEqual(self.status(result, "=/public", "www.example.test"), "migrated")
+                    self.assertEqual(self.status(result, "/", "app.example.test"), "refused")
+                    self.assertEqual(live_routes(result.config), [("=/public", ["www.example.test"])])
+                    self.assertIn("frontend-https-disabled", codes(report, "error"))
+                    self.assertEqual(plan.settings.client_ca_paths, [])
+                    assert_listener_contract(self, plan, result, "http", http_port=80, https_port=0)
 
     def test_same_frontend_bindings_on_one_host_stay_migrated(self):
         # Two plaintext Gateways and two VirtualServices for one host: the same frontend, no trust to mix.

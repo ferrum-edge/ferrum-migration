@@ -59,7 +59,7 @@ Options:
 | Option | Meaning |
 |---|---|
 | `--run-mode file\|database\|cp\|dp` | Which Ferrum operating mode `ferrum.conf` targets (default `file`). For database/cp, validate in file mode, then import through Ferrum's documented Admin API. This tool does no network I/O. |
-| `--tls-only` | Disable Ferrum's plaintext listener so routes that were HTTPS-only in the source can be migrated. This is chosen automatically when every migrated route requires HTTPS. |
+| `--tls-only` | Disable Ferrum's plaintext listener so routes that were HTTPS-only in the source can be migrated. This is chosen automatically when every migrated route requires HTTPS. Routes the source served over plaintext only are then refused (`frontend-protocol-scope`), because Ferrum would serve them on its HTTPS listener. |
 | `--include-secrets` | Explicit opt-in to write migratable plaintext credentials (Kong key-auth keys) into the resources file. Kong JWT secrets are never written (see Safety model). Output files are always mode `0600`; with this flag a `.gitignore` containing `*` is also written. |
 | `--strict` | Treat warnings as "review required" (exit 4). |
 | `--max-input-bytes N` | Input size cap (default 8 MiB). |
@@ -172,6 +172,18 @@ rather than opening routes or downgrading security:
   one through another Gateway) are checked together on the final plan, refused projections included:
   overlapping hosts served through different frontends (plaintext vs HTTPS, different client CA, or
   a refused frontend) refuse every projection involved (`istio-frontend-scope-conflict`).
+* **Each route is served only on the protocols the source used.** Ferrum serves every route on each
+  listener its profile opens, whatever the host names, so host names that look disjoint, unknown hosts
+  or a missing TLS setting prove nothing (Ferrum opens HTTPS on its default port as soon as a frontend
+  certificate is configured). Every translator records which main frontends (plaintext, HTTPS) served
+  each route, and the output opens only protocols that every live route was served on:
+  both listeners when every live route was served on both. When a live route was plaintext-only,
+  HTTPS-only routes are refused and HTTPS is disabled explicitly (`FERRUM_PROXY_HTTPS_PORT=0`, no
+  frontend TLS settings; `frontend-https-disabled`). With `--tls-only` or HTTPS-only sources, the
+  plaintext listener is disabled (`FERRUM_PROXY_HTTP_PORT=0`) and plaintext-only routes are refused. This
+  holds even when the source's HTTPS listener was not migrated (Envoy RDS, skipped listeners). A route
+  without that information refuses the whole plan (`frontend-protocol-unknown`). The rendered `ferrum.conf`
+  is checked against the decision before anything is written.
 * **Restricted listeners stay restricted.** NGINX `listen`, Envoy listener and Istio `Server.bind`
   addresses are reproduced only when every server shares one address (`FERRUM_PROXY_BIND_ADDRESS`).
   Otherwise the address-restricted servers (and Unix sockets) are skipped, never exposed on

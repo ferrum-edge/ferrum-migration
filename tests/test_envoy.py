@@ -4,7 +4,8 @@ import unittest
 
 import yaml
 
-from helpers import assert_structurally_valid, codes, migrate, one_proxy, plugin, proxies, read_fixture, upstream_of
+from helpers import assert_listener_contract, assert_structurally_valid, codes, live_routes, migrate, one_proxy, \
+    plugin, proxies, read_fixture, upstream_of
 
 
 class EnvoyFixtureTest(unittest.TestCase):
@@ -187,36 +188,52 @@ def two_listener_bootstrap(plain_domains, tls_domains, client_ca=None):
 
 class EnvoyFrontendScopeTest(unittest.TestCase):
     CA = "/etc/synthetic/client-ca.pem"
+    CERT = ("/etc/synthetic/server.crt", "/etc/synthetic/server.key")
 
     def status(self, result, path, host):
         return one_proxy(self, result.config, path, host)["labels"]["ferrum-migration/status"]
 
-    def test_plaintext_and_https_listeners_with_overlapping_hosts_are_refused(self):
-        # Ferrum serves port-agnostic routes on both of its listeners, so the plaintext listener's routes would also
-        # answer HTTPS requests for hosts the HTTPS listener (with its client CA) served. Neither side is kept, the
-        # client CA is not configured from a partial plan, and --tls-only does not change that.
+    def check_listener_split(self, plain_domains, tls_only):
+        """A plaintext listener (/plain) and an HTTPS listener with a client CA (/secure) never share a listener.
+
+        Ferrum serves every port-agnostic route on each listener it opens, whatever the host names, so host overlap
+        or disjointness proves nothing. Default: the plaintext listener's routes stay live, the HTTPS-only routes
+        become placeholders, and the profile disables HTTPS explicitly (no certificate, no client CA). --tls-only: the
+        HTTPS listener's routes stay live with their one client CA, the plaintext-only routes become placeholders, and
+        the profile disables the plaintext listener.
+        """
+        doc = two_listener_bootstrap(plain_domains, ("app.example.test",), client_ca=self.CA)
+        result, report, plan = migrate("envoy", yaml.safe_dump(doc), tls_only=tls_only)
+        assert_structurally_valid(self, result.config)
+        plain_host = None if plain_domains == ("*",) else plain_domains[0]
+        self.assertNotIn("envoy-frontend-scope-conflict", codes(report))
+        if tls_only:
+            self.assertEqual(self.status(result, "/plain", plain_host), "refused")
+            self.assertEqual(self.status(result, "/secure", "app.example.test"), "migrated")
+            self.assertEqual(live_routes(result.config), [("/secure", ["app.example.test"])])
+            self.assertIn("frontend-protocol-scope", codes(report, "error"))
+            self.assertEqual(plan.settings.client_ca_paths, [self.CA])
+            assert_listener_contract(self, plan, result, "https", http_port=0, https_port=8443,
+                                     cert_pair=self.CERT, client_ca=self.CA)
+        else:
+            self.assertEqual(self.status(result, "/plain", plain_host), "migrated")
+            self.assertEqual(self.status(result, "/secure", "app.example.test"), "refused")
+            self.assertEqual(live_routes(result.config), [("/plain", [plain_host] if plain_host else [])])
+            self.assertIn("frontend-https-disabled", codes(report, "error"))
+            self.assertEqual(plan.settings.client_ca_paths, [])
+            assert_listener_contract(self, plan, result, "http", http_port=8080, https_port=0)
+
+    def test_plaintext_and_https_listeners_with_overlapping_hosts_never_share_a_listener(self):
         for plain_domains in (("app.example.test",), ("*",)):
             for tls_only in (False, True):
                 with self.subTest(plain_domains=plain_domains, tls_only=tls_only):
-                    doc = two_listener_bootstrap(plain_domains, ("app.example.test",), client_ca=self.CA)
-                    result, report, plan = migrate("envoy", yaml.safe_dump(doc), tls_only=tls_only)
-                    assert_structurally_valid(self, result.config)
-                    plain_host = None if plain_domains == ("*",) else "app.example.test"
-                    self.assertEqual(self.status(result, "/plain", plain_host), "refused")
-                    self.assertEqual(self.status(result, "/secure", "app.example.test"), "refused")
-                    self.assertEqual([p for p in result.config["proxies"]
-                                      if p["labels"]["ferrum-migration/status"] == "migrated"], [])
-                    self.assertIn("envoy-frontend-scope-conflict", codes(report, "error"))
-                    self.assertEqual(plan.settings.client_ca_paths, [])
+                    self.check_listener_split(plain_domains, tls_only)
 
-    def test_disjoint_hosts_on_plaintext_and_https_listeners_are_kept(self):
-        doc = two_listener_bootstrap(("www.example.test",), ("app.example.test",), client_ca=self.CA)
-        result, report, plan = migrate("envoy", yaml.safe_dump(doc), tls_only=True)
-        assert_structurally_valid(self, result.config)
-        self.assertEqual(self.status(result, "/plain", "www.example.test"), "migrated")
-        self.assertEqual(self.status(result, "/secure", "app.example.test"), "migrated")
-        self.assertNotIn("envoy-frontend-scope-conflict", codes(report))
-        self.assertEqual(plan.settings.client_ca_paths, [self.CA])
+    def test_disjoint_hosts_on_plaintext_and_https_listeners_never_share_a_listener(self):
+        # Disjoint host names do not keep Ferrum's listeners apart: the same contract as for overlapping hosts.
+        for tls_only in (False, True):
+            with self.subTest(tls_only=tls_only):
+                self.check_listener_split(("www.example.test",), tls_only)
 
     def test_single_listener_plans_are_unchanged(self):
         # Overlapping virtual hosts of one listener share one frontend; the emitter's checks apply as before.

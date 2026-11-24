@@ -287,6 +287,9 @@ class _Traefik:
         priority = util.as_int(router.get("priority"))
         priority = priority if priority and priority > 0 else len(rule)
         requires_tls = router.get("tls") is not None
+        # A Traefik router matches TLS requests only with a tls block and plaintext requests only without one, so
+        # each router has exactly one frontend (entryPoint-level TLS lives in the static configuration, not read).
+        frontends = frozenset({"https" if requires_tls else "http"})
         if requires_tls and mapping(router.get("tls")).get("certResolver"):
             self.report.warning("traefik-cert-resolver", ref, "ACME certResolver is not migrated; provide a "
                                 "certificate or configure Ferrum's ACME settings.")
@@ -296,7 +299,8 @@ class _Traefik:
                 raise RuleError("rule too long")
             terms = rule_to_dnf(rule, self.ctx.limits.max_rule_terms)
         except RuleError as exc:
-            spec = RouteSpec(ref=ref, name=name, hosts=None, kind="prefix", path="/", requires_tls=requires_tls)
+            spec = RouteSpec(ref=ref, name=name, hosts=None, kind="prefix", path="/", requires_tls=requires_tls,
+                             protocols=frontends)
             spec.path_ok = False
             spec.extra_conditions = True
             spec.refuse(f"rule cannot be parsed ({exc})")
@@ -347,6 +351,7 @@ class _Traefik:
                 spec.report_prefix_siblings = kind == "prefix"
             spec.methods = list(methods) if methods else None
             spec.requires_tls = requires_tls
+            spec.protocols = frontends
             if tls_option_problem:
                 spec.refuse(tls_option_problem)
             elif tls_option is not None:

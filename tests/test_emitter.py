@@ -10,10 +10,18 @@ from ferrum_migration.model import BackendRef, ConsumerSpec, HostScope, Plan, Pl
 from ferrum_migration.report import Report
 from ferrum_migration.sources.common import apply_first_match_order
 
+#: Source frontend metadata (RouteSpec.protocols) as adapters record it. Hand-built routes default to a source that
+#: served them on both main listeners (a Kong route with default protocols, an NGINX server listening on 80 and
+#: 443 ssl). Unknown metadata (None) refuses the whole plan; see test_frontend_protocols.FrontendAccountingTest.
+BOTH = frozenset({"http", "https"})
+PLAINTEXT = frozenset({"http"})
+HTTPS = frozenset({"https"})
+
 
 def route(name, path="/", kind="prefix", hosts=None, **kwargs):
     spec = RouteSpec(ref=f"test route {name}", name=name, hosts=list(hosts or []), kind=kind, path=path)
     spec.backend = kwargs.pop("backend", BackendRef(scheme="http", host=f"{name}.internal", port=8080))
+    kwargs.setdefault("protocols", BOTH)
     for key, value in kwargs.items():
         setattr(spec, key, value)
     return spec
@@ -54,13 +62,34 @@ class EmitterTest(unittest.TestCase):
         self.assertIn("route-refused", codes(report, "error"))
 
     def test_tls_only_decision(self):
-        secure = route("s", "/s", requires_tls=True)
-        plain = route("p", "/p")
-        result, _ = run([secure, plain])
-        statuses = {p["listen_path"]: p["labels"]["ferrum-migration/status"] for p in result.config["proxies"]}
-        self.assertEqual(statuses, {"/s": "refused", "/p": "migrated"})
-        result, _ = run([route("s", "/s", requires_tls=True), route("p", "/p")], tls_only=True)
-        self.assertEqual({p["labels"]["ferrum-migration/status"] for p in result.config["proxies"]}, {"migrated"})
+        def statuses(result):
+            return {p["listen_path"]: p["labels"]["ferrum-migration/status"] for p in result.config["proxies"]}
+
+        # An HTTPS-only route next to a route served on both listeners: by default the plaintext listener stays, the
+        # HTTPS-only route is refused and HTTPS stays open (every live route was also served over HTTPS).
+        result, report = run([route("s", "/s", requires_tls=True, protocols=HTTPS), route("p", "/p")])
+        self.assertEqual(statuses(result), {"/s": "refused", "/p": "migrated"})
+        self.assertEqual(result.frontend_protocols, "both")
+        self.assertNotIn("frontend-https-disabled", codes(report))
+        # --tls-only: both routes were served over HTTPS, so both are live on the HTTPS listener alone.
+        result, report = run([route("s", "/s", requires_tls=True, protocols=HTTPS), route("p", "/p")], tls_only=True)
+        self.assertEqual(set(statuses(result).values()), {"migrated"})
+        self.assertEqual(result.frontend_protocols, "https")
+        self.assertNotIn("frontend-protocol-scope", codes(report))
+
+        # A route the source served over plaintext only. Default: it stays live and HTTPS is disabled, so it is never
+        # served over HTTPS. --tls-only: it is refused instead of being exposed on the HTTPS listener.
+        def mixed():
+            return [route("s", "/s", requires_tls=True, protocols=HTTPS), route("p", "/p", protocols=PLAINTEXT)]
+
+        result, report = run(mixed())
+        self.assertEqual(statuses(result), {"/s": "refused", "/p": "migrated"})
+        self.assertEqual(result.frontend_protocols, "http")
+        self.assertIn("frontend-https-disabled", codes(report, "error"))
+        result, report = run(mixed(), tls_only=True)
+        self.assertEqual(statuses(result), {"/s": "migrated", "/p": "refused"})
+        self.assertEqual(result.frontend_protocols, "https")
+        self.assertIn("frontend-protocol-scope", codes(report, "error"))
 
     def test_backend_tls_verification_policy(self):
         tls = TlsSpec(verify=False)
@@ -273,9 +302,13 @@ class MatchingTest(unittest.TestCase):
         # The first branch's literal says nothing about the other branches: the proof is unknown ("").
         for pattern in ("/other|/ADMIN/.*", "^/a|^/b", "/a/(x)|/b"):
             self.assertEqual(util.regex_literal_prefix(pattern), "", pattern)
-        # Alternation inside a group or a character class keeps the literal every match starts with.
+        # Alternation inside a group keeps the literal every match starts with (the narrow grammar proves it).
         self.assertEqual(util.regex_literal_prefix("/api/(v1|v2)/x"), "/api/")
-        self.assertEqual(util.regex_literal_prefix("/a[|]b"), "/a")
+        # A pipe next to a character class is outside that grammar (Rust nests classes and has set operators), so
+        # nothing is proven about it: unknown (""), fail closed. Without a pipe, a class still ends the literal only.
+        self.assertEqual(util.regex_literal_prefix("/a[|]b"), "")
+        self.assertTrue(util.regex_alternation_unproven("/a[|]b"))
+        self.assertEqual(util.regex_literal_prefix("/a[0-9]b"), "/a")
         ci = RouteSpec(ref="ci", name="ci", kind="prefix", path="/admin", case_insensitive=True)
         alternation = RouteSpec(ref="alt", name="alt", kind="regex", path="/other|/ADMIN/.*")
         self.assertTrue(matching.receives_case_variants(ci, alternation))

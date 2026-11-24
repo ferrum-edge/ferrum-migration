@@ -213,8 +213,9 @@ def receives_case_variants(source, other) -> bool:
         return True
     if other.kind == "regex":
         # A top-level alternation has no literal prefix shared by every branch: the first branch's literal says
-        # nothing about the others, so whether it intersects the variants is unknown (fail closed).
-        if util.has_top_level_alternation(other.path):
+        # nothing about the others, so whether it intersects the variants is unknown (fail closed). Any pipe the
+        # shared narrow-grammar proof cannot place inside a group counts as such.
+        if util.regex_alternation_unproven(other.path):
             return True
         # Every regex match starts with its literal prefix; the rest of the pattern may match any case.
         q, q_exact = util.regex_literal_prefix(other.path), False

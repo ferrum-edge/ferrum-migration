@@ -11,6 +11,7 @@ SRC = os.path.join(ROOT, "src")
 if SRC not in sys.path:
     sys.path.insert(0, SRC)
 
+from ferrum_migration.envprofile import render  # noqa: E402
 from ferrum_migration.ferrum import EmitOptions, emit  # noqa: E402
 from ferrum_migration.limits import Limits  # noqa: E402
 from ferrum_migration.report import Report  # noqa: E402
@@ -74,6 +75,49 @@ def upstream_of(config: dict, proxy: dict) -> dict:
 
 def codes(report: Report, severity: str | None = None) -> set[str]:
     return {item.code for item in report.caveats if severity is None or item.severity == severity}
+
+
+def live_routes(config: dict) -> list[tuple[str | None, list[str]]]:
+    """(listen_path, hosts) of every forwarding (``migrated``) proxy, in emitted order."""
+    return [(p.get("listen_path"), p.get("hosts", [])) for p in config["proxies"]
+            if p["labels"].get("ferrum-migration/status") == "migrated"]
+
+
+def rendered_profile(plan, result, run_mode: str = "file") -> tuple[str, dict[str, str]]:
+    """The ferrum.conf the CLI would write for this result, and its active ``KEY=value`` settings."""
+    profile = render(run_mode, plan.platform, plan.settings, result.tls_only, result.basic_auth_used, "resources.yaml")
+    values: dict[str, str] = {}
+    for line in profile.splitlines():
+        text = line.strip()
+        if text and not text.startswith("#") and "=" in text:
+            key, _, value = text.partition("=")
+            values[key.strip()] = value.strip()
+    return profile, values
+
+
+def assert_listener_contract(test, plan, result, mode: str, http_port: int, https_port: int,
+                             cert_pair: tuple[str, str] | None = None, client_ca: str | None = None) -> None:
+    """The deployed listener contract: the emitter's decision and the exact rendered listener/TLS settings.
+
+    ``http_port``/``https_port`` are the exact rendered values (0: explicitly disabled). The active frontend TLS
+    settings must be exactly ``cert_pair`` and ``client_ca`` (none at all when HTTPS is disabled).
+    """
+    test.assertEqual(result.frontend_protocols, mode)
+    test.assertEqual(plan.settings.frontend_protocols, mode)
+    test.assertEqual(result.tls_only, mode == "https")
+    profile, values = rendered_profile(plan, result)
+    test.assertEqual(values.get("FERRUM_PROXY_HTTP_PORT"), str(http_port))
+    test.assertEqual(values.get("FERRUM_PROXY_HTTPS_PORT"), str(https_port))
+    expected: dict[str, str] = {}
+    if cert_pair:
+        expected["FERRUM_FRONTEND_TLS_CERT_PATH"], expected["FERRUM_FRONTEND_TLS_KEY_PATH"] = cert_pair
+    if client_ca:
+        expected["FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH"] = client_ca
+    active_tls = {key: value for key, value in values.items()
+                  if key.startswith("FERRUM_FRONTEND_TLS_") or key == "FERRUM_ENABLE_HTTP3"}
+    test.assertEqual(active_tls, expected)
+    if mode == "http":
+        test.assertNotIn("REQUIRED for HTTPS", profile)
 
 
 def assert_structurally_valid(test, config: dict) -> None:

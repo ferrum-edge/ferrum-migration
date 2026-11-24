@@ -341,6 +341,11 @@ def frontend_conflict(first: tuple[bool, bool], second: tuple[bool, bool]) -> bo
 def refuse_frontend_scope_conflicts(projections: list[dict], report: Report, code: str) -> None:
     """Refuse overlapping source scopes served through incompatible main listeners (fail closed).
 
+    No longer called by any adapter: host overlap does not decide protocol exposure (Ferrum serves every route on
+    every listener it opens, disjoint or unknown host names included). Translators record each route's source
+    frontends in ``RouteSpec.protocols`` and the emitter enforces the listener invariant for every platform
+    (``ferrum._decide_frontend``). Kept only as a stable helper; do not use it as the protocol-isolation proof.
+
     The same frontend isolation invariant the Istio adapter enforces for Gateway bindings
     (``istio-frontend-scope-conflict``). Each projection is one source scope on the main listeners (an Envoy
     virtual host, an NGINX server): ``scope`` identifies its source listener/server, ``frontend`` is

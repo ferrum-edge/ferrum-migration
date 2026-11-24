@@ -647,6 +647,8 @@ class _Kong:
                               "Configure a Ferrum stream proxy (tcp/tcps/udp/dtls) manually.")
             return
         requires_tls = all(protocol in TLS_PROTOCOLS for protocol in protocols)
+        # Kong matches one route set on its plaintext and its TLS proxy listeners, filtered by the route's protocols.
+        frontends = frozenset(("https" if protocol in TLS_PROTOCOLS else "http") for protocol in protocols)
         hosts = str_list(route.get("hosts"))
         methods = str_list(route.get("methods"))
         paths = str_list(route.get("paths"))
@@ -682,6 +684,7 @@ class _Kong:
             spec.hosts = list(hosts)
             spec.methods = list(methods) or None
             spec.requires_tls = requires_tls
+            spec.protocols = frontends
             spec.strip = strip
             spec.preserve_host = preserve
             if path is None:

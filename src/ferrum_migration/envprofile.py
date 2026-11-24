@@ -102,19 +102,40 @@ def render(run_mode: str, platform: str, settings: SettingsHints, tls_only: bool
                     "Without either, `ferrum-edge run` discovers ./resources.yaml before ./resources.json.")
     out.blank()
 
+    # The emitter records which listeners every live route may be served on; a caller without a plan falls back to
+    # the TLS-only flag. The rendered settings are checked against it below (assert_listener_invariant).
+    protocols = settings.frontend_protocols or ("https" if tls_only else "both")
+    if protocols not in LISTENER_MODES or tls_only != (protocols == "https"):
+        raise AssertionError("profile listener mode disagrees with the emitter's frontend decision")
+    if run_mode == "cp" and protocols != "both":
+        out.comment("Listeners: this control plane serves no proxy traffic. Every data plane that loads these")
+        out.comment("resources must open only the listener(s) below, or it serves routes on a protocol the source")
+        out.comment("never served them on:")
+        if protocols == "http":
+            out.lines.append("#   FERRUM_PROXY_HTTPS_PORT=0 and no FERRUM_FRONTEND_TLS_* settings (plaintext only)")
+        else:
+            out.lines.append("#   FERRUM_PROXY_HTTP_PORT=0 (HTTPS only)")
+        out.blank()
     if run_mode != "cp":
         out.comment("Listeners")
-        if tls_only:
+        if protocols == "https":
             out.put("FERRUM_PROXY_HTTP_PORT", 0, "Source routes require HTTPS: the plaintext listener is disabled.")
         elif settings.main_http_port:
             out.put("FERRUM_PROXY_HTTP_PORT", settings.main_http_port,
                     "Plaintext port from the source (ports below 1024 need CAP_NET_BIND_SERVICE).")
-        if settings.main_https_port:
+        if protocols == "http":
+            out.put("FERRUM_PROXY_HTTPS_PORT", 0,
+                    "Migrated routes were served over plaintext in the source: the HTTPS listener is disabled "
+                    "explicitly, because Ferrum would open it on its default port whenever frontend TLS material is "
+                    "configured and serve these routes there. Do not configure FERRUM_FRONTEND_TLS_* for this "
+                    "profile (environment variables override this file).")
+        elif settings.main_https_port:
             out.put("FERRUM_PROXY_HTTPS_PORT", settings.main_https_port, "TLS port from the source.")
         if settings.bind_address:
             out.put("FERRUM_PROXY_BIND_ADDRESS", settings.bind_address,
                     "The source only listened on this address; keep Ferrum on it too.")
-        needs_cert = tls_only or settings.frontend_tls_expected or bool(settings.main_https_port)
+        needs_cert = protocols != "http" and (protocols == "https" or settings.frontend_tls_expected
+                                              or bool(settings.main_https_port))
         pairs = sorted(set(settings.frontend_cert_pairs))
         if needs_cert:
             if len(pairs) == 1:
@@ -128,12 +149,14 @@ def render(run_mode: str, platform: str, settings: SettingsHints, tls_only: bool
                 out.comment("REQUIRED for HTTPS: write the certificate and key to files and set:")
                 out.lines.append("# FERRUM_FRONTEND_TLS_CERT_PATH=/etc/ferrum/tls/fullchain.pem")
                 out.lines.append("# FERRUM_FRONTEND_TLS_KEY_PATH=/etc/ferrum/tls/privkey.pem")
-        cas = sorted(set(settings.client_ca_paths))
-        if len(cas) == 1 and not settings.client_ca_scope_conflict:
+        # HTTPS disabled: no frontend TLS at all (the emitter configured no client CA and refused HTTPS-only routes).
+        cas = sorted(set(settings.client_ca_paths)) if protocols != "http" else []
+        ca_conflict = settings.client_ca_scope_conflict and protocols != "http"
+        if len(cas) == 1 and not ca_conflict:
             out.put("FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH", cas[0],
                     "Every migrated route that required client certificates (mTLS) used this one CA bundle; Ferrum "
                     "applies it to the whole HTTPS listener.")
-        elif cas or settings.client_ca_scope_conflict:
+        elif cas or ca_conflict:
             # Never suggest merging bundles: that would let clients trusted by one source scope reach another.
             out.comment("REVIEW REQUIRED (frontend-client-ca-scope): the source required client certificates from")
             out.comment("several CA bundles on separate servers/listeners. One shared Ferrum listener cannot keep")
@@ -144,7 +167,7 @@ def render(run_mode: str, platform: str, settings: SettingsHints, tls_only: bool
         if settings.max_request_body_bytes:
             out.put("FERRUM_MAX_REQUEST_BODY_SIZE_BYTES", settings.max_request_body_bytes,
                     "Largest request body any source route accepted; smaller per-route limits use request_size_limiting.")
-        if settings.http3:
+        if settings.http3 and protocols != "http":
             out.suggest("FERRUM_ENABLE_HTTP3", "true", "The source enabled HTTP/3 (QUIC).")
         if settings.trusted_proxies:
             out.suggest("FERRUM_TRUSTED_PROXIES", ",".join(settings.trusted_proxies),
@@ -185,7 +208,46 @@ def render(run_mode: str, platform: str, settings: SettingsHints, tls_only: bool
         out.comment("This profile serves an ingress projection of Gateway-bound routes only (no mesh, no workload")
         out.comment("mTLS). Ferrum documents separate Istio CRD support (FERRUM_K8S_CONTROLLER_ENABLED,")
         out.comment("FERRUM_K8S_WATCH_ISTIO_CRDS; see Ferrum docs/mesh.md); ferrum-migration does not exercise it.")
-    return "\n".join(out.lines).rstrip("\n") + "\n"
+    profile = "\n".join(out.lines).rstrip("\n") + "\n"
+    assert_listener_invariant(profile, protocols, run_mode)
+    return profile
+
+
+#: Frontend modes the emitter decides (see ferrum._decide_frontend).
+LISTENER_MODES = ("http", "https", "both")
+
+
+def assert_listener_invariant(profile: str, protocols: str, run_mode: str) -> None:
+    """Hard invariant on the RENDERED profile: it opens exactly the listeners the emitter decided on.
+
+    Ferrum opens its plaintext listener unless ``FERRUM_PROXY_HTTP_PORT=0`` and its HTTPS listener (default port)
+    whenever frontend TLS material is configured unless ``FERRUM_PROXY_HTTPS_PORT=0``, so absent settings prove
+    nothing. ``http``: HTTPS explicitly disabled and no active ``FERRUM_FRONTEND_TLS_*``/HTTP/3 setting; ``https``:
+    plaintext explicitly disabled; ``both``: neither disabled. A control plane renders no proxy listeners. A
+    violation is a tool bug: it raises, and the CLI writes nothing.
+    """
+    if protocols not in LISTENER_MODES:
+        raise AssertionError("unknown frontend listener mode")
+    if run_mode == "cp":
+        return
+    values: dict[str, str] = {}
+    for line in profile.splitlines():
+        text = line.strip()
+        if not text or text.startswith("#") or "=" not in text:
+            continue
+        key, _, value = text.partition("=")
+        values[key.strip()] = value.strip()
+    http_off = values.get("FERRUM_PROXY_HTTP_PORT") == "0"
+    https_off = values.get("FERRUM_PROXY_HTTPS_PORT") == "0"
+    tls_active = any(key.startswith("FERRUM_FRONTEND_TLS_") or key == "FERRUM_ENABLE_HTTP3" for key in values)
+    if protocols == "http":
+        valid = https_off and not http_off and not tls_active
+    elif protocols == "https":
+        valid = http_off and not https_off
+    else:
+        valid = not http_off and not https_off
+    if not valid:
+        raise AssertionError("rendered listener settings do not match the emitter's frontend decision")
 
 
 def next_steps(run_mode: str, resources_name: str, tls_only: bool, basic_auth_used: bool,

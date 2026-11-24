@@ -34,8 +34,15 @@ Fail-closed rules applied here (see ``docs/design.md``):
    requests are refused (error ``scope-closure-skipped``). A wildcard scope
    covering another scope's narrower wildcard has its routes refused
    (``nested-wildcard-scope``): Ferrum's wildcard tier mixes their path routes.
-6. Routes that require HTTPS in the source are only emitted when Ferrum runs
-   TLS-only (``FERRUM_PROXY_HTTP_PORT=0``); otherwise they are refused.
+6. Ferrum serves every route on each listener its profile opens, so a live
+   route must have been served by the source on every opened protocol
+   (``RouteSpec.protocols``; host names never prove isolation). HTTPS-only
+   output (``FERRUM_PROXY_HTTP_PORT=0``) refuses plaintext-only routes; with the
+   plaintext listener open, HTTPS-only routes are refused and the HTTPS listener
+   is disabled explicitly (``FERRUM_PROXY_HTTPS_PORT=0``, no frontend TLS) unless
+   every live route was served on both. Unknown frontend metadata refuses the
+   whole plan. A final output invariant checks the emitted candidates, and the
+   rendered profile is checked against the decision.
 7. Backend TLS verification is never disabled. There is no opt-out: a source
    that did not verify gets verification turned on (warning), and every emitted
    ``backend_tls_verify_server_cert`` is literally ``true``.
@@ -96,6 +103,12 @@ class EmitResult:
     tls_only: bool
     basic_auth_used: bool
     secrets_emitted: int
+    #: Ferrum listeners the profile opens: "http", "https" or "both" (also stored in ``plan.settings``).
+    frontend_protocols: str = "both"
+
+
+#: Protocols each frontend mode serves every emitted route on.
+FRONTEND_MODES = {"both": frozenset({"http", "https"}), "http": frozenset({"http"}), "https": frozenset({"https"})}
 
 
 @dataclass
@@ -119,15 +132,18 @@ def emit(plan: Plan, options: EmitOptions, report: Report) -> EmitResult:
                 route.refuse(f"a global plugin could not be translated ({reason})")
     for route in routes:
         _validate_route(route, plan, options, report)
-    tls_only = _decide_tls(routes, options, report)
+    # Decided before any candidate exists; every later step only adds refusals, so the decision stays valid.
+    mode = _decide_frontend(plan, routes, options, report)
+    tls_only = mode == "https"
     _poison(routes)
     _poison_case_variants(plan, routes)
-    _resolve_frontend_client_ca(plan, routes, report)
+    _resolve_frontend_client_ca(plan, routes, report, mode)
     candidates = _build_candidates(routes)
     candidates = _resolve_conflicts(candidates)
     _add_scope_closures(plan, candidates, report)
     _add_trailing_slash_placeholders(candidates, report)
     _add_divergence_guards(candidates, report)
+    _assert_frontend_protocols(candidates, mode)
     builder = _Builder(plan, options, report)
     config = builder.build(candidates)
     _assert_backend_tls_verified(config)
@@ -137,8 +153,26 @@ def emit(plan: Plan, options: EmitOptions, report: Report) -> EmitResult:
     _report_timeout_semantics(plan, routes, report)
     stats = builder.stats(routes, candidates)
     stats["tls_only"] = tls_only
+    stats["frontend_protocols"] = mode
     return EmitResult(config=config, stats=stats, tls_only=tls_only,
-                      basic_auth_used=builder.basic_auth_used, secrets_emitted=builder.secrets_emitted)
+                      basic_auth_used=builder.basic_auth_used, secrets_emitted=builder.secrets_emitted,
+                      frontend_protocols=mode)
+
+
+def _assert_frontend_protocols(candidates: list[_Cand], mode: str) -> None:
+    """Hard invariant: every live (non-placeholder) route was served by the source on every listener Ferrum opens.
+
+    Ferrum serves port-agnostic routes on each listener its profile opens, so a live route whose source frontend
+    does not include one of them would be exposed there. Placeholders and synthetic 404 routes fail closed on any
+    listener. A violation is a tool bug: it raises, and the CLI writes nothing.
+    """
+    required = FRONTEND_MODES[mode]
+    for cand in candidates:
+        if cand.placeholder:
+            continue
+        protocols = _effective_protocols(cand.route)
+        if protocols is None or not required <= protocols:
+            raise AssertionError("a live route would be served on a frontend protocol the source never served it on")
 
 
 def _assert_backend_tls_verified(config: dict[str, Any]) -> None:
@@ -332,10 +366,60 @@ def _apply_tls_policy(tls: TlsSpec, ref: str, options: EmitOptions, report: Repo
                    "Provide the backend CA (backend_tls_server_ca_cert_path) if the backend uses a private CA.")
 
 
-def _decide_tls(routes: list[RouteSpec], options: EmitOptions, report: Report) -> bool:
-    active = [route for route in routes if not route.skip and not route.refusals]
-    needs_tls = [route for route in active if route.requires_tls]
-    tls_only = options.tls_only or (bool(active) and len(needs_tls) == len(active))
+def _effective_protocols(route: RouteSpec) -> frozenset[str] | None:
+    """The source main frontends of ``route`` (``None``: unknown). ``requires_tls`` never leaves plaintext in it."""
+    if route.protocols is None:
+        return None
+    protocols = frozenset(p for p in route.protocols if p in ("http", "https"))
+    return protocols - {"http"} if route.requires_tls else protocols
+
+
+def _source_https_activity(plan: Plan, present: list[RouteSpec]) -> bool:
+    """Whether the source had any HTTPS frontend, projected or not (settings captured from skipped listeners count)."""
+    settings = plan.settings
+    return bool(settings.main_https_port or settings.frontend_tls_expected or settings.frontend_cert_pairs
+                or any("https" in (_effective_protocols(route) or ()) for route in present))
+
+
+def _decide_frontend(plan: Plan, routes: list[RouteSpec], options: EmitOptions, report: Report) -> str:
+    """Decide which Ferrum listeners the output opens; refuse every live route the source did not serve on all of them.
+
+    Ferrum serves each emitted (port-agnostic) route on every listener its profile opens, whatever the source host
+    patterns: host names that look disjoint, unknown host input or the same listener strings prove nothing, and
+    neither does the absence of TLS directives (Ferrum opens HTTPS on its default port whenever frontend TLS
+    material is configured). The invariant is therefore tied to the opened listeners and every live route's source
+    frontends (``RouteSpec.protocols``), never to pairwise overlaps:
+
+    * Unknown frontend metadata on a live route: the source frontends cannot be accounted for, so every route of
+      the plan is refused (``frontend-protocol-unknown``) before any candidate exists.
+    * HTTPS only (``--tls-only``, or no live route was served over plaintext): ``FERRUM_PROXY_HTTP_PORT=0``; live
+      routes the source never served over HTTPS are refused (``frontend-protocol-scope``).
+    * Otherwise the plaintext listener stays. HTTPS-only routes are refused (as before). The HTTPS listener stays
+      open only when every remaining live route was also served over HTTPS; else it is disabled explicitly
+      (``FERRUM_PROXY_HTTPS_PORT=0``, no frontend TLS settings) and reported (``frontend-https-disabled``).
+
+    Refused routes become 503 placeholders, which fail closed on any listener. Later emitter steps only add
+    refusals, so the decision stays valid; ``_assert_frontend_protocols`` re-checks it on the final candidates.
+    """
+    present = [route for route in routes if not route.skip]
+    unknown = [route for route in present if not route.refusals and _effective_protocols(route) is None]
+    if unknown:
+        for route in present:
+            route.refuse("the source frontend (plaintext or HTTPS listener) of some routes in this plan is unknown, "
+                         "so no Ferrum listener set can be proven to serve only what the source served")
+        report.error("frontend-protocol-unknown", "frontend listeners",
+                     f"{len(unknown)} route(s) carry no source frontend information (which main plaintext or HTTPS "
+                     "listener served them). Ferrum serves every route on each listener it opens, so the plan "
+                     "could expose routes on a protocol the source never used. Every route was refused (fail closed).",
+                     "Report this as a converter issue; convert the listeners separately in the meantime.")
+    active = [route for route in present if not route.refusals]
+    for route in active:
+        if not _effective_protocols(route):
+            route.refuse("the source served this route on no main plaintext or HTTPS listener that Ferrum provides "
+                         "(for example a plaintext listener that requires TLS), so it cannot be served faithfully")
+    active = [route for route in active if not route.refusals]
+    plaintext = [route for route in active if "http" in _effective_protocols(route)]
+    tls_only = options.tls_only or (bool(active) and not plaintext)
     if tls_only:
         if not options.tls_only:
             report.info("tls-only", "-",
@@ -344,14 +428,51 @@ def _decide_tls(routes: list[RouteSpec], options: EmitOptions, report: Report) -
         for route in active:
             if route.listen_port is not None:
                 route.refuse("served on an extra plaintext port, which cannot exist in TLS-only mode")
+        exposed = [route for route in active if not route.refusals and "https" not in _effective_protocols(route)]
+        for route in exposed:
+            route.refuse("the source served this route over plaintext only; with Ferrum's plaintext listener "
+                         "disabled it would be served on the HTTPS listener, where the source never served it")
+        if exposed:
+            report.error("frontend-protocol-scope", "frontend listeners",
+                         f"The profile disables Ferrum's plaintext listener, but {len(exposed)} route(s) were served "
+                         "over plaintext only in the source. Ferrum would serve them on its HTTPS listener (whatever "
+                         "their host names), so they were refused (fail closed).",
+                         "Serve the plaintext routes from a separately configured Ferrum instance (convert a copy of "
+                         "the source that contains only them), then validate each instance.")
+        mode = "https"
     else:
-        for route in needs_tls:
-            route.refuse("the source serves this route over HTTPS only, but other routes are plaintext and "
-                         "Ferrum would expose it on the plaintext listener too (re-run with --tls-only)")
-    return tls_only
+        for route in active:
+            if "http" not in _effective_protocols(route):
+                route.refuse("the source serves this route over HTTPS only, but other routes are plaintext and "
+                             "Ferrum would expose it on the plaintext listener too (re-run with --tls-only)")
+        remaining = [route for route in active if not route.refusals]
+        if not remaining or all("https" in _effective_protocols(route) for route in remaining):
+            mode = "both"  # nothing live, or every live route was served on both main listeners
+        else:
+            mode = "http"
+            plaintext_only = sum(1 for route in remaining if "https" not in _effective_protocols(route))
+            dual = len(remaining) - plaintext_only
+            if _source_https_activity(plan, present):
+                report.error("frontend-https-disabled", "frontend listeners",
+                             f"{plaintext_only} migrated route(s) were served over plaintext only in the source. Ferrum "
+                             "serves every route on each listener it opens, whatever its host names, so with HTTPS "
+                             "open they would also answer HTTPS requests the source never sent to them. The profile "
+                             "therefore disables Ferrum's HTTPS listener (FERRUM_PROXY_HTTPS_PORT=0) and configures no "
+                             f"frontend TLS. {dual} migrated route(s) the source also served over HTTPS are served "
+                             "over plaintext only, and HTTPS-only routes were refused (fail closed).",
+                             "Serve the source's HTTPS listener from a separately configured Ferrum instance (convert "
+                             "a copy of the source that contains only it, or re-run with --tls-only to keep only the "
+                             "routes the source served over HTTPS), then validate each instance.")
+            else:
+                report.info("frontend-http-only", "frontend listeners",
+                            "Every migrated route was served over plaintext only in the source, so the profile "
+                            "disables Ferrum's HTTPS listener explicitly (FERRUM_PROXY_HTTPS_PORT=0); otherwise it "
+                            "would open on its default port as soon as frontend TLS material is configured.")
+    plan.settings.frontend_protocols = mode
+    return mode
 
 
-def _resolve_frontend_client_ca(plan: Plan, routes: list[RouteSpec], report: Report) -> None:
+def _resolve_frontend_client_ca(plan: Plan, routes: list[RouteSpec], report: Report, mode: str = "both") -> None:
     """Configure the listener-wide client CA bundle only when it preserves every route's trust scope.
 
     Ferrum file mode verifies client certificates with one bundle
@@ -359,11 +480,15 @@ def _resolve_frontend_client_ca(plan: Plan, routes: list[RouteSpec], report: Rep
     named by every route that required client certificates is equivalent for those routes
     (routes that required none become stricter: warning). Several bundles cannot be scoped
     per host/listener, and merging them would widen who is trusted, so none is configured and
-    every route that required one is refused (fail closed).
+    every route that required one is refused (fail closed). With the HTTPS listener disabled
+    (``mode == "http"``) no client CA applies: the source never asked for client certificates
+    over plaintext, and the profile configures no frontend TLS at all.
     """
     settings = plan.settings
     settings.client_ca_paths = []
     settings.client_ca_scope_conflict = False
+    if mode == "http":
+        return
     live = [route for route in routes if not route.skip and not route.refusals]
     required = sorted({ca for route in live for ca in route.client_cas})
     if not required:
@@ -742,9 +867,10 @@ def _regex_reaches_siblings(regex: str | None, prefix: str) -> bool:
     """Whether a (Ferrum-anchored) regex route can match a string-prefix sibling of ``prefix`` (``/apix`` for ``/api``).
 
     Siblings start with ``prefix`` but are neither ``prefix`` itself nor under ``prefix + "/"``. Conservative:
-    unknown or alternating patterns count as reaching them.
+    unknown or alternating patterns (any pipe the shared narrow-grammar proof cannot place inside a group) count as
+    reaching them.
     """
-    if not regex or util.has_top_level_alternation(regex):
+    if not regex or util.regex_alternation_unproven(regex):
         return True
     literal = util.regex_literal_prefix(regex)
     return prefix.startswith(literal) or (literal.startswith(prefix) and not literal.startswith(prefix + "/"))

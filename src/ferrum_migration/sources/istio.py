@@ -311,9 +311,22 @@ class _Istio:
         # match.port selects routes per gateway server port; a shared projection must not pick one port's view.
         port_specific = any(mapping(match).get("port") for entry in seq(spec.get("http"))
                             for match in seq(mapping(entry).get("match")))
+        # Hosts this binding served on the main HTTPS listener, taken before the merge below folds HTTPS groups into
+        # plaintext ones. Only these count as an HTTPS source frontend for a merged plaintext route set.
+        https_any = any(group["any"] for key, group in groups.items() if key[1] is True)
+        https_hosts = {host for key, group in groups.items() if key[1] is True for host in group["hosts"]}
         self._merge_shared_hosts(groups, ref, port_specific)
         for group in groups.values():
             listen_port, requires_tls = group["listen_port"], group["requires_tls"]
+            if requires_tls:
+                frontends = frozenset({"https"})
+            elif listen_port is not None:
+                frontends = frozenset()  # extra plaintext listener: never emitted (extra-listener-refused)
+            elif https_any or (not group["any"] and group["hosts"]
+                               and all(host in https_hosts for host in group["hosts"])):
+                frontends = frozenset({"http", "https"})  # every host is also bound on the main HTTPS server
+            else:
+                frontends = frozenset({"http"})
             hosts = [] if group["any"] else group["hosts"]
             server_ports = group.get("shared_ports") or [group["port"]]
             routes: list[RouteSpec] = []
@@ -322,6 +335,7 @@ class _Istio:
                                                requires_tls, gw_ns, gateway_ref, server_ports))
             for route in routes:
                 route.client_cas = list(group["client_cas"])
+                route.protocols = frontends
                 for reason in group["refusals"] + refusals:
                     route.refuse(reason)
             apply_first_match_order(routes, self.report)

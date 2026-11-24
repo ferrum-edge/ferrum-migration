@@ -20,8 +20,8 @@ from ..model import BackendRef, HostScope, Plan, PluginSpec, RouteSpec, Target, 
 from ..redact import safe_label
 from ..safe_load import load_structured
 from .common import (SourceContext, apply_first_match_order, check_route_budget, choose_main_port, cors_config,
-                     literal_value, mapping, merge_weighted_targets, refuse_frontend_scope_conflicts,
-                     request_header_rule, response_header_rule, retry_from_policy, seq, split_csv, str_list)
+                     literal_value, mapping, merge_weighted_targets, request_header_rule, response_header_rule,
+                     retry_from_policy, seq, split_csv, str_list)
 
 PLATFORM = "envoy"
 _REDIRECT_CODES = {"MOVED_PERMANENTLY": 301, "FOUND": 302, "SEE_OTHER": 303, "TEMPORARY_REDIRECT": 307,
@@ -54,8 +54,6 @@ class _Envoy:
         self.report = ctx.report
         self.plan = Plan(platform=PLATFORM)
         self.clusters: dict[str, dict] = {}
-        # One entry per virtual host on a main listener, checked together once every listener is translated.
-        self.projections: list[dict] = []
 
     def run(self) -> Plan:
         if self.root.get("dynamic_resources"):
@@ -75,8 +73,9 @@ class _Envoy:
         self._elect_ports(infos)
         for info in infos:
             self._listener(info)
-        # A plaintext listener's virtual hosts must not answer HTTPS requests for hosts the HTTPS listener served.
-        refuse_frontend_scope_conflicts(self.projections, self.report, "envoy-frontend-scope-conflict")
+        # Each route records its one source frontend (RouteSpec.protocols). The emitter keeps a plaintext
+        # listener's routes off Ferrum's HTTPS listener (and vice versa) for every host, which also covers TLS
+        # listeners that were skipped (RDS, filter_chain_match) after their port and certificate were recorded.
         check_route_budget(len(self.plan.routes), self.ctx.limits)
         return self.plan
 
@@ -281,11 +280,6 @@ class _Envoy:
                 route.refuse("https_redirect on a route mixed with forwarding routes")
         apply_first_match_order(routes, self.report)
         self.plan.routes.extend(routes)
-        if listen_port is None:
-            # The listener's protocol, not the vhost's require_tls: a plaintext redirect lands on another listener.
-            # Listener names may repeat; the protocol keeps a plaintext and an HTTPS listener apart regardless.
-            self.projections.append({"scope": (listener_ref, tls), "ref": ref, "routes": routes,
-                                     "frontend": (not tls, tls), "hosts": None if hosts is None else list(hosts)})
         if hosts:
             self.plan.host_scopes.append(HostScope(ref, list(hosts), listen_port))
 
@@ -296,8 +290,11 @@ class _Envoy:
                shared: dict) -> RouteSpec:
         name = str(raw.get("name") or f"{vhost_name}-route-{index + 1}")
         ref = f"envoy route '{safe_label(name)}' in {vhost_ref}"
+        # An Envoy listener is either plaintext or TLS, and its virtual hosts are its own: each route was served on
+        # exactly one source frontend. require_tls on a plaintext listener only redirects (requires_tls removes it).
         spec = RouteSpec(ref=ref, name=name, hosts=None if hosts is None else list(hosts),
-                         listen_port=listen_port, requires_tls=requires_tls)
+                         listen_port=listen_port, requires_tls=requires_tls,
+                         protocols=frozenset({"https" if tls else "http"}))
         if hosts is None:
             spec.extra_conditions = True
             spec.refuse("virtual host domains are not representable")

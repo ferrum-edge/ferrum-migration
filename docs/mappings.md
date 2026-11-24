@@ -27,6 +27,7 @@ constructors in `src/plugins/*.rs` (closed key sets), `src/consumer_index.rs`,
 | `request_transformer` header `add` is add-if-absent, `update` always sets, `remove` drops; Ferrum-owned headers (Host, X-Forwarded-*, `x-consumer-*`, ...) cannot be set; `$(` starts a template (`$$(` is literal). | `request_transformer.rs` |
 | `ip_restriction` keys are `allow`/`deny` (canonical IPs or CIDRs); a deny match always wins. | `ip_restriction.rs` |
 | A top-level `resource_counts` seal is accepted and stripped by the file loader. | `file_loader.rs` |
+| The plaintext proxy listener is open (default 8000) unless `FERRUM_PROXY_HTTP_PORT=0`. The HTTPS proxy listener opens on its default port (8443) whenever frontend TLS material is configured, and `FERRUM_PROXY_HTTPS_PORT=0` disables it even then. Port-agnostic routes serve every open listener, so the profile opens only protocols every live route was served on in the source (`frontend-https-disabled`, `frontend-protocol-scope`). | `ferrum.conf` template, `docs/configuration.md` |
 | `ferrum-edge validate -m file -c <spec>` runs the real admission pipeline. | `docs/cli.md` |
 | `backend_read_timeout_ms` (v0.9.21) is one budget covering the wait for response headers, idle time between streamed response frames, and the total time to send a buffered client request body. No source read timeout means exactly that, so every projected timeout is an **approximation** (report warning `timeout-approximate`): the number in milliseconds carries over, the semantics do not. | Ferrum Edge v0.9.21 |
 
@@ -41,7 +42,7 @@ constructors in `src/plugins/*.rs` (closed key sets), `src/consumer_index.rs`,
 | https service with `ca_certificates` | **refused** (placeholder, error `kong-ca-certificates`) | the restricted backend trust set is never copied, and Ferrum's default trust store would trust more issuers; provision the CA file manually and set `backend_tls_server_ca_cert_path` |
 | route `paths` (one proxy per path), `hosts`, `methods`, `strip_path`, `preserve_host` | `listen_path`, `hosts`, `allowed_methods`, `strip_listen_path`, `preserve_host_header` | `~regex` paths become anchored Ferrum regexes; regex + `strip_path` refused. Literal paths are string prefixes in Kong's traditional and traditional_compatible routers, so `/api` also matched `/apix`. The path is never widened; when such siblings do not reach an equivalent route in Ferrum (always the case with `strip_path: true`), the route gets a `prefix-string-siblings` error |
 | route `headers`, `snis`, `expression`, `sources/destinations` | refused + overlap poisoning | |
-| `protocols: [https]` only | emitted only in TLS-only mode | |
+| `protocols: [https]` only | emitted only in TLS-only mode | route `protocols` are the route's source frontends: `[http]` only routes are refused in TLS-only mode, and keep HTTPS disabled otherwise |
 | upstream targets/weights, algorithm, `hash_on` ip/header/cookie, healthchecks | targets, `weighted_round_robin`/`least_connections`/`least_latency`/`consistent_hashing`, `hash_on`, `health_checks` (approximate) | weight 0 targets dropped; default target port 8000 |
 | `key-auth` (`key_names` × header/query) | `key_auth.key_location` (max 8) | `anonymous` and body keys are not supported (stricter) |
 | `basic-auth` | `basic_auth` without credentials (fail closed) | password hashes are not convertible |
@@ -132,7 +133,7 @@ proxies:
 
 | Envoy | Ferrum | Notes |
 |---|---|---|
-| listener port, downstream TLS | main ports, TLS-only, frontend cert paths | inline/SDS material never copied; a plaintext listener on another port is **not migrated** (`extra-listener-refused`) |
+| listener port, downstream TLS | main ports, TLS-only, frontend cert paths | inline/SDS material never copied; a plaintext listener on another port is **not migrated** (`extra-listener-refused`). Each route has exactly one source frontend (its listener), so a plan with live plaintext routes gets `FERRUM_PROXY_HTTPS_PORT=0` and no frontend TLS settings, even when the TLS listener itself was skipped (RDS) |
 | `require_client_certificate` with a file `trusted_ca` | frontend client CA | inline/SDS/missing CA or extra validation constraints (SAN/hash/SPKI pins, CRLs) → listener's routes refused (`envoy-client-ca`) |
 | HCM with inline `route_config` | routes | RDS/scoped routes/xDS not read |
 | virtual host `domains` | `hosts` (+ host-only 404 closure) | prefix wildcards refused |

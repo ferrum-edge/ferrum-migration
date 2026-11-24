@@ -211,15 +211,80 @@ def regex_problem(pattern: object) -> str | None:
     return None
 
 
+#: Escapes the narrow alternation grammar accepts: one ASCII punctuation character (a literal in Rust's regex
+#: syntax outside a class) or a one-letter Perl class. ``\|`` is deliberately absent (escaped and raw pipes are both
+#: unknown), as are multi-character escapes (``\x``, ``\p``, ``\u``...).
+_NARROW_ESCAPES = frozenset("/.-_~:@!$&',;=*+?(){}[]^#\\" + "dDwWsSbB")
+
+
+def _narrow_alternation_depths(pattern: str) -> list[int] | None:
+    """Group depth of every ``|`` when the WHOLE pattern is in a narrow grammar; ``None`` when it is not.
+
+    The grammar is deliberately small so the depth bookkeeping is exact under Rust's regex syntax: printable ASCII
+    without whitespace, single-character escapes from ``_NARROW_ESCAPES``, plain ``(`` and non-capturing ``(?:``
+    groups. Character classes (``[``/``]``: Rust nests classes and has set operators), any other ``(?`` construct
+    (inline flags such as ``x`` change what ``#`` and whitespace mean; names, lookaround), escaped pipes and
+    unbalanced parentheses are outside it, so nothing is proven about them.
+    """
+    depths: list[int] = []
+    depth = 0
+    index = 0
+    while index < len(pattern):
+        char = pattern[index]
+        if char == "\\":
+            if index + 1 >= len(pattern) or pattern[index + 1] not in _NARROW_ESCAPES:
+                return None
+            index += 2
+            continue
+        if char in "[]":
+            return None
+        if char == "(":
+            if pattern.startswith("(?", index):
+                if not pattern.startswith("(?:", index):
+                    return None
+                index += 3
+            else:
+                index += 1
+            depth += 1
+            continue
+        if char == ")":
+            depth -= 1
+            if depth < 0:
+                return None
+        elif char == "|":
+            depths.append(depth)
+        elif not 0x21 <= ord(char) <= 0x7E:
+            return None
+        index += 1
+    return depths if depth == 0 else None
+
+
+def regex_alternation_unproven(pattern: object) -> bool:
+    """Whether a pipe in ``pattern`` may be a top-level alternation (the only shared alternation proof).
+
+    Safety-sensitive coverage, overlap and disjointness reasoning must use this, never a hand lexer of the full
+    grammar. A pattern without any ``|`` (escaped or raw) answers False. A pattern with one answers False only when
+    the whole pattern is in the narrow grammar of ``_narrow_alternation_depths`` and every ``|`` sits inside a group
+    (``/api/(v1|v2)/.*``); everything else, including a non-string, answers True (unknown, fail closed).
+    """
+    if not isinstance(pattern, str):
+        return True
+    if "|" not in pattern:
+        return False
+    depths = _narrow_alternation_depths(pattern)
+    return depths is None or any(depth == 0 for depth in depths)
+
+
 def regex_literal_prefix(pattern: str) -> str:
     """Literal text every match must start with (pattern is anchored at the start).
 
     A top-level alternation (``/a|/B``) has no literal that every branch shares, and the first branch's literal
     proves nothing about the others. The proof is then unknown: ``""`` is returned, so callers treat the pattern as
-    able to match any path (overlaps everything, covered by nothing narrower).
+    able to match any path (overlaps everything, covered by nothing narrower). Any pipe, escaped or raw, makes the
+    proof unknown unless :func:`regex_alternation_unproven` shows on its narrow grammar that it is inside a group.
     """
     text = pattern[1:] if pattern.startswith("^") else pattern
-    if has_top_level_alternation(text):
+    if regex_alternation_unproven(text):
         return ""
     out: list[str] = []
     index = 0
@@ -247,6 +312,12 @@ def regex_literal_prefix(pattern: str) -> str:
 
 
 def has_top_level_alternation(pattern: str) -> bool:
+    """Heuristic top-level alternation check for source-pattern translation only (NGINX location anchoring).
+
+    Its character-class tracking follows PCRE/Python, not Rust's regex grammar (nested classes, set operators), so
+    it is NOT a sound proof. Never use it for coverage, overlap or disjointness reasoning; use
+    :func:`regex_alternation_unproven` instead.
+    """
     depth = 0
     in_class = False
     index = 0

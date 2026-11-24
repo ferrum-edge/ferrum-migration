@@ -90,6 +90,14 @@ class RouteSpec:
     other route that could receive the case variants the source sent here.
     Overlap and coverage checks fold case for such routes and never apply the
     segment/exact disjointness proof to them.
+
+    ``protocols`` is the set of source main frontends (``"http"``: the main
+    plaintext listener, ``"https"``: the main TLS listener) on which the source
+    served exactly this route's match and policy for every one of its hosts.
+    ``None`` means unknown. Ferrum serves every emitted route on every listener
+    its profile opens, so the emitter only opens protocols that every live route
+    was served on; unknown metadata never proves isolation. ``requires_tls``
+    always removes ``"http"``.
     """
 
     ref: str
@@ -116,6 +124,7 @@ class RouteSpec:
     extra_conditions: bool = False
     client_cas: list[str] = field(default_factory=list)
     case_insensitive: bool = False
+    protocols: frozenset[str] | None = None
     skip: bool = False
     skip_reason: str = ""
     # Maintained by the emitter.
@@ -169,6 +178,8 @@ class SettingsHints:
     max_request_body_bytes: int | None = None
     https_redirect_seen: bool = False
     frontend_tls_expected: bool = False
+    #: Set by the emitter only: the Ferrum listeners the profile must open, ``"http"``, ``"https"`` or ``"both"``.
+    frontend_protocols: str | None = None
 
 
 @dataclass

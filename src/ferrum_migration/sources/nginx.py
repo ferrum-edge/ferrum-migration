@@ -19,7 +19,7 @@ from ..limits import Limits
 from ..model import BackendRef, HostScope, Plan, PluginSpec, RouteSpec, Target, TlsSpec, UpstreamSpec
 from ..redact import safe_label
 from .common import (SourceContext, check_route_budget, choose_main_port, is_sensitive_header, literal_value,
-                     refuse_frontend_scope_conflicts, request_header_rule, response_header_rule)
+                     request_header_rule, response_header_rule)
 
 PLATFORM = "nginx"
 
@@ -215,8 +215,6 @@ class _Nginx:
         self.zones: dict[str, dict] = {}
         self.body_sizes: list[tuple[RouteSpec, int]] = []
         self.catch_all_routes: dict[int, list[RouteSpec]] = {}
-        # One entry per server on the main listeners, checked together once every server is translated.
-        self.projections: list[dict] = []
 
     # --------------------------------------------------------- scope merge
 
@@ -316,9 +314,8 @@ class _Nginx:
         for info in infos:
             self._translate_server(info)
         self._refuse_conflicting_defaults()
-        # A plaintext-only server must not answer HTTPS requests for hosts a server on the TLS listener served.
-        # Runs before body-size ceilings are taken from the remaining live routes.
-        refuse_frontend_scope_conflicts(self.projections, self.report, "nginx-frontend-scope-conflict")
+        # Each route records the main listeners its server was served on (RouteSpec.protocols). The emitter keeps a
+        # plaintext-only server's routes off Ferrum's HTTPS listener (and vice versa) for every host name.
         check_route_budget(len(self.plan.routes), self.ctx.limits)
         self._finish_body_sizes()
         return self.plan
@@ -484,7 +481,8 @@ class _Nginx:
         client_cas, client_ca_problem = self._client_trust(server, ref, on_tls)
         base = {"hosts": None if host_problem else hosts, "listen_port": listen_port, "requires_tls": requires_tls,
                 "server_label": info["label"], "server_ref": ref, "extra": bool(host_problem),
-                "client_cas": client_cas, "client_ca_problem": client_ca_problem}
+                "client_cas": client_cas, "client_ca_problem": client_ca_problem,
+                "on_plain": on_plain, "on_tls": on_tls}
         server_return = next((d for d in server.block or [] if d.name == "return"), None)
         server_if = [d for d in server.block or [] if d.name == "if"]
         for condition in server_if:
@@ -506,7 +504,6 @@ class _Nginx:
                 route.refuse(problem)
             self.plan.routes.append(route)
             self._note_catch_all(info, base, [route])
-            self._note_projection(info, base, [route], on_plain, on_tls)
             return
         locations = [d for d in server.block or [] if d.name == "location"]
         if not locations:
@@ -525,20 +522,8 @@ class _Nginx:
         _check_precedence(routes)
         self.plan.routes.extend(routes)
         self._note_catch_all(info, base, routes)
-        self._note_projection(info, base, routes, on_plain, on_tls)
         if base["hosts"]:
             self.plan.host_scopes.append(HostScope(ref, list(base["hosts"]), listen_port))
-
-    def _note_projection(self, info: dict, base: dict, routes: list[RouteSpec], on_plain: bool, on_tls: bool) -> None:
-        """Remember a server served on the main listeners for the frontend isolation check in run().
-
-        ``frontend`` is the pair of main listeners Ferrum serves it on (plaintext, TLS). Refused routes are included.
-        """
-        if base["listen_port"] is not None:
-            return
-        self.projections.append({"scope": info["index"], "ref": info["ref"], "routes": list(routes),
-                                 "frontend": (on_plain, on_tls),
-                                 "hosts": None if base["hosts"] is None else list(base["hosts"])})
 
     def _note_catch_all(self, info: dict, base: dict, routes: list[RouteSpec]) -> None:
         """Remember port-agnostic catch-all routes per server (checked for conflicting defaults in run())."""
@@ -587,6 +572,15 @@ class _Nginx:
         route.kind, route.path = kind, path
         route.listen_port = base["listen_port"]
         route.requires_tls = base["requires_tls"]
+        # The main listeners NGINX served this server on (a plaintext side that only redirects to HTTPS does not
+        # count; neither do dropped extra ports). Extra-listener servers are never emitted.
+        protocols = set()
+        if base["listen_port"] is None:
+            if base["on_plain"] and not base["requires_tls"]:
+                protocols.add("http")
+            if base["on_tls"]:
+                protocols.add("https")
+        route.protocols = frozenset(protocols)
         if base["extra"]:
             route.extra_conditions = True
             route.refuse("server_name is not representable")
