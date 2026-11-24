@@ -758,11 +758,25 @@ class NginxFrontendScopeTest(unittest.TestCase):
         })
         nogzip = one_proxy(self, result.config, "/nogzip", "app.example.test")
         self.assertNotIn("compression", [p["plugin_name"] for p in plugins_of(result.config, nogzip)])
+        # Wildcard gzip_types * omits compression rather than widening to Ferrum's defaults.
         wild = one_proxy(self, result.config, "/wild", "app.example.test")
-        wild_comp = plugin(self, result.config, wild, "compression")["config"]
-        self.assertEqual(wild_comp["algorithms"], ["gzip"])
-        self.assertNotIn("content_types", wild_comp)
+        self.assertNotIn("compression", [p["plugin_name"] for p in plugins_of(result.config, wild)])
         self.assertIn("nginx-gzip", codes(report, "warning"))
+
+        # Default gzip on without gzip_types compresses ONLY text/html (matching NGINX default).
+        default_conf = """
+        server {
+            listen 80;
+            server_name def.example.test;
+            gzip on;
+            location /html/ { proxy_pass http://html.internal:8080; }
+        }
+        """
+        def_res, _def_rep, _ = nginx(default_conf)
+        html_p = one_proxy(self, def_res.config, "/html", "def.example.test")
+        self.assertEqual(plugin(self, def_res.config, html_p, "compression")["config"], {
+            "algorithms": ["gzip"], "content_types": ["text/html"],
+        })
 
 
 if __name__ == "__main__":

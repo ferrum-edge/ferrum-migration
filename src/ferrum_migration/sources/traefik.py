@@ -1061,7 +1061,8 @@ class _Traefik:
                 acc.plugins.append(PluginSpec("request_size_limiting", {"max_bytes": req_size}, ref))
             resp_size = util.as_int(config.get("maxResponseBodyBytes"))
             if resp_size and resp_size > 0:
-                acc.plugins.append(PluginSpec("response_size_limiting", {"max_bytes": resp_size}, ref))
+                acc.plugins.append(PluginSpec("response_size_limiting",
+                                              {"max_bytes": resp_size, "require_buffered_check": True}, ref))
             if any(config.get(k) for k in ("memRequestBodyBytes", "memResponseBodyBytes", "retryExpression")) \
                     or not ((req_size and req_size > 0) or (resp_size and resp_size > 0)):
                 self.report.info("traefik-buffering", ref,
@@ -1092,6 +1093,11 @@ class _Traefik:
             acc.refusals.append(f"middleware type {safe_label(mw_type, 40)} has no safe Ferrum equivalent")
 
     def _compress(self, config: dict, acc: _Acc, ref: str) -> None:
+        if config.get("excludedContentTypes"):
+            self.report.warning("traefik-compress", ref,
+                                "compress omitted: excludedContentTypes has no Ferrum equivalent (Ferrum uses an "
+                                "allow-list and cannot exclude specific response media types).")
+            return
         raw_enc = config.get("encodings")
         encodings = str_list(raw_enc) if raw_enc is not None else ["gzip", "br"]
         if raw_enc is not None and (encodings is None or not encodings):
@@ -1115,10 +1121,6 @@ class _Traefik:
         if built is None:
             self.report.warning("traefik-compress", ref, f"compress omitted ({problem}).")
             return
-        if config.get("excludedContentTypes"):
-            self.report.warning("traefik-compress", ref,
-                                "compress.excludedContentTypes has no Ferrum equivalent (Ferrum uses an allow-list "
-                                "of content_types).")
         if config.get("defaultEncoding"):
             self.report.warning("traefik-compress", ref,
                                 "compress.defaultEncoding is not migrated; Ferrum negotiates via Accept-Encoding.")
@@ -1292,11 +1294,22 @@ class _Traefik:
     def _mirror_plugins(self, mirroring: dict, ref: str) -> tuple[list[PluginSpec], int]:
         plugins: list[PluginSpec] = []
         dropped = 0
+        raw_mirrors = seq(mirroring.get("mirrors"))
         raw_body = mirroring.get("mirrorBody")
-        mirror_body = raw_body if isinstance(raw_body, bool) else (True if raw_body is None else None)
-        raw_max = util.as_int(mirroring.get("maxBodySize"))
-        max_body = raw_max if (raw_max is not None and raw_max > 0) else None
-        for entry in seq(mirroring.get("mirrors")):
+        if raw_body is not None and not isinstance(raw_body, bool):
+            return [], len(raw_mirrors)
+        mirror_body = True if raw_body is None else raw_body
+        raw_max_val = mirroring.get("maxBodySize")
+        max_body: int | None = None
+        if raw_max_val is not None:
+            parsed_max = util.as_int(raw_max_val)
+            if parsed_max is None or parsed_max == 0 or parsed_max < -1:
+                # Traefik maxBodySize=0 refuses mirroring any request carrying a body, whereas Ferrum would default to
+                # 10 MiB; drop mirrors rather than forwarding bodies Traefik suppressed.
+                return [], len(raw_mirrors)
+            if parsed_max > 0:
+                max_body = parsed_max
+        for entry in raw_mirrors:
             if not isinstance(entry, dict) or not isinstance(entry.get("name"), str):
                 dropped += 1
                 continue

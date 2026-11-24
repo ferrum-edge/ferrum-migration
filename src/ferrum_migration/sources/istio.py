@@ -23,9 +23,9 @@ from ..model import BackendRef, HostScope, Plan, PluginSpec, RouteSpec, Target, 
 from ..redact import contains_secret_reference, safe_label
 from ..safe_load import load_structured
 from .common import (SourceContext, apply_first_match_order, check_route_budget, choose_main_port, cors_config,
-                     fault_injection_config, header_value_ok, jwks_provider_config, literal_value, mapping,
-                     merge_weighted_targets, request_header_rule, request_mirror_config, response_header_rule,
-                     retry_from_policy, seq, str_list)
+                     fault_injection_config, header_value_ok, is_loopback_ip_literal, jwks_provider_config,
+                     literal_value, mapping, merge_weighted_targets, request_header_rule, request_mirror_config,
+                     response_header_rule, retry_from_policy, seq, str_list, validate_jwks_providers)
 
 PLATFORM = "istio"
 ROOT_NAMESPACE = "istio-system"
@@ -193,12 +193,13 @@ class _Istio:
         because it only matters if the gateway pods run there.
 
         A ``RequestAuthentication`` that is provably bound to this Gateway (explicit
-        ``targetRef``/``targetRefs``, a workload selector whose labels are a non-empty
-        subset of the Gateway's selector, or namespace-wide in the Gateway's namespace
-        or ``istio-system``) and whose ``jwtRules`` all map cleanly to Ferrum
-        ``jwks_auth`` providers is translated to a shared ``jwks_auth`` plugin with
-        ``allow_missing_token: true`` (matching Istio semantics). Any unprovable scope
-        or untranslatable rule refuses the Gateway's routes (fail closed).
+        ``targetRef``/``targetRefs`` naming this ``networking.istio.io`` Gateway, or a
+        root-namespace ``istio-system`` policy with no selector or a workload selector
+        whose labels are a non-empty subset of the Gateway's selector) and whose
+        ``jwtRules`` all map cleanly to Ferrum ``jwks_auth`` providers is translated to
+        a shared ``jwks_auth`` plugin with ``allow_missing_token: true`` (matching
+        Istio semantics). Any unprovable scope or untranslatable rule refuses the
+        Gateway's routes (fail closed).
         """
         gw_ns, gw_name = _meta(gateway)
         selector = mapping(mapping(gateway.get("spec")).get("selector"))
@@ -212,13 +213,19 @@ class _Istio:
             refs = [mapping(r) for r in seq(spec.get("targetRefs")) + seq(spec.get("targetRef"))]
             targeted = any(r.get("kind") == "Gateway" and r.get("name") == gw_name and
                            (r.get("namespace") or ns) == gw_ns for r in refs)
+            targeted_istio_gw = any(
+                r.get("kind") == "Gateway" and r.get("name") == gw_name
+                and (r.get("namespace") or ns) == gw_ns
+                and r.get("group") in (None, "", "networking.istio.io")
+                for r in refs
+            )
             labels = mapping(mapping(spec.get("selector")).get("matchLabels")) or \
                 mapping(mapping(spec.get("workloadSelector")).get("labels"))
             label = f"{kind} {safe_label(ns)}/{safe_label(name)}"
             provably_bound = False
             if targeted:
                 applies = True
-                provably_bound = True
+                provably_bound = targeted_istio_gw
             elif refs and all(isinstance(r.get("kind"), str) and r["kind"].strip()
                               and isinstance(r.get("name"), str) and r["name"].strip() for r in refs):
                 applies = False
@@ -226,14 +233,17 @@ class _Istio:
                 applies = True
             elif labels:
                 applies = not _selectors_disjoint(selector, labels)
-                if applies and selector and all(k in selector and str(selector[k]) == str(v)
-                                                for k, v in labels.items()):
+                # Workload-selector policies only provably apply across unknown gateway pod namespaces when defined
+                # in the mesh root namespace (istio-system); non-root policies might belong to a different namespace
+                # than the gateway pods and must not be merged into the gateway's trusted issuer set.
+                if applies and ns == ROOT_NAMESPACE and selector \
+                        and all(k in selector and str(selector[k]) == str(v) for k, v in labels.items()):
                     provably_bound = True
             else:
                 applies = True
-                if ns in (gw_ns, ROOT_NAMESPACE):
+                if ns == ROOT_NAMESPACE:
                     provably_bound = True
-                else:
+                elif ns != gw_ns:
                     self.report.error("istio-policy-scope-unknown", ref,
                                       f"{label} has no workload selector, so it applies to every workload in its "
                                       "namespace. The gateway pods' namespace is not part of the input, so it may "
@@ -253,16 +263,20 @@ class _Istio:
             reasons.append(f"{label} applies to this gateway's workloads and cannot be translated")
         gw_plugins: list[PluginSpec] = []
         if jwks_providers and not reasons:
-            gw_plugins.append(PluginSpec(
-                "jwks_auth",
-                {"providers": jwks_providers, "allow_missing_token": True},
-                ", ".join(jwks_refs),
-                shared_key=f"gw-{gw_ns}-{gw_name}-jwks",
-            ))
-            self.report.warning("istio-request-auth", ref,
-                                f"Translated {', '.join(jwks_refs)} to jwks_auth with allow_missing_token: true "
-                                "(matching Istio RequestAuthentication: invalid tokens are rejected while requests "
-                                "without a token proceed unless an authorization policy requires authentication).")
+            bound_err = validate_jwks_providers(jwks_providers)
+            if bound_err is not None:
+                reasons.append(f"{', '.join(jwks_refs)} cannot be translated ({bound_err})")
+            else:
+                gw_plugins.append(PluginSpec(
+                    "jwks_auth",
+                    {"providers": jwks_providers, "allow_missing_token": True},
+                    ", ".join(jwks_refs),
+                    shared_key=f"gw-{gw_ns}-{gw_name}-jwks",
+                ))
+                self.report.warning("istio-request-auth", ref,
+                                    f"Translated {', '.join(jwks_refs)} to jwks_auth with allow_missing_token: true "
+                                    "(matching Istio RequestAuthentication: invalid tokens are rejected while requests "
+                                    "without a token proceed unless an authorization policy requires authentication).")
         return reasons, gw_plugins
 
     # --------------------------------------------------------- virtualservices
@@ -748,6 +762,21 @@ class _Istio:
             if tls_err or (scheme == "https" and (tls.ca_path or tls.client_cert_path or tls.sni or tls.san_allow_list)):
                 dropped += 1
                 continue
+            # Without an explicit DestinationRule TLS policy (e.g. mode: DISABLE), Istio Auto mTLS may encrypt
+            # mirror traffic; never opt into cleartext allow_plaintext for non-loopback targets unless proven plaintext.
+            if scheme == "http" and not is_loopback_ip_literal(targets[0].host):
+                explicit_disable = False
+                if rule is not None:
+                    pol = mapping(mapping(rule.get("spec")).get("trafficPolicy"))
+                    for lvl in seq(pol.get("portLevelSettings")):
+                        lvl = mapping(lvl)
+                        if util.parse_port(mapping(lvl.get("port")).get("number")) == resolved_port:
+                            pol = {**pol, **{k: v for k, v in lvl.items() if k != "port"}}
+                    tls_pol = mapping(pol.get("tls"))
+                    explicit_disable = str(tls_pol.get("mode", "")).upper() == "DISABLE"
+                if not explicit_disable:
+                    dropped += 1
+                    continue
             built, _problem = request_mirror_config(targets[0].host, targets[0].port, scheme, percentage=pct)
             if built is None:
                 dropped += 1
@@ -1069,6 +1098,7 @@ def _translate_request_auth(spec: dict) -> tuple[list[dict[str, Any]] | None, st
         if raw_fh is not None:
             if not isinstance(raw_fh, list) or any(not isinstance(h, dict) or set(h) - {"name", "prefix"} for h in raw_fh):
                 return None, "fromHeaders entry has unsupported shape"
+        # Istio defaults forwardOriginalToken to false (strips the original token); Ferrum defaults to true.
         provider, problem = jwks_provider_config(
             issuer=issuer,
             jwks_uri=rule.get("jwksUri"),
@@ -1076,7 +1106,7 @@ def _translate_request_auth(spec: dict) -> tuple[list[dict[str, Any]] | None, st
             audiences=rule.get("audiences"),
             from_headers=raw_fh,
             from_params=rule.get("fromParams"),
-            forward_original_token=rule.get("forwardOriginalToken"),
+            forward_original_token=rule.get("forwardOriginalToken", False),
             output_claim_headers=och,
         )
         if provider is None:

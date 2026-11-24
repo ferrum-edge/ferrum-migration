@@ -1147,7 +1147,12 @@ class TraefikHardeningTest(unittest.TestCase):
                         "rule": "Host(`a.example.test`) && PathPrefix(`/api/`)",
                         "service": "mirrored",
                         "middlewares": ["comp", "gw", "buf"],
-                    }
+                    },
+                    "r_excl": {
+                        "rule": "Host(`a.example.test`) && PathPrefix(`/excl/`)",
+                        "service": "mirrored_zero",
+                        "middlewares": ["comp_excl"],
+                    },
                 },
                 "middlewares": {
                     "comp": {
@@ -1155,7 +1160,12 @@ class TraefikHardeningTest(unittest.TestCase):
                             "encodings": ["br", "gzip"],
                             "minResponseBodyBytes": 2048,
                             "includedContentTypes": ["application/json", "text/plain"],
-                            "excludedContentTypes": ["image/png"],
+                        }
+                    },
+                    "comp_excl": {
+                        "compress": {
+                            "encodings": ["gzip"],
+                            "excludedContentTypes": ["text/html"],
                         }
                     },
                     "gw": {"grpcWeb": {"allowOrigins": ["https://app.example.test"]}},
@@ -1167,6 +1177,13 @@ class TraefikHardeningTest(unittest.TestCase):
                             "service": "main",
                             "mirrorBody": True,
                             "maxBodySize": 65536,
+                            "mirrors": [{"name": "shadow", "percent": 25}],
+                        }
+                    },
+                    "mirrored_zero": {
+                        "mirroring": {
+                            "service": "main",
+                            "maxBodySize": 0,
                             "mirrors": [{"name": "shadow", "percent": 25}],
                         }
                     },
@@ -1186,7 +1203,8 @@ class TraefikHardeningTest(unittest.TestCase):
         })
         self.assertEqual(plugin(self, result.config, proxy, "grpc_web")["config"], {})
         self.assertEqual(plugin(self, result.config, proxy, "request_size_limiting")["config"], {"max_bytes": 1048576})
-        self.assertEqual(plugin(self, result.config, proxy, "response_size_limiting")["config"], {"max_bytes": 4194304})
+        self.assertEqual(plugin(self, result.config, proxy, "response_size_limiting")["config"],
+                         {"max_bytes": 4194304, "require_buffered_check": True})
         self.assertEqual(plugin(self, result.config, proxy, "request_mirror")["config"], {
             "mirror_host": "shadow.internal",
             "mirror_port": 9090,
@@ -1196,6 +1214,9 @@ class TraefikHardeningTest(unittest.TestCase):
             "mirror_request_body": True,
             "max_mirrored_request_body_bytes": 65536,
         })
+        # excludedContentTypes omits compression; maxBodySize=0 drops mirror rather than mirroring 10 MiB.
+        excl = one_proxy(self, result.config, "/excl", "a.example.test")
+        self.assertEqual(plugins_of(result.config, excl), [])
         self.assertIn("traefik-compress", codes(report, "warning"))
         self.assertIn("traefik-grpc-web", codes(report, "warning"))
         self.assertIn("traefik-mirroring", codes(report, "warning"))

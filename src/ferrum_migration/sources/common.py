@@ -282,7 +282,16 @@ _GATEWAY_ASSERTION_HEADERS = frozenset({"x-authenticated-identity", "x-geo-count
 _OUTPUT_CLAIM_RESERVED_HEADERS = (
     GATEWAY_OWNED_REQUEST_HEADERS
     | _CORRELATION_ID_RESERVED_HEADERS
-    | frozenset({"x-forwarded-client-cert", "x-envoy-peer-metadata", "x-envoy-peer-metadata-id"})
+    | frozenset({
+        "a-im", "accept", "b3", "baggage", "cache-control", "cdn-loop", "date", "dnt",
+        "from", "http2-settings", "max-forwards", "origin", "pragma", "prefer", "priority",
+        "range", "referer", "upgrade-insecure-requests", "user-agent",
+        "x-forwarded-client-cert", "x-envoy-peer-metadata", "x-envoy-peer-metadata-id",
+    })
+)
+_OUTPUT_CLAIM_RESERVED_PREFIXES = (
+    "accept-", "access-control-", "content-", "grpc-", "if-", "proxy-", "sec-",
+    "x-b3-", "x-consumer-", "x-ferrum-", "x-forwarded-", "x-path-param-",
 )
 MAX_COMPRESSION_CONTENT_TYPES = 64
 MAX_FAULT_DELAY_MS = 60_000
@@ -291,6 +300,9 @@ MAX_OUTPUT_CLAIM_HEADERS = 16
 MAX_OUTPUT_CLAIM_HEADER_LEN = 128
 MAX_OUTPUT_CLAIM_PATH_LEN = 256
 MAX_MIRROR_BODY_BYTES = 10 * 1024 * 1024
+MAX_JWKS_KEYS = 256
+MAX_JWKS_PROVIDERS = 64
+MAX_JWKS_CANDIDATE_PROVIDERS = 8
 
 
 def is_loopback_ip_literal(host: str) -> bool:
@@ -325,6 +337,7 @@ def compression_config(
     brotli_quality: int | None = None,
     zstd_level: int | None = None,
     decompress_request: bool | None = None,
+    remove_accept_encoding: bool | None = None,
 ) -> tuple[dict | None, str | None]:
     """Build a Ferrum v0.9.21 ``compression`` plugin config, rejecting unsupported values."""
     config: dict[str, Any] = {}
@@ -374,6 +387,10 @@ def compression_config(
         if not isinstance(decompress_request, bool):
             return None, "decompress_request must be a boolean"
         config["decompress_request"] = decompress_request
+    if remove_accept_encoding is not None:
+        if not isinstance(remove_accept_encoding, bool):
+            return None, "remove_accept_encoding must be a boolean"
+        config["remove_accept_encoding"] = remove_accept_encoding
     return config, None
 
 
@@ -432,7 +449,7 @@ def fault_injection_config(
             lower = raw_name.lower()
             folded = fold(lower)
             if lower in _GATEWAY_ASSERTION_HEADERS or folded in _GATEWAY_ASSERTION_HEADERS \
-                    or folded.startswith(("x-consumer-", "x-ferrum-")):
+                    or folded.startswith(("x-consumer-", "x-ferrum-", "x-path-param-")):
                 return None, f"match.headers cannot name gateway-asserted header {lower}"
             if lower in clean_headers:
                 return None, f"match.headers repeats header {lower}"
@@ -515,6 +532,7 @@ def jwks_provider_config(
             return None, "jwks_uri contains whitespace or control characters"
         try:
             parts = urlsplit(uri)
+            _ = parts.port
         except ValueError:
             return None, "jwks_uri is not a valid URL"
         if parts.username is not None or parts.password is not None or not parts.hostname:
@@ -543,10 +561,29 @@ def jwks_provider_config(
         if not isinstance(parsed_jwks, dict) or not isinstance(parsed_jwks.get("keys"), list) \
                 or not parsed_jwks["keys"] or not all(isinstance(k, dict) for k in parsed_jwks["keys"]):
             return None, "inline jwks must be a JWKS object with a non-empty keys array"
+        if len(parsed_jwks["keys"]) > MAX_JWKS_KEYS:
+            return None, f"inline jwks exceeds Ferrum's {MAX_JWKS_KEYS}-key limit"
+        seen_kids: set[str] = set()
         for key_entry in parsed_jwks["keys"]:
-            if str(key_entry.get("kty", "")).lower() == "oct" \
+            kty = key_entry.get("kty")
+            if not isinstance(kty, str) or kty not in ("RSA", "EC", "OKP") \
                     or any(secret_field in key_entry for secret_field in ("d", "p", "q", "dp", "dq", "qi", "k", "oth")):
-                return None, "inline jwks contains private or symmetric key material, which is never copied"
+                return None, "inline jwks contains unsupported, private, or symmetric key material"
+            kid = key_entry.get("kid")
+            if not isinstance(kid, str) or not kid.strip():
+                return None, "every inline jwks key must declare a non-empty kid"
+            if kid in seen_kids:
+                return None, "inline jwks contains duplicate kid values"
+            seen_kids.add(kid)
+            use = key_entry.get("use")
+            if use is not None and use != "sig":
+                return None, "inline jwks keys must have use 'sig' when specified"
+            key_ops = key_entry.get("key_ops")
+            if key_ops is not None and (not isinstance(key_ops, list) or "verify" not in key_ops):
+                return None, "inline jwks key_ops must include 'verify' when specified"
+            required_fields = {"RSA": ("n", "e"), "EC": ("crv", "x", "y"), "OKP": ("crv", "x")}[kty]
+            if any(not isinstance(key_entry.get(f), str) or not key_entry[f].strip() for f in required_fields):
+                return None, f"inline jwks {kty} key is missing required public key fields"
         provider["jwks"] = parsed_jwks
     if issuer is not None:
         if not isinstance(issuer, str) or not issuer.strip() \
@@ -603,7 +640,8 @@ def jwks_provider_config(
             claim = item.get("claim")
             header = item.get("header")
             if not isinstance(claim, str) or not claim or len(claim.encode("utf-8")) > MAX_OUTPUT_CLAIM_PATH_LEN \
-                    or any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7F for ch in claim):
+                    or any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7F for ch in claim) \
+                    or any(seg == "" for seg in claim.split(".")):
                 return None, "output_claim_headers claim path is not valid"
             if not isinstance(header, str) or not header.strip() or not header_name_ok(header.strip()):
                 return None, "output_claim_headers header name is not valid"
@@ -611,7 +649,7 @@ def jwks_provider_config(
             folded = fold(dest)
             if len(dest.encode("utf-8")) > MAX_OUTPUT_CLAIM_HEADER_LEN \
                     or dest in _OUTPUT_CLAIM_RESERVED_HEADERS or folded in _OUTPUT_CLAIM_RESERVED_HEADERS \
-                    or folded.startswith(("x-consumer-", "x-ferrum-", "x-path-param-", "grpc-", "sec-")):
+                    or folded.startswith(_OUTPUT_CLAIM_RESERVED_PREFIXES):
                 return None, f"output_claim_headers cannot target reserved header {dest}"
             if folded in seen_dests:
                 return None, f"output_claim_headers declares header {dest} more than once"
@@ -620,6 +658,40 @@ def jwks_provider_config(
         if clean_och:
             provider["output_claim_headers"] = clean_och
     return provider, None
+
+
+def validate_jwks_providers(providers: list[dict[str, Any]]) -> str | None:
+    """Enforce Ferrum v0.9.21 aggregate provider bounds and single-location extraction equivalence."""
+    if not providers:
+        return "jwks_auth requires at least one provider"
+    if len(providers) > MAX_JWKS_PROVIDERS:
+        return f"at most {MAX_JWKS_PROVIDERS} jwks_auth providers are supported in one instance"
+    open_count = 0
+    per_issuer: dict[str, int] = {}
+    location_sigs: set[tuple] = set()
+    for prov in providers:
+        iss = prov.get("issuer")
+        if iss is None:
+            open_count += 1
+        else:
+            per_issuer[iss] = per_issuer.get(iss, 0) + 1
+        fh = prov.get("from_headers") or []
+        fp = prov.get("from_params") or []
+        if len(fh) + len(fp) != 1:
+            return ("every provider must declare exactly one explicit token location (from_headers or from_params); "
+                    "multi-location and implicit default (Authorization + access_token) extraction cannot be proven "
+                    "equivalent because Ferrum selects only the first matching location")
+        if fh:
+            location_sigs.add(("header", fh[0]["name"], fh[0].get("prefix")))
+        else:
+            location_sigs.add(("param", fp[0]))
+    if open_count > MAX_JWKS_CANDIDATE_PROVIDERS:
+        return f"at most {MAX_JWKS_CANDIDATE_PROVIDERS} jwks_auth providers may omit issuer"
+    if any(count + open_count > MAX_JWKS_CANDIDATE_PROVIDERS for count in per_issuer.values()):
+        return f"at most {MAX_JWKS_CANDIDATE_PROVIDERS} candidate jwks_auth providers may match any issuer"
+    if len(location_sigs) > 1:
+        return "all providers in one jwks_auth instance must share the same single explicit token location"
+    return None
 
 
 def split_csv(value: Any) -> list[str]:

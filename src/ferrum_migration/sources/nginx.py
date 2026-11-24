@@ -274,9 +274,9 @@ class _Nginx:
                 if args[0] in ("on", "off"):
                     child.gzip = args[0]
             elif name == "gzip_comp_level" and args:
-                level = util.as_int(args[0])
-                if level is not None and 1 <= level <= 9:
-                    child.gzip_comp_level = level
+                gzip_level = util.as_int(args[0])
+                if gzip_level is not None and 1 <= gzip_level <= 9:
+                    child.gzip_comp_level = gzip_level
             elif name == "gzip_min_length" and args:
                 length = util.parse_nginx_size(args[0])
                 if length is not None and length >= 0:
@@ -1042,12 +1042,13 @@ class _Nginx:
             self.report.warning("nginx-limit-req", ref, "limit_req burst/delay semantics differ: Ferrum enforces the "
                                 "same average rate with its own bucket behavior.")
         if scope.gzip == "on":
-            content_types: list[str] | None = None
+            content_types: list[str] | None = ["text/html"]
+            omit_gzip = False
             if scope.gzip_types is not None:
                 if "*" in scope.gzip_types:
                     self.report.warning("nginx-gzip", ref,
-                                        "gzip_types '*' has no Ferrum equivalent; using Ferrum's default "
-                                        "compressible content types.")
+                                        "gzip omitted: gzip_types '*' has no Ferrum equivalent (Ferrum rejects '*/*').")
+                    omit_gzip = True
                 else:
                     candidate = ["text/html"] + [t for t in scope.gzip_types if t.lower() != "text/html"]
                     built_check, problem = compression_config(["gzip"], content_types=candidate)
@@ -1055,18 +1056,19 @@ class _Nginx:
                         content_types = built_check["content_types"]
                     else:
                         self.report.warning("nginx-gzip", ref,
-                                            f"gzip_types could not be represented ({problem}); using Ferrum's "
-                                            "default compressible content types.")
-            comp_cfg, comp_problem = compression_config(
-                ["gzip"],
-                min_content_length=scope.gzip_min_length,
-                content_types=content_types,
-                gzip_level=scope.gzip_comp_level,
-            )
-            if comp_cfg is not None:
-                route.plugins.append(PluginSpec("compression", comp_cfg, ref))
-            else:
-                self.report.warning("nginx-gzip", ref, f"gzip omitted ({comp_problem}).")
+                                            f"gzip omitted: gzip_types could not be represented ({problem}).")
+                        omit_gzip = True
+            if not omit_gzip:
+                comp_cfg, comp_problem = compression_config(
+                    ["gzip"],
+                    min_content_length=scope.gzip_min_length,
+                    content_types=content_types,
+                    gzip_level=scope.gzip_comp_level,
+                )
+                if comp_cfg is not None:
+                    route.plugins.append(PluginSpec("compression", comp_cfg, ref))
+                else:
+                    self.report.warning("nginx-gzip", ref, f"gzip omitted ({comp_problem}).")
         size = scope.body_size if scope.body_size is not None else 1024 * 1024
         self.body_sizes.append((route, size))
 

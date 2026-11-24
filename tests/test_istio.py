@@ -963,7 +963,7 @@ class IstioCaseAndNamesTest(unittest.TestCase):
             ---
             apiVersion: security.istio.io/v1
             kind: RequestAuthentication
-            metadata: {name: jwt-policy, namespace: edge}
+            metadata: {name: jwt-policy, namespace: istio-system}
             spec:
               selector:
                 matchLabels: {istio: ingressgateway}
@@ -972,8 +972,15 @@ class IstioCaseAndNamesTest(unittest.TestCase):
                   jwksUri: https://idp.example.test/.well-known/jwks.json
                   audiences: [api]
                   fromHeaders: [{name: Authorization, prefix: "Bearer "}]
-                  forwardOriginalToken: true
                   outputClaimToHeaders: [{header: x-jwt-sub, claim: sub}]
+            ---
+            apiVersion: networking.istio.io/v1
+            kind: DestinationRule
+            metadata: {name: shadow-plain, namespace: edge}
+            spec:
+              host: shadow.edge.svc.cluster.local
+              trafficPolicy:
+                tls: {mode: DISABLE}
             ---
             apiVersion: networking.istio.io/v1
             kind: VirtualService
@@ -998,13 +1005,14 @@ class IstioCaseAndNamesTest(unittest.TestCase):
         assert_structurally_valid(self, result.config)
         api = one_proxy(self, result.config, "=/api", "api.example.test")
         self.assertEqual(api["labels"]["ferrum-migration/status"], "migrated")
+        # Omitted forwardOriginalToken explicitly emits forward_original_token: False (matching Istio default).
         self.assertEqual(plugin(self, result.config, api, "jwks_auth")["config"], {
             "providers": [{
                 "jwks_uri": "https://idp.example.test/.well-known/jwks.json",
                 "issuer": "https://idp.example.test",
                 "audiences": ["api"],
                 "from_headers": [{"name": "authorization", "prefix": "Bearer "}],
-                "forward_original_token": True,
+                "forward_original_token": False,
                 "output_claim_headers": [{"claim": "sub", "header": "x-jwt-sub"}],
             }],
             "allow_missing_token": True,
@@ -1026,8 +1034,14 @@ class IstioCaseAndNamesTest(unittest.TestCase):
         self.assertEqual(one_proxy(self, result.config, "=/healthz", "api.example.test")["labels"][
             "ferrum-migration/status"], "refused")
 
-        # RequestAuthentication with unsupported field (fromCookies) still refuses the Gateway fail-closed.
-        bad = text.replace("forwardOriginalToken: true", "fromCookies: [session]")
+        # Non-root namespace RequestAuthentication selector (unknown gateway pod namespace) refuses fail-closed.
+        non_root = text.replace("namespace: istio-system", "namespace: edge")
+        nr_res, _nr_rep, _ = migrate("istio", non_root)
+        self.assertEqual(one_proxy(self, nr_res.config, "=/api", "api.example.test")["labels"][
+            "ferrum-migration/status"], "refused")
+
+        # RequestAuthentication with unsupported field (fromCookies) refuses fail-closed.
+        bad = text.replace('fromHeaders: [{name: Authorization, prefix: "Bearer "}]', "fromCookies: [session]")
         bad_res, _bad_rep, _ = migrate("istio", bad)
         self.assertEqual(one_proxy(self, bad_res.config, "=/api", "api.example.test")["labels"][
             "ferrum-migration/status"], "refused")

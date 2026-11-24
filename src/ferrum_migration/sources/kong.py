@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import math
 import re
+import unicodedata
 from collections import Counter
 from typing import Any
 
@@ -31,6 +32,9 @@ OBSERVABILITY_PLUGINS = {
     "syslog", "loggly", "zipkin", "opentelemetry", "kafka-log", "splunk", "app-dynamics",
 }
 COSMETIC_PLUGINS = {
+    "proxy-cache": "response caching is not migrated: Kong restricts caching by content_type (default text/plain, "
+                   "application/json) whereas Ferrum response_caching has no MIME allow-list, and an omitted scoped "
+                   "override cannot suppress a global Ferrum cache",
     "acme": "certificate automation is not migrated; Ferrum supports ACME via FERRUM_ACME_* settings",
     "response-ratelimiting": None,
 }
@@ -38,9 +42,7 @@ KNOWN_TOP_LEVEL = {"_format_version", "_transform", "_info", "_workspace", "_kon
                    "upstreams", "consumers", "plugins", "certificates", "ca_certificates", "snis", "vaults",
                    "acls", "consumer_groups", "consumer_group_consumers", "consumer_group_plugins"}
 _REGEX_HINT = re.compile(r"[\\^$*+?()\[\]{}|]")
-_BOT_REGEX_HINT = re.compile(r"[\\^$*+?()\[\]{}|.]")
 _KEY_NAME = re.compile(r"^[A-Za-z0-9!#$%&'*+.^_`|~-]+$")
-_UNCACHEABLE_STATUSES = frozenset({206, 304, 401, 407})
 # Ferrum authentication plugins this translator can emit (from key-auth, basic-auth and jwt).
 AUTH_PLUGINS = frozenset({"key_auth", "basic_auth", "jwt_auth"})
 
@@ -505,9 +507,24 @@ class _Kong:
                                 custom_id=custom_id if isinstance(custom_id, str) else None)
             tags = str_list(consumer.get("tags"))
             if tags:
-                clean_tags = [t.strip() for t in tags if t.strip()]
-                if clean_tags:
-                    spec.labels["ferrum-migration/kong-tags"] = safe_label(",".join(dict.fromkeys(clean_tags)), 255)
+                sanitized_tags: list[str] = []
+                for raw_tag in tags:
+                    if contains_secret_reference(raw_tag):
+                        continue
+                    cleaned = "".join(ch for ch in raw_tag if not unicodedata.category(ch).startswith("C")).strip()
+                    if not cleaned:
+                        continue
+                    redacted = safe_label(cleaned, 128)
+                    if redacted and redacted not in sanitized_tags:
+                        sanitized_tags.append(redacted)
+                joined = ""
+                for tag in sanitized_tags:
+                    candidate = f"{joined},{tag}" if joined else tag
+                    if len(candidate.encode("utf-8")) > 512:
+                        break
+                    joined = candidate
+                if joined:
+                    spec.labels["ferrum-migration/kong-tags"] = joined
             for acl in seq(consumer.get("acls")):
                 group = acl.get("group") if isinstance(acl, dict) else None
                 if isinstance(group, str):
@@ -1399,100 +1416,17 @@ def _kong_correlation_id(self: _Kong, config: dict, ref: str) -> tuple:
 
 
 def _kong_bot_detection(self: _Kong, config: dict, ref: str) -> tuple:
-    raw_allow = config.get("allow")
-    raw_deny = config.get("deny")
-    allow = str_list(raw_allow)
-    deny = str_list(raw_deny)
-    if (raw_allow is not None and allow is None) or (raw_deny is not None and deny is None):
-        return ("refuse", "bot-detection allow/deny lists have unexpected types")
-    allow = [item.strip() for item in (allow or []) if item.strip()]
-    deny = [item.strip() for item in (deny or []) if item.strip()]
-    if deny:
-        return ("refuse", "Kong bot-detection 'deny' extends Kong's built-in bot list, whereas Ferrum's "
-                          "blocked_patterns replaces Ferrum's built-in defaults (dropping default blocks would weaken "
-                          "protection); configure bot_detection.blocked_patterns explicitly in Ferrum")
-    if any(_BOT_REGEX_HINT.search(pattern) for pattern in allow):
-        return ("refuse", "Kong bot-detection 'allow' contains regex/pattern metacharacters; Ferrum matches "
-                          "allow_list entries as literal word-boundary tokens")
-    plugin_config: dict[str, Any] = {}
-    if allow:
-        plugin_config["allow_list"] = list(dict.fromkeys(allow))
-    self.report.warning("kong-bot-detection", ref,
-                        "bot_detection uses Ferrum's built-in bot User-Agent list (which differs from Kong's); "
-                        "allow_list entries match case-insensitively on word boundaries rather than as regexes.")
-    return ("plugin", PluginSpec("bot_detection", plugin_config, ref))
+    return ("refuse", "Kong bot-detection uses Kong's built-in regex bot list (blocking agents such as bingbot "
+                      "that Ferrum's default substring list does not) and regex allow/deny rules; configure "
+                      "Ferrum's bot_detection.blocked_patterns and allow_list explicitly")
 
 
 def _kong_grpc_web(self: _Kong, config: dict, ref: str) -> tuple:
     if config.get("proto"):
         return ("refuse", "grpc-web .proto JSON transcoding has no Ferrum equivalent")
-    if config.get("allow_origin_header"):
-        self.report.warning("kong-grpc-web", ref,
-                            "grpc-web allow_origin_header is not migrated inside grpc_web; configure CORS via "
-                            "Ferrum's cors plugin if cross-origin browser access is required.")
-    return ("plugin", PluginSpec("grpc_web", {}, ref))
-
-
-def _kong_proxy_cache(self: _Kong, config: dict, ref: str) -> tuple:
-    strategy = config.get("strategy")
-    if strategy is not None and str(strategy) != "memory":
-        self.report.warning("kong-plugin-omitted", ref,
-                            f"proxy-cache with strategy '{safe_label(strategy, 24)}' is not migrated; Ferrum's "
-                            "response_caching is in-memory only.")
-        return ("omit",)
-    plugin_config: dict[str, Any] = {}
-    raw_methods = config.get("request_method")
-    if raw_methods is not None:
-        methods = str_list(raw_methods)
-        if not methods:
-            self.report.warning("kong-plugin-omitted", ref, "proxy-cache omitted: invalid request_method.")
-            return ("omit",)
-        upper = [m.strip().upper() for m in methods if m.strip()]
-        if not upper or any(m not in ("GET", "HEAD") for m in upper):
-            self.report.warning("kong-plugin-omitted", ref,
-                                "proxy-cache omitted: Ferrum response_caching only caches GET and HEAD requests.")
-            return ("omit",)
-        plugin_config["cacheable_methods"] = list(dict.fromkeys(upper))
-    raw_codes = config.get("response_code")
-    if raw_codes is not None:
-        if not isinstance(raw_codes, list) or not raw_codes:
-            self.report.warning("kong-plugin-omitted", ref, "proxy-cache omitted: invalid response_code list.")
-            return ("omit",)
-        codes: list[int] = []
-        for code in raw_codes:
-            parsed = util.as_int(code)
-            if parsed is None or not 200 <= parsed <= 599 or parsed in _UNCACHEABLE_STATUSES:
-                self.report.warning("kong-plugin-omitted", ref,
-                                    "proxy-cache omitted: response_code contains a status Ferrum does not cache.")
-                return ("omit",)
-            if parsed not in codes:
-                codes.append(parsed)
-        plugin_config["cacheable_status_codes"] = codes
-    if config.get("cache_ttl") is not None:
-        ttl = util.as_int(config.get("cache_ttl"))
-        if ttl is None or ttl <= 0:
-            self.report.warning("kong-plugin-omitted", ref, "proxy-cache omitted: invalid cache_ttl.")
-            return ("omit",)
-        plugin_config["ttl_seconds"] = ttl
-    if config.get("cache_control") is not None:
-        if not isinstance(config["cache_control"], bool):
-            self.report.warning("kong-plugin-omitted", ref, "proxy-cache omitted: invalid cache_control.")
-            return ("omit",)
-        plugin_config["respect_cache_control"] = config["cache_control"]
-    raw_vary = config.get("vary_headers")
-    if raw_vary is not None:
-        vary = str_list(raw_vary)
-        if vary is None or any(not header_name_ok(h.strip()) for h in vary):
-            self.report.warning("kong-plugin-omitted", ref, "proxy-cache omitted: invalid vary_headers.")
-            return ("omit",)
-        if vary:
-            plugin_config["vary_by_headers"] = list(dict.fromkeys(h.strip().lower() for h in vary))
-    notes = ["Ferrum response_caching uses RFC 9111 credential/Vary partitioning and ignores Kong's content_type "
-             "allow-list and storage_ttl settings."]
-    if config.get("vary_query_params"):
-        notes.append("Ferrum always partitions by the full query string (stricter than vary_query_params).")
-    self.report.warning("kong-proxy-cache", ref, " ".join(notes))
-    return ("plugin", PluginSpec("response_caching", plugin_config, ref))
+    return ("refuse", "Kong grpc-web rejects native application/grpc requests and handles OPTIONS locally, whereas "
+                      "Ferrum grpc_web passes native application/grpc through to the backend; configure grpc_web "
+                      "manually if native gRPC access is acceptable")
 
 
 _PLUGIN_HANDLERS = {
@@ -1511,5 +1445,4 @@ _PLUGIN_HANDLERS = {
     "correlation-id": _kong_correlation_id,
     "bot-detection": _kong_bot_detection,
     "grpc-web": _kong_grpc_web,
-    "proxy-cache": _kong_proxy_cache,
 }
