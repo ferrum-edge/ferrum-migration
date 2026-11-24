@@ -126,6 +126,15 @@ No case claims Istio mesh behavior, database-mode import (`/batch` additive or
   `socket.getfqdn` lookup at bind time (`harness/loopback.py`).
 * Every child runs in its own process group with bounded waits:
   SIGTERM → grace → SIGKILL, also from `atexit` and on SIGTERM/SIGHUP.
+* Scratch: each run creates its own fresh private (mode `0700`) directory: a
+  new temp dir by default, or a new `run-*` directory inside `--work-root`.
+  Every case then gets its own fresh `<case-id>-*` directory in that run
+  directory. `--work-root` is only a parent: entries already beneath it are
+  never reused, followed or deleted. The work dirs of `PASS`,
+  `REJECTED_ACCEPTABLE` and `STATIC_ONLY` cases are removed unless
+  `--keep-workdirs` is given. Other cases keep theirs, and each result's
+  `workdir` field records the path. When no work dir is kept, the run directory
+  is removed too. `--results` is written exactly where given.
 
 ## Adding a case
 

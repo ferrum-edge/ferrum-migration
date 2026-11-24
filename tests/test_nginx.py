@@ -120,6 +120,45 @@ class NginxSemanticsTest(unittest.TestCase):
         self.assertEqual(plugin(self, result.config, closure[0], "request_termination")["config"]["status_code"], 404)
         self.assertIn("nginx-return-444", codes(report, "warning"))
 
+    def test_named_default_server_keeps_its_named_tier(self):
+        # NGINX sends app.example.test to the default server (exact name beats the wildcard). As a Ferrum catch-all,
+        # /api/ for that host would reach the wildcard server's "/" route without the IP restriction.
+        result, report, _ = nginx("""
+            server {
+                listen 80 default_server;
+                server_name app.example.test;
+                location /api/ { allow 10.0.0.0/8; deny all; proxy_pass http://app.internal:8080; }
+            }
+            server {
+                listen 80;
+                server_name *.example.test;
+                location / { proxy_pass http://wild.internal:8080; }
+            }
+        """)
+        api = one_proxy(self, result.config, "/api", "app.example.test")
+        self.assertEqual(api["labels"]["ferrum-migration/status"], "migrated")
+        self.assertEqual(plugin(self, result.config, api, "ip_restriction")["config"], {"allow": ["10.0.0.0/8"]})
+        self.assertEqual([p for p in proxies(result.config, "/api") if "hosts" not in p], [])
+        closure = [p for p in proxies(result.config, host="app.example.test") if "listen_path" not in p]
+        self.assertEqual(len(closure), 1)
+        self.assertIn("nginx-default-server-named", codes(report, "error"))
+
+    def test_named_default_server_without_competing_names_stays_catch_all(self):
+        result, report, _ = nginx("""
+            server {
+                listen 80 default_server;
+                server_name app.example.test;
+                location /api/ { proxy_pass http://app.internal:8080; }
+            }
+            server {
+                listen 80;
+                server_name other.example.test;
+                location / { proxy_pass http://other.internal:8080; }
+            }
+        """)
+        self.assertNotIn("hosts", one_proxy(self, result.config, "/api"))
+        self.assertNotIn("nginx-default-server-named", codes(report))
+
     def test_loopback_listener_is_not_exposed(self):
         result, report, _ = nginx("""
             server { listen 127.0.0.1:8081; server_name admin.local; location / { proxy_pass http://127.0.0.1:9000; } }

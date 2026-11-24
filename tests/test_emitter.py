@@ -6,8 +6,9 @@ from helpers import assert_structurally_valid, codes, plugins_of
 
 from ferrum_migration import matching, util
 from ferrum_migration.ferrum import EmitOptions, emit
-from ferrum_migration.model import BackendRef, Plan, PluginSpec, RouteSpec, TlsSpec
+from ferrum_migration.model import BackendRef, ConsumerSpec, HostScope, Plan, PluginSpec, RouteSpec, TlsSpec
 from ferrum_migration.report import Report
+from ferrum_migration.sources.common import apply_first_match_order
 
 
 def route(name, path="/", kind="prefix", hosts=None, **kwargs):
@@ -108,6 +109,46 @@ class EmitterTest(unittest.TestCase):
         _result, report = run([route("n", "/n")])
         self.assertNotIn("timeout-approximate", codes(report))
 
+    def test_refused_string_prefix_siblings_cannot_reach_broader_route(self):
+        # The source sent /adminx to the refused string-prefix route /admin; Ferrum's segment prefix would hand it
+        # to the broader live "/" route, skipping the refused policy. A guard must close that path.
+        def guards(result):
+            root = next(p for p in result.config["proxies"] if p["listen_path"] == "/")
+            return [p["config"]["trigger"]["path_prefix"] for p in plugins_of(result.config, root)
+                    if p["plugin_name"] == "request_termination"]
+
+        result, report = run([route("admin", "/admin", refusals=["synthetic untranslatable policy"]), route("root", "/")])
+        self.assertEqual(guards(result), ["/admin"])
+        self.assertNotIn("prefix-divergence-refused", codes(report))
+        # The refused route covers fewer hosts than the broader route: still guarded (fail closed), reported.
+        result, report = run([route("admin", "/admin", hosts=["a.example.test"], refusals=["synthetic"]),
+                              route("root", "/", hosts=["a.example.test", "b.example.test"])])
+        self.assertEqual(guards(result), ["/admin"])
+        self.assertIn("prefix-divergence-refused", codes(report, "error"))
+
+    def test_covering_wildcard_closure_does_not_close_narrower_wildcard_scope(self):
+        # Ferrum tries every matching wildcard pattern's path routes before any wildcard host-only route, so the
+        # *.example.test closure does not keep *.a.example.test's unmatched paths away from other scopes' routes.
+        plan = Plan(platform="test", routes=[route("w", "/w", hosts=["*.example.test"]),
+                                             route("n", "/n", hosts=["*.a.example.test"])])
+        plan.host_scopes = [HostScope("scope wide", ["*.example.test"]), HostScope("scope narrow", ["*.a.example.test"])]
+        report = Report("test", "synthetic")
+        result = emit(plan, EmitOptions(), report)
+        closures = [p["hosts"] for p in result.config["proxies"] if "listen_path" not in p]
+        self.assertEqual(closures, [["*.example.test"]])
+        self.assertIn("scope-closure-skipped", codes(report, "error"))
+
+    def test_one_consumer_never_receives_several_jwt_secrets(self):
+        consumer = ConsumerSpec(ref="test consumer", key="c", username="c",
+                                jwt=["synthetic-jwt-secret-one-0000000000000001",
+                                     "synthetic-jwt-secret-two-0000000000000002"])
+        plan = Plan(platform="test", routes=[route("r", "/r")], consumers=[consumer])
+        report = Report("test", "synthetic")
+        result = emit(plan, EmitOptions(include_secrets=True), report)
+        self.assertNotIn("credentials", result.config["consumers"][0])
+        self.assertEqual(result.secrets_emitted, 0)
+        self.assertIn("jwt-multiple-secrets", codes(report, "error"))
+
 
 class MatchingTest(unittest.TestCase):
     def test_host_semantics(self):
@@ -133,6 +174,21 @@ class MatchingTest(unittest.TestCase):
         self.assertEqual(util.parse_nginx_size("10m"), 10 * 1024 * 1024)
         self.assertEqual(util.proto_duration_ms("0.25s"), 250)
         self.assertEqual(util.canonical_cidr("10.1.2.3/8"), "10.0.0.0/8")
+
+    def test_segment_prefix_shadows_only_segment_descendants(self):
+        # A segment prefix /api (Envoy path_separated_prefix) never matches /apix, so a later /apix route is
+        # reachable in the source and must not be dropped as shadowed; /api/v1 really is shadowed.
+        seg = RouteSpec(ref="seg", name="seg", kind="prefix", path="/api", prefix_semantics="segment")
+        sibling = RouteSpec(ref="sibling", name="sibling", kind="prefix", path="/apix")
+        nested = RouteSpec(ref="nested", name="nested", kind="prefix", path="/api/v1")
+        exact = RouteSpec(ref="exact", name="exact", kind="exact", path="/api")
+        apply_first_match_order([seg, sibling, nested, exact], Report("test", "synthetic"))
+        self.assertFalse(sibling.skip)
+        self.assertTrue(nested.skip)
+        self.assertTrue(exact.skip)
+        self.assertFalse(matching.route_covers(seg, sibling))
+        string = RouteSpec(ref="string", name="string", kind="prefix", path="/api")
+        self.assertTrue(matching.route_covers(string, sibling))
 
     def test_url_userinfo_refused(self):
         with self.assertRaises(util.UrlProblem):

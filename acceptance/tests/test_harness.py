@@ -12,6 +12,8 @@ import base64
 import hashlib
 import hmac
 import json
+import os
+import stat
 import sys
 import tempfile
 import time
@@ -33,7 +35,7 @@ from harness.echo import PROBE_HEADER, EchoBackend, EchoRecorder  # noqa: E402
 from harness.ferrum import GatewayIdentity, ferrum_env, FerrumOptions  # noqa: E402
 from harness.loopback import LoopbackThreadingHTTPServer  # noqa: E402
 from harness.procs import ManagedProcess, PortHold, minimal_env  # noqa: E402
-from harness.runner import outcome_kind  # noqa: E402
+from harness.runner import RunContext, outcome_kind, run_case  # noqa: E402
 from harness.util import (  # noqa: E402
     SyntheticCanaries,
     TemplateError,
@@ -337,6 +339,92 @@ class EndToEndSelfTest(unittest.TestCase):
         payload = self._run("copy")
         self.assertEqual(payload["cases"][0]["outcome_kind"], "behavioral-conversion")
         self.assertEqual(payload["outcome_kinds"], {"behavioral-conversion": 1})
+
+
+class WorkRootOwnershipTests(unittest.TestCase):
+    """Case scratch lives in fresh, private, run-owned dirs; pre-existing --work-root entries are left alone."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(tmp.name).resolve()
+        self.work = self.tmp / "work"
+        self.cases = load_cases(TESTS / "selftest_fixtures")
+        self.preexisting = [c.id for c in self.cases] + ["_preflight"]
+        # Ordinary directories carrying exactly the names the harness used to reuse or delete.
+        self.sentinels = {}
+        for name in self.preexisting:
+            sentinel = self.work / name / "keep-me.txt"
+            sentinel.parent.mkdir(parents=True)
+            sentinel.write_text(f"pre-existing {name}\n", encoding="utf-8")
+            self.sentinels[sentinel] = sentinel.read_text(encoding="utf-8")
+
+    def assert_sentinels_intact(self):
+        for sentinel, text in self.sentinels.items():
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), text)
+            self.assertEqual([p.name for p in sentinel.parent.iterdir()], ["keep-me.txt"], sentinel.parent)
+
+    def _run_cli(self, *extra: str) -> "tuple[int, dict]":
+        results = self.tmp / "results.json"
+        argv = [
+            "--fixtures", str(TESTS / "selftest_fixtures"),
+            "--converter-argv", json.dumps(["{python}", str(TESTS / "fake_converter.py"), "{source}", "{outdir}"]),
+            "--converter-env", "FAKE_CONVERTER_MODE=copy",
+            "--ferrum-argv", json.dumps([sys.executable, str(TESTS / "fake_ferrum.py")]),
+            "--work-root", str(self.work),
+            "--results", str(results),
+            "--startup-timeout", "20",
+            *extra,
+        ]
+        code = run_cli.main(argv)
+        return code, json.loads(results.read_text(encoding="utf-8"))
+
+    def test_passing_run_keeps_preexisting_entries_and_removes_only_its_own_scratch(self):
+        code, payload = self._run_cli()
+        self.assertEqual(code, 0, json.dumps(payload["cases"], indent=1))
+        self.assertTrue(payload["cases"])
+        for case in payload["cases"]:
+            self.assertEqual(case["status"], "PASS")
+            self.assertIsNone(case["workdir"])
+        self.assert_sentinels_intact()
+        self.assertEqual(sorted(p.name for p in self.work.iterdir()), sorted(self.preexisting))
+
+    def test_kept_workdirs_live_in_a_fresh_private_run_dir(self):
+        code, payload = self._run_cli("--keep-workdirs")
+        self.assertEqual(code, 0, json.dumps(payload["cases"], indent=1))
+        self.assert_sentinels_intact()
+        run_dirs = [p for p in self.work.iterdir() if p.name not in self.preexisting]
+        self.assertEqual(len(run_dirs), 1, run_dirs)
+        run_dir = run_dirs[0]
+        self.assertTrue(run_dir.name.startswith("run-"), run_dir)
+        self.assertTrue((run_dir / "_preflight").is_dir())
+        owned = [run_dir]
+        for case in payload["cases"]:
+            workdir = Path(case["workdir"])
+            self.assertEqual(workdir.parent, run_dir)
+            self.assertTrue(workdir.name.startswith(case["id"] + "-"), workdir)
+            self.assertTrue((workdir / "input").is_dir())
+            owned.append(workdir)
+        if os.name == "posix":
+            for directory in owned:
+                self.assertEqual(stat.S_IMODE(directory.stat().st_mode) & 0o077, 0, directory)
+
+    def test_runner_creates_a_new_case_dir_instead_of_reusing_an_existing_one(self):
+        case = self.cases[0]
+        ctx = RunContext(
+            work_root=self.work, converter=None, converter_env={}, ferrum=None, upstream=None,
+            pass_env=[], mesh_validate_env=None, strict_mesh=False, keep_workdirs=False,
+        )
+        first = run_case(case, ctx, SyntheticCanaries())
+        second = run_case(case, ctx, SyntheticCanaries())
+        self.assertEqual((first["status"], second["status"]), ("SKIPPED", "SKIPPED"))
+        dirs = [Path(first["workdir"]), Path(second["workdir"])]
+        self.assertNotEqual(dirs[0], dirs[1])
+        for workdir in dirs:
+            self.assertEqual(workdir.parent, self.work)
+            self.assertNotEqual(workdir, self.work / case.id)
+            self.assertTrue((workdir / "input" / case.source.name).is_file())
+        self.assert_sentinels_intact()
 
 
 if __name__ == "__main__":

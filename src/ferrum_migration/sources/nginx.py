@@ -308,6 +308,7 @@ class _Nginx:
                                 "suggested in ferrum.conf; ip_restriction and rate limits use the socket peer until "
                                 "FERRUM_TRUSTED_PROXIES is set.")
         infos = [self._server_info(server, index) for index, server in enumerate(servers)]
+        self.infos = infos
         self._elect_ports(infos)
         for info in infos:
             self._translate_server(info)
@@ -424,7 +425,19 @@ class _Nginx:
             return
         is_default = any(self.default_server.get((listen["port"], listen["ssl"])) == info["index"] for listen in listens)
         hosts, host_problem = _server_hosts(info["names"])
-        if is_default:
+        if is_default and hosts and not host_problem and self._names_covered_elsewhere(info, listens, hosts):
+            # NGINX picks this server for its own names (exact beats wildcard, longer wildcard beats shorter) and
+            # only falls back to it for unknown names. As a Ferrum catch-all, its own names would go to the other
+            # server's exact/wildcard tier instead. Keep the named tier; the fallback role is not migrated.
+            self.report.error("nginx-default-server-named", ref,
+                              "This default server also has server_name entries that another server on the same "
+                              "listener covers (same name or a wildcard). NGINX sends those names to this server, "
+                              "but a Ferrum catch-all route would lose them to the other server's routes. It is "
+                              "migrated for its own server_name hosts only; requests for unknown host names, which "
+                              "NGINX also sent to this default server, are not routed to it (fail closed).",
+                              "If unknown host names must reach this server, add a separate catch-all server for "
+                              "them in the source and convert again.")
+        elif is_default:
             hosts, host_problem = [], None
             self.report.info("nginx-default-server", ref, "Default server: its routes are catch-all (any Host).")
         elif hosts == [] and not host_problem:
@@ -483,6 +496,22 @@ class _Nginx:
         self.plan.routes.extend(routes)
         if base["hosts"]:
             self.plan.host_scopes.append(HostScope(ref, list(base["hosts"]), listen_port))
+
+    def _names_covered_elsewhere(self, info: dict, listens: list[dict], hosts: list[str]) -> bool:
+        """Whether another server sharing a listen socket has a server name equal to or covering one of ``hosts``."""
+        sockets = {(listen["port"], listen["ssl"]) for listen in listens}
+        for other in self.infos:
+            if other is info:
+                continue
+            other_sockets = {(listen["port"], listen["ssl"]) for listen in other["listens"] if not listen.get("invalid")}
+            if not sockets & other_sockets:
+                continue
+            other_hosts, other_problem = _server_hosts(other["names"])
+            if other_problem:
+                continue
+            if any(matching.host_cover(outer, name) for outer in other_hosts for name in hosts):
+                return True
+        return False
 
     def _new_route(self, base: dict, path: str, kind: str, ref: str) -> RouteSpec:
         route = RouteSpec(ref=ref, name=f"{base['server_label']}-{path}")

@@ -675,8 +675,19 @@ class _Traefik:
                 else:
                     self.report.warning("traefik-cors", ref, f"CORS omitted ({problem}).")
         if config.get("allowedHosts"):
-            hosts = str_list(config.get("allowedHosts")) or []
-            acc.allowed_hosts = [host.lower() for host in hosts]
+            hosts = [host.lower() for host in (str_list(config.get("allowedHosts")) or [])]
+            # Every headers middleware in the chain checks its own list, so a request must pass all of them:
+            # keep the intersection, never let a later (broader) list replace an earlier one.
+            acc.allowed_hosts = hosts if acc.allowed_hosts is None else \
+                [host for host in acc.allowed_hosts if host in hosts]
+            if config.get("hostsProxyHeaders"):
+                # allowedHosts is then also checked against these request headers (for example X-Forwarded-Host),
+                # a restriction beyond the router's Host match that Ferrum cannot enforce.
+                acc.refusals.append("headers.allowedHosts is also checked against hostsProxyHeaders, which Ferrum "
+                                    "cannot enforce")
+        elif config.get("hostsProxyHeaders"):
+            self.report.info("traefik-hosts-proxy-headers", ref, "hostsProxyHeaders only affects allowedHosts and SSL "
+                             "redirect host checks, which this middleware does not configure; ignored.")
         if request_rules:
             acc.plugins.append(PluginSpec("request_transformer", {"rules": request_rules}, ref))
         if response_rules:

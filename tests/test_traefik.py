@@ -73,7 +73,8 @@ class TraefikFixtureTest(unittest.TestCase):
         self.assertFalse(root[0]["preserve_host_header"])
         guards = sorted(p["config"]["trigger"]["path_prefix"] for p in plugins_of(self.config, root[0])
                         if p["plugin_name"] == "request_termination")
-        self.assertEqual(guards, ["/api", "/beta", "/v2"])
+        # /admin is refused (Header matcher); its string-prefix siblings must not reach the host-only root.
+        self.assertEqual(guards, ["/admin", "/api", "/beta", "/v2"])
 
     def test_weighted_canary_shares_one_upstream(self):
         v2 = one_proxy(self, self.config, "/v2", "app.example.com")
@@ -109,6 +110,27 @@ class TraefikSemanticsTest(unittest.TestCase):
             "middlewares": middlewares or {},
             "services": {"s": {"loadBalancer": {"servers": [{"url": "http://s.internal:80"}]}}},
         }})
+
+    def test_allowed_hosts_from_several_middlewares_never_broaden(self):
+        # Each headers middleware checks its own allowedHosts; the later, broader list must not replace the
+        # earlier one that rejects a.example.test.
+        router = {"r": {"rule": "Host(`a.example.test`) && Path(`/x`)", "service": "s",
+                        "middlewares": ["narrow", "broad"]}}
+        middlewares = {"narrow": {"headers": {"allowedHosts": ["b.example.test"]}},
+                       "broad": {"headers": {"allowedHosts": ["a.example.test", "b.example.test"]}}}
+        result, _report, _ = migrate("traefik", self._doc(router, middlewares))
+        self.assertEqual(one_proxy(self, result.config, "=/x", "a.example.test")["labels"]["ferrum-migration/status"],
+                         "refused")
+        # One list covering the router host is a no-op, unless hostsProxyHeaders also subjects other headers to it.
+        result, _report, _ = migrate("traefik", self._doc(router, {
+            "narrow": {"headers": {"allowedHosts": ["a.example.test"]}}, "broad": {"headers": {}}}))
+        self.assertEqual(one_proxy(self, result.config, "=/x", "a.example.test")["labels"]["ferrum-migration/status"],
+                         "migrated")
+        result, _report, _ = migrate("traefik", self._doc(router, {
+            "narrow": {"headers": {"allowedHosts": ["a.example.test"], "hostsProxyHeaders": ["X-Forwarded-Host"]}},
+            "broad": {"headers": {}}}))
+        self.assertEqual(one_proxy(self, result.config, "=/x", "a.example.test")["labels"]["ferrum-migration/status"],
+                         "refused")
 
     def test_higher_priority_catch_all_shadows_specific_router(self):
         result, report, _ = migrate("traefik", self._doc({

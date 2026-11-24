@@ -81,12 +81,34 @@ def spaces_overlap(a: tuple[str, bool] | None, b: tuple[str, bool] | None) -> bo
     return pa.startswith(pb) or pb.startswith(pa)
 
 
-def space_covers(outer_kind: str, outer_path: str | None, inner_kind: str, inner_path: str | None) -> bool:
+def space_covers(outer_kind: str, outer_path: str | None, inner_kind: str, inner_path: str | None,
+                 outer_segment: bool = False, inner_segment: bool = False) -> bool:
+    """Whether every path matched by the inner space is matched by the outer one (definitive, not conservative).
+
+    ``outer_segment``/``inner_segment`` mark prefixes with segment semantics (Envoy ``path_separated_prefix``):
+    ``/api`` then matches ``/api`` and ``/api/...`` but not ``/apix``. Without it a prefix is a plain string prefix.
+    """
     if outer_kind == "hostonly":
         return True
     if outer_kind == "prefix" and outer_path is not None:
         if inner_kind == "hostonly":
             return outer_path == "/"
+        if outer_segment:
+            base = outer_path.rstrip("/")
+            if not base:
+                return True  # a segment prefix of "/" matches every path
+
+            def under(path: str, may_equal: bool) -> bool:
+                return path.startswith(base + "/") or (may_equal and path == base)
+
+            if inner_kind == "exact" and inner_path is not None:
+                return under(inner_path, True)
+            if inner_kind == "prefix" and inner_path is not None:
+                # A string-prefix inner /api also matches /apix, which a segment /api does not.
+                return under(inner_path, inner_segment)
+            if inner_kind == "regex" and inner_path is not None:
+                return under(util.regex_literal_prefix(inner_path), False)
+            return False
         if inner_kind in ("prefix", "exact") and inner_path is not None:
             return inner_path.startswith(outer_path)
         if inner_kind == "regex" and inner_path is not None:
@@ -148,7 +170,9 @@ def route_covers(outer, inner) -> bool:
         return False
     return (hosts_cover(outer.hosts, inner.hosts)
             and methods_cover(outer.methods, inner.methods)
-            and space_covers(outer.kind, outer.path, inner.kind, inner.path))
+            and space_covers(outer.kind, outer.path, inner.kind, inner.path,
+                             outer_segment=getattr(outer, "prefix_semantics", "string") == "segment",
+                             inner_segment=getattr(inner, "prefix_semantics", "string") == "segment"))
 
 
 def ferrum_prefers(a, b) -> bool | None:

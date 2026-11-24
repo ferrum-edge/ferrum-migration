@@ -15,7 +15,10 @@ Fail-closed rules applied here (see ``docs/design.md``):
 4. Source prefixes use plain string matching, Ferrum matches by path segment.
    Where ``/api`` and a broader route differ in policy, a ``request_termination``
    guard with ``trigger.path_prefix`` is added to the broader route so
-   ``/apix`` cannot reach it; a trailing-slash prefix gets an exact 404 route
+   ``/apix`` cannot reach it. A refused string-prefix route's placeholder counts
+   too, so its siblings never fall through to a broader live route (guarded even
+   when the broader route serves more hosts; error ``prefix-divergence-refused``).
+   A trailing-slash prefix gets an exact 404 route
    for its bare path. Routes are never widened to cover ``/apix``. For routes
    whose source matched literal string prefixes (NGINX prefix locations, Kong
    ``paths``, Traefik ``PathPrefix``, Envoy ``prefix``, Istio ``uri.prefix``),
@@ -23,7 +26,10 @@ Fail-closed rules applied here (see ``docs/design.md``):
    ``prefix-string-siblings`` error instead of becoming silent 404s.
 5. Source scopes that do not fall through between hosts (NGINX servers, Envoy
    virtual hosts, Istio hosts) get a host-only 404 route so unmatched paths do
-   not reach another host tier.
+   not reach another host tier. Only a closure for the same host names counts:
+   a covering wildcard closure does not close a narrower scope (Ferrum tries all
+   wildcard path routes before wildcard host-only routes). When no closure can
+   be added, error ``scope-closure-skipped``.
 6. Routes that require HTTPS in the source are only emitted when Ferrum runs
    TLS-only (``FERRUM_PROXY_HTTP_PORT=0``); otherwise they are refused.
 7. Backend TLS verification is never disabled. There is no opt-out: a source
@@ -456,16 +462,24 @@ def _add_scope_closures(plan: Plan, candidates: list[_Cand], report: Report) -> 
         hosts = [h for h in (util.normalize_host(x) for x in scope.hosts) if h]
         if not hosts:
             continue
+        # A prefix route for "/" on exactly these host names already catches every unmatched path in their tier.
+        if all(host in root_hosts.get(scope.listen_port, set()) for host in hosts):
+            continue
         overlapping = [c for c in host_only.get(scope.listen_port, []) if matching.hosts_overlap(c.hosts, hosts)]
+        # Only a closure for the very same host names closes this scope. A covering wildcard closure does not:
+        # Ferrum tries every path route of every matching wildcard pattern (and of the exact tier) before any
+        # wildcard host-only route, so another scope's routes would still receive these hosts' unmatched paths.
         if overlapping and all(c.kind_label == "scope-default" for c in overlapping) and \
-                any(matching.hosts_cover(c.hosts, hosts) for c in overlapping):
+                all(any(host in c.hosts for c in overlapping) for host in hosts):
             continue
         if overlapping:
-            report.warning("scope-closure-skipped", scope.ref,
-                           "Another host-only route overlaps this scope's hosts, so no default 404 route was added; "
-                           "unmatched paths for these hosts may reach that route.")
-            continue
-        if all(host in root_hosts.get(scope.listen_port, set()) for host in hosts):
+            report.error("scope-closure-skipped", scope.ref,
+                         "Another host-only route overlaps this scope's hosts without closing exactly these host "
+                         "names, so no default 404 route could be added (overlapping host-only routes are not "
+                         "emitted). Unmatched paths for these hosts can reach other host scopes' routes in Ferrum "
+                         "(another wildcard pattern or the catch-all tier), which the source never did.",
+                         "Add explicit routes in the source for paths these hosts must answer, or serve the "
+                         "overlapping host scopes from separate Ferrum frontends, then convert again.")
             continue
         synthetic = RouteSpec(ref=scope.ref, name=f"{scope.ref}-default", hosts=hosts, kind="hostonly", path=None)
         closure = _Cand(synthetic, True, hosts, None, scope.listen_port,
@@ -536,7 +550,10 @@ def _add_divergence_guards(candidates: list[_Cand], report: Report) -> None:
 
     for cand in candidates:
         route = cand.route
-        if cand.placeholder or route.kind != "prefix" or route.prefix_semantics != "string" \
+        # A refused route's placeholder keeps its envelope too: the source sent its string-prefix siblings
+        # (/apix for /api) to the refused route, so they must not fall through to a broader live route.
+        refused = cand.placeholder and cand.kind_label == "refused"
+        if (cand.placeholder and not refused) or route.kind != "prefix" or route.prefix_semantics != "string" \
                 or route.trailing_slash or route.path in (None, "/"):
             continue
         fingerprint = fp(cand)
@@ -582,6 +599,20 @@ def _add_divergence_guards(candidates: list[_Cand], report: Report) -> None:
                                 f"Added a request_termination guard (trigger.path_prefix {route.path}) so paths "
                                 f"like {route.path}x, which the source routed to {route.ref}, cannot reach this "
                                 f"broader route under Ferrum's segment-based prefix matching.")
+            elif refused:
+                # The guard cannot be scoped to the refused route's hosts. Letting its siblings reach this broader
+                # route would bypass the refused policy, so the guard is added anyway (fail closed) and the
+                # collateral 404s on the broader route's other hosts are a review error.
+                if route.path not in other.guards:
+                    other.guards.append(route.path or "/")
+                report.error("prefix-divergence-refused", route.ref,
+                             f"The source sent paths such as {route.path}x to this refused route. Ferrum would hand "
+                             f"them to the broader route {other_route.ref}, which serves more hosts, so a "
+                             f"request_termination guard (trigger.path_prefix {route.path}) was added to it for all "
+                             f"of its hosts: such paths now answer 404 there even on hosts the source forwarded "
+                             f"(fail closed).",
+                             "Recreate the refused route in Ferrum, then remove the guard only for hosts where the "
+                             "broader route should serve those paths.")
             else:
                 divergence_error = True
                 report.error("prefix-divergence", route.ref,
@@ -589,7 +620,7 @@ def _add_divergence_guards(candidates: list[_Cand], report: Report) -> None:
                              f"Ferrum matches by path segment, so on some hosts those paths reach "
                              f"{other_route.ref}, which has a different policy, and no exact guard could be added.",
                              "Confirm such paths are not reachable or add an explicit route for them.")
-        if route.report_prefix_siblings and not divergence_error \
+        if route.report_prefix_siblings and not refused and not divergence_error \
                 and not (equivalent and not intercepted and not guarded):
             report.error("prefix-string-siblings", route.ref,
                          f"The source matched every path that starts with {route.path}, including paths such as "
@@ -886,6 +917,14 @@ class _Builder:
                                   "(fail closed).", "Rotate to a random secret of at least 32 characters.")
             elif secret not in secrets:
                 secrets.append(secret)
+        if len(secrets) > 1:
+            # Ferrum's jwt_auth accepts a signature from any of the resolved consumer's JWT secrets, so several
+            # secrets on one consumer would no longer be bound to the key claim of their own source credential.
+            self.report.error("jwt-multiple-secrets", consumer.ref,
+                              f"{len(secrets)} JWT secrets would be attached to one consumer; Ferrum cannot bind each "
+                              "to its own key claim, so none was migrated (fail closed).",
+                              "Issue one new random secret of at least 32 characters for this consumer in Ferrum.")
+            secrets = []
         if secrets:
             credentials["jwt"] = [{"secret": secret} for secret in secrets]
             self.secrets_emitted += len(secrets)

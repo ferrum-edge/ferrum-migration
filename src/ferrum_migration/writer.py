@@ -32,7 +32,13 @@ def prepare_output_dir(path: str) -> str:
     return target
 
 
-def write_files(directory: str, files: dict[str, str], force: bool) -> list[str]:
+def write_files(directory: str, files: dict[str, str], force: bool, forbidden: tuple[str, ...] = ()) -> list[str]:
+    """Write ``files`` atomically. ``forbidden`` names must not exist at all (checked first, even with ``force``)."""
+    for name in forbidden:
+        if os.path.lexists(os.path.join(directory, name)):
+            raise OutputError(f"{name} from an earlier run exists in the output directory; it would be stale next to "
+                              "the requested resources file, and Ferrum's spec discovery prefers resources.yaml over "
+                              "resources.json. Remove it or use a new output directory (--force never removes it)")
     for name in files:
         if os.sep in name or name.startswith("."):
             if name != ".gitignore":

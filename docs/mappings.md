@@ -52,7 +52,7 @@ constructors in `src/plugins/*.rs` (closed key sets), `src/consumer_index.rs`,
 | `request-termination` (no trigger/echo), `redirect` (static) | `request_termination` | Ferrum answers before auth |
 | logging/metrics/tracing plugins | omitted (info) | configure Ferrum observability separately |
 | any other plugin (oauth2, openid-connect, hmac-auth, pre-function, …) | **refused** (placeholder; global → every route refused) | |
-| consumers: username/custom_id, `acls`, `keyauth_credentials`, HMAC `jwt_secrets` | consumers, `acl_groups`, `credentials.keyauth/jwt` (only with `--include-secrets`) | consumer-scoped plugins and consumer groups quarantine the consumer; with `_transform: false` keys/secrets are stored values and are never migrated |
+| consumers: username/custom_id, `acls`, `keyauth_credentials`, HMAC `jwt_secrets` | consumers, `acl_groups`, `credentials.keyauth/jwt` (only with `--include-secrets`) | consumer-scoped plugins and consumer groups quarantine the consumer; with `_transform: false` keys/secrets are stored values and are never migrated. At most one HMAC JWT credential per consumer: Ferrum's `jwt_auth` accepts any of the resolved consumer's secrets, so a Kong key could no longer be bound to its own secret. Consumers with several are withheld (`kong-jwt-multiple-credentials`); issue one new secret per consumer in Ferrum (or split consumers in the source), keeping the old credentials until clients switch. A JWT key that also names another consumer's username/custom_id/id is not migrated |
 | DB-less `kong.yml` vs decK dump | same translation (`--from kong`, no extra flag) | report `kong-input-flavor` states which was detected (decK metadata `_info`/`_konnect`/`_workspace`) |
 | certificates, vaults, ca_certificates | not copied (warning/error) | provide frontend cert paths in `ferrum.conf` |
 
@@ -75,14 +75,14 @@ proxies:
     plugins: [{plugin_config_id: kong-legacy-admin-refused-terminate}]
   - id: kong-legacy-root
     listen_path: /
-    plugins: [{plugin_config_id: kong-legacy-root-guard}]   # path_prefix /orders guard
+    plugins: [{plugin_config_id: kong-legacy-root-guard}, ...]   # path_prefix /orders and /admin guards
 ```
 
 ## NGINX OSS
 
 | NGINX | Ferrum | Notes |
 |---|---|---|
-| `server` + `listen` + `server_name` | `hosts`; default server → catch-all | regex/trailing-wildcard names refused; `.example.com` → `example.com` + `*.example.com` |
+| `server` + `listen` + `server_name` | `hosts`; default server → catch-all | regex/trailing-wildcard names refused; `.example.com` → `example.com` + `*.example.com`. A default server whose own name another server on the same listener covers (same name or a wildcard) keeps its named hosts instead, because a catch-all would lose those names to the other server; unknown names are then not routed to it (error `nginx-default-server-named`) |
 | main plaintext/TLS ports | `FERRUM_PROXY_HTTP(S)_PORT`; other plaintext ports → `listen_port` | other TLS ports and conflicting bind addresses skipped (error) |
 | HTTPS redirect server / `if ($scheme = http) { return 301 https://… }` | TLS-only profile | |
 | `location /p`, `^~ /p`, `= /p`, `~`/`~*` | prefix, prefix, exact, anchored regex (`(?i)`) | overlapping regex + prefix → whole server refused; `/p` is never widened, and when sibling paths such as `/px` (string-prefix matches) do not reach an equivalent route in Ferrum, the location gets a `prefix-string-siblings` error (exit 4) |
@@ -115,7 +115,7 @@ proxies:
 | `weighted` services | merged weighted upstream | children must agree on scheme, `passHostHeader`, backend TLS and forwarding timeouts; their shared `dialTimeout`/`responseHeaderTimeout` are carried over, and differing timeouts are refused. `healthCheck`/`sticky` on the weighted service or its children are not migrated (warning `traefik-weighted-lb-options`) |
 | `mirroring` | main service only (warning) | `failover` refused |
 | `stripPrefix` / `addPrefix` | `strip_listen_path` + `backend_path` | partial/conditional strip refused |
-| `headers` custom request/response, STS/frame/nosniff/XSS/CSP/referrer/permissions, `accessControl*` | `request_transformer`, `response_transformer`, `cors` | `sslRedirect` etc. refused |
+| `headers` custom request/response, STS/frame/nosniff/XSS/CSP/referrer/permissions, `accessControl*` | `request_transformer`, `response_transformer`, `cors` | `sslRedirect` etc. refused. `allowedHosts` is a no-op only when the router's hosts are inside every applicable list (lists from several middlewares are intersected); otherwise the route is refused, and so is `allowedHosts` combined with `hostsProxyHeaders` (Ferrum cannot check those headers) |
 | `basicAuth` | `basic_auth` without credentials | hashes never echoed |
 | `ipAllowList`/`ipWhiteList` | `ip_restriction.allow` | `ipStrategy` refused |
 | `rateLimit` average/period | `rate_limiting` limit_by ip | `sourceCriterion` refused |
@@ -132,7 +132,7 @@ proxies:
 | HCM with inline `route_config` | routes | RDS/scoped routes/xDS not read |
 | virtual host `domains` | `hosts` (+ host-only 404 closure) | prefix wildcards refused |
 | route `prefix` / `path` / `safe_regex` / `path_separated_prefix` | prefix / exact / regex / prefix (segment, no guard) | header/query/grpc/runtime matchers refused + poisoning. `prefix` is a string prefix (`/api` also matched `/apix`): never widened, `prefix-string-siblings` error when such siblings do not reach an equivalent route |
-| ordered routes | first-match analysis | |
+| ordered routes | first-match analysis | a `path_separated_prefix` only shadows later routes under its own segments (`/api`, `/api/...`), never `/apix`; overlap checks stay conservative (string-prefix), so such a pair may be refused instead |
 | `cluster`, `weighted_clusters` | upstream / merged weighted upstream | EDS/original_dst refused; priority>0 endpoints dropped |
 | `prefix_rewrite`, `auto_host_rewrite`, default host pass-through | strip + `backend_path`, `preserve_host_header` | regex rewrites refused |
 | `timeout` (default 15s), `retry_policy` | `backend_read_timeout_ms`, `retry` | timeout approximate: Envoy's route timeout covers the complete response, Ferrum's value is not a total deadline |
@@ -152,7 +152,8 @@ not exercise it.
 
 | Istio | Ferrum | Notes |
 |---|---|---|
-| `Gateway` servers (HTTP, HTTPS SIMPLE/MUTUAL with file paths) | ports, TLS-only, frontend cert/client CA | PASSTHROUGH/ISTIO_MUTUAL/credentialName not migrated; MUTUAL servers with different `caCertificates` → affected routes refused (`frontend-client-ca-scope`), never concatenated |
+| `Gateway` servers (HTTP, HTTPS SIMPLE/MUTUAL with file paths) | ports, TLS-only, frontend cert/client CA | `credentialName` Secrets are never read (warning). PASSTHROUGH/AUTO_PASSTHROUGH/ISTIO_MUTUAL, and MUTUAL without a `caCertificates` file path, cannot be projected: on the main TLS port the routes bound to such a server are refused (placeholders), elsewhere the server is skipped. MUTUAL servers with different `caCertificates` → affected routes refused (`frontend-client-ca-scope`), never concatenated. MUTUAL/OPTIONAL_MUTUAL with `subjectAltNames`, `verifyCertificateSpki`, `verifyCertificateHash` or `caCrl` → refused (`istio-client-ca`). A host bound by both a plaintext and an HTTPS server gets one route set that keeps the HTTPS server's client CA or refusal (`istio-shared-host-tls`) |
+| `Server.bind` | `FERRUM_PROXY_BIND_ADDRESS` | only when every HTTP(S) server binds the same IP address; otherwise servers with a specific address or Unix socket are skipped (`istio-server-bind`), never exposed on Ferrum's shared address |
 | `VirtualService` bound to a Gateway; `gateways: [mesh]` | edge routes; mesh routes reported only | not translated |
 | `http[].match` uri exact/prefix/regex, method exact | exact/prefix/regex, `allowed_methods` | headers/query/authority/... refused + poisoning. A VirtualService `uri.prefix` is a string prefix (`/api` also matched `/apix`): never widened, `prefix-string-siblings` error when such siblings do not reach an equivalent route |
 | ordered `http[]` | first-match analysis | |
@@ -172,6 +173,19 @@ not exercise it.
 `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES`, `FERRUM_ADMIN_BIND_ADDRESS`, `FERRUM_DB_TYPE` and
 `FERRUM_CP_GRPC_LISTEN_ADDR`. Suggestions (trusted proxies, PROXY protocol, HTTP/3) are
 written as comments. Secrets appear only as comments asking for `*_FILE` environment variables.
+
+Values follow Ferrum's `ferrum.conf` grammar (`src/config/conf_file.rs`): one `KEY=value` per line,
+values trimmed, a value starting with `"` or `'` is literal up to the next identical quote (no
+escapes), and an unquoted value ends at the first ` #`. Source-derived values that need it are
+quoted. Values that cannot round-trip (empty, line breaks or other non-printable characters, or
+both quote characters when quoting is needed) reject the input with exit 3 before anything is
+written, so a client CA path is never silently dropped or altered. Unrepresentable values in
+commented suggestions are replaced by a note.
+
+The resources file is `resources.yaml` or `resources.json`. Ferrum's spec discovery tries
+`./resources.yaml` before `./resources.json`, so `convert` refuses (exit 5, even with `--force`) to
+write one format next to an existing file of the other format. The report's next steps always pass
+`--spec` explicitly.
 
 ## Open questions (not verifiable from source alone; review on first real run)
 

@@ -85,8 +85,11 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--upstream-profile", type=Path, help="JSON profile: adapter -> argv/env to run the source product")
     g = p.add_argument_group("run control")
     g.add_argument("--pass-env", action="append", default=[], metavar="NAME", help="inherit this env var into children")
-    g.add_argument("--work-root", type=Path, help="parent for per-case work dirs (default: new temp dir)")
-    g.add_argument("--keep-workdirs", action="store_true")
+    g.add_argument("--work-root", type=Path,
+                   help="parent under which each run creates a fresh private run-* directory for its per-case "
+                        "work dirs; existing entries are never reused or removed (default: new temp dir)")
+    g.add_argument("--keep-workdirs", action="store_true",
+                   help="keep every case work dir (non-passing cases always keep theirs)")
     g.add_argument("--results", type=Path, help="write machine-readable results JSON here")
     g.add_argument("--strict", action="store_true", help="BLOCKED/SKIPPED/STATIC_ONLY also fail the run")
     g.add_argument("--require-behavioral", action="store_true",
@@ -142,12 +145,7 @@ def main(argv: "list[str] | None" = None) -> int:
             file=sys.stderr,
         )
 
-    work_root = args.work_root or Path(tempfile.mkdtemp(prefix="ferrum-acceptance-"))
-    work_root = work_root.resolve()
-    work_root.mkdir(parents=True, exist_ok=True)
-
-    ferrum_opts = None
-    version_info = None
+    prefix = None
     if not args.no_ferrum:
         if args.ferrum_argv:
             prefix = _argv_json(args.ferrum_argv, "--ferrum-argv")
@@ -156,6 +154,20 @@ def main(argv: "list[str] | None" = None) -> int:
         else:
             print("no Ferrum binary: pass --ferrum-bin/--ferrum-argv (or $FERRUM_EDGE_BIN), or --no-ferrum", file=sys.stderr)
             return 2
+
+    # All scratch of this run lives in a directory the run itself just created
+    # (mkdtemp: fresh name, mode 0700). A caller-supplied --work-root is only a
+    # parent: nothing already beneath it is reused, followed or deleted.
+    if args.work_root is None:
+        run_root = Path(tempfile.mkdtemp(prefix="ferrum-acceptance-")).resolve()
+    else:
+        work_root = args.work_root.resolve()
+        work_root.mkdir(parents=True, exist_ok=True)
+        run_root = Path(tempfile.mkdtemp(prefix="run-", dir=work_root))
+
+    ferrum_opts = None
+    version_info = None
+    if prefix is not None:
         ferrum_opts = ferrum_mod.FerrumOptions(
             argv_prefix=prefix,
             expected_version=args.expect_ferrum_version,
@@ -164,20 +176,22 @@ def main(argv: "list[str] | None" = None) -> int:
             pass_env=tuple(args.pass_env),
         )
         try:
-            version_info = ferrum_mod.check_version(ferrum_opts, work_root / "_preflight")
+            version_info = ferrum_mod.check_version(ferrum_opts, run_root / "_preflight")
         except OSError as exc:
             print(f"cannot execute ferrum-edge: {type(exc).__name__}", file=sys.stderr)
+            _discard_run_scratch(run_root)
             return 2
         if not version_info["ok"]:
             msg = f"ferrum-edge version is {version_info.get('version')!r}, expected {args.expect_ferrum_version!r}"
             if not args.allow_version_mismatch:
                 print(f"{msg} (use --allow-version-mismatch to proceed)", file=sys.stderr)
+                _discard_run_scratch(run_root)
                 return 2
             print(f"WARNING: {msg}", file=sys.stderr)
 
     canaries = SyntheticCanaries()
     ctx = RunContext(
-        work_root=work_root,
+        work_root=run_root,
         converter=profile,
         converter_env=converter_env,
         ferrum=ferrum_opts,
@@ -245,14 +259,23 @@ def main(argv: "list[str] | None" = None) -> int:
     print("outcomes: " + ", ".join(f"{k}={v}" for k, v in sorted(kinds.items())))
     kept = [r["workdir"] for r in results if r.get("workdir")]
     if kept:
-        print(f"work dirs kept under {work_root}")
-    elif not args.work_root:
-        shutil.rmtree(work_root / "_preflight", ignore_errors=True)
-        try:
-            work_root.rmdir()
-        except OSError:
-            pass
+        print(f"work dirs kept under {run_root}")
+    else:
+        _discard_run_scratch(run_root)
     return exit_code
+
+
+def _discard_run_scratch(run_root: Path) -> None:
+    """Remove only what this run created: its preflight dir and its (then empty) run dir.
+
+    ``run_root`` is always a directory this run made with mkdtemp. Case work dirs
+    are removed by the runner itself; anything else left inside keeps the run dir.
+    """
+    shutil.rmtree(run_root / "_preflight", ignore_errors=True)
+    try:
+        run_root.rmdir()
+    except OSError:
+        pass
 
 
 if __name__ == "__main__":

@@ -19,7 +19,10 @@ It writes, into a private output directory:
 * `resources.yaml`: Ferrum file-mode resources (proxies, upstreams, consumers, plugin_configs)
   with a `resource_counts` truncation seal.
 * `ferrum.conf`: `KEY=value` settings for the run mode you pick (`file`, `database`, `cp`, `dp`).
-  It contains no secrets.
+  It contains no secrets. Values from the source (certificate, key and client CA paths, bind
+  address) are quoted when Ferrum's parser needs it. A value that cannot be read back unchanged
+  (line breaks or other non-printable characters) rejects the input (exit 3) before anything is
+  written.
 * `migration-report.md` and `migration-report.json`: every caveat, refusal and safe omission,
   plus next steps. These never contain credential values.
 
@@ -60,7 +63,7 @@ Options:
 | `--include-secrets` | Explicit opt-in to write migratable plaintext credentials (Kong key-auth keys, HMAC JWT secrets) into the resources file. Output files are always mode `0600`; with this flag a `.gitignore` containing `*` is also written. |
 | `--strict` | Treat warnings as "review required" (exit 4). |
 | `--max-input-bytes N` | Input size cap (default 8 MiB). |
-| `--resources-format yaml\|json` | Output format for the resources file. |
+| `--resources-format yaml\|json` | Output format for the resources file. A resources file of the other format already in the output directory is refused (exit 5), even with `--force`, because Ferrum discovers `resources.yaml` before `resources.json`. Pass `--spec` explicitly when you run Ferrum. |
 | `--force` | Replace existing output files (atomic rename). |
 
 There is no option to turn backend TLS verification off. The former `--allow-insecure-backend-tls` flag
@@ -101,13 +104,24 @@ rather than opening routes or downgrading security:
   carries a `prefix-string-siblings` error (exit 4) instead of a silent 404. This applies to NGINX
   prefix locations, Kong `paths`, Traefik `PathPrefix`, Envoy `prefix` and Istio `uri.prefix`.
   It does not apply to Envoy `path_separated_prefix` (already segment-based), exact or regex
-  matches, or prefixes ending in `/`.
+  matches, or prefixes ending in `/`. A refused route's placeholder is guarded the same way, so
+  `/adminx` cannot reach a broader, open route when `/admin` was refused. If the broader route
+  serves more hosts, the guard still applies to all of them and a `prefix-divergence-refused`
+  error reports the extra 404s.
 * **No cross-host fallthrough.** An NGINX server, Envoy virtual host or Istio host never falls
   through to another host's routes. Ferrum can, so a host-only 404 route closes each such scope.
+  When another host-only route overlaps a scope without closing exactly its host names, no closure
+  is emitted and a `scope-closure-skipped` error (exit 4) asks for review. An NGINX default server
+  whose own `server_name` another server on the same listener covers keeps its named routes
+  instead of becoming a catch-all (error `nginx-default-server-named`; unknown host names are then
+  not routed to it).
 * **Credentials are handled narrowly.** The only credentials that can be carried over are Kong
   key-auth keys and Kong HMAC (HS256/384/512) JWT secrets. They are written only with
   `--include-secrets`, and only where Ferrum's semantics match: key length minimums,
-  no shared keys or secrets, and a JWT identity claim that resolves to the same consumer.
+  no shared keys or secrets, a JWT identity claim that resolves to the same consumer, and at most
+  one HMAC JWT credential per consumer. Ferrum accepts a signature from any of a consumer's JWT
+  secrets, so it cannot bind a Kong credential key to its own secret: consumers with several are
+  withheld (`kong-jwt-multiple-credentials`). Issue one new secret per consumer in Ferrum instead.
   No other source's credentials, and no other credential type, are portable.
   Password hashes (Kong basic-auth, htpasswd, Traefik `basicAuth`) cannot be converted.
   The matching auth plugin is emitted with no credentials, so nobody can authenticate until
@@ -130,7 +144,14 @@ rather than opening routes or downgrading security:
   Client-certificate requirements are never dropped as metadata. Traefik `tls.options` `clientAuth`
   (named or `default`) becomes the route's client CA. If it cannot be known or reproduced (another
   provider, undefined, several or inline CA files, unverified certificate types, or SNI-dependent
-  selection), the route is refused.
+  selection), the route is refused. Istio `MUTUAL` servers with `subjectAltNames`,
+  `verifyCertificateSpki`, `verifyCertificateHash` or `caCrl` are refused (`istio-client-ca`).
+  When a plaintext and an HTTPS Istio server bind the same host, the shared routes keep the HTTPS
+  server's client CA or refusal.
+* **Restricted listeners stay restricted.** NGINX `listen`, Envoy listener and Istio `Server.bind`
+  addresses are reproduced only when every server shares one address (`FERRUM_PROXY_BIND_ADDRESS`).
+  Otherwise the address-restricted servers (and Unix sockets) are skipped, never exposed on
+  Ferrum's shared address.
 * **Auth is not silently skipped.** Auth plugins, middlewares, directives and HTTP filters the
   tool cannot translate refuse their routes (see above). In addition, an Envoy route or virtual host whose
   `typed_per_filter_config` could enable or change an HTTP filter is refused. An Istio

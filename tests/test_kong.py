@@ -68,9 +68,10 @@ class KongFixtureTest(unittest.TestCase):
         self.assertIn("route-refused", codes(self.report, "error"))
 
     def test_prefix_divergence_guard_on_catch_all(self):
+        # /admin is refused (oauth2); Kong sent /adminx to it, so /adminx must not reach the open "/" route either.
         root = one_proxy(self, self.config, "/")
         guards = [p for p in plugins_of(self.config, root) if p["plugin_name"] == "request_termination"]
-        self.assertEqual([g["config"]["trigger"]["path_prefix"] for g in guards], ["/orders"])
+        self.assertEqual([g["config"]["trigger"]["path_prefix"] for g in guards], ["/orders", "/admin"])
 
     def test_consumers_without_secrets(self):
         consumers = {c["username"]: c for c in self.config["consumers"]}
@@ -139,6 +140,32 @@ class KongSecretsTest(unittest.TestCase):
         self.assertEqual(carol["custom_id"], "carol-issuer")
         self.assertEqual(carol["credentials"]["jwt"], [{"secret": "test-only-jwt-secret-carol-000000000001"}])
         self.assertIn("kong-jwt-credential", codes(report, "error"))
+
+    def test_several_jwt_credentials_on_one_consumer_are_withheld(self):
+        # Kong binds each key claim to its own credential's secret; Ferrum would accept either secret for either
+        # key once both sit on one consumer, so neither synthetic secret may be written.
+        text = textwrap.dedent("""
+            _format_version: "3.0"
+            services:
+              - name: s
+                url: http://s.internal:80
+                routes: [{name: r, paths: [/jwt]}]
+                plugins:
+                  - name: jwt
+                    config: {claims_to_verify: [exp], uri_param_names: []}
+            consumers:
+              - username: erin
+                jwt_secrets:
+                  - {key: erin, algorithm: HS256, secret: test-only-jwt-secret-erin-primary-000001}
+                  - {key: erin-partner, algorithm: HS256, secret: test-only-jwt-secret-erin-partner-00001}
+        """)
+        result, report, _ = migrate("kong", text, include_secrets=True)
+        erin = result.config["consumers"][0]
+        self.assertNotIn("credentials", erin)
+        self.assertNotIn("custom_id", erin)
+        self.assertEqual(result.secrets_emitted, 0)
+        self.assertIn("kong-jwt-multiple-credentials", codes(report, "error"))
+        self.assertNotIn("test-only-jwt-secret-erin", json.dumps(result.config))
 
 
 class KongFailClosedTest(unittest.TestCase):

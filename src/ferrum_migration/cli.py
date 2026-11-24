@@ -134,6 +134,10 @@ def _run(args: argparse.Namespace) -> int:
     summary["run_mode"] = args.run_mode
     steps = next_steps(args.run_mode, resources_name, result.tls_only, result.basic_auth_used, result.secrets_emitted)
     exit_code = EXIT_REVIEW if report.has_errors or (args.strict and report.has_warnings) else EXIT_OK
+    # Rendered for `check` too, so a source value that cannot be written safely in ferrum.conf syntax is rejected
+    # (exit 3) by both commands, before anything is written.
+    profile = render(args.run_mode, args.platform, plan.settings, result.tls_only, result.basic_auth_used,
+                     resources_name)
 
     if args.command == "check":
         if args.json:
@@ -142,8 +146,6 @@ def _run(args: argparse.Namespace) -> int:
             _print_text(report, summary)
         return exit_code
 
-    profile = render(args.run_mode, args.platform, plan.settings, result.tls_only, result.basic_auth_used,
-                     resources_name)
     files = {
         resources_name: _dump_resources(result.config, args.resources_format, args.platform),
         "ferrum.conf": profile,
@@ -153,7 +155,10 @@ def _run(args: argparse.Namespace) -> int:
     if result.secrets_emitted:
         files[".gitignore"] = "# Generated: this directory contains plaintext credentials.\n*\n"
     directory = prepare_output_dir(args.out)
-    write_files(directory, files, args.force)
+    # A resources file of the other format left by an earlier run would be stale and ambiguous: Ferrum's spec
+    # discovery prefers ./resources.yaml over ./resources.json. It is never replaced or deleted, not even with --force.
+    other_format = RESOURCES_YAML if resources_name == RESOURCES_JSON else RESOURCES_JSON
+    write_files(directory, files, args.force, forbidden=(other_format,))
     _print_text(report, summary, details=False)
     print(f"Wrote {', '.join(sorted(name for name in files if not name.startswith('.')))} to {directory}")
     if result.secrets_emitted:

@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import secrets
 import shutil
+import tempfile
 import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -228,11 +229,20 @@ def run_case(case: Case, ctx: RunContext, canaries: SyntheticCanaries) -> dict:
     return result
 
 
+def new_case_workdir(work_root: Path, case_id: str) -> Path:
+    """Create a fresh, private (0700) scratch directory owned by this case run.
+
+    ``mkdtemp`` creates the directory atomically under a new random name, so a
+    pre-existing entry beneath ``work_root`` (a directory, file or link that
+    happens to carry the case id) is never reused, followed or removed. The
+    path is made absolute without resolving links. The runner only ever deletes
+    the directory returned here.
+    """
+    return Path(tempfile.mkdtemp(prefix=f"{case_id}-", dir=work_root)).absolute()
+
+
 def _run_case(case: Case, ctx: RunContext, canaries: SyntheticCanaries) -> dict:
-    workdir = (ctx.work_root / case.id).resolve()
-    if workdir.exists():
-        shutil.rmtree(workdir)
-    workdir.mkdir(parents=True)
+    workdir = new_case_workdir(ctx.work_root, case.id)
     result: dict = {
         "id": case.id,
         "adapter": case.adapter,
@@ -505,6 +515,7 @@ def _run_case(case: Case, ctx: RunContext, canaries: SyntheticCanaries) -> dict:
         for backend in backends.values():
             backend.stop()
         if result.get("status") in (PASS, REJECTED_ACCEPTABLE, STATIC_ONLY) and not ctx.keep_workdirs:
+            # ``workdir`` was created by new_case_workdir() for this case alone.
             shutil.rmtree(workdir, ignore_errors=True)
             result["workdir"] = None
 

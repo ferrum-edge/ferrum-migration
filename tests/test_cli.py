@@ -11,7 +11,8 @@ import yaml
 from helpers import fixture_path
 
 from ferrum_migration.cli import main
-from ferrum_migration.envprofile import KNOWN_SETTINGS
+from ferrum_migration.envprofile import KNOWN_SETTINGS, conf_value
+from ferrum_migration.errors import InputError
 
 OUTPUT_FILES = ("resources.yaml", "ferrum.conf", "migration-report.json", "migration-report.md")
 FIXTURES = {
@@ -193,6 +194,45 @@ class CliTest(unittest.TestCase):
         resources = json.loads(self.read(out, "resources.json"))
         self.assertEqual(resources["resource_counts"]["proxies"], len(resources["proxies"]))
         self.assertIn("--spec resources.json", self.read(out, "migration-report.md"))
+
+    def test_alternating_resource_formats_never_leave_ambiguous_specs(self):
+        # Ferrum discovers ./resources.yaml before ./resources.json, so a stale file of the other format must be
+        # rejected before anything is written, even with --force.
+        out = self.out_dir()
+        args = ("convert", fixture_path("nginx", "nginx.conf"), "--from", "nginx", "--out", out)
+        self.assertEqual(run_cli(*args)[0], 0)
+        before = self.read(out, "ferrum.conf")
+        code, _out, err = run_cli(*args, "--force", "--resources-format", "json")
+        self.assertEqual(code, 5)
+        self.assertIn("resources.yaml", err)
+        self.assertNotIn("resources.json", os.listdir(out))
+        self.assertEqual(self.read(out, "ferrum.conf"), before)
+
+    def test_conf_values_round_trip_or_fail_closed(self):
+        key = "FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH"
+        self.assertEqual(conf_value(key, "/etc/synthetic/ca.pem"), "/etc/synthetic/ca.pem")
+        self.assertEqual(conf_value(key, "/etc/synthetic/client ca #1.pem"), '"/etc/synthetic/client ca #1.pem"')
+        self.assertEqual(conf_value(key, '"quoted-start.pem'), "'\"quoted-start.pem'")
+        self.assertEqual(conf_value(key, " padded.pem"), '" padded.pem"')
+        for bad in ("", "/etc/synthetic/ca\n.pem", "/etc/synthetic/ca\r.pem", "/etc/synthetic/ca .pem",
+                    "/etc/synthetic/both\"'quotes #.pem"):
+            with self.subTest(value=repr(bad)), self.assertRaises(InputError):
+                conf_value(key, bad)
+
+    def test_unrepresentable_client_ca_path_writes_nothing(self):
+        path = os.path.join(self.temp.name, "nginx.conf")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("server {\n listen 443 ssl;\n server_name m.example.test;\n"
+                         " ssl_certificate /etc/synthetic/server.crt;\n ssl_certificate_key /etc/synthetic/server.key;\n"
+                         ' ssl_client_certificate "/etc/synthetic/client\nca.pem";\n ssl_verify_client on;\n'
+                         " location /m/ { proxy_pass http://m.internal:8080; }\n}\n")
+        for command in (("convert", path, "--from", "nginx", "--out", self.out_dir()), ("check", path, "--from", "nginx")):
+            with self.subTest(command=command[0]):
+                code, _out, err = run_cli(*command)
+                self.assertEqual(code, 3)
+                self.assertIn("FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH", err)
+                self.assertNotIn("client\nca.pem", err)
+        self.assertFalse(os.path.exists(self.out_dir()))
 
 
 if __name__ == "__main__":

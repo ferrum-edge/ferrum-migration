@@ -336,6 +336,10 @@ class _Kong:
     def _consumer_jwt(self, consumer: dict, spec: ConsumerSpec, identities: Counter) -> None:
         if self.pretransformed:
             return  # reported once by run(); stored values are never reused as credentials
+        # Kong binds each credential's key (the token's key claim) to that credential's own secret. Ferrum's
+        # jwt_auth resolves the consumer from the claim and then accepts a signature from ANY of that consumer's
+        # JWT secrets, so it cannot bind a key to one individual credential. Collect first, decide below.
+        candidates: list[tuple[str, str]] = []
         for cred in seq(consumer.get("jwt_secrets")):
             if not isinstance(cred, dict):
                 continue
@@ -357,22 +361,45 @@ class _Kong:
             if not isinstance(key, str):
                 self.report.error("kong-jwt-credential", spec.ref, "A JWT credential has no key; not migrated.")
                 continue
-            if key not in (spec.username, spec.custom_id):
-                if spec.custom_id is None and identities[key] == 0:
-                    spec.custom_id = key
-                    identities[key] += 1
-                    self.report.info("kong-jwt-identity", spec.ref,
-                                     "The JWT key claim value was mapped to custom_id so Ferrum resolves the same "
-                                     "consumer from the token.")
-                else:
-                    self.report.error("kong-jwt-identity", spec.ref,
-                                      "A JWT credential key does not match the consumer's username/custom_id and "
-                                      "cannot be mapped unambiguously; not migrated.")
-                    continue
-            if self.ctx.include_secrets:
-                spec.jwt.append(secret)
-            else:
-                spec.withheld_secrets += 1
+            candidates.append((key, secret))
+        if len(candidates) > 1:
+            self.report.error("kong-jwt-multiple-credentials", spec.ref,
+                              f"The consumer has {len(candidates)} HMAC JWT credentials. Kong only accepts a token "
+                              "signed with the secret of the credential its key claim names; Ferrum would accept a "
+                              "signature from any of the consumer's secrets for every key, merging the credentials' "
+                              "scopes. None of them was migrated (fail closed).",
+                              "Issue one new random HMAC secret (at least 32 characters) for this consumer in Ferrum, "
+                              "or split the credentials into separate consumers in the source and convert again. "
+                              "Do not reuse the old secrets, and keep the old credentials active in the source until "
+                              "clients have switched.")
+            return
+        if not candidates:
+            return
+        key, secret = candidates[0]
+        if key in (spec.username, spec.custom_id):
+            own = sum(1 for value in (consumer.get("username"), consumer.get("custom_id"), consumer.get("id"))
+                      if value == key)
+            if identities[key] > own:
+                # Ferrum resolves the claim by username, id or custom_id across all consumers.
+                self.report.error("kong-jwt-identity", spec.ref,
+                                  "A JWT credential key also names another consumer's username/custom_id/id, so "
+                                  "Ferrum could resolve the token to a different consumer; not migrated.")
+                return
+        elif spec.custom_id is None and identities[key] == 0:
+            spec.custom_id = key
+            identities[key] += 1
+            self.report.info("kong-jwt-identity", spec.ref,
+                             "The JWT key claim value was mapped to custom_id so Ferrum resolves the same "
+                             "consumer from the token.")
+        else:
+            self.report.error("kong-jwt-identity", spec.ref,
+                              "A JWT credential key does not match the consumer's username/custom_id and "
+                              "cannot be mapped unambiguously; not migrated.")
+            return
+        if self.ctx.include_secrets:
+            spec.jwt.append(secret)
+        else:
+            spec.withheld_secrets += 1
 
     # -------------------------------------------------------------- plugins
 

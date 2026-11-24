@@ -2,7 +2,8 @@ import json
 import textwrap
 import unittest
 
-from helpers import assert_structurally_valid, codes, migrate, one_proxy, plugin, plugins_of, read_fixture, upstream_of
+from helpers import assert_structurally_valid, codes, migrate, one_proxy, plugin, plugins_of, proxies, read_fixture, \
+    upstream_of
 
 from ferrum_migration.errors import InputError
 
@@ -54,7 +55,8 @@ class IstioFixtureTest(unittest.TestCase):
         self.assertIn({"operation": "remove", "target": "header", "key": "x-internal-debug"}, rules)
         guards = sorted(p["config"]["trigger"]["path_prefix"] for p in plugins_of(self.config, root)
                         if p["plugin_name"] == "request_termination")
-        self.assertEqual(guards, ["/billing", "/cart", "/catalog"])
+        # /reviews is refused (subset); Istio sent /reviewsx to it, so it must not reach the "/" route either.
+        self.assertEqual(guards, ["/billing", "/cart", "/catalog", "/reviews"])
 
     def test_mesh_routes_and_secrets_not_translated(self):
         self.assertIn("istio-mesh-routes", codes(self.report, "info"))
@@ -212,6 +214,84 @@ class IstioSecurityTest(unittest.TestCase):
                              "refused", host)
         self.assertIn("frontend-client-ca-scope", codes(report, "error"))
         self.assertEqual(plan.settings.client_ca_paths, [])
+
+    # Synthetic paths only; no certificate material is read or needed.
+    SHARED_HOST = textwrap.dedent("""
+        apiVersion: networking.istio.io/v1
+        kind: Gateway
+        metadata: {name: gw, namespace: default}
+        spec:
+          servers:
+            - port: {number: 80, name: http, protocol: HTTP}
+              hosts: ["app.example.test"]
+            - port: {number: 443, name: https, protocol: HTTPS}
+              hosts: ["app.example.test"]
+              tls:
+                mode: MUTUAL
+                serverCertificate: /etc/synthetic/server.crt
+                privateKey: /etc/synthetic/server.key
+                caCertificates: /etc/synthetic/client-ca.pem
+        EXTRA_TLS
+        ---
+        apiVersion: networking.istio.io/v1
+        kind: VirtualService
+        metadata: {name: app, namespace: default}
+        spec:
+          hosts: [app.example.test]
+          gateways: [gw]
+          http:
+            - route: [{destination: {host: web, port: {number: 80}}}]
+    """)
+
+    def test_shared_http_https_host_keeps_https_client_ca(self):
+        result, report, plan = migrate("istio", self.SHARED_HOST.replace("EXTRA_TLS", ""))
+        self.assertEqual(one_proxy(self, result.config, "/", "app.example.test")["labels"]["ferrum-migration/status"],
+                         "migrated")
+        self.assertEqual(plan.settings.client_ca_paths, ["/etc/synthetic/client-ca.pem"])
+        self.assertIn("istio-shared-host-tls", codes(report, "warning"))
+
+    def test_client_certificate_constraints_refuse_shared_host_routes(self):
+        constrained = "        subjectAltNames: [client.example.test]"
+        result, report, plan = migrate("istio", self.SHARED_HOST.replace("EXTRA_TLS", constrained))
+        self.assertEqual(one_proxy(self, result.config, "/", "app.example.test")["labels"]["ferrum-migration/status"],
+                         "refused")
+        self.assertIn("istio-client-ca", codes(report, "error"))
+        self.assertEqual(plan.settings.client_ca_paths, [])
+
+    def test_restricted_server_bind_is_not_exposed_on_shared_address(self):
+        text = textwrap.dedent("""
+            apiVersion: networking.istio.io/v1
+            kind: Gateway
+            metadata: {name: gw, namespace: default}
+            spec:
+              servers:
+                - port: {number: 80, name: http, protocol: HTTP}
+                  hosts: ["public.example.test"]
+                  BIND_PUBLIC
+                - port: {number: 80, name: http-local, protocol: HTTP}
+                  bind: 127.0.0.1
+                  hosts: ["local.example.test"]
+            ---
+            apiVersion: networking.istio.io/v1
+            kind: VirtualService
+            metadata: {name: app, namespace: default}
+            spec:
+              hosts: [public.example.test, local.example.test]
+              gateways: [gw]
+              http:
+                - route: [{destination: {host: web, port: {number: 80}}}]
+        """)
+        result, report, plan = migrate("istio", text.replace("BIND_PUBLIC", ""))
+        self.assertEqual(proxies(result.config, host="local.example.test"), [])
+        self.assertIn("istio-server-bind", codes(report, "error"))
+        self.assertEqual(one_proxy(self, result.config, "/", "public.example.test")["labels"]["ferrum-migration/status"],
+                         "migrated")
+        self.assertIsNone(plan.settings.bind_address)
+        # Every HTTP server shares the same restricted address: Ferrum binds that address instead.
+        result, report, plan = migrate("istio", text.replace("BIND_PUBLIC", "bind: 127.0.0.1"))
+        self.assertNotIn("istio-server-bind", codes(report))
+        self.assertEqual(plan.settings.bind_address, "127.0.0.1")
+        self.assertEqual(len(proxies(result.config, "/", host="local.example.test")), 1)
 
     def test_uri_prefix_siblings_reported_but_not_exact_matches(self):
         # uri.prefix /api also matches /apix through an Istio gateway; uri.exact has no siblings.

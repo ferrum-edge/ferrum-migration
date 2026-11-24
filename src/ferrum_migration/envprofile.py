@@ -12,6 +12,7 @@ so the file stays valid until the operator fills them in.
 from __future__ import annotations
 
 from . import FERRUM_EDGE_REFERENCE_COMMIT, __version__
+from .errors import InputError
 from .model import SettingsHints
 
 RUN_MODES = ("file", "database", "cp", "dp")
@@ -31,6 +32,28 @@ KNOWN_SETTINGS = frozenset({
 })
 
 
+def conf_value(key: str, value: object) -> str:
+    """Render ``value`` so Ferrum's ``ferrum.conf`` parser reads back exactly the same string.
+
+    Ferrum (``src/config/conf_file.rs``) splits lines on newlines, trims each line and value, treats a value
+    starting with ``"`` or ``'`` as quoted up to the next identical quote (no escapes), and otherwise ends an
+    unquoted value at the first `` #``. Values that need it are quoted; values that cannot round-trip (empty,
+    non-printable or line-breaking characters, or both quote characters when quoting is required) raise
+    :class:`InputError` before anything is written. The message never contains the value.
+    """
+    text = str(value)
+    if not text or not all(ch.isprintable() for ch in text):
+        raise InputError(f"a source-derived value for {key} cannot be written safely in ferrum.conf syntax "
+                         "(empty, or it contains control, line-breaking or other non-printable characters)")
+    if text == text.strip() and text[0] not in "\"'" and " #" not in text:
+        return text
+    for quote in ('"', "'"):
+        if quote not in text:
+            return f"{quote}{text}{quote}"
+    raise InputError(f"a source-derived value for {key} cannot be written safely in ferrum.conf syntax (it needs "
+                     "quoting but contains both quote characters)")
+
+
 class _Lines:
     def __init__(self) -> None:
         self.lines: list[str] = []
@@ -40,14 +63,21 @@ class _Lines:
 
     def put(self, key: str, value: object, note: str | None = None) -> None:
         assert key in KNOWN_SETTINGS, key
+        rendered = conf_value(key, value)  # fail closed: never write a setting Ferrum would read differently
         if note:
             self.comment(note)
-        self.lines.append(f"{key}={value}")
+        self.lines.append(f"{key}={rendered}")
 
     def suggest(self, key: str, value: object, note: str) -> None:
         assert key in KNOWN_SETTINGS, key
         self.comment(note)
-        self.lines.append(f"# {key}={value}")
+        try:
+            rendered = conf_value(key, value)
+        except InputError:
+            # Only a commented suggestion: omit the value rather than break out of the comment line.
+            self.comment(f"{key}: the source value cannot be written safely in ferrum.conf syntax; set it manually.")
+            return
+        self.lines.append(f"# {key}={rendered}")
 
     def blank(self) -> None:
         self.lines.append("")
@@ -68,7 +98,8 @@ def render(run_mode: str, platform: str, settings: SettingsHints, tls_only: bool
     out.put("FERRUM_ADMIN_BIND_ADDRESS", "127.0.0.1", "Keep the admin API on loopback; see Ferrum docs before exposing it.")
     if run_mode == "file":
         out.suggest("FERRUM_FILE_CONFIG_PATH", resources_name,
-                    f"`ferrum-edge run` discovers ./{resources_name} automatically; set an absolute path otherwise.")
+                    f"Pass --spec {resources_name} (see the report's next steps) or set an absolute path here. "
+                    "Without either, `ferrum-edge run` discovers ./resources.yaml before ./resources.json.")
     out.blank()
 
     if run_mode != "cp":

@@ -13,6 +13,7 @@ Secrets are never read.
 
 from __future__ import annotations
 
+import ipaddress
 from typing import Any
 
 from .. import matching, util
@@ -29,6 +30,8 @@ ROOT_NAMESPACE = "istio-system"
 ISTIO_GROUPS = ("networking.istio.io/", "security.istio.io/", "extensions.istio.io/", "telemetry.istio.io/")
 POLICY_KINDS = ("AuthorizationPolicy", "RequestAuthentication", "EnvoyFilter", "WasmPlugin")
 DEFAULT_RETRY_ON = "connect-failure,refused-stream,unavailable,cancelled,retriable-status-codes"
+# ServerTLSSettings fields that restrict which client certificates a MUTUAL/OPTIONAL_MUTUAL server accepts.
+CLIENT_CERT_CONSTRAINTS = ("subjectAltNames", "verifyCertificateSpki", "verifyCertificateHash", "caCrl")
 
 
 def _meta(obj: dict) -> tuple[str, str]:
@@ -47,6 +50,7 @@ class _Istio:
         self.service_entries: list[dict] = []
         self.policies: list[dict] = []
         self.no_dr_warned = False
+        self.shared_bind: str | None = None
         for obj in objects:
             self._classify(obj)
 
@@ -108,19 +112,29 @@ class _Istio:
                 "redirect": tls.get("httpsRedirect") is True and protocol != "HTTPS",
                 "hosts": str_list(raw.get("hosts")) or [],
                 "tls_config": tls,
+                "bind": _bind_address(raw.get("bind")),
             })
         return servers
 
     def _elect_ports(self) -> None:
         plain: dict[int, int] = {}
         tls: dict[int, int] = {}
+        binds: set[str | None] = set()
         for gateway in self.gateways.values():
             for server in self._servers(gateway):
                 if server["port"] and server["protocol"] in ("HTTP", "HTTP2", "GRPC", "HTTPS"):
                     bucket = tls if server["tls"] else plain
                     bucket[server["port"]] = bucket.get(server["port"], 0) + 1
+                    binds.add(server["bind"])
         self.plan.settings.main_http_port = choose_main_port(plain)
         self.plan.settings.main_https_port = choose_main_port(tls)
+        # Server.bind restricts a listener to one address (or a Unix socket). Ferrum binds one proxy address for
+        # all routes, so a restricted bind is only reproduced when every HTTP(S) server shares the same IP literal.
+        specific = {bind for bind in binds if bind}
+        self.shared_bind = None
+        if len(specific) == 1 and None not in binds and _is_ip_literal(next(iter(specific))):
+            self.shared_bind = next(iter(specific))
+            self.plan.settings.bind_address = self.shared_bind
 
     def _server_tls(self, server: dict) -> str | None:
         mode = server["tls_mode"]
@@ -136,6 +150,18 @@ class _Istio:
                                 "FERRUM_FRONTEND_TLS_CERT_PATH/KEY_PATH.")
         self.plan.settings.frontend_tls_expected = True
         if mode in ("MUTUAL", "OPTIONAL_MUTUAL"):
+            # These ServerTLSSettings fields narrow which client certificates the CA bundle admits (SAN, SPKI or
+            # certificate-hash pins, a CRL). Ferrum's listener-wide client CA bundle would admit every client
+            # certificate that CA issued, so the trust boundary cannot be reproduced.
+            constraints = [key for key in CLIENT_CERT_CONSTRAINTS if tls.get(key)]
+            if constraints:
+                self.report.error("istio-client-ca", server["ref"],
+                                  "The server requires client certificates with extra constraints ("
+                                  + ", ".join(constraints) + ") that Ferrum's frontend client CA bundle cannot "
+                                  "reproduce.", "Configure a Ferrum frontend dedicated to this trust boundary and "
+                                  "review the dropped constraints before serving traffic.")
+                return "client certificate constraints beyond the CA bundle (" + ", ".join(constraints) + \
+                    ") cannot be reproduced"
             ca = tls.get("caCertificates")
             if isinstance(ca, str):
                 # Recorded per server; the emitter decides whether one listener-wide bundle preserves every scope.
@@ -224,7 +250,9 @@ class _Istio:
     def _bind(self, vs: dict, spec: dict, namespace: str, name: str, ref: str, vs_hosts: list[str],
               gateway: dict, gw_ns: str, gateway_ref: str) -> None:
         settings = self.plan.settings
-        groups: dict[tuple[int | None, bool], dict] = {}
+        # One group per Ferrum projection: (listen_port, requires_tls, client CA, TLS refusal). HTTPS servers with
+        # different client trust stay apart, so one server's trust requirement never covers another's hosts.
+        groups: dict[tuple, dict] = {}
         refusals = self._gateway_refusals(gateway, f"{ref} via {safe_label(gateway_ref)}")
         for server in self._servers(gateway):
             hosts = _bind_hosts(vs_hosts, namespace, gw_ns, server["hosts"])
@@ -233,41 +261,51 @@ class _Istio:
             if server["protocol"] not in ("HTTP", "HTTP2", "GRPC", "HTTPS"):
                 self.report.error("istio-server-protocol", server["ref"], "Non-HTTP gateway servers are not migrated.")
                 continue
+            if server["bind"] and server["bind"] != self.shared_bind:
+                # A listener restricted to one address (or a Unix socket) must not become reachable on Ferrum's
+                # shared proxy address. Requests on the other addresses never reached this server in the source.
+                self.report.error("istio-server-bind", server["ref"],
+                                  "The server binds a specific address or Unix socket that Ferrum cannot reproduce "
+                                  "(other servers listen elsewhere, or it is not an IP address). Ferrum binds one "
+                                  "proxy address for all routes, which would expose it more widely; skipped.",
+                                  "Run a separate Ferrum instance bound to that address for these routes.")
+                continue
             if server["redirect"]:
                 settings.https_redirect_seen = True
                 self.report.info("istio-https-redirect", server["ref"], "httpsRedirect server: not emitted; the "
                                  "TLS-only profile disables the plaintext listener instead.")
                 continue
+            refusal = None
+            client_ca = None
             if server["tls"]:
                 problem = self._server_tls(server)
-                if problem:
-                    self.report.error("istio-server-tls", server["ref"], f"{problem}; server skipped.")
-                    continue
                 if server["port"] != settings.main_https_port:
-                    self.report.error("istio-tls-port", server["ref"], "TLS on a non-main port is not migrated.")
+                    if problem:
+                        self.report.error("istio-server-tls", server["ref"], f"{problem}; server skipped.")
+                    else:
+                        self.report.error("istio-tls-port", server["ref"], "TLS on a non-main port is not migrated.")
                     continue
-                key = (None, True)
+                if problem:
+                    # Skipping the server would let a plaintext server's routes for the same hosts serve its
+                    # HTTPS traffic without its TLS requirements; refuse its routes instead (fail closed).
+                    self.report.error("istio-server-tls", server["ref"], f"{problem}; the routes bound to this "
+                                      "server are refused (fail closed).")
+                    refusal = f"the HTTPS gateway server's TLS settings cannot be reproduced ({problem})"
+                client_ca = server.get("client_ca")
+                key: tuple = (None, True, client_ca, refusal)
             else:
-                key = (None if server["port"] == settings.main_http_port else server["port"], False)
-            group = groups.setdefault(key, {"hosts": [], "any": False, "port": server["port"], "client_cas": []})
-            client_ca = server.get("client_ca")
-            if client_ca and client_ca not in group["client_cas"]:
-                group["client_cas"].append(client_ca)
+                key = (None if server["port"] == settings.main_http_port else server["port"], False, None, None)
+            group = groups.setdefault(key, {"hosts": [], "any": False, "port": server["port"], "listen_port": key[0],
+                                            "requires_tls": key[1], "client_cas": [client_ca] if client_ca else [],
+                                            "refusals": [refusal] if refusal else []})
             if hosts == []:
                 group["any"] = True
             for host in hosts:
                 if host not in group["hosts"]:
                     group["hosts"].append(host)
-        plain = groups.get((None, False))
-        secure = groups.get((None, True))
-        if plain and secure:
-            if plain["any"]:
-                del groups[(None, True)]
-            else:
-                secure["hosts"] = [h for h in secure["hosts"] if h not in plain["hosts"]]
-                if not secure["hosts"] and not secure["any"]:
-                    del groups[(None, True)]
-        for (listen_port, requires_tls), group in groups.items():
+        self._merge_shared_hosts(groups, ref)
+        for group in groups.values():
+            listen_port, requires_tls = group["listen_port"], group["requires_tls"]
             hosts = [] if group["any"] else group["hosts"]
             routes: list[RouteSpec] = []
             for index, entry in enumerate(seq(spec.get("http"))):
@@ -275,12 +313,66 @@ class _Istio:
                                                requires_tls, gw_ns, gateway_ref, group["port"]))
             for route in routes:
                 route.client_cas = list(group["client_cas"])
-                for reason in refusals:
+                for reason in group["refusals"] + refusals:
                     route.refuse(reason)
             apply_first_match_order(routes, self.report)
             self.plan.routes.extend(routes)
             if hosts:
                 self.plan.host_scopes.append(HostScope(f"{ref} via {safe_label(gateway_ref)}", list(hosts), listen_port))
+
+    def _merge_shared_hosts(self, groups: dict, ref: str) -> None:
+        """Keep an HTTPS server's requirements for hosts a plaintext main-port server also binds.
+
+        Ferrum serves port-agnostic routes on its plaintext and its HTTPS listener, so such hosts get one route
+        set. It must carry the HTTPS server's client CA (Ferrum checks the client CA bundle on the HTTPS listener
+        only, so plaintext access stays as in the source) or its refusal; dropping the HTTPS group would serve
+        HTTPS without them.
+        """
+        plain_key = (None, False, None, None)
+        for key in [k for k in groups if k[1] is True]:
+            plain = groups.get(plain_key)
+            if plain is None:
+                return
+            secure = groups[key]
+            strict = bool(secure["client_cas"] or secure["refusals"])
+            if plain["any"]:
+                # The plaintext catch-all routes already serve every host this HTTPS server binds.
+                del groups[key]
+                if strict:
+                    self._carry_tls(plain, secure, ref, whole_catch_all=not secure["any"])
+                continue
+            if secure["any"]:
+                if strict and plain["hosts"]:
+                    self._carry_tls(plain, secure, ref, whole_catch_all=False)  # every plaintext host is shared
+                continue
+            shared = [host for host in secure["hosts"] if host in plain["hosts"]]
+            secure["hosts"] = [host for host in secure["hosts"] if host not in shared]
+            if not secure["hosts"]:
+                del groups[key]
+            if not shared or not strict:
+                continue
+            plain["hosts"] = [host for host in plain["hosts"] if host not in shared]
+            split = {"hosts": shared, "any": False, "port": plain["port"], "listen_port": None, "requires_tls": False,
+                     "client_cas": [], "refusals": []}
+            self._carry_tls(split, secure, ref, whole_catch_all=False)
+            groups[("shared",) + key] = split
+            if not plain["hosts"]:
+                del groups[plain_key]
+
+    def _carry_tls(self, target: dict, secure: dict, ref: str, whole_catch_all: bool) -> None:
+        for ca in secure["client_cas"]:
+            if ca not in target["client_cas"]:
+                target["client_cas"].append(ca)
+        for reason in secure["refusals"]:
+            if reason not in target["refusals"]:
+                target["refusals"].append(reason)
+        message = ("A plaintext and an HTTPS gateway server bind the same hosts. Ferrum serves one route set for "
+                   "them on both listeners, so the HTTPS server's client certificate requirement or refusal is kept "
+                   "on those routes (Ferrum checks client certificates on its HTTPS listener only).")
+        if whole_catch_all:
+            message += (" The plaintext server matches any host, so this applies to every host it serves over "
+                        "HTTPS (stricter or refused).")
+        self.report.warning("istio-shared-host-tls", ref, message)
 
     def _http_route(self, entry: dict, index: int, namespace: str, vs_name: str, vs_ref: str, hosts: list[str],
                     listen_port: int | None, requires_tls: bool, gw_ns: str, gateway_ref: str,
@@ -613,6 +705,24 @@ class _Istio:
         if policy.get("outlierDetection") or policy.get("connectionPool"):
             self.report.warning("istio-resilience", ref, "outlierDetection/connectionPool are not migrated.")
         return tls, scheme, algorithm, hash_on, None
+
+
+def _bind_address(value: Any) -> str | None:
+    """A Gateway Server ``bind``: None for unset or a wildcard address, else the restricted address/socket."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    if text in ("", "0.0.0.0", "::", "[::]"):
+        return None
+    return text
+
+
+def _is_ip_literal(value: str) -> bool:
+    try:
+        ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    return True
 
 
 def _fqdn(host: str, namespace: str) -> str:
