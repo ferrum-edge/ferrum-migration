@@ -195,7 +195,7 @@ def regex_problem(pattern: object) -> str | None:
     """Conservative check that ``pattern`` is accepted by Ferrum's Rust regex engine."""
     if not isinstance(pattern, str) or not pattern:
         return "empty regex"
-    if len(pattern) > MAX_REGEX_LENGTH:
+    if len(pattern.encode("utf-8")) > MAX_REGEX_LENGTH:
         return "regex longer than 1024 bytes"
     if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in pattern):
         return "regex contains control characters"
@@ -209,6 +209,42 @@ def regex_problem(pattern: object) -> str | None:
     except re.error:
         return "regex does not compile"
     return None
+
+
+def ends_with_unescaped_dollar(pattern: str) -> bool:
+    """True when ``pattern`` ends with an unescaped ``$`` anchor (even number of preceding backslashes)."""
+    if not pattern.endswith("$"):
+        return False
+    slashes = 0
+    index = len(pattern) - 2
+    while index >= 0 and pattern[index] == "\\":
+        slashes += 1
+        index -= 1
+    return slashes % 2 == 0
+
+
+def valid_backend_tls_san(san: object) -> bool:
+    """Whether ``san`` matches Ferrum's ``backend_tls_san_allow_list`` admission rules.
+
+    Ferrum accepts exact DNS names (no wildcards), IP addresses, and ``spiffe://<domain>/<path>`` URIs
+    without whitespace or control characters.
+    """
+    if not isinstance(san, str) or not san or len(san.encode("utf-8")) > 255:
+        return False
+    if any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7F for ch in san):
+        return False
+    try:
+        ipaddress.ip_address(san)
+        return True
+    except ValueError:
+        pass
+    if san.lower().startswith("spiffe://"):
+        rest = san[9:]
+        slash = rest.find("/")
+        return slash > 0 and slash + 1 < len(rest)
+    if "://" in san or "*" in san:
+        return False
+    return normalize_host(san) is not None and not san.startswith("*.")
 
 
 #: Escapes the narrow alternation grammar accepts: one ASCII punctuation character (a literal in Rust's regex

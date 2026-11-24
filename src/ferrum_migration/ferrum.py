@@ -251,6 +251,8 @@ def _validate_route(route: RouteSpec, plan: Plan, options: EmitOptions, report: 
         else:
             if len(normalized) > util.MAX_HOSTS_PER_PROXY:
                 route.refuse("more than 100 hosts on one route")
+                route.path_ok = False
+                route.extra_conditions = True
             route.hosts = normalized
     if route.kind == "hostonly" and not route.hosts:
         if route.hosts == []:
@@ -289,6 +291,8 @@ def _validate_route(route: RouteSpec, plan: Plan, options: EmitOptions, report: 
         route.methods = methods or None
     if route.termination is None:
         _validate_backend(route, plan, options, report)
+    else:
+        _validate_termination(route)
     if route.backend_path:
         path = route.backend_path.rstrip("/")
         if not path:
@@ -306,8 +310,37 @@ def _validate_route(route: RouteSpec, plan: Plan, options: EmitOptions, report: 
             report.warning("timeout-clamped", route.ref,
                            "A timeout above Ferrum's 24h maximum (or a disabled timeout) was set to 24h.")
     for plugin in route.plugins:
-        if len(json.dumps(plugin.config, sort_keys=True)) > MAX_PLUGIN_CONFIG_BYTES:
+        if len(json.dumps(plugin.config, sort_keys=True).encode("utf-8")) > MAX_PLUGIN_CONFIG_BYTES:
             route.refuse(f"plugin {plugin.name} config exceeds Ferrum's 1 MiB limit")
+
+
+def _validate_termination(route: RouteSpec) -> None:
+    termination = route.termination
+    if not isinstance(termination, dict):
+        route.refuse("termination response is not representable")
+        return
+    status = termination.get("status_code")
+    if isinstance(status, bool) or not isinstance(status, int) or not 200 <= status <= 599:
+        route.refuse("termination status code is outside 200-599")
+        return
+    content_type = termination.get("content_type")
+    if content_type is not None:
+        if not isinstance(content_type, str) or not content_type \
+                or len(content_type.encode("utf-8")) > 4096 \
+                or not all(ch == "\t" or 0x20 <= ord(ch) <= 0x7E for ch in content_type):
+            route.refuse("termination content_type is not representable")
+            return
+    headers = termination.get("headers")
+    if headers is not None:
+        if not isinstance(headers, dict) or len(headers) > 32:
+            route.refuse("termination headers are not representable")
+            return
+        for key, value in headers.items():
+            if not isinstance(key, str) or not key or not isinstance(value, str) \
+                    or len(value.encode("utf-8")) > 4096 \
+                    or not all(ch == "\t" or 0x20 <= ord(ch) <= 0x7E for ch in value):
+                route.refuse("a termination header is not representable")
+                return
 
 
 def _validate_backend(route: RouteSpec, plan: Plan, options: EmitOptions, report: Report) -> None:
@@ -334,6 +367,9 @@ def _validate_backend(route: RouteSpec, plan: Plan, options: EmitOptions, report
             target.host = host
             target.weight = max(1, min(int(target.weight), util.MAX_TARGET_WEIGHT))
         if backend.scheme == "https":
+            if any(not util.valid_backend_tls_san(san) for san in upstream.tls.san_allow_list):
+                route.refuse("upstream backend TLS SAN allow-list contains an entry Ferrum cannot represent")
+                return
             _apply_tls_policy(upstream.tls, upstream.ref, options, report)
         return
     host = util.normalize_backend_host(backend.host)
@@ -564,12 +600,13 @@ def _poison_case_variants(plan: Plan, routes: list[RouteSpec]) -> None:
     sources = [route for route in routes if not route.skip and route.case_insensitive]
     for source in sources:
         closed = bool(source.hosts) and set(source.hosts) in scopes
-        tier = matching.host_tier(source.hosts) if closed else None
         for other in routes:
             if other is source or other.skip:
                 continue
-            if tier is not None and other.hosts is not None and matching.host_tier(other.hosts) > tier:
-                continue
+            if closed and other.hosts is not None:
+                pairs = matching.overlapping_tier_pairs(source.hosts, other.hosts)
+                if pairs and all(tb > ta for ta, tb in pairs):
+                    continue
             if not matching.receives_case_variants(source, other):
                 continue
             other.refuse(f"it could receive case variants of the path of {source.ref} (for example different "
@@ -608,11 +645,43 @@ def _build_candidates(routes: list[RouteSpec]) -> list[_Cand]:
     return candidates
 
 
+def _prune_covered_hosts(hosts: list[str]) -> list[str]:
+    """Drop hosts already covered by another host in ``hosts`` (exact or narrower wildcard under a broader wildcard)."""
+    pruned: list[str] = []
+    for host in hosts:
+        if any(other != host and matching.host_cover(other, host) for other in hosts):
+            continue
+        if host not in pruned:
+            pruned.append(host)
+    return pruned
+
+
+def _chunk_conflict_hosts(hosts: list[str], host_only: bool) -> list[list[str]]:
+    """Split a merged conflict host list into chunks of at most ``MAX_HOSTS_PER_PROXY`` non-conflicting entries.
+
+    For path-carrying proxies, Ferrum checks exact and wildcard host tiers separately, so exact hosts keep their
+    exact tier while wildcards are pruned of covered sub-wildcards; chunks are pairwise disjoint in Ferrum's
+    duplicate-path check. For host-only proxies, Ferrum rejects exact+wildcard overlap too, so covered hosts are
+    pruned across both tiers first, leaving pairwise-disjoint hosts.
+    """
+    if len(hosts) <= util.MAX_HOSTS_PER_PROXY:
+        return [hosts]
+    limit = util.MAX_HOSTS_PER_PROXY
+    if host_only:
+        pruned = _prune_covered_hosts(hosts)
+        return [pruned[i:i + limit] for i in range(0, len(pruned), limit)]
+    exact = [h for h in hosts if not h.startswith("*.")]
+    wildcards = _prune_covered_hosts([h for h in hosts if h.startswith("*.")])
+    chunks = [exact[i:i + limit] for i in range(0, len(exact), limit)]
+    chunks.extend(wildcards[i:i + limit] for i in range(0, len(wildcards), limit))
+    return chunks
+
+
 def _resolve_conflicts(candidates: list[_Cand]) -> list[_Cand]:
     groups: dict[tuple[int | None, str | None], list[_Cand]] = {}
     for cand in candidates:
         groups.setdefault((cand.listen_port, cand.listen_path), []).append(cand)
-    replacement: dict[int, _Cand | None] = {}
+    replacement: dict[int, list[_Cand]] = {}
     for (port, path), members in groups.items():
         if len(members) < 2:
             continue
@@ -630,19 +699,18 @@ def _resolve_conflicts(candidates: list[_Cand]) -> list[_Cand]:
                     for host in member.hosts:
                         if host not in hosts:
                             hosts.append(host)
-            if len(hosts) > util.MAX_HOSTS_PER_PROXY:
-                hosts = []
             first = component[0]
-            replacement[id(first)] = _Cand(first.route, True, hosts, path, port,
-                                           termination=REFUSED_TERMINATION, kind_label="refused")
+            host_chunks = _chunk_conflict_hosts(hosts, host_only=path is None) if hosts else [[]]
+            replacement[id(first)] = [
+                _Cand(first.route, True, chunk, path, port, termination=REFUSED_TERMINATION, kind_label="refused")
+                for chunk in host_chunks
+            ]
             for member in component[1:]:
-                replacement[id(member)] = None
+                replacement[id(member)] = []
     result: list[_Cand] = []
     for cand in candidates:
         if id(cand) in replacement:
-            new = replacement[id(cand)]
-            if new is not None:
-                result.append(new)
+            result.extend(replacement[id(cand)])
         else:
             result.append(cand)
     return result
@@ -899,12 +967,14 @@ def _add_divergence_guards(candidates: list[_Cand], report: Report) -> None:
                 or route.trailing_slash or route.path in (None, "/"):
             continue
         fingerprint = fp(cand)
-        tier = matching.host_tier(cand.hosts)
         # Port-agnostic routes (no listen_port) also receive requests on a port-scoped route's listener.
         ports = [cand.listen_port] if cand.listen_port is None else [cand.listen_port, None]
-        closed = bool(cand.hosts) and any(
-            o.placeholder and matching.host_tier(o.hosts) <= tier and matching.hosts_cover(o.hosts, cand.hosts)
-            for port in ports for o in by_path.get((port, None), []))
+        closures = [o for port in ports for o in by_path.get((port, None), []) if o.placeholder]
+        closed = bool(cand.hosts) and all(
+            any(matching.single_host_tier(oh) <= matching.single_host_tier(h) and matching.host_cover(oh, h)
+                for o in closures for oh in o.hosts)
+            for h in cand.hosts
+        )
         related: list[_Cand] = []
         for port in ports:
             related.extend(by_path.get((port, None), []))
@@ -912,9 +982,16 @@ def _add_divergence_guards(candidates: list[_Cand], report: Report) -> None:
                 related.extend(by_path.get((port, ancestor), []))
         # Regex routes the source's priority kept away from the siblings (an NGINX ^~ prefix stops the regex
         # search; Envoy/Istio match the earlier prefix first) still receive them in Ferrum unless an ancestor
-        # prefix in this host tier, covering every host of this route, catches them first (prefix beats regex).
-        shield = any(matching.host_tier(o.hosts) == tier and matching.hosts_cover(o.hosts, cand.hosts)
-                     for o in related if o.listen_path is not None)
+        # prefix in each host's tier, covering every host of this route, catches them first (prefix beats regex).
+        prefix_related = [o for o in related if o.listen_path is not None]
+        if not cand.hosts:
+            shield = any(not o.hosts for o in prefix_related)
+        else:
+            shield = all(
+                any(matching.single_host_tier(oh) == matching.single_host_tier(h) and matching.host_cover(oh, h)
+                    for o in prefix_related for oh in o.hosts)
+                for h in cand.hosts
+            )
         if not shield:
             for port in ports:
                 related.extend(other for other in regex_by_port.get(port, [])
@@ -924,16 +1001,17 @@ def _add_divergence_guards(candidates: list[_Cand], report: Report) -> None:
         # covering every host) catches them and nothing more specific intercepts them.
         equivalent = intercepted = guarded = divergence_error = False
         for other in related:
-            if closed and matching.host_tier(other.hosts) > tier:
-                continue  # a host-only 404/placeholder in this host tier intercepts first
             if other is cand or other.listen_port not in ports:
                 continue
             if not matching.hosts_overlap(cand.hosts, other.hosts):
                 continue
+            pairs = matching.overlapping_tier_pairs(cand.hosts, other.hosts)
+            if closed and pairs and all(tb > ta for ta, tb in pairs):
+                continue  # a host-only 404/placeholder in each overlapping host's tier intercepts first
             other_route = other.route
             regex_other = other.listen_path is not None and other.listen_path.startswith("~")
-            if regex_other and matching.host_tier(other.hosts) < tier:
-                continue  # a more specific host tier: Ferrum picks it only for host names the source also routed there
+            if regex_other and pairs and all(tb < ta for ta, tb in pairs):
+                continue  # strictly more specific host tier for every overlapping host: source routed those there too
             if other.listen_path is None or regex_other:
                 covers = True
             elif other_route.kind == "prefix":
@@ -1261,18 +1339,28 @@ class _Builder:
             if consumer.custom_id and custom_ids[consumer.custom_id] > 1:
                 consumer.quarantined.append("its custom_id is not unique")
             username = consumer.username
-            if not username or len(username) > util.MAX_NAME_LENGTH or any(ord(ch) < 0x20 for ch in username):
+            if not username or not username.strip() or len(username.encode("utf-8")) > util.MAX_NAME_LENGTH \
+                    or any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in username):
                 self.report.error("consumer-invalid", consumer.ref, "Consumer username is not representable; skipped.")
+                continue
+            custom_id = consumer.custom_id
+            if custom_id is not None and not custom_id.strip():
+                custom_id = None
+            if custom_id is not None and (
+                    len(custom_id.encode("utf-8")) > util.MAX_NAME_LENGTH
+                    or any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in custom_id)):
+                self.report.error("consumer-invalid", consumer.ref, "Consumer custom_id is not representable; skipped.")
                 continue
             entry: dict[str, Any] = {
                 "id": self.consumer_ids.take(self.plan.platform, "consumer", consumer.key),
                 "username": username,
                 "labels": self.labels(consumer.ref),
             }
-            if consumer.custom_id:
-                entry["custom_id"] = consumer.custom_id
-            groups = [g for g in consumer.acl_groups if isinstance(g, str) and g and len(g) <= 255
-                      and not any(ord(ch) < 0x20 for ch in g)]
+            if custom_id:
+                entry["custom_id"] = custom_id
+            groups = [g for g in consumer.acl_groups if isinstance(g, str) and g.strip()
+                      and len(g.encode("utf-8")) <= 255
+                      and not any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in g)]
             if len(groups) != len(consumer.acl_groups) or len(groups) > 500:
                 self.report.error("consumer-acl-groups", consumer.ref,
                                   "Some ACL group names were not representable and were dropped; ACL decisions "
@@ -1310,7 +1398,7 @@ class _Builder:
             if key_owners.get(key, 0) > 1:
                 self.report.error("keyauth-duplicate", consumer.ref,
                                   "An API key is shared with another consumer; it was not migrated (fail closed).")
-            elif stripped < MIN_KEYAUTH_KEY_LENGTH or len(key) > MAX_CREDENTIAL_VALUE_LENGTH \
+            elif stripped < MIN_KEYAUTH_KEY_LENGTH or len(key.encode("utf-8")) > MAX_CREDENTIAL_VALUE_LENGTH \
                     or any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in key):
                 self.report.error("keyauth-weak", consumer.ref,
                                   "An API key is shorter than Ferrum's 16-character minimum or not representable; "
@@ -1328,7 +1416,8 @@ class _Builder:
                 self.report.error("jwt-secret-duplicate", consumer.ref,
                                   "A JWT secret is shared with another consumer; Ferrum refuses shared secrets, so it "
                                   "was not migrated (fail closed).")
-            elif stripped < MIN_JWT_SECRET_LENGTH or len(secret) > MAX_CREDENTIAL_VALUE_LENGTH:
+            elif stripped < MIN_JWT_SECRET_LENGTH or len(secret.encode("utf-8")) > MAX_CREDENTIAL_VALUE_LENGTH \
+                    or any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in secret):
                 self.report.error("jwt-secret-weak", consumer.ref,
                                   "A JWT secret is shorter than Ferrum's 32-character minimum; it was not migrated "
                                   "(fail closed).", "Rotate to a random secret of at least 32 characters.")

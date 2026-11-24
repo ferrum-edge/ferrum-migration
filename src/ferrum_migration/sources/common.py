@@ -232,7 +232,8 @@ def cors_config(origins: Any, methods: Any = None, headers: Any = None, exposed:
         if values is None:
             continue
         items = str_list(values)
-        if items is None or len(items) > 128 or any(not item or len(item) > 256 or item != item.strip()
+        if items is None or len(items) > 128 or any(not item or len(item.encode("utf-8")) > 256
+                                                    or item != item.strip() or not header_name_ok(item)
                                                     for item in items):
             return None, f"{field_name} is not representable"
         if items:

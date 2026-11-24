@@ -320,6 +320,114 @@ class MatchingTest(unittest.TestCase):
         with self.assertRaises(util.UrlProblem):
             util.split_url("http://user:pass@host:80/", {"http": 80})
 
+    def test_mixed_exact_and_wildcard_hosts_per_tier_preference_and_poisoning(self):
+        exact = RouteSpec(ref="exact", name="exact", hosts=["example.com"], kind="prefix", path="/api",
+                          protocols=frozenset({"http"}), backend=BackendRef("http", "a.internal", 80))
+        mixed_longer = RouteSpec(ref="mixed", name="mixed", hosts=["example.com", "*.example.com"], kind="prefix",
+                                 path="/api/admin", protocols=frozenset({"http"}),
+                                 backend=BackendRef("http", "b.internal", 80))
+        # On example.com both sit in tier 0 so /api/admin wins over /api; ferrum_prefers must not claim exact wins.
+        self.assertIs(matching.ferrum_prefers(exact, mixed_longer), False)
+        self.assertIs(matching.ferrum_prefers(mixed_longer, exact), True)
+        # Across example.com (both tier 0 -> a wins on longer path) and sub.example.com (b tier 0 > a tier 1 -> b wins),
+        # preference differs by host, so ferrum_prefers must report None (ambiguous).
+        mixed_a = RouteSpec(ref="ma", name="ma", hosts=["example.com", "*.example.com"], kind="prefix", path="/api/v1")
+        mixed_b = RouteSpec(ref="mb", name="mb", hosts=["example.com", "sub.example.com"], kind="prefix", path="/api")
+        self.assertIsNone(matching.ferrum_prefers(mixed_a, mixed_b))
+        # Poisoning: unrepresentable exact /api must refuse mixed /api/admin because mixed wins in tier 0 on example.com.
+        exact.refuse("header match")
+        exact.extra_conditions = True
+        plan = Plan(platform="test", routes=[exact, mixed_longer])
+        result = emit(plan, EmitOptions(), Report("test", "synthetic"))
+        self.assertTrue(mixed_longer.refusals)
+        self.assertFalse([p for p in result.config["proxies"] if p["labels"].get("ferrum-migration/status") == "migrated"])
+
+    def test_mixed_hosts_case_variant_poisoning_and_divergence_guards(self):
+        from ferrum_migration.model import HostScope
+        # Case-insensitive exact /api on closed example.com must still refuse mixed ["example.com", "*.example.com"] "/"
+        # because the mixed route sits in exact_hosts["example.com"] (tier 0) before the host-only closure.
+        ci = RouteSpec(ref="ci", name="ci", hosts=["example.com"], kind="prefix", path="/api",
+                       case_insensitive=True, protocols=frozenset({"http"}),
+                       backend=BackendRef("http", "a.internal", 80))
+        mixed_root = RouteSpec(ref="mr", name="mr", hosts=["example.com", "*.example.com"], kind="prefix", path="/",
+                               protocols=frozenset({"http"}), backend=BackendRef("http", "b.internal", 80))
+        plan = Plan(platform="test", routes=[ci, mixed_root], host_scopes=[HostScope("s", ["example.com"])])
+        emit(plan, EmitOptions(), Report("test", "synthetic"))
+        self.assertTrue(mixed_root.refusals)
+        # String-prefix divergence: closed exact /api must still guard/report mixed ["example.com", "*.example.com"] "/".
+        api = RouteSpec(ref="api", name="api", hosts=["example.com"], kind="prefix", path="/api",
+                        prefix_semantics="string", protocols=frozenset({"http"}),
+                        backend=BackendRef("http", "a.internal", 80))
+        mixed_broad = RouteSpec(ref="mb", name="mb", hosts=["example.com", "*.example.com"], kind="prefix", path="/",
+                                protocols=frozenset({"http"}), backend=BackendRef("http", "b.internal", 80))
+        report = Report("test", "synthetic")
+        emit(Plan(platform="test", routes=[api, mixed_broad], host_scopes=[HostScope("s", ["example.com"])]),
+             EmitOptions(), report)
+        self.assertIn("prefix-divergence", {c.code for c in report.caveats})
+        # Mixed string-prefix /api must guard exact regex /api.* on example.com (both share tier 0 on example.com).
+        mixed_api = RouteSpec(ref="mapi", name="mapi", hosts=["example.com", "*.example.com"], kind="prefix",
+                              path="/api", prefix_semantics="string", protocols=frozenset({"http"}),
+                              backend=BackendRef("http", "a.internal", 80))
+        exact_rx = RouteSpec(ref="rx", name="rx", hosts=["example.com"], kind="regex", path="/api.*",
+                             protocols=frozenset({"http"}), backend=BackendRef("http", "b.internal", 80))
+        report2 = Report("test", "synthetic")
+        result2 = emit(Plan(platform="test", routes=[mixed_api, exact_rx]), EmitOptions(), report2)
+        self.assertGreaterEqual(result2.stats["prefix_guards"], 1)
+
+    def test_over_100_hosts_route_refused_without_emitting_invalid_proxy(self):
+        many = [f"h{i}.example.test" for i in range(105)]
+        bad = RouteSpec(ref="many", name="many", hosts=many, kind="prefix", path="/api",
+                        protocols=frozenset({"http"}), backend=BackendRef("http", "a.internal", 80))
+        overlap = RouteSpec(ref="one", name="one", hosts=["h0.example.test"], kind="prefix", path="/api/sub",
+                            protocols=frozenset({"http"}), backend=BackendRef("http", "b.internal", 80))
+        result = emit(Plan(platform="test", routes=[bad, overlap]), EmitOptions(), Report("test", "synthetic"))
+        self.assertTrue(bad.refusals)
+        self.assertTrue(overlap.refusals)
+        for proxy in result.config["proxies"]:
+            self.assertLessEqual(len(proxy.get("hosts", [])), util.MAX_HOSTS_PER_PROXY)
+
+    def test_conflict_merging_over_100_hosts_chunks_without_colliding_with_sibling(self):
+        hosts_a = ["shared.example.test"] + [f"a{i}.example.test" for i in range(60)]
+        hosts_b = ["shared.example.test"] + [f"b{i}.example.test" for i in range(60)]
+        r1 = RouteSpec(ref="r1", name="r1", hosts=hosts_a, kind="prefix", path="/api",
+                       protocols=frozenset({"http"}), backend=BackendRef("http", "a.internal", 80))
+        r2 = RouteSpec(ref="r2", name="r2", hosts=hosts_b, kind="prefix", path="/api",
+                       protocols=frozenset({"http"}), backend=BackendRef("http", "b.internal", 80))
+        sibling = RouteSpec(ref="sib", name="sib", hosts=["other.example.test"], kind="prefix", path="/api",
+                            protocols=frozenset({"http"}), backend=BackendRef("http", "c.internal", 80))
+        result = emit(Plan(platform="test", routes=[r1, r2, sibling]), EmitOptions(), Report("test", "synthetic"))
+        self.assertFalse(sibling.refusals)
+        placeholders = [p for p in result.config["proxies"] if p["labels"].get("ferrum-migration/status") == "refused"]
+        self.assertEqual(len(placeholders), 2)
+        for proxy in result.config["proxies"]:
+            self.assertLessEqual(len(proxy.get("hosts", [])), util.MAX_HOSTS_PER_PROXY)
+            self.assertTrue(proxy.get("hosts"))
+
+    def test_termination_header_crlf_and_invalid_backend_san_refused(self):
+        from ferrum_migration.model import Target, TlsSpec, UpstreamSpec
+        bad_term = RouteSpec(ref="t", name="t", hosts=["a.example.test"], kind="prefix", path="/r",
+                             protocols=frozenset({"http"}),
+                             termination={"status_code": 302, "headers": {"location": "https://x\r\nBad: 1"}, "body": ""})
+        up = UpstreamSpec(key="u", name="u", ref="u", targets=[Target("b.internal", 443, 1)],
+                          tls=TlsSpec(verify=True, san_allow_list=["https://not-spiffe.example/id"]))
+        bad_san = RouteSpec(ref="s", name="s", hosts=["b.example.test"], kind="prefix", path="/s",
+                            protocols=frozenset({"http"}), backend=BackendRef("https", upstream_key="u"))
+        emit(Plan(platform="test", routes=[bad_term, bad_san], upstreams={"u": up}), EmitOptions(),
+             Report("test", "synthetic"))
+        self.assertTrue(bad_term.refusals)
+        self.assertTrue(bad_san.refusals)
+
+    def test_consumer_byte_length_and_control_char_validation(self):
+        from ferrum_migration.model import ConsumerSpec
+        bad_cid = ConsumerSpec(ref="c1", key="c1", username="alice", custom_id="bad\nid")
+        bad_utf8 = ConsumerSpec(ref="c2", key="c2", username="é" * 130)  # 260 UTF-8 bytes > 255
+        blank_acl = ConsumerSpec(ref="c3", key="c3", username="bob", custom_id="   ", acl_groups=["   ", "ok"])
+        report = Report("test", "synthetic")
+        result = emit(Plan(platform="test", consumers=[bad_cid, bad_utf8, blank_acl]), EmitOptions(), report)
+        self.assertEqual([c["username"] for c in result.config["consumers"]], ["bob"])
+        self.assertNotIn("custom_id", result.config["consumers"][0])
+        self.assertEqual(result.config["consumers"][0]["acl_groups"], ["ok"])
+
 
 if __name__ == "__main__":
     unittest.main()

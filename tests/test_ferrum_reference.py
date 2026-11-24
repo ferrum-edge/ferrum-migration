@@ -340,6 +340,32 @@ class FerrumBinaryValidateTest(unittest.TestCase):
                 self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
                 self.assertIn("Validation passed", completed.stdout)
 
+    def test_over_100_hosts_and_chunked_conflicts_pass_ferrum_validate(self):
+        """Admission regression: >100-host routes and >100-host conflict merges pass ferrum-edge validate."""
+        from ferrum_migration.ferrum import EmitOptions, emit
+        from ferrum_migration.model import BackendRef, Plan, RouteSpec
+        from ferrum_migration.report import Report
+
+        binary = os.environ["FERRUM_EDGE_BIN"]
+        many = RouteSpec(ref="many", name="many", hosts=[f"m{i}.example.test" for i in range(105)],
+                         kind="prefix", path="/many", protocols=frozenset({"http"}),
+                         backend=BackendRef("http", "m.internal", 80))
+        r1 = RouteSpec(ref="r1", name="r1",
+                       hosts=["shared.example.test"] + [f"a{i}.example.test" for i in range(60)],
+                       kind="prefix", path="/api", protocols=frozenset({"http"}),
+                       backend=BackendRef("http", "a.internal", 80))
+        r2 = RouteSpec(ref="r2", name="r2",
+                       hosts=["shared.example.test"] + [f"b{i}.example.test" for i in range(60)],
+                       kind="prefix", path="/api", protocols=frozenset({"http"}),
+                       backend=BackendRef("http", "b.internal", 80))
+        sib = RouteSpec(ref="sib", name="sib", hosts=["other.example.test"], kind="prefix", path="/api",
+                        protocols=frozenset({"http"}), backend=BackendRef("http", "c.internal", 80))
+        result = emit(Plan(platform="test", routes=[many, r1, r2, sib]), EmitOptions(), Report("test", "synthetic"))
+        with tempfile.TemporaryDirectory() as directory:
+            completed = self.validate(binary, directory, result.config, result.basic_auth_used)
+            self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+            self.assertIn("Validation passed", completed.stdout)
+
     def test_missing_operator_ca_is_rejected_not_ignored(self):
         """Evidence that the operator-CA reference is real: Ferrum refuses it while the file is absent."""
         binary = os.environ["FERRUM_EDGE_BIN"]

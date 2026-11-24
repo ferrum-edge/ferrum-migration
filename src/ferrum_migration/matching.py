@@ -51,10 +51,34 @@ def hosts_cover(outer: list[str] | None, inner: list[str] | None) -> bool:
     return all(any(host_cover(o, i) for o in outer) for i in inner)
 
 
+def single_host_tier(host: str) -> int:
+    """Ferrum router tier for one normalized host entry: 0 = exact, 1 = wildcard."""
+    return 1 if host.startswith("*.") else 0
+
+
 def host_tier(hosts: list[str] | None) -> int:
     if not hosts:
         return 2
     return 1 if any(host.startswith("*.") for host in hosts) else 0
+
+
+def overlapping_tier_pairs(a: list[str] | None, b: list[str] | None) -> set[tuple[int, int]]:
+    """All ``(tier_a, tier_b)`` pairs under which Ferrum can evaluate ``a`` and ``b`` for one hostname.
+
+    Ferrum indexes each host of a proxy individually into exact (0) or wildcard (1), and empty ``hosts``
+    into catch-all (2). A proxy with mixed exact and wildcard hosts (such as NGINX ``.example.com`` ->
+    ``["example.com", "*.example.com"]``) therefore sits in BOTH tiers 0 and 1. Returns an empty set when
+    either host list is unknown (``None``) or the two lists do not overlap.
+    """
+    if a is None or b is None:
+        return set()
+    if not a and not b:
+        return {(2, 2)}
+    if not a:
+        return {(2, single_host_tier(hb)) for hb in b}
+    if not b:
+        return {(single_host_tier(ha), 2) for ha in a}
+    return {(single_host_tier(ha), single_host_tier(hb)) for ha in a for hb in b if host_overlap(ha, hb)}
 
 
 def path_space(kind: str, path: str | None) -> tuple[str, bool] | None:
@@ -278,11 +302,24 @@ def route_covers(outer, inner) -> bool:
 
 
 def ferrum_prefers(a, b) -> bool | None:
-    """True if Ferrum picks ``a`` over ``b`` for requests matching both; None if unclear."""
-    tier_a, tier_b = host_tier(a.hosts), host_tier(b.hosts)
-    if tier_a != tier_b:
-        return tier_a < tier_b
+    """True if Ferrum picks ``a`` over ``b`` for every overlapping request; False if ``b``; None if unclear.
+
+    Because Ferrum indexes each host entry individually into exact (0) or wildcard (1), mixed host lists
+    (e.g. ``["example.com", "*.example.com"]``) participate in both tiers. Preference is definite only when
+    every overlapping ``(tier_a, tier_b)`` pair resolves to the same winner.
+    """
+    pairs = overlapping_tier_pairs(a.hosts, b.hosts)
+    if not pairs:
+        return None
     rank_a, rank_b = path_rank(a.kind, a.path), path_rank(b.kind, b.path)
-    if rank_a != rank_b:
-        return rank_a < rank_b
+    verdicts: set[bool | None] = set()
+    for tier_a, tier_b in pairs:
+        if tier_a != tier_b:
+            verdicts.add(tier_a < tier_b)
+        elif rank_a != rank_b:
+            verdicts.add(rank_a < rank_b)
+        else:
+            return None
+    if len(verdicts) == 1:
+        return next(iter(verdicts))
     return None
