@@ -70,8 +70,8 @@ def outputs():
     # The synthetic Traefik fixtures stand for deployments whose every effective routing, TLS and access control is in
     # the input (no static entryPoint controls, no TLS options outside it, no competing routers), so they are converted
     # with the operator's statement (as with --assert-traefik-input-includes-effective-controls); the default refusal
-    # output is admitted separately (test_traefik_default_refusal_passes_ferrum_validate), and so are the sniStrict
-    # refusals (test_traefik_tls_option_refusals_pass_ferrum_validate).
+    # output is admitted separately (test_traefik_default_refusal_passes_ferrum_validate), and so are the TLS options
+    # scope and sniStrict refusals (test_traefik_tls_option_refusals_pass_ferrum_validate).
     for platform, parts, fmt in CASES:
         result, _report, plan = migrate(platform, read_fixture(*parts), fmt=fmt, include_secrets=False,
                                         traefik_controls_asserted=platform == "traefik")
@@ -313,22 +313,24 @@ class FerrumBinaryValidateTest(unittest.TestCase):
                 self.assertIn("Validation passed", completed.stdout)
 
     def test_traefik_tls_option_refusals_pass_ferrum_validate(self):
-        """Admission regression: sniStrict refusals under the operator statement load as placeholders.
+        """Admission regression: Traefik handshake-policy refusals under the operator statement load as placeholders.
 
-        Ordinary synthetic HTTPS routers whose TLS options enable sniStrict (explicitly referenced, and as the
-        'default' options) are converted with the statement; each becomes a fail-closed 503 placeholder. Only the
-        resources are validated; no traffic is sent.
+        Ordinary synthetic HTTPS routers are converted with the statement: under named TLS options (outside the one
+        global 'default' policy, traefik-tls-options-scope) and under 'default' options that enable sniStrict
+        (traefik-sni-strict). Each becomes a fail-closed 503 placeholder. Only the resources are validated; no
+        traffic is sent.
         """
         binary = os.environ["FERRUM_EDGE_BIN"]
         service = {"s": {"loadBalancer": {"servers": [{"url": "http://s.internal:80"}]}}}
         router = {"rule": "Host(`t.example.test`) && Path(`/t`)", "service": "s"}
-        cases = {"explicit": ({**router, "tls": {"options": "strict"}}, {"strict": {"sniStrict": True}}),
-                 "default": ({**router, "tls": {}}, {"default": {"sniStrict": True}})}
-        for label, (spec, options) in cases.items():
+        cases = {"named": ({**router, "tls": {"options": "relaxed"}}, {"relaxed": {"minVersion": "VersionTLS12"}},
+                           "traefik-tls-options-scope"),
+                 "default": ({**router, "tls": {}}, {"default": {"sniStrict": True}}, "traefik-sni-strict")}
+        for label, (spec, options, code) in cases.items():
             text = yaml.safe_dump({"http": {"routers": {"r": spec}, "services": service}, "tls": {"options": options}})
             result, report, _plan = migrate("traefik", text, traefik_controls_asserted=True)
             with self.subTest(case=label), tempfile.TemporaryDirectory() as directory:
-                self.assertIn("traefik-sni-strict", {c.code for c in report.caveats})
+                self.assertIn(code, {c.code for c in report.caveats})
                 self.assertFalse([p for p in result.config["proxies"]
                                   if p["labels"].get("ferrum-migration/status") == "migrated"])
                 completed = self.validate(binary, directory, result.config, result.basic_auth_used)

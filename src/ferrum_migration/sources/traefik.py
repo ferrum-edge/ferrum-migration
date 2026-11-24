@@ -19,6 +19,11 @@ scoped representation, never verified here) every route that would forward traff
 are translated from the dynamic input alone, and everything the input does state (router ``tls`` and TLS options,
 middlewares, explicit ``entryPoints`` lists) still applies or refuses; unresolved references and controls Ferrum
 cannot reproduce (such as enabled ``sniStrict``) refuse their routes whatever the operator states.
+
+HTTPS is translated only under one global handshake policy: the ``default`` TLS options (or Traefik's built-in
+default) used by every TLS router. Traefik chooses TLS options per handshake from the SNI, for every path of the
+frontend at once, and Ferrum's HTTPS listener applies one policy to every connection, so per-route SNI selection is
+not reconstructed: any other TLS options in the input refuse every HTTPS route (see ``_handshake_scope``).
 """
 
 from __future__ import annotations
@@ -261,12 +266,6 @@ class _Traefik:
         self.middlewares = mapping(http.get("middlewares"))
         self.transports = mapping(http.get("serversTransports"))
         self.priority: dict[int, tuple[int, str]] = {}
-        # Per HTTPS route spec (by id): effective TLS options name and the host names Traefik maps those options to
-        # for SNI selection (empty when selection depends on the SNI). Plus the per-name client auth verdicts.
-        self.tls_option_of: dict[int, tuple[str, list[str]]] = {}
-        self.client_auth_cache: dict[str, tuple[tuple[str, ...], str | None]] = {}
-        # Per TLS options name: refusal reason when it enables sniStrict (or states it unreadably), else None.
-        self.sni_strict_cache: dict[str, str | None] = {}
         self.builtin_default_tls_used = False
         # Per route spec (by id): the sorted entryPoint names its router lists, or None when it lists none (Traefik
         # then attaches it to its default entryPoints, which only the static configuration defines).
@@ -283,9 +282,12 @@ class _Traefik:
                                     "Unknown top-level section ignored (static configuration is not read).")
         self._tls_section()
         check_route_budget(len(self.routers), self.ctx.limits)
+        # Decided on every router of the input as written: before rule parsing, early exits (invalid, unparseable,
+        # unsatisfiable or redirect routers) and shadowing, none of which changes which handshakes Traefik admitted.
+        handshake_scope_problems = self._handshake_scope()
         for name, router in self.routers.items():
             self._router(str(name), router)
-        self._tls_option_scopes()
+        self._https_handshake_policy(handshake_scope_problems)
         if self.builtin_default_tls_used:
             self.report.info("traefik-tls-default-options", "traefik tls options",
                              "The input defines no 'default' TLS options, so HTTPS routers that use the default were "
@@ -410,12 +412,13 @@ class _Traefik:
                 and "BEGIN" not in default["certFile"] + default["keyFile"]:
             self.plan.settings.frontend_cert_pairs.append((default["certFile"], default["keyFile"]))
         if tls.get("options"):
-            # clientAuth and sniStrict are not part of this note: both are admission controls, resolved per HTTPS
-            # router (see _client_auth and _sni_strict), carried over or refusing the route, never dropped.
-            self.report.info("traefik-tls-options", "traefik tls", "TLS options other than clientAuth and sniStrict "
-                             "(versions, ciphers, curves, ALPN) are not migrated; set FERRUM_TLS_* settings manually. "
-                             "clientAuth is applied per HTTPS router or refuses it; enabled sniStrict refuses the "
-                             "HTTPS routers it applies to.")
+            # clientAuth and sniStrict are not part of this note: both are admission controls of the one global
+            # handshake policy (see _https_handshake_policy), carried over or refusing every HTTPS route, never dropped.
+            self.report.info("traefik-tls-options", "traefik tls", "TLS option settings other than clientAuth and "
+                             "sniStrict (versions, ciphers, curves, ALPN) are not migrated; set FERRUM_TLS_* settings "
+                             "manually. HTTPS routers are translated only under the 'default' TLS options: their "
+                             "clientAuth is applied to every HTTPS route or refuses them all, enabled sniStrict refuses "
+                             "them all, and any other TLS options refuse them all (traefik-tls-options-scope).")
 
     # ---------------------------------------------------------------- routers
 
@@ -444,7 +447,8 @@ class _Traefik:
         if requires_tls and mapping(router.get("tls")).get("certResolver"):
             self.report.warning("traefik-cert-resolver", ref, "ACME certResolver is not migrated; provide a "
                                 "certificate or configure Ferrum's ACME settings.")
-        tls_option, tls_option_problem = self._router_tls_option(router) if requires_tls else (None, None)
+        # The router's tls.options reference is not resolved here: the handshake policy is decided once for every
+        # HTTPS route (_handshake_scope on the input as written, applied in _https_handshake_policy).
         try:
             if len(rule) > 4096:
                 raise RuleError("rule too long")
@@ -460,9 +464,6 @@ class _Traefik:
             self.entrypoints_of[id(spec)] = entrypoints
             self.plan.routes.append(spec)
             return
-        # Traefik maps TLS options to SNI names from Host matchers only; HostHeader does not take part, so such
-        # routers get the options selected by each connection's SNI.
-        sni_mapped = not any(kind == "ident" and value == "HostHeader" for kind, value in tokenize_rule(rule))
         service_name = router.get("service")
         backend_info = self._service_ref(service_name, ref)
         middleware_names = str_list(router.get("middlewares"))
@@ -506,14 +507,6 @@ class _Traefik:
             spec.methods = list(methods) if methods else None
             spec.requires_tls = requires_tls
             spec.protocols = frontends
-            if tls_option_problem:
-                spec.refuse(tls_option_problem)
-            elif tls_option is not None:
-                client_cas, client_auth_problem = self._client_auth(tls_option)
-                spec.client_cas = list(client_cas)
-                if client_auth_problem:
-                    spec.refuse(client_auth_problem)
-                self.tls_option_of[id(spec)] = (tls_option, list(spec.hosts) if sni_mapped else [])
             if entrypoints_problem:
                 spec.refuse(entrypoints_problem)
             self.entrypoints_of[id(spec)] = entrypoints
@@ -561,54 +554,122 @@ class _Traefik:
         if acc.add_prefix:
             spec.backend_path = acc.add_prefix.rstrip("/") + (spec.backend_path or "")
 
-    # ------------------------------------------------------ TLS client auth
+    # ------------------------------------------------- TLS handshake policy
 
-    def _router_tls_option(self, router: dict) -> tuple[str | None, str | None]:
-        """Name of the TLS options an HTTPS router uses, or a refusal reason when they cannot be known."""
-        raw = mapping(router.get("tls")).get("options")
-        if raw is None or raw == "":
-            return DEFAULT_TLS_OPTIONS, None
-        if not isinstance(raw, str):
-            return None, ("router tls.options is not a TLS options name, so its client certificate requirements are "
-                          "unknown")
-        base, _, provider = raw.partition("@")
-        if provider not in ("", "file"):
-            return None, (f"TLS options from provider {safe_label(provider, 32)} are not in the input, so the router's "
-                          "client certificate requirements (clientAuth) are unknown")
-        return base, None
+    def _handshake_scope(self) -> list[str]:
+        """Reasons why HTTPS cannot be translated under one global default handshake policy (empty: it can).
 
-    def _client_auth(self, name: str) -> tuple[tuple[str, ...], str | None]:
-        """Client CA bundle a TLS options entry requires (empty: none), or a refusal reason.
+        Traefik admits a TLS handshake before any HTTP router runs, choosing the TLS options (clientAuth, sniStrict,
+        versions...) from the connection's SNI for every path of that frontend at once, and Ferrum's HTTPS listener
+        applies one policy to every connection. So the only policy translated is the ``default`` TLS options (or
+        Traefik's built-in default, on the operator's statement), used by every TLS router. The check runs on every
+        router of the input as written, whatever its rule, and on every TLS options definition, used or not:
 
-        clientAuth is never dropped: a requirement that cannot be reproduced exactly (or more strictly) as one
-        frontend client CA bundle file refuses every route that uses it. The emitter decides whether one
-        listener-wide bundle preserves all routes' trust scopes.
+        * a ``tls.options`` section that cannot be read;
+        * any TLS options definition other than ``default`` (whether a router reaches it is not analysed);
+        * a router that is not a mapping, or whose ``tls`` block or ``tls.options`` reference cannot be read;
+        * a TLS router referencing anything other than ``default``/``default@file`` (named options, options of
+          another provider, undefined names).
+
+        Any of them refuses every HTTPS route, whatever the hosts or paths and whatever the operator states.
+        Reasons are value-free.
         """
-        if name not in self.client_auth_cache:
-            verdict = self._classify_client_auth(name)
-            self.client_auth_cache[name] = verdict
-            if verdict[1]:
-                self.report.error("traefik-client-auth", f"traefik tls options '{safe_label(name)}'",
-                                  f"Client certificate requirements cannot be reproduced ({verdict[1]}). Every HTTPS "
-                                  "router using these TLS options was refused (fail closed); clientAuth is never "
-                                  "dropped.",
-                                  "Use clientAuthType RequireAndVerifyClientCert with exactly one caFiles file path, "
-                                  "or configure a dedicated Ferrum frontend with "
-                                  "FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH manually and validate it.")
-        return self.client_auth_cache[name]
-
-    def _classify_client_auth(self, name: str) -> tuple[tuple[str, ...], str | None]:
+        problems: list[str] = []
         tls_root = self.root.get("tls")
-        options = mapping(tls_root).get("options")
+        options = tls_root.get("options") if isinstance(tls_root, dict) else None
         if (tls_root is not None and not isinstance(tls_root, dict)) or \
                 (options is not None and not isinstance(options, dict)):
-            return (), "the tls.options section is malformed"
-        options = options or {}
+            problems.append("the tls.options section cannot be read")
+        elif options and any(name != DEFAULT_TLS_OPTIONS for name in options):
+            problems.append("the input defines TLS options other than 'default'")
+        unreadable = other = False
+        for router in self.routers.values():
+            if not isinstance(router, dict):
+                unreadable = True  # whether it is a TLS router, and which options it uses, is unknown
+                continue
+            tls = router.get("tls")
+            if tls is None:
+                continue  # not a TLS router (see _router); it references no TLS options
+            if not isinstance(tls, dict):
+                unreadable = True
+                continue
+            reference = tls.get("options")
+            if reference is None or reference == "":
+                continue  # Traefik applies 'default'
+            if not isinstance(reference, str):
+                unreadable = True
+                continue
+            base, _, provider = reference.partition("@")
+            if base != DEFAULT_TLS_OPTIONS or provider not in ("", "file"):
+                other = True
+        if unreadable:
+            problems.append("a router or its tls block or tls.options reference cannot be read")
+        if other:
+            problems.append("a TLS router references TLS options other than 'default' (named, from another provider "
+                            "or undefined)")
+        return problems
+
+    def _https_handshake_policy(self, scope_problems: list[str]) -> None:
+        """Apply the one global handshake policy to every HTTPS route, or refuse them all.
+
+        Plaintext routes are not affected. Refused HTTPS routes stay HTTPS-only placeholders; they are never served
+        on the plaintext listener instead.
+        """
+        https = [spec for spec in self.plan.routes if spec.requires_tls]
+        if not https:
+            return
+        if scope_problems:
+            for spec in https:
+                spec.refuse("Traefik HTTPS routes are translated only under one global 'default' TLS handshake "
+                            f"policy, and the input does not establish one ({'; '.join(scope_problems)})")
+            self.report.error(
+                "traefik-tls-options-scope", "traefik tls options",
+                "Traefik selects TLS options during the handshake, by SNI, for every path of an entryPoint at once; "
+                "Ferrum's HTTPS listener applies one policy to every connection. HTTPS routes are therefore "
+                "translated only when every TLS router uses the 'default' TLS options and no other TLS options "
+                f"exist in the input, which does not hold here ({'; '.join(scope_problems)}). All {len(https)} "
+                "HTTPS route(s) were refused (fail closed), whatever their hosts or paths; plaintext routes are not "
+                "affected.",
+                "Keep these HTTPS routes on the source proxy, or move the handshake requirements into one 'default' "
+                "TLS options entry used by every TLS router, remove the other TLS options and references, and "
+                "convert again. For separate handshake policies, convert each policy's routers separately for "
+                "separately configured Ferrum frontends.")
+            return
+        cas, client_auth_problem = self._default_client_auth()
+        strict_problem = self._default_sni_strict()
+        for spec in https:
+            spec.client_cas = list(cas)
+            if client_auth_problem:
+                spec.refuse(client_auth_problem)
+            if strict_problem:
+                spec.refuse("the default TLS options enable sniStrict (or state it unreadably), an admission control "
+                            "Ferrum's HTTPS listener cannot reproduce")
+
+    def _default_client_auth(self) -> tuple[tuple[str, ...], str | None]:
+        """Client CA bundle the default TLS options require (empty: none), or a refusal reason.
+
+        clientAuth is never dropped: a requirement that cannot be reproduced exactly (or more strictly) as one
+        frontend client CA bundle file refuses every HTTPS route. The emitter decides whether one listener-wide
+        bundle preserves all routes' trust scopes.
+        """
+        verdict = self._classify_default_client_auth()
+        if verdict[1]:
+            self.report.error("traefik-client-auth", f"traefik tls options '{DEFAULT_TLS_OPTIONS}'",
+                              f"Client certificate requirements cannot be reproduced ({verdict[1]}). Every HTTPS "
+                              "router uses these TLS options, so every HTTPS route was refused (fail closed); "
+                              "clientAuth is never dropped.",
+                              "Use clientAuthType RequireAndVerifyClientCert with exactly one caFiles file path, "
+                              "or configure a dedicated Ferrum frontend with "
+                              "FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH manually and validate it.")
+        return verdict
+
+    def _classify_default_client_auth(self) -> tuple[tuple[str, ...], str | None]:
+        # Only called when _handshake_scope found a readable tls.options section with no entry besides 'default'.
+        options = mapping(mapping(self.root.get("tls")).get("options"))
+        name = DEFAULT_TLS_OPTIONS
         if name not in options:
-            if name == DEFAULT_TLS_OPTIONS:
-                self.builtin_default_tls_used = True  # Traefik's built-in default requests no client certificates
-                return (), None
-            return (), f"TLS options {safe_label(name, 48)} are undefined"
+            self.builtin_default_tls_used = True  # Traefik's built-in default requests no client certificates
+            return (), None
         option = options[name] if options[name] is not None else {}
         if not isinstance(option, dict):
             return (), "the TLS options entry is malformed"
@@ -640,30 +701,28 @@ class _Traefik:
                                 "Ferrum's frontend client CA (stricter).")
         return (cas[0],), None
 
-    def _sni_strict(self, name: str) -> str | None:
-        """Refusal reason when the TLS options ``name`` enable sniStrict (or state it unreadably), else None.
+    def _default_sni_strict(self) -> str | None:
+        """Refusal reason when the default TLS options enable sniStrict (or state it unreadably), else None.
 
         Traefik's sniStrict rejects TLS handshakes without SNI, or for names that match no configured certificate,
         before any router runs. Ferrum's HTTPS listener completes every handshake with its frontend certificate, so
-        this admission control cannot be reproduced. It is never dropped: the routes it applies to are refused,
-        whatever the operator states about the scope of the input.
+        this admission control cannot be reproduced. It is never dropped: every HTTPS route is refused, whatever
+        the operator states about the scope of the input.
         """
-        if name not in self.sni_strict_cache:
-            problem = self._classify_sni_strict(name)
-            self.sni_strict_cache[name] = problem
-            if problem:
-                self.report.error("traefik-sni-strict", f"traefik tls options '{safe_label(name)}'",
-                                  f"Strict SNI checking cannot be reproduced ({problem}). Every HTTPS router these TLS "
-                                  "options apply to was refused (fail closed); sniStrict is never dropped.",
-                                  "Keep these routes on the source proxy, or remove sniStrict from the source TLS "
-                                  "options only if accepting handshakes without a matching SNI is acceptable there, "
-                                  "and convert again.")
-        return self.sni_strict_cache[name]
+        problem = self._classify_default_sni_strict()
+        if problem:
+            self.report.error("traefik-sni-strict", f"traefik tls options '{DEFAULT_TLS_OPTIONS}'",
+                              f"Strict SNI checking cannot be reproduced ({problem}). Every HTTPS router uses these TLS "
+                              "options, so every HTTPS route was refused (fail closed); sniStrict is never dropped.",
+                              "Keep these routes on the source proxy, or remove sniStrict from the source TLS "
+                              "options only if accepting handshakes without a matching SNI is acceptable there, "
+                              "and convert again.")
+        return problem
 
-    def _classify_sni_strict(self, name: str) -> str | None:
-        option = mapping(mapping(self.root.get("tls")).get("options")).get(name)
+    def _classify_default_sni_strict(self) -> str | None:
+        option = mapping(mapping(self.root.get("tls")).get("options")).get(DEFAULT_TLS_OPTIONS)
         if not isinstance(option, dict):
-            # Undefined or malformed entries already refuse their routes (_client_auth). Traefik's built-in default
+            # A malformed entry already refuses every HTTPS route (_default_client_auth). Traefik's built-in default
             # (no 'default' entry in the input, covered by the operator's statement) does not enable sniStrict.
             return None
         value = option.get("sniStrict")
@@ -673,62 +732,6 @@ class _Traefik:
             return ("sniStrict is enabled, so the source rejected handshakes without SNI or for names matching no "
                     "certificate")
         return "sniStrict is not a boolean, so whether the source rejected handshakes by SNI is unknown"
-
-    def _tls_option_scopes(self) -> None:
-        """Refuse HTTPS routes whose TLS admission controls (sniStrict, clientAuth) cannot be reproduced.
-
-        Traefik selects TLS options during the handshake by SNI host name, not per router. A router without a
-        Host matcher gets whatever options the SNI selects (the default options for names no router claims), a
-        host name that routers map to different TLS options falls back to the default options, and a handshake
-        without SNI always gets the default options. Therefore:
-
-        * enabled sniStrict in the default options refuses every HTTPS route, because those options govern the
-          handshakes without SNI that reach any of them; enabled sniStrict in any other options that can apply to
-          a route (its own explicit reference, or an SNI-dependent candidate) refuses that route;
-        * when the candidate options disagree on clientAuth, the requirement cannot be reproduced, so the route is
-          refused.
-        """
-        specs = [spec for spec in self.plan.routes if id(spec) in self.tls_option_of and not spec.skip]
-        if not specs:
-            return
-        options_by_host: dict[str, set[str]] = {}
-        for spec in specs:
-            name, sni_hosts = self.tls_option_of[id(spec)]
-            for host in sni_hosts:
-                options_by_host.setdefault(host, set()).add(name)
-        default_strict = self._sni_strict(DEFAULT_TLS_OPTIONS)
-        for spec in specs:
-            name, sni_hosts = self.tls_option_of[id(spec)]
-            candidates = {name}
-            reason = None
-            if not sni_hosts:
-                candidates.add(DEFAULT_TLS_OPTIONS)
-                reason = ("the router has no Host matcher, so Traefik applied the TLS options selected by each "
-                          "connection's SNI (the default options for unclaimed names)")
-            else:
-                conflicting = [host for host in sni_hosts if len(options_by_host.get(host, ())) > 1]
-                if conflicting:
-                    for host in conflicting:
-                        candidates |= options_by_host[host]
-                    candidates.add(DEFAULT_TLS_OPTIONS)
-                    reason = ("routers for the same host reference different TLS options, so Traefik fell back to "
-                              "the default TLS options for that host")
-            if default_strict:
-                spec.refuse("the default TLS options enable sniStrict (or state it unreadably); Traefik applies them "
-                            "to every handshake without SNI, and Ferrum's HTTPS listener cannot reject those "
-                            "handshakes")
-            elif [candidate for candidate in sorted(candidates) if self._sni_strict(candidate)]:
-                spec.refuse("TLS options that apply to this route enable sniStrict (or state it unreadably), an "
-                            "admission control Ferrum's HTTPS listener cannot reproduce")
-            if reason is None:
-                continue
-            verdicts = set()
-            for name in sorted(candidates):
-                cas, problem = self._client_auth(name)
-                verdicts.add((cas, problem is not None))
-            if len(verdicts) > 1:
-                spec.refuse(f"{reason}, and those TLS options differ in client certificate requirements "
-                            "(clientAuth), so the requirement for this route cannot be reproduced")
 
     # ------------------------------------------------------------ middleware
 

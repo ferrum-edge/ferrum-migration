@@ -264,7 +264,8 @@ class TraefikServersTransportTest(unittest.TestCase):
 
 
 class TraefikClientAuthTest(unittest.TestCase):
-    """tls.options clientAuth becomes the frontend client CA or refuses the route; it is never dropped."""
+    """The default TLS options' clientAuth becomes the frontend client CA of every HTTPS route, or refuses them all;
+    it is never dropped. (Other TLS options refuse HTTPS through the handshake scope; see TraefikHandshakeScopeTest.)"""
 
     CA = "/etc/test-only/client-ca.pem"  # synthetic path; never read by the tool
 
@@ -278,16 +279,26 @@ class TraefikClientAuthTest(unittest.TestCase):
     def _status(self, result, path, host=None):
         return one_proxy(self, result.config, path, host)["labels"]["ferrum-migration/status"]
 
-    def test_referenced_client_auth_is_preserved_as_frontend_client_ca(self):
-        router = {"r": {"rule": "Host(`m.example.test`) && Path(`/m`)", "service": "s",
-                        "tls": {"options": "mtls@file"}}}
-        result, report, plan = asserted(self._doc(router, {"mtls": {"clientAuth": {
+    def test_default_client_auth_is_preserved_for_every_https_route(self):
+        # One homogeneous handshake policy: routers naming no options and routers naming 'default' explicitly (with
+        # or without @file), on different hosts and paths, all get the default options' client CA.
+        routers = {
+            "implicit": {"rule": "Host(`m.example.test`) && Path(`/m`)", "service": "s", "tls": {}},
+            "explicit": {"rule": "Host(`n.example.test`) && Path(`/n`)", "service": "s",
+                         "tls": {"options": "default"}},
+            "file": {"rule": "Host(`o.example.test`) && Path(`/o`)", "service": "s",
+                     "tls": {"options": "default@file"}},
+        }
+        result, report, plan = asserted(self._doc(routers, {"default": {"clientAuth": {
             "caFiles": [self.CA], "clientAuthType": "RequireAndVerifyClientCert"}}}))
-        self.assertEqual(self._status(result, "=/m", "m.example.test"), "migrated")
+        for path, host in (("=/m", "m.example.test"), ("=/n", "n.example.test"), ("=/o", "o.example.test")):
+            self.assertEqual(self._status(result, path, host), "migrated", path)
         self.assertEqual(plan.settings.client_ca_paths, [self.CA])
+        self.assertTrue(result.tls_only)
         self.assertNotIn("traefik-client-auth", codes(report))
+        self.assertNotIn("traefik-tls-options-scope", codes(report))
         # Optional verification becomes mandatory (stricter), with a warning.
-        _result, report, plan = asserted(self._doc(router, {"mtls": {"clientAuth": {
+        _result, report, plan = asserted(self._doc(routers, {"default": {"clientAuth": {
             "caFiles": [self.CA], "clientAuthType": "VerifyClientCertIfGiven"}}}))
         self.assertEqual(plan.settings.client_ca_paths, [self.CA])
         self.assertIn("traefik-mtls-optional", codes(report, "warning"))
@@ -300,41 +311,28 @@ class TraefikClientAuthTest(unittest.TestCase):
         self.assertEqual(self._status(result, None, "d.example.test"), "migrated")
         self.assertEqual(plan.settings.client_ca_paths, [self.CA])
 
-    def test_unknown_or_unreproducible_client_auth_refuses_the_route(self):
+    def test_unreproducible_default_client_auth_refuses_every_https_route(self):
         cases = {
-            "other provider": ({"options": "mtls@kubernetescrd"}, {}),
-            "undefined": ({"options": "missing"}, {}),
-            "several CA files": ({"options": "m"}, {"m": {"clientAuth": {
-                "caFiles": [self.CA, "/etc/test-only/other-ca.pem"]}}}),
-            "unverified certificates": ({"options": "m"}, {"m": {"clientAuth": {
-                "clientAuthType": "RequireAnyClientCert"}}}),
-            "malformed default": ({}, {"default": {"clientAuth": "yes"}}),
+            "several CA files": {"clientAuth": {"caFiles": [self.CA, "/etc/test-only/other-ca.pem"]}},
+            "unverified certificates": {"clientAuth": {"clientAuthType": "RequireAnyClientCert"}},
+            "malformed clientAuth": {"clientAuth": "yes"},
+            "malformed entry": "yes",
         }
-        for label, (router_tls, options) in cases.items():
+        for label, default in cases.items():
             with self.subTest(label):
-                result, report, plan = asserted(self._doc(
-                    {"r": {"rule": "Host(`u.example.test`) && Path(`/u`)", "service": "s", "tls": router_tls}},
-                    options))
+                result, report, plan = asserted(self._doc({
+                    "u": {"rule": "Host(`u.example.test`) && Path(`/u`)", "service": "s", "tls": {}},
+                    "v": {"rule": "Host(`v.example.test`) && Path(`/v`)", "service": "s",
+                          "tls": {"options": "default"}},
+                }, {"default": default}))
                 self.assertEqual(self._status(result, "=/u", "u.example.test"), "refused")
+                self.assertEqual(self._status(result, "=/v", "v.example.test"), "refused")
                 self.assertEqual(plan.settings.client_ca_paths, [])
+                self.assertIn("traefik-client-auth", codes(report, "error"))
                 self.assertIn("route-refused", codes(report, "error"))
 
-    def test_sni_dependent_client_auth_is_refused(self):
-        options = {"mtls": {"clientAuth": {"caFiles": [self.CA]}}}
-        # No Host matcher: Traefik applies the options selected by SNI (the default ones for unclaimed names).
-        result, _report, _plan = asserted(self._doc(
-            {"r": {"rule": "Path(`/h`)", "service": "s", "tls": {"options": "mtls"}}}, options))
-        self.assertEqual(self._status(result, "=/h"), "refused")
-        # One host mapped to different TLS options: Traefik falls back to the default options for that host.
-        result, _report, _plan = asserted(self._doc({
-            "a": {"rule": "Host(`c.example.test`) && Path(`/a`)", "service": "s", "tls": {"options": "mtls"}},
-            "b": {"rule": "Host(`c.example.test`) && Path(`/b`)", "service": "s", "tls": {}},
-        }, options))
-        for path in ("=/a", "=/b"):
-            self.assertEqual(self._status(result, path, "c.example.test"), "refused")
-
     def test_plaintext_and_tls_routers_without_client_auth_are_unaffected(self):
-        options = {"default": {"minVersion": "VersionTLS12"}, "mtls": {"clientAuth": {"caFiles": [self.CA]}}}
+        options = {"default": {"minVersion": "VersionTLS12"}}
         for router_tls in (None, {}):
             with self.subTest(tls=router_tls):
                 router = {"rule": "Host(`p.example.test`) && Path(`/p`)", "service": "s"}
@@ -344,11 +342,13 @@ class TraefikClientAuthTest(unittest.TestCase):
                 self.assertEqual(self._status(result, "=/p", "p.example.test"), "migrated")
                 self.assertEqual(plan.settings.client_ca_paths, [])
                 self.assertNotIn("traefik-client-auth", codes(report))
+                self.assertNotIn("traefik-tls-options-scope", codes(report))
 
 
 class TraefikSniStrictTest(unittest.TestCase):
-    """Enabled tls.options sniStrict is an admission control: the HTTPS routes it applies to are refused, with or
-    without the operator's statement; it is never dropped as a TLS tuning setting."""
+    """Enabled sniStrict in the default TLS options is an admission control: every HTTPS route is refused, with or
+    without the operator's statement; it is never dropped as a TLS tuning setting. (sniStrict in any other TLS options
+    refuses HTTPS through the handshake scope; see TraefikHandshakeScopeTest.)"""
 
     SERVICE = {"s": {"loadBalancer": {"servers": [{"url": "http://s.internal:80"}]}}}
 
@@ -362,41 +362,30 @@ class TraefikSniStrictTest(unittest.TestCase):
     def _router(host, path, tls):
         return {"rule": f"Host(`{host}`) && Path(`{path}`)", "service": "s", "tls": tls}
 
-    def test_explicit_strict_options_refuse_the_route_even_with_the_statement(self):
-        for reference in ("strict", "strict@file"):
+    def test_explicit_reference_to_strict_default_refuses_the_route_even_with_the_statement(self):
+        for reference in ("default", "default@file"):
             with self.subTest(reference=reference):
                 result, report, plan = asserted(self._doc(
                     {"r": self._router("s.example.test", "/s", {"options": reference})},
-                    {"strict": {"sniStrict": True, "minVersion": "VersionTLS12"}}))
+                    {"default": {"sniStrict": True, "minVersion": "VersionTLS12"}}))
                 self.assertEqual(self._status(result, "=/s", "s.example.test"), "refused")
                 self.assertEqual(live_routes(result.config), [])
                 self.assertIn("traefik-sni-strict", codes(report, "error"))
                 self.assertIn("route-refused", codes(report, "error"))
+                self.assertNotIn("traefik-tls-options-scope", codes(report))
                 self.assertTrue(any("sniStrict" in reason for reason in plan.routes[0].refusals))
 
     def test_strict_default_options_refuse_every_https_route(self):
-        # Routers naming no options and routers referencing 'default' explicitly use it; a router with other,
-        # non-strict options is refused too, because 'default' governs every handshake without SNI.
+        # Routers naming no options and routers referencing 'default' explicitly, on different hosts, all use it.
         result, report, _plan = asserted(self._doc({
             "implicit": self._router("d.example.test", "/implicit", {}),
             "explicit": self._router("d.example.test", "/explicit", {"options": "default"}),
-            "other": self._router("o.example.test", "/other", {"options": "relaxed"}),
-        }, {"default": {"sniStrict": True}, "relaxed": {"minVersion": "VersionTLS12"}}))
+            "other-host": self._router("o.example.test", "/other", {}),
+        }, {"default": {"sniStrict": True}}))
         for path, host in (("=/implicit", "d.example.test"), ("=/explicit", "d.example.test"),
                            ("=/other", "o.example.test")):
             self.assertEqual(self._status(result, path, host), "refused", path)
         self.assertEqual(live_routes(result.config), [])
-        self.assertIn("traefik-sni-strict", codes(report, "error"))
-
-    def test_conflicting_sni_selection_with_a_strict_candidate_is_refused(self):
-        # Two routers map one host to different options; the selection is SNI-dependent, so a strict candidate
-        # refuses both (fail closed).
-        result, report, _plan = asserted(self._doc({
-            "a": self._router("c.example.test", "/a", {"options": "strict"}),
-            "b": self._router("c.example.test", "/b", {}),
-        }, {"strict": {"sniStrict": True}}))
-        for path in ("=/a", "=/b"):
-            self.assertEqual(self._status(result, path, "c.example.test"), "refused", path)
         self.assertIn("traefik-sni-strict", codes(report, "error"))
 
     def test_unreadable_sni_strict_is_refused(self):
@@ -409,19 +398,159 @@ class TraefikSniStrictTest(unittest.TestCase):
         options_cases = {
             "sniStrict false": {"default": {"sniStrict": False, "minVersion": "VersionTLS12"}},
             "sniStrict absent": {"default": {"minVersion": "VersionTLS12"}},
-            "strict options unused": {"strict": {"sniStrict": True}},
+            "empty default entry": {"default": None},
         }
         for label, options in options_cases.items():
             with self.subTest(label):
                 result, report, _plan = asserted(self._doc({"r": self._router("t.example.test", "/t", {})}, options))
                 self.assertEqual(self._status(result, "=/t", "t.example.test"), "migrated")
                 self.assertNotIn("traefik-sni-strict", codes(report))
+                self.assertNotIn("traefik-tls-options-scope", codes(report))
 
     def test_plaintext_routers_are_not_subject_to_sni_strict(self):
         router = {"rule": "Host(`p.example.test`) && Path(`/p`)", "service": "s"}
         result, report, _plan = asserted(self._doc({"r": router}, {"default": {"sniStrict": True}}))
         self.assertEqual(self._status(result, "=/p", "p.example.test"), "migrated")
         self.assertNotIn("traefik-sni-strict", codes(report))
+
+
+class TraefikHandshakeScopeTest(unittest.TestCase):
+    """HTTPS is translated only under one global 'default' handshake policy. Any other TLS options in the input (a
+    definition, used or not, or a named, provider-scoped, undefined or unreadable reference on any router as written)
+    refuse every HTTPS route, whatever the hosts or paths and with or without the operator's statement. Plaintext
+    routes are unaffected, and refused HTTPS routes are never moved to the plaintext listener."""
+
+    SERVICE = {"s": {"loadBalancer": {"servers": [{"url": "http://s.internal:80"}]}}}
+
+    def _doc(self, routers, options=None):
+        doc = {"http": {"routers": routers, "services": self.SERVICE}}
+        if options is not None:
+            doc["tls"] = {"options": options}
+        return yaml.safe_dump(doc)
+
+    def _status(self, result, path, host):
+        return one_proxy(self, result.config, path, host)["labels"]["ferrum-migration/status"]
+
+    @staticmethod
+    def _router(host, path, tls=None):
+        router = {"rule": f"Host(`{host}`) && Path(`{path}`)", "service": "s"}
+        if tls is not None:
+            router["tls"] = tls
+        return router
+
+    def _assert_https_refused(self, result, report, plan, hosts_paths):
+        for path, host in hosts_paths:
+            self.assertEqual(self._status(result, path, host), "refused", path)
+        self.assertIn("traefik-tls-options-scope", codes(report, "error"))
+        https = [spec for spec in plan.routes if spec.requires_tls]
+        self.assertTrue(https)
+        for spec in https:
+            # Still HTTPS-only placeholders: never broadened to the plaintext listener.
+            self.assertEqual(spec.protocols, frozenset({"https"}))
+            self.assertTrue(any("global 'default' TLS handshake policy" in reason for reason in spec.refusals))
+
+    def test_named_options_refuse_every_https_route_on_distinct_hosts_and_paths(self):
+        result, report, plan = asserted(self._doc({
+            "named": self._router("a.example.test", "/a", {"options": "relaxed"}),
+            "implicit": self._router("b.example.test", "/b", {}),
+            "explicit": self._router("c.example.test", "/c", {"options": "default"}),
+            "plain": self._router("p.example.test", "/p"),
+        }, {"default": {"minVersion": "VersionTLS12"}, "relaxed": {"minVersion": "VersionTLS13"}}))
+        self._assert_https_refused(result, report, plan, (("=/a", "a.example.test"), ("=/b", "b.example.test"),
+                                                          ("=/c", "c.example.test")))
+        # Independent plaintext stays live on the plaintext listener only.
+        self.assertEqual(self._status(result, "=/p", "p.example.test"), "migrated")
+        self.assertEqual(live_routes(result.config), [("=/p", ["p.example.test"])])
+        self.assertEqual(result.frontend_protocols, "http")
+        self.assertNotIn("traefik-sni-strict", codes(report))
+        self.assertNotIn("traefik-client-auth", codes(report))
+
+    def test_unused_named_definitions_refuse_https(self):
+        # No reachability analysis: a definition no router names still refuses HTTPS.
+        cases = {
+            "spare relaxed": {"spare": {"minVersion": "VersionTLS12"}},
+            "spare strict": {"default": {}, "spare": {"sniStrict": True}},
+            "spare client auth": {"spare": {"clientAuth": {"caFiles": ["/etc/test-only/ca.pem"]}}},
+        }
+        for label, options in cases.items():
+            with self.subTest(label):
+                result, report, plan = asserted(self._doc({"r": self._router("t.example.test", "/t", {})}, options))
+                self._assert_https_refused(result, report, plan, (("=/t", "t.example.test"),))
+                self.assertEqual(live_routes(result.config), [])
+                self.assertEqual(plan.settings.client_ca_paths, [])
+
+    def test_unresolved_or_unreadable_references_refuse_every_https_route(self):
+        cases = {
+            "other provider": ({"options": "mtls@kubernetescrd"}, None),
+            "default of another provider": ({"options": "default@kubernetescrd"}, None),
+            "undefined name": ({"options": "missing"}, None),
+            "non-string reference": ({"options": ["default"]}, None),
+            "unreadable tls block": ("yes", None),
+            "unreadable tls.options section": ({}, ["default"]),
+        }
+        for label, (odd_tls, options) in cases.items():
+            with self.subTest(label):
+                result, report, plan = asserted(self._doc({
+                    "odd": self._router("o.example.test", "/o", odd_tls),
+                    "ordinary": self._router("n.example.test", "/n", {}),
+                }, options))
+                self._assert_https_refused(result, report, plan, (("=/o", "o.example.test"),
+                                                                  ("=/n", "n.example.test")))
+
+    def test_scope_is_decided_on_routers_before_parsing_early_exits_and_shadowing(self):
+        # Routers that never become routes still name the TLS options Traefik loaded for the frontend.
+        ordinary = {"ordinary": self._router("n.example.test", "/n", {})}
+        cases = {
+            "router without a rule": {"norule": {"service": "s", "tls": {"options": "elsewhere"}}},
+            "router that is not a mapping": {"broken": "not a router"},
+            "unparseable rule": {"bad": {"rule": "Host(`x.example.test`", "service": "s",
+                                         "tls": {"options": "elsewhere"}}},
+            "unsatisfiable rule": {"never": {"rule": "Host(`x.example.test`) && Host(`y.example.test`)",
+                                             "service": "s", "tls": {"options": "elsewhere"}}},
+            "shadowed router": {"wide": {"rule": "Host(`n.example.test`) && PathPrefix(`/`)", "priority": 1000,
+                                         "service": "s", "tls": {}},
+                                "narrow": {"rule": "Host(`n.example.test`) && Path(`/n`)", "service": "s",
+                                           "tls": {"options": "elsewhere"}}},
+        }
+        for label, routers in cases.items():
+            with self.subTest(label):
+                merged = {**ordinary, **routers} if label != "shadowed router" else routers
+                result, report, plan = asserted(self._doc(merged))
+                self.assertEqual(live_routes(result.config), [])
+                self.assertIn("traefik-tls-options-scope", codes(report, "error"))
+                for spec in plan.routes:
+                    if spec.requires_tls and not spec.skip:
+                        self.assertTrue(any("global 'default' TLS handshake policy" in reason
+                                            for reason in spec.refusals), spec.ref)
+
+    def test_scope_refusal_applies_without_the_statement(self):
+        result, report, plan = migrate("traefik", self._doc({
+            "named": self._router("a.example.test", "/a", {"options": "relaxed"}),
+            "plain": self._router("p.example.test", "/p"),
+        }, {"relaxed": {"minVersion": "VersionTLS12"}}))
+        self.assertEqual(live_routes(result.config), [])
+        self.assertIn("traefik-tls-options-scope", codes(report, "error"))
+        self.assertIn("traefik-controls-unverified", codes(report, "error"))
+        [https] = [spec for spec in plan.routes if spec.requires_tls]
+        self.assertTrue(any("global 'default' TLS handshake policy" in reason for reason in https.refusals))
+
+    def test_plaintext_only_input_ignores_tls_options(self):
+        result, report, _plan = asserted(self._doc({"plain": self._router("p.example.test", "/p")},
+                                                   {"relaxed": {"minVersion": "VersionTLS12"}}))
+        self.assertEqual(self._status(result, "=/p", "p.example.test"), "migrated")
+        self.assertNotIn("traefik-tls-options-scope", codes(report))
+
+    def test_builtin_default_without_tls_options_stays_supported(self):
+        result, report, plan = asserted(self._doc({
+            "a": self._router("a.example.test", "/a", {}),
+            "b": self._router("b.example.test", "/b", {"options": "default@file"}),
+        }))
+        self.assertEqual(sorted(live_routes(result.config)),
+                         [("=/a", ["a.example.test"]), ("=/b", ["b.example.test"])])
+        self.assertTrue(result.tls_only)
+        self.assertEqual(plan.settings.client_ca_paths, [])
+        self.assertIn("traefik-tls-default-options", codes(report, "info"))
+        self.assertNotIn("traefik-tls-options-scope", codes(report))
 
 
 class TraefikInputControlsTest(unittest.TestCase):
