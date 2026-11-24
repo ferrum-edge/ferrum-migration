@@ -14,16 +14,18 @@ Secrets are never read.
 from __future__ import annotations
 
 import ipaddress
+import json
 from typing import Any
 
 from .. import matching, util
 from ..errors import InputError
 from ..model import BackendRef, HostScope, Plan, PluginSpec, RouteSpec, Target, TlsSpec, UpstreamSpec
-from ..redact import safe_label
+from ..redact import contains_secret_reference, safe_label
 from ..safe_load import load_structured
 from .common import (SourceContext, apply_first_match_order, check_route_budget, choose_main_port, cors_config,
-                     header_value_ok, literal_value, mapping, merge_weighted_targets, request_header_rule,
-                     response_header_rule, retry_from_policy, seq, str_list)
+                     fault_injection_config, header_value_ok, jwks_provider_config, literal_value, mapping,
+                     merge_weighted_targets, request_header_rule, request_mirror_config, response_header_rule,
+                     retry_from_policy, seq, str_list)
 
 PLATFORM = "istio"
 ROOT_NAMESPACE = "istio-system"
@@ -177,8 +179,8 @@ class _Istio:
                                     "certificates (stricter).")
         return None
 
-    def _gateway_refusals(self, gateway: dict, ref: str) -> list[str]:
-        """Policies that (may) apply to the gateway workloads refuse that gateway's routes.
+    def _gateway_policies(self, gateway: dict, ref: str) -> tuple[list[str], list[PluginSpec]]:
+        """Policies that (may) apply to the gateway workloads: translate clean RequestAuthentication or refuse.
 
         The namespace the ingress gateway *pods* run in is not part of the input (it is
         often ``istio-system`` or ``istio-ingress``, not the Gateway resource's
@@ -189,10 +191,20 @@ class _Istio:
         A namespace-wide policy (no selector) also applies in any namespace (fail
         closed); outside the Gateway's and the root namespace it is also reported,
         because it only matters if the gateway pods run there.
+
+        A ``RequestAuthentication`` that is provably bound to this Gateway (explicit
+        ``targetRef``/``targetRefs``, a workload selector whose labels are a non-empty
+        subset of the Gateway's selector, or namespace-wide in the Gateway's namespace
+        or ``istio-system``) and whose ``jwtRules`` all map cleanly to Ferrum
+        ``jwks_auth`` providers is translated to a shared ``jwks_auth`` plugin with
+        ``allow_missing_token: true`` (matching Istio semantics). Any unprovable scope
+        or untranslatable rule refuses the Gateway's routes (fail closed).
         """
         gw_ns, gw_name = _meta(gateway)
         selector = mapping(mapping(gateway.get("spec")).get("selector"))
-        reasons = []
+        reasons: list[str] = []
+        jwks_providers: list[dict[str, Any]] = []
+        jwks_refs: list[str] = []
         for policy in self.policies:
             ns, name = _meta(policy)
             spec = mapping(policy.get("spec"))
@@ -203,8 +215,10 @@ class _Istio:
             labels = mapping(mapping(spec.get("selector")).get("matchLabels")) or \
                 mapping(mapping(spec.get("workloadSelector")).get("labels"))
             label = f"{kind} {safe_label(ns)}/{safe_label(name)}"
+            provably_bound = False
             if targeted:
                 applies = True
+                provably_bound = True
             elif refs and all(isinstance(r.get("kind"), str) and r["kind"].strip()
                               and isinstance(r.get("name"), str) and r["name"].strip() for r in refs):
                 applies = False
@@ -212,18 +226,44 @@ class _Istio:
                 applies = True
             elif labels:
                 applies = not _selectors_disjoint(selector, labels)
+                if applies and selector and all(k in selector and str(selector[k]) == str(v)
+                                                for k, v in labels.items()):
+                    provably_bound = True
             else:
                 applies = True
-                if ns not in (gw_ns, ROOT_NAMESPACE):
+                if ns in (gw_ns, ROOT_NAMESPACE):
+                    provably_bound = True
+                else:
                     self.report.error("istio-policy-scope-unknown", ref,
                                       f"{label} has no workload selector, so it applies to every workload in its "
                                       "namespace. The gateway pods' namespace is not part of the input, so it may "
                                       "apply to them; this gateway's routes were refused (fail closed).",
                                       "Confirm the gateway pods' namespace. If the policy does not apply to them, "
                                       "convert again without it; otherwise recreate its policy in Ferrum first.")
-            if applies:
-                reasons.append(f"{label} applies to this gateway's workloads and cannot be translated")
-        return reasons
+            if not applies:
+                continue
+            if kind == "RequestAuthentication" and provably_bound:
+                providers, problem = _translate_request_auth(spec)
+                if providers is not None:
+                    jwks_providers.extend(providers)
+                    jwks_refs.append(label)
+                    continue
+                reasons.append(f"{label} applies to this gateway's workloads and cannot be translated ({problem})")
+                continue
+            reasons.append(f"{label} applies to this gateway's workloads and cannot be translated")
+        gw_plugins: list[PluginSpec] = []
+        if jwks_providers and not reasons:
+            gw_plugins.append(PluginSpec(
+                "jwks_auth",
+                {"providers": jwks_providers, "allow_missing_token": True},
+                ", ".join(jwks_refs),
+                shared_key=f"gw-{gw_ns}-{gw_name}-jwks",
+            ))
+            self.report.warning("istio-request-auth", ref,
+                                f"Translated {', '.join(jwks_refs)} to jwks_auth with allow_missing_token: true "
+                                "(matching Istio RequestAuthentication: invalid tokens are rejected while requests "
+                                "without a token proceed unless an authorization policy requires authentication).")
+        return reasons, gw_plugins
 
     # --------------------------------------------------------- virtualservices
 
@@ -270,7 +310,8 @@ class _Istio:
         # One group per Ferrum projection: (listen_port, requires_tls, client CA, TLS refusal). HTTPS servers with
         # different client trust stay apart, so one server's trust requirement never covers another's hosts.
         groups: dict[tuple, dict] = {}
-        refusals = self._gateway_refusals(gateway, f"{ref} via {safe_label(gateway_ref)}")
+        refusals, gw_plugins = self._gateway_policies(gateway, f"{ref} via {safe_label(gateway_ref)}")
+        gw_policy_sig = json.dumps([(p.name, p.config) for p in gw_plugins], sort_keys=True) if gw_plugins else ""
         for server in self._servers(gateway):
             hosts = _bind_hosts(vs_hosts, namespace, gw_ns, server["hosts"])
             if hosts is None:
@@ -350,16 +391,23 @@ class _Istio:
                 route.protocols = frontends
                 for reason in group["refusals"] + refusals:
                     route.refuse(reason)
+                if gw_plugins and not route.refusals:
+                    if route.termination is not None:
+                        route.refuse("RequestAuthentication runs before directResponse/redirect in Istio, whereas "
+                                     "Ferrum request_termination answers before jwks_auth")
+                    else:
+                        for gp in gw_plugins:
+                            route.plugins.append(PluginSpec(gp.name, gp.config, gp.ref, gp.shared_key))
             apply_first_match_order(routes, self.report)
             self.plan.routes.extend(routes)
             self.projections.append({
                 "binding": (ref, gateway_ref), "ref": f"{ref} via {safe_label(gateway_ref)}",
                 "hosts": list(hosts), "listen_port": listen_port, "routes": routes,
                 # What a request for these hosts gets from the source frontend before any route matches: the
-                # protocol, the client-certificate trust, and whether the frontend itself is refused (TLS settings,
-                # shared-scope conflict, or a gateway policy). Refused projections count: they are part of the plan.
+                # protocol, the client-certificate trust, gateway authentication policy, and whether the frontend
+                # itself is refused (TLS settings, shared-scope conflict, or a gateway policy).
                 "frontend": (bool(requires_tls), tuple(sorted(group["client_cas"])),
-                             bool(group["refusals"] or refusals)),
+                             bool(group["refusals"] or refusals), gw_policy_sig),
             })
             if hosts:
                 self.plan.host_scopes.append(HostScope(f"{ref} via {safe_label(gateway_ref)}", list(hosts), listen_port))
@@ -644,15 +692,77 @@ class _Istio:
                 self.report.warning("istio-retry", ref, note)
         else:
             self.report.info("istio-default-retries", ref, "Istio's implicit default retry policy is not reproduced.")
-        for key, label in (("fault", "fault injection"), ("mirror", "mirroring"), ("mirrors", "mirroring")):
-            if entry.get(key):
-                self.report.warning("istio-dropped", ref, f"{label} is dropped.")
+        if entry.get("fault"):
+            fault_cfg, fault_err = _translate_istio_fault(entry["fault"])
+            if fault_cfg is not None:
+                spec.plugins.append(PluginSpec("fault_injection", fault_cfg, ref))
+            else:
+                self.report.warning("istio-dropped", ref, f"fault injection is dropped ({fault_err}).")
+        if entry.get("mirror") or entry.get("mirrors"):
+            self._mirrors(spec, entry, namespace, gw_ns, ref)
         self._cors(spec, mapping(entry.get("corsPolicy")))
         raw_headers = entry.get("headers")
         if raw_headers is not None and not isinstance(raw_headers, dict):
             spec.refuse("route headers section is not a mapping")
         elif isinstance(raw_headers, dict):
             self._headers(spec, raw_headers)
+
+    def _mirrors(self, spec: RouteSpec, entry: dict, namespace: str, gw_ns: str, ref: str) -> None:
+        raw_items: list[tuple[Any, Any]] = []
+        if entry.get("mirror") is not None:
+            pct_obj = entry.get("mirrorPercentage")
+            if isinstance(pct_obj, dict) and pct_obj.get("value") is not None:
+                raw_pct = pct_obj.get("value")
+            elif entry.get("mirrorPercent") is not None:
+                raw_pct = entry.get("mirrorPercent")
+            else:
+                raw_pct = 100.0
+            raw_items.append((entry.get("mirror"), raw_pct))
+        for item in seq(entry.get("mirrors")):
+            if not isinstance(item, dict):
+                raw_items.append((None, None))
+                continue
+            pct_obj = item.get("percentage")
+            raw_pct = pct_obj.get("value") if isinstance(pct_obj, dict) and pct_obj.get("value") is not None else 100.0
+            raw_items.append((item.get("destination"), raw_pct))
+        migrated = 0
+        dropped = 0
+        for dest_raw, raw_pct in raw_items:
+            if not isinstance(dest_raw, dict) or dest_raw.get("subset") or not isinstance(dest_raw.get("host"), str):
+                dropped += 1
+                continue
+            if isinstance(raw_pct, bool) or not isinstance(raw_pct, (int, float)):
+                dropped += 1
+                continue
+            pct = float(raw_pct)
+            if pct == 0.0:
+                continue
+            fqdn = _fqdn(dest_raw["host"], namespace)
+            port = util.parse_port(mapping(dest_raw.get("port")).get("number"))
+            targets, resolved_port, se_sans, ep_err = self._service_entry(fqdn, port)
+            if ep_err or len(targets) != 1:
+                dropped += 1
+                continue
+            rule = self._destination_rule(fqdn, gw_ns)
+            tls, scheme, _algo, _hash, tls_err = self._traffic_policy(rule, resolved_port, ref, se_sans)
+            if tls_err or (scheme == "https" and (tls.ca_path or tls.client_cert_path or tls.sni or tls.san_allow_list)):
+                dropped += 1
+                continue
+            built, _problem = request_mirror_config(targets[0].host, targets[0].port, scheme, percentage=pct)
+            if built is None:
+                dropped += 1
+                continue
+            spec.plugins.append(PluginSpec("request_mirror", built, ref))
+            migrated += 1
+        if migrated:
+            self.report.warning("istio-mirror", ref,
+                                f"Migrated {migrated} mirror destination(s) to request_mirror; Ferrum redacts "
+                                "credential-like headers and query parameters on mirrored requests by default "
+                                "(stricter).")
+        if dropped:
+            self.report.warning("istio-dropped", ref,
+                                f"{dropped} mirror destination(s) could not be represented as a single static "
+                                "request_mirror target and were dropped.")
 
     def _cors(self, spec: RouteSpec, policy: dict) -> None:
         if not policy:
@@ -915,6 +1025,111 @@ class _Istio:
         if policy.get("outlierDetection") or policy.get("connectionPool"):
             self.report.warning("istio-resilience", ref, "outlierDetection/connectionPool are not migrated.")
         return tls, scheme, algorithm, hash_on, None
+
+
+_ISTIO_JWT_RULE_KEYS = frozenset({
+    "issuer", "audiences", "jwksUri", "jwks", "fromHeaders", "fromParams",
+    "forwardOriginalToken", "outputClaimToHeaders",
+})
+_GRPC_STATUS_NAMES = {
+    "OK": 0, "CANCELLED": 1, "UNKNOWN": 2, "INVALID_ARGUMENT": 3, "DEADLINE_EXCEEDED": 4,
+    "NOT_FOUND": 5, "ALREADY_EXISTS": 6, "PERMISSION_DENIED": 7, "RESOURCE_EXHAUSTED": 8,
+    "FAILED_PRECONDITION": 9, "ABORTED": 10, "OUT_OF_RANGE": 11, "UNIMPLEMENTED": 12,
+    "INTERNAL": 13, "UNAVAILABLE": 14, "DATA_LOSS": 15, "UNAUTHENTICATED": 16,
+}
+
+
+def _translate_request_auth(spec: dict) -> tuple[list[dict[str, Any]] | None, str | None]:
+    raw_rules = spec.get("jwtRules")
+    if not isinstance(raw_rules, list) or not raw_rules:
+        return None, "RequestAuthentication has no jwtRules"
+    if contains_secret_reference(raw_rules):
+        return None, "jwtRules contains a secret/vault reference"
+    providers: list[dict[str, Any]] = []
+    for rule in raw_rules:
+        if not isinstance(rule, dict):
+            return None, "jwtRules entry is not a mapping"
+        unknown = [str(k) for k in rule if k not in _ISTIO_JWT_RULE_KEYS]
+        if unknown:
+            return None, f"unsupported jwtRule field(s): {', '.join(sorted(unknown)[:4])}"
+        issuer = rule.get("issuer")
+        if not isinstance(issuer, str) or not issuer.strip():
+            return None, "jwtRule requires a non-empty issuer"
+        raw_och = rule.get("outputClaimToHeaders")
+        och: list[dict[str, Any]] | None = None
+        if raw_och is not None:
+            if not isinstance(raw_och, list):
+                return None, "outputClaimToHeaders must be a list"
+            och = []
+            for entry in raw_och:
+                if not isinstance(entry, dict) or set(entry) - {"header", "claim"}:
+                    return None, "outputClaimToHeaders entry has unsupported shape"
+                och.append({"claim": entry.get("claim"), "header": entry.get("header")})
+        raw_fh = rule.get("fromHeaders")
+        if raw_fh is not None:
+            if not isinstance(raw_fh, list) or any(not isinstance(h, dict) or set(h) - {"name", "prefix"} for h in raw_fh):
+                return None, "fromHeaders entry has unsupported shape"
+        provider, problem = jwks_provider_config(
+            issuer=issuer,
+            jwks_uri=rule.get("jwksUri"),
+            jwks=rule.get("jwks"),
+            audiences=rule.get("audiences"),
+            from_headers=raw_fh,
+            from_params=rule.get("fromParams"),
+            forward_original_token=rule.get("forwardOriginalToken"),
+            output_claim_headers=och,
+        )
+        if provider is None:
+            return None, problem
+        providers.append(provider)
+    return providers, None
+
+
+def _translate_istio_fault(raw: Any) -> tuple[dict[str, Any] | None, str | None]:
+    if not isinstance(raw, dict):
+        return None, "fault must be a mapping"
+    delay_cfg: dict[str, Any] | None = None
+    abort_cfg: dict[str, Any] | None = None
+    if raw.get("delay") is not None:
+        delay = raw.get("delay")
+        if not isinstance(delay, dict) or delay.get("exponentialDelay") is not None:
+            return None, "unsupported fault delay shape"
+        duration_ms = util.parse_go_duration_ms(delay.get("fixedDelay"))
+        if duration_ms is None:
+            return None, "delay.fixedDelay is missing or invalid"
+        pct_obj = delay.get("percentage")
+        if isinstance(pct_obj, dict) and pct_obj.get("value") is not None:
+            pct = pct_obj["value"]
+        elif delay.get("percent") is not None:
+            pct = delay["percent"]
+        else:
+            return None, "delay requires an explicit percentage"
+        delay_cfg = {"duration_ms": duration_ms, "percentage": pct}
+    if raw.get("abort") is not None:
+        abort = raw.get("abort")
+        if not isinstance(abort, dict) or abort.get("http2Error") is not None:
+            return None, "unsupported fault abort shape"
+        pct_obj = abort.get("percentage")
+        if not isinstance(pct_obj, dict) or pct_obj.get("value") is None:
+            return None, "abort requires an explicit percentage"
+        http_status = util.as_int(abort.get("httpStatus"))
+        grpc_raw = abort.get("grpcStatus")
+        grpc_code: int | None = None
+        if grpc_raw is not None:
+            if isinstance(grpc_raw, str) and grpc_raw.upper() in _GRPC_STATUS_NAMES:
+                grpc_code = _GRPC_STATUS_NAMES[grpc_raw.upper()]
+            else:
+                grpc_code = util.as_int(grpc_raw)
+            if grpc_code is None:
+                return None, "abort.grpcStatus is not representable"
+            if http_status is None:
+                http_status = 503
+        if http_status is None:
+            return None, "abort.httpStatus is missing or invalid"
+        abort_cfg = {"status_code": http_status, "percentage": pct_obj["value"]}
+        if grpc_code is not None:
+            abort_cfg["grpc_status"] = grpc_code
+    return fault_injection_config(abort=abort_cfg, delay=delay_cfg)
 
 
 def _bind_address(value: Any) -> str | None:

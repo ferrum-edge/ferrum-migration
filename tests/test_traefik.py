@@ -1139,6 +1139,71 @@ class TraefikHardeningTest(unittest.TestCase):
         self.assertEqual(len(result.config["upstreams"]), 1)
         self.assertEqual(result.config["upstreams"][0]["backend_tls_sni"], "backend.internal.test")
 
+    def test_compress_grpc_web_response_size_limiting_and_request_mirror(self):
+        doc = {
+            "http": {
+                "routers": {
+                    "r": {
+                        "rule": "Host(`a.example.test`) && PathPrefix(`/api/`)",
+                        "service": "mirrored",
+                        "middlewares": ["comp", "gw", "buf"],
+                    }
+                },
+                "middlewares": {
+                    "comp": {
+                        "compress": {
+                            "encodings": ["br", "gzip"],
+                            "minResponseBodyBytes": 2048,
+                            "includedContentTypes": ["application/json", "text/plain"],
+                            "excludedContentTypes": ["image/png"],
+                        }
+                    },
+                    "gw": {"grpcWeb": {"allowOrigins": ["https://app.example.test"]}},
+                    "buf": {"buffering": {"maxRequestBodyBytes": 1048576, "maxResponseBodyBytes": 4194304}},
+                },
+                "services": {
+                    "mirrored": {
+                        "mirroring": {
+                            "service": "main",
+                            "mirrorBody": True,
+                            "maxBodySize": 65536,
+                            "mirrors": [{"name": "shadow", "percent": 25}],
+                        }
+                    },
+                    "main": {"loadBalancer": {"servers": [{"url": "http://main.internal:8080"}]}},
+                    "shadow": {"loadBalancer": {"servers": [{"url": "http://shadow.internal:9090"}]}},
+                },
+            }
+        }
+        result, report, _ = asserted(yaml.safe_dump(doc))
+        assert_structurally_valid(self, result.config)
+        proxy = one_proxy(self, result.config, "/api", "a.example.test")
+        self.assertEqual(proxy["labels"]["ferrum-migration/status"], "migrated")
+        self.assertEqual(plugin(self, result.config, proxy, "compression")["config"], {
+            "algorithms": ["br", "gzip"],
+            "min_content_length": 2048,
+            "content_types": ["application/json", "text/plain"],
+        })
+        self.assertEqual(plugin(self, result.config, proxy, "grpc_web")["config"], {})
+        self.assertEqual(plugin(self, result.config, proxy, "request_size_limiting")["config"], {"max_bytes": 1048576})
+        self.assertEqual(plugin(self, result.config, proxy, "response_size_limiting")["config"], {"max_bytes": 4194304})
+        self.assertEqual(plugin(self, result.config, proxy, "request_mirror")["config"], {
+            "mirror_host": "shadow.internal",
+            "mirror_port": 9090,
+            "mirror_protocol": "http",
+            "allow_plaintext": True,
+            "percentage": 25.0,
+            "mirror_request_body": True,
+            "max_mirrored_request_body_bytes": 65536,
+        })
+        self.assertIn("traefik-compress", codes(report, "warning"))
+        self.assertIn("traefik-grpc-web", codes(report, "warning"))
+        self.assertIn("traefik-mirroring", codes(report, "warning"))
+        # Canonical schema gate checks newly supported compress/grpcWeb/mirror fields.
+        bad = yaml.safe_dump({"http": {"middlewares": {"c": {"compress": {"Encodings": ["gzip"]}}}}})
+        with self.assertRaises(InputError):
+            asserted(bad)
+
 
 if __name__ == "__main__":
     unittest.main()

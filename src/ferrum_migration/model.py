@@ -148,6 +148,8 @@ class ConsumerSpec:
     keyauth: list[str] = field(default_factory=list)
     #: HMAC JWT secrets; only populated with explicit --include-secrets.
     jwt: list[str] = field(default_factory=list)
+    #: Non-sensitive source metadata preserved as Ferrum consumer labels (e.g., Kong tags).
+    labels: dict[str, str] = field(default_factory=dict)
     withheld_secrets: int = 0
     quarantined: list[str] = field(default_factory=list)
 

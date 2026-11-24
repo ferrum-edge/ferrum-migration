@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import ipaddress
+import json
+import math
 import re
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlsplit
 
 from .. import matching, util
 from ..errors import InputError
@@ -258,6 +262,364 @@ def cors_config(origins: Any, methods: Any = None, headers: Any = None, exposed:
     if private_network is not None:
         config["allow_private_network"] = bool(private_network)
     return config, None
+
+
+# ------------------------------------------- shared plugin config builders
+
+_MEDIA_TYPE_RULE_RE = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+/(?:\*|[!#$%&'*+.^_`|~0-9A-Za-z-]+)$")
+_CORRELATION_ID_RESERVED_HEADERS = frozenset({
+    "api-key", "authentication-info", "authorization", "connection", "content-encoding", "content-length",
+    "cookie", "early-data", "expect", "forwarded", "grpc-message", "grpc-status", "grpc-status-details-bin",
+    "host", "keep-alive", "proxy-authenticate", "proxy-authentication-info", "proxy-authorization",
+    "proxy-connection", "sec-websocket-accept", "sec-websocket-extensions", "sec-websocket-key",
+    "sec-websocket-protocol", "sec-websocket-version", "set-cookie", "te", "traceparent", "tracestate",
+    "trailer", "transfer-encoding", "upgrade", "via", "www-authenticate", "x-api-key", "x-auth-token",
+    "x-csrf-token", "x-ferrum-original-content-encoding", "x-forwarded-authorization", "x-forwarded-for",
+    "x-forwarded-host", "x-forwarded-proto", "x-goog-api-key", "x-grpc-web-mode", "x-real-ip",
+    "x-xsrf-token", "x-authenticated-identity", "x-geo-country", "x-ferrum-hops",
+})
+_GATEWAY_ASSERTION_HEADERS = frozenset({"x-authenticated-identity", "x-geo-country", "x-ferrum-hops"})
+_OUTPUT_CLAIM_RESERVED_HEADERS = (
+    GATEWAY_OWNED_REQUEST_HEADERS
+    | _CORRELATION_ID_RESERVED_HEADERS
+    | frozenset({"x-forwarded-client-cert", "x-envoy-peer-metadata", "x-envoy-peer-metadata-id"})
+)
+MAX_COMPRESSION_CONTENT_TYPES = 64
+MAX_FAULT_DELAY_MS = 60_000
+MAX_FAULT_MATCH_HEADERS = 16
+MAX_OUTPUT_CLAIM_HEADERS = 16
+MAX_OUTPUT_CLAIM_HEADER_LEN = 128
+MAX_OUTPUT_CLAIM_PATH_LEN = 256
+MAX_MIRROR_BODY_BYTES = 10 * 1024 * 1024
+
+
+def is_loopback_ip_literal(host: str) -> bool:
+    """Whether ``host`` is an IPv4 or IPv6 loopback literal (``127.0.0.0/8`` or ``::1``)."""
+    bare = host[1:-1] if host.startswith("[") and host.endswith("]") else host
+    try:
+        return ipaddress.ip_address(bare).is_loopback
+    except ValueError:
+        return False
+
+
+def correlation_id_header_ok(name: Any) -> bool:
+    """Whether ``name`` is accepted by Ferrum v0.9.21 ``correlation_id.header_name``."""
+    if not isinstance(name, str):
+        return False
+    trimmed = name.strip()
+    if not trimmed or len(trimmed.encode("utf-8")) > 65_535 or not header_name_ok(trimmed):
+        return False
+    lower = trimmed.lower()
+    folded = fold(lower)
+    if lower in _CORRELATION_ID_RESERVED_HEADERS or folded in _CORRELATION_ID_RESERVED_HEADERS:
+        return False
+    return not folded.startswith(("x-consumer-", "x-ferrum-"))
+
+
+def compression_config(
+    algorithms: list[str] | None,
+    *,
+    min_content_length: int | None = None,
+    content_types: list[str] | None = None,
+    gzip_level: int | None = None,
+    brotli_quality: int | None = None,
+    zstd_level: int | None = None,
+    decompress_request: bool | None = None,
+) -> tuple[dict | None, str | None]:
+    """Build a Ferrum v0.9.21 ``compression`` plugin config, rejecting unsupported values."""
+    config: dict[str, Any] = {}
+    if algorithms is not None:
+        if not isinstance(algorithms, list) or not algorithms:
+            return None, "compression algorithms must be a non-empty list"
+        clean_algos: list[str] = []
+        for raw in algorithms:
+            if not isinstance(raw, str):
+                return None, "compression algorithm is not a string"
+            mapped = "br" if raw.lower() == "brotli" else raw.lower()
+            if mapped not in ("gzip", "br", "zstd"):
+                return None, f"unsupported compression algorithm {safe_label(raw, 24)}"
+            if mapped not in clean_algos:
+                clean_algos.append(mapped)
+        config["algorithms"] = clean_algos
+    if min_content_length is not None:
+        if isinstance(min_content_length, bool) or not isinstance(min_content_length, int) or min_content_length < 0:
+            return None, "min_content_length must be a non-negative integer"
+        config["min_content_length"] = min_content_length
+    if content_types is not None:
+        if not isinstance(content_types, list) or not content_types:
+            return None, "content_types must be a non-empty list"
+        clean_types: list[str] = []
+        for raw in content_types:
+            if not isinstance(raw, str) or not raw.isascii() or not _MEDIA_TYPE_RULE_RE.fullmatch(raw):
+                return None, f"content_type {safe_label(raw, 48)} is not a valid Ferrum media type rule"
+            lower = raw.lower()
+            if lower not in clean_types:
+                clean_types.append(lower)
+        if len(clean_types) > MAX_COMPRESSION_CONTENT_TYPES:
+            return None, f"content_types exceeds Ferrum's {MAX_COMPRESSION_CONTENT_TYPES}-entry limit"
+        config["content_types"] = clean_types
+    if gzip_level is not None:
+        if isinstance(gzip_level, bool) or not isinstance(gzip_level, int) or not 0 <= gzip_level <= 9:
+            return None, "gzip_level must be 0-9"
+        config["gzip_level"] = gzip_level
+    if brotli_quality is not None:
+        if isinstance(brotli_quality, bool) or not isinstance(brotli_quality, int) or not 0 <= brotli_quality <= 11:
+            return None, "brotli_quality must be 0-11"
+        config["brotli_quality"] = brotli_quality
+    if zstd_level is not None:
+        if isinstance(zstd_level, bool) or not isinstance(zstd_level, int) or not 1 <= zstd_level <= 19:
+            return None, "zstd_level must be 1-19"
+        config["zstd_level"] = zstd_level
+    if decompress_request is not None:
+        if not isinstance(decompress_request, bool):
+            return None, "decompress_request must be a boolean"
+        config["decompress_request"] = decompress_request
+    return config, None
+
+
+def _parse_percentage(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    val = float(value)
+    if not math.isfinite(val) or not 0.0 <= val <= 100.0:
+        return None
+    return val
+
+
+def fault_injection_config(
+    *,
+    abort: dict[str, Any] | None = None,
+    delay: dict[str, Any] | None = None,
+    match_headers: dict[str, str] | None = None,
+) -> tuple[dict | None, str | None]:
+    """Build a Ferrum v0.9.21 ``fault_injection`` config."""
+    config: dict[str, Any] = {}
+    if abort is not None:
+        status = util.as_int(abort.get("status_code"))
+        if status is None or not 200 <= status <= 599:
+            return None, "abort.status_code must be an integer in 200-599"
+        pct = _parse_percentage(abort.get("percentage"))
+        if pct is None:
+            return None, "abort.percentage must be in 0-100"
+        entry: dict[str, Any] = {"status_code": status, "percentage": pct}
+        if abort.get("grpc_status") is not None:
+            grpc = util.as_int(abort.get("grpc_status"))
+            if grpc is None or not 0 <= grpc <= 16:
+                return None, "abort.grpc_status must be an integer in 0-16"
+            entry["grpc_status"] = grpc
+        if abort.get("body") is not None:
+            if not isinstance(abort["body"], str):
+                return None, "abort.body must be a string"
+            entry["body"] = abort["body"]
+        config["abort"] = entry
+    if delay is not None:
+        duration_ms = util.as_int(delay.get("duration_ms"))
+        if duration_ms is None or not 1 <= duration_ms <= MAX_FAULT_DELAY_MS:
+            return None, f"delay.duration_ms must be 1-{MAX_FAULT_DELAY_MS}"
+        pct = _parse_percentage(delay.get("percentage"))
+        if pct is None:
+            return None, "delay.percentage must be in 0-100"
+        config["delay"] = {"duration_ms": duration_ms, "percentage": pct}
+    if not config:
+        return None, "fault_injection requires at least one of abort or delay"
+    if match_headers:
+        if len(match_headers) > MAX_FAULT_MATCH_HEADERS:
+            return None, f"match.headers exceeds Ferrum's {MAX_FAULT_MATCH_HEADERS}-header limit"
+        clean_headers: dict[str, str] = {}
+        for raw_name, raw_value in match_headers.items():
+            if not header_name_ok(raw_name):
+                return None, "match.headers contains an invalid HTTP header name"
+            lower = raw_name.lower()
+            folded = fold(lower)
+            if lower in _GATEWAY_ASSERTION_HEADERS or folded in _GATEWAY_ASSERTION_HEADERS \
+                    or folded.startswith(("x-consumer-", "x-ferrum-")):
+                return None, f"match.headers cannot name gateway-asserted header {lower}"
+            if lower in clean_headers:
+                return None, f"match.headers repeats header {lower}"
+            if not header_value_ok(raw_value):
+                return None, f"match.headers value for {lower} is not a valid HTTP header value"
+            clean_headers[lower] = raw_value
+        config["match"] = {"headers": clean_headers}
+    return config, None
+
+
+def request_mirror_config(
+    host: Any,
+    port: Any,
+    protocol: str = "http",
+    *,
+    percentage: float = 100.0,
+    mirror_path: str | None = None,
+    mirror_request_body: bool | None = None,
+    max_body_bytes: int | None = None,
+) -> tuple[dict | None, str | None]:
+    """Build a Ferrum v0.9.21 ``request_mirror`` config."""
+    norm_host = util.normalize_backend_host(host)
+    if norm_host is None:
+        return None, "mirror_host is not a valid hostname or IP address"
+    parsed_port = util.parse_port(port)
+    if parsed_port is None:
+        return None, "mirror_port must be 1-65535"
+    proto = str(protocol).lower()
+    if proto not in ("http", "https"):
+        return None, "mirror_protocol must be http or https"
+    pct = _parse_percentage(percentage)
+    if pct is None:
+        return None, "percentage must be in 0-100"
+    config: dict[str, Any] = {
+        "mirror_host": norm_host,
+        "mirror_port": parsed_port,
+        "mirror_protocol": proto,
+        "percentage": pct,
+    }
+    if proto == "http" and not is_loopback_ip_literal(norm_host):
+        config["allow_plaintext"] = True
+    if mirror_path is not None:
+        if not isinstance(mirror_path, str) or not mirror_path.startswith("/") \
+                or any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in mirror_path):
+            return None, "mirror_path must start with '/' and contain no control characters"
+        config["mirror_path"] = mirror_path
+    if mirror_request_body is not None:
+        if not isinstance(mirror_request_body, bool):
+            return None, "mirror_request_body must be a boolean"
+        config["mirror_request_body"] = mirror_request_body
+    if max_body_bytes is not None:
+        if isinstance(max_body_bytes, bool) or not isinstance(max_body_bytes, int) or max_body_bytes <= 0:
+            return None, "max_mirrored_request_body_bytes must be a positive integer"
+        config["max_mirrored_request_body_bytes"] = min(max_body_bytes, MAX_MIRROR_BODY_BYTES)
+    return config, None
+
+
+def jwks_provider_config(
+    *,
+    issuer: Any = None,
+    jwks_uri: Any = None,
+    jwks: Any = None,
+    audiences: Any = None,
+    from_headers: Any = None,
+    from_params: Any = None,
+    forward_original_token: Any = None,
+    output_claim_headers: Any = None,
+) -> tuple[dict | None, str | None]:
+    """Build one validated Ferrum v0.9.21 ``jwks_auth.providers[]`` entry."""
+    has_uri = jwks_uri is not None
+    has_inline = jwks is not None
+    if has_uri == has_inline:
+        return None, "provider must specify exactly one of jwks_uri or inline jwks"
+    provider: dict[str, Any] = {}
+    if has_uri:
+        if not isinstance(jwks_uri, str) or not jwks_uri.strip():
+            return None, "jwks_uri must be a non-empty URL string"
+        uri = jwks_uri.strip()
+        if any(ord(ch) <= 0x20 or ord(ch) == 0x7F for ch in uri):
+            return None, "jwks_uri contains whitespace or control characters"
+        try:
+            parts = urlsplit(uri)
+        except ValueError:
+            return None, "jwks_uri is not a valid URL"
+        if parts.username is not None or parts.password is not None or not parts.hostname:
+            return None, "jwks_uri must have a host and no userinfo"
+        scheme = parts.scheme.lower()
+        if scheme == "https":
+            pass
+        elif scheme == "http" and is_loopback_ip_literal(parts.hostname):
+            pass
+        else:
+            return None, "jwks_uri must use https (or http to a loopback IP literal)"
+        provider["jwks_uri"] = uri
+    else:
+        if isinstance(jwks, str):
+            raw_jwks = jwks.strip()
+            if not raw_jwks:
+                return None, "inline jwks must not be empty"
+            try:
+                parsed_jwks = json.loads(raw_jwks)
+            except ValueError:
+                return None, "inline jwks is not valid JSON"
+        elif isinstance(jwks, dict):
+            parsed_jwks = jwks
+        else:
+            return None, "inline jwks must be a JSON string or object"
+        if not isinstance(parsed_jwks, dict) or not isinstance(parsed_jwks.get("keys"), list) \
+                or not parsed_jwks["keys"] or not all(isinstance(k, dict) for k in parsed_jwks["keys"]):
+            return None, "inline jwks must be a JWKS object with a non-empty keys array"
+        for key_entry in parsed_jwks["keys"]:
+            if str(key_entry.get("kty", "")).lower() == "oct" \
+                    or any(secret_field in key_entry for secret_field in ("d", "p", "q", "dp", "dq", "qi", "k", "oth")):
+                return None, "inline jwks contains private or symmetric key material, which is never copied"
+        provider["jwks"] = parsed_jwks
+    if issuer is not None:
+        if not isinstance(issuer, str) or not issuer.strip() \
+                or any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in issuer):
+            return None, "issuer must be a non-empty printable string"
+        provider["issuer"] = issuer.strip()
+    if audiences is not None:
+        auds = str_list(audiences)
+        if auds is None or any(not a.strip() for a in auds):
+            return None, "audiences must be a list of non-empty strings"
+        if auds:
+            provider["audiences"] = [a.strip() for a in auds]
+    if from_headers is not None:
+        if not isinstance(from_headers, list):
+            return None, "from_headers must be a list"
+        clean_fh: list[dict[str, str]] = []
+        for item in from_headers:
+            if not isinstance(item, dict):
+                return None, "from_headers entry must be a mapping"
+            hname = item.get("name")
+            if not isinstance(hname, str) or not hname.strip() or not header_name_ok(hname.strip()):
+                return None, "from_headers entry has an invalid header name"
+            entry: dict[str, str] = {"name": hname.strip().lower()}
+            prefix = item.get("prefix")
+            if prefix is not None:
+                if not isinstance(prefix, str):
+                    return None, "from_headers prefix must be a string"
+                if prefix:
+                    entry["prefix"] = prefix
+            clean_fh.append(entry)
+        if clean_fh:
+            provider["from_headers"] = clean_fh
+    if from_params is not None:
+        params = str_list(from_params)
+        if params is None or any(not p.strip() or any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7F for ch in p)
+                                 for p in params):
+            return None, "from_params must be a list of valid parameter names"
+        if params:
+            provider["from_params"] = [p.strip() for p in params]
+    if forward_original_token is not None:
+        if not isinstance(forward_original_token, bool):
+            return None, "forward_original_token must be a boolean"
+        provider["forward_original_token"] = forward_original_token
+    if output_claim_headers is not None:
+        if not isinstance(output_claim_headers, list):
+            return None, "output_claim_headers must be a list"
+        if len(output_claim_headers) > MAX_OUTPUT_CLAIM_HEADERS:
+            return None, f"output_claim_headers exceeds Ferrum's {MAX_OUTPUT_CLAIM_HEADERS}-entry limit"
+        seen_dests: set[str] = set()
+        clean_och: list[dict[str, str]] = []
+        for item in output_claim_headers:
+            if not isinstance(item, dict):
+                return None, "output_claim_headers entry must be a mapping"
+            claim = item.get("claim")
+            header = item.get("header")
+            if not isinstance(claim, str) or not claim or len(claim.encode("utf-8")) > MAX_OUTPUT_CLAIM_PATH_LEN \
+                    or any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7F for ch in claim):
+                return None, "output_claim_headers claim path is not valid"
+            if not isinstance(header, str) or not header.strip() or not header_name_ok(header.strip()):
+                return None, "output_claim_headers header name is not valid"
+            dest = header.strip().lower()
+            folded = fold(dest)
+            if len(dest.encode("utf-8")) > MAX_OUTPUT_CLAIM_HEADER_LEN \
+                    or dest in _OUTPUT_CLAIM_RESERVED_HEADERS or folded in _OUTPUT_CLAIM_RESERVED_HEADERS \
+                    or folded.startswith(("x-consumer-", "x-ferrum-", "x-path-param-", "grpc-", "sec-")):
+                return None, f"output_claim_headers cannot target reserved header {dest}"
+            if folded in seen_dests:
+                return None, f"output_claim_headers declares header {dest} more than once"
+            seen_dests.add(folded)
+            clean_och.append({"claim": claim, "header": dest})
+        if clean_och:
+            provider["output_claim_headers"] = clean_och
+    return provider, None
 
 
 def split_csv(value: Any) -> list[str]:

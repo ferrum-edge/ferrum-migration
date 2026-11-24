@@ -55,8 +55,9 @@ from ..errors import InputError
 from ..model import BackendRef, Plan, PluginSpec, RouteSpec, Target, TlsSpec, UpstreamSpec
 from ..redact import safe_label
 from ..safe_load import load_structured
-from .common import (SourceContext, check_route_budget, cors_config, literal_value, mapping,
-                     merge_weighted_targets, request_header_rule, response_header_rule, seq, str_list)
+from .common import (SourceContext, check_route_budget, compression_config, cors_config, literal_value, mapping,
+                     merge_weighted_targets, request_header_rule, request_mirror_config, response_header_rule, seq,
+                     str_list)
 
 PLATFORM = "traefik"
 REPRESENTABLE_MATCHERS = {"Host", "HostHeader", "Path", "PathPrefix", "Method"}
@@ -134,7 +135,9 @@ _TYPED_FIELDS: dict[str, dict[str, Any]] = {
                     "followRedirects": None, "headers": None},
     "weighted": {"services": ("list", "weightedService"), "sticky": "sticky", "healthCheck": None},
     "weightedService": {"name": None, "weight": None},
-    "mirroring": {"service": None, "mirrorBody": None, "maxBodySize": None, "mirrors": None, "healthCheck": None},
+    "mirroring": {"service": None, "mirrorBody": None, "maxBodySize": None, "mirrors": ("list", "mirror"),
+                  "healthCheck": None},
+    "mirror": {"name": None, "percent": None},
     "serversTransport": {"serverName": None, "insecureSkipVerify": None, "rootCAs": None,
                          "certificates": ("list", "certificate"), "maxIdleConnsPerHost": None,
                          "forwardingTimeouts": "forwardingTimeouts", "disableHTTP2": None, "peerCertURI": None,
@@ -148,8 +151,11 @@ _TYPED_FIELDS: dict[str, dict[str, Any]] = {
                    "ipAllowList": "ipAllowList", "headers": "headers", "errors": None, "rateLimit": "rateLimit",
                    "redirectRegex": None, "redirectScheme": "redirectScheme", "basicAuth": "basicAuth",
                    "digestAuth": None, "forwardAuth": None, "inFlightReq": None, "buffering": "buffering",
-                   "circuitBreaker": None, "compress": None, "passTLSClientCert": None, "retry": "retry",
-                   "contentType": None, "grpcWeb": None, "plugin": None},
+                   "circuitBreaker": None, "compress": "compress", "passTLSClientCert": None, "retry": "retry",
+                   "contentType": None, "grpcWeb": "grpcWeb", "plugin": None},
+    "compress": {"excludedContentTypes": None, "includedContentTypes": None, "minResponseBodyBytes": None,
+                 "defaultEncoding": None, "encodings": None},
+    "grpcWeb": {"allowOrigins": None},
     "addPrefix": {"prefix": None},
     "stripPrefix": {"prefixes": None, "forceSlash": None},
     "chain": {"middlewares": None},
@@ -755,6 +761,9 @@ class _Traefik:
             spec.read_timeout_ms = backend_info.get("read")
             spec.retry = acc.retry
             spec.plugins = [PluginSpec(p.name, p.config, p.ref, p.shared_key) for p in acc.plugins]
+            for extra_plugin in backend_info.get("plugins", []):
+                spec.plugins.append(PluginSpec(extra_plugin.name, extra_plugin.config, extra_plugin.ref,
+                                               extra_plugin.shared_key))
             self._apply_paths(spec, acc)
             self.priority[id(spec)] = (priority, name)
             self.plan.routes.append(spec)
@@ -1047,10 +1056,24 @@ class _Traefik:
         elif mw_type == "rateLimit":
             self._rate_limit(config, acc, ref)
         elif mw_type == "buffering":
-            size = util.as_int(config.get("maxRequestBodyBytes"))
-            if size and size > 0:
-                acc.plugins.append(PluginSpec("request_size_limiting", {"max_bytes": size}, ref))
-            self.report.info("traefik-buffering", ref, "Only maxRequestBodyBytes is migrated from buffering.")
+            req_size = util.as_int(config.get("maxRequestBodyBytes"))
+            if req_size and req_size > 0:
+                acc.plugins.append(PluginSpec("request_size_limiting", {"max_bytes": req_size}, ref))
+            resp_size = util.as_int(config.get("maxResponseBodyBytes"))
+            if resp_size and resp_size > 0:
+                acc.plugins.append(PluginSpec("response_size_limiting", {"max_bytes": resp_size}, ref))
+            if any(config.get(k) for k in ("memRequestBodyBytes", "memResponseBodyBytes", "retryExpression")) \
+                    or not ((req_size and req_size > 0) or (resp_size and resp_size > 0)):
+                self.report.info("traefik-buffering", ref,
+                                 "Only maxRequestBodyBytes and maxResponseBodyBytes are migrated from buffering.")
+        elif mw_type == "compress":
+            self._compress(config, acc, ref)
+        elif mw_type == "grpcWeb":
+            acc.plugins.append(PluginSpec("grpc_web", {}, ref))
+            if config.get("allowOrigins"):
+                self.report.warning("traefik-grpc-web", ref,
+                                    "grpcWeb.allowOrigins is not configured inside Ferrum's grpc_web plugin; "
+                                    "configure Ferrum's cors plugin if cross-origin browser access is required.")
         elif mw_type == "redirectScheme":
             if config.get("scheme") == "https":
                 acc.https_redirect = True
@@ -1061,12 +1084,45 @@ class _Traefik:
             if attempts and attempts > 0:
                 acc.retry = {"max_retries": min(attempts, util.MAX_RETRIES), "retry_on_connect_failure": True,
                              "retryable_status_codes": []}
-        elif mw_type in ("compress", "contentType"):
+        elif mw_type == "contentType":
             self.report.info("traefik-middleware-omitted", ref, f"{mw_type} is not migrated (no security impact).")
         elif mw_type in ("circuitBreaker", "errors", "passTLSClientCert"):
             self.report.warning("traefik-middleware-omitted", ref, f"{mw_type} is not migrated.")
         else:
             acc.refusals.append(f"middleware type {safe_label(mw_type, 40)} has no safe Ferrum equivalent")
+
+    def _compress(self, config: dict, acc: _Acc, ref: str) -> None:
+        raw_enc = config.get("encodings")
+        encodings = str_list(raw_enc) if raw_enc is not None else ["gzip", "br"]
+        if raw_enc is not None and (encodings is None or not encodings):
+            self.report.warning("traefik-compress", ref, "compress omitted: encodings has unexpected types.")
+            return
+        raw_min = config.get("minResponseBodyBytes")
+        min_len: int | None = None
+        if raw_min is not None:
+            min_len = util.as_int(raw_min)
+            if min_len is None or min_len < 0:
+                self.report.warning("traefik-compress", ref, "compress omitted: invalid minResponseBodyBytes.")
+                return
+        raw_inc = config.get("includedContentTypes")
+        inc: list[str] | None = None
+        if raw_inc is not None:
+            inc = str_list(raw_inc)
+            if not inc:
+                self.report.warning("traefik-compress", ref, "compress omitted: invalid includedContentTypes.")
+                return
+        built, problem = compression_config(encodings, min_content_length=min_len, content_types=inc)
+        if built is None:
+            self.report.warning("traefik-compress", ref, f"compress omitted ({problem}).")
+            return
+        if config.get("excludedContentTypes"):
+            self.report.warning("traefik-compress", ref,
+                                "compress.excludedContentTypes has no Ferrum equivalent (Ferrum uses an allow-list "
+                                "of content_types).")
+        if config.get("defaultEncoding"):
+            self.report.warning("traefik-compress", ref,
+                                "compress.defaultEncoding is not migrated; Ferrum negotiates via Accept-Encoding.")
+        acc.plugins.append(PluginSpec("compression", built, ref))
 
     def _headers(self, config: dict, acc: _Acc, ref: str) -> None:
         for key in ("sslRedirect", "sslTemporaryRedirect", "sslHost", "sslForceHost", "sslProxyHeaders"):
@@ -1206,8 +1262,8 @@ class _Traefik:
         if "weighted" in raw and depth == 0:
             return self._weighted(name, mapping(raw["weighted"]), ref)
         if "mirroring" in raw and depth == 0:
-            self.report.warning("traefik-mirroring", ref, "Mirrors are dropped; only the main service is migrated.")
-            main = mapping(raw["mirroring"]).get("service")
+            mirroring = mapping(raw["mirroring"])
+            main = mirroring.get("service")
             if not isinstance(main, str) or not main:
                 return {"problems": ["mirroring without service"]}
             main_base, _, main_provider = main.partition("@")
@@ -1215,8 +1271,66 @@ class _Traefik:
                 return {"problems": [f"internal service {safe_label(main_base, 32)} (dashboard/API) is not migrated"]}
             if main_provider not in ("", "file"):
                 return {"problems": [f"service from provider {safe_label(main_provider, 32)} is not in the input"]}
-            return self._service(main_base, depth + 1)
+            main_result = self._service(main_base, depth + 1)
+            if main_result.get("problems"):
+                return main_result
+            mirror_plugins, dropped = self._mirror_plugins(mirroring, ref)
+            if mirror_plugins:
+                main_result = dict(main_result)
+                main_result["plugins"] = list(main_result.get("plugins", [])) + mirror_plugins
+                self.report.warning("traefik-mirroring", ref,
+                                    f"Migrated {len(mirror_plugins)} mirror target(s) to request_mirror; Ferrum "
+                                    "redacts credential-like headers and query parameters on mirrored requests by "
+                                    "default (stricter).")
+            if dropped:
+                self.report.warning("traefik-mirroring", ref,
+                                    f"{dropped} mirror target(s) could not be represented as a single static "
+                                    "request_mirror target and were dropped.")
+            return main_result
         return {"problems": ["service type (failover or nested weighted) is not supported"]}
+
+    def _mirror_plugins(self, mirroring: dict, ref: str) -> tuple[list[PluginSpec], int]:
+        plugins: list[PluginSpec] = []
+        dropped = 0
+        raw_body = mirroring.get("mirrorBody")
+        mirror_body = raw_body if isinstance(raw_body, bool) else (True if raw_body is None else None)
+        raw_max = util.as_int(mirroring.get("maxBodySize"))
+        max_body = raw_max if (raw_max is not None and raw_max > 0) else None
+        for entry in seq(mirroring.get("mirrors")):
+            if not isinstance(entry, dict) or not isinstance(entry.get("name"), str):
+                dropped += 1
+                continue
+            raw_pct = entry.get("percent")
+            if isinstance(raw_pct, bool) or not isinstance(raw_pct, (int, float)):
+                dropped += 1
+                continue
+            pct = float(raw_pct)
+            if pct == 0.0:
+                continue
+            base, _, provider = entry["name"].partition("@")
+            if provider not in ("", "file"):
+                dropped += 1
+                continue
+            target_raw = mapping(self.services.get(base))
+            lb = mapping(target_raw.get("loadBalancer"))
+            if not lb:
+                dropped += 1
+                continue
+            scheme, targets, problems = self._servers(lb, ref)
+            tls, _timeouts, transport_problems = self._transport(lb.get("serversTransport"), ref)
+            if problems or transport_problems or scheme is None or len(targets) != 1 \
+                    or (scheme == "https" and (tls.ca_path or tls.client_cert_path or tls.sni or tls.san_allow_list)):
+                dropped += 1
+                continue
+            built, problem = request_mirror_config(
+                targets[0].host, targets[0].port, scheme,
+                percentage=pct, mirror_request_body=mirror_body, max_body_bytes=max_body,
+            )
+            if built is None:
+                dropped += 1
+                continue
+            plugins.append(PluginSpec("request_mirror", built, ref))
+        return plugins, dropped
 
     def _transport(self, name: Any, ref: str) -> tuple[TlsSpec, dict, list[str]]:
         """Backend TLS, forwarding timeouts and refusal reasons for one ``serversTransport`` reference.

@@ -18,8 +18,8 @@ from ..errors import InputError
 from ..limits import Limits
 from ..model import BackendRef, HostScope, Plan, PluginSpec, RouteSpec, Target, TlsSpec, UpstreamSpec
 from ..redact import safe_label
-from .common import (SourceContext, check_route_budget, choose_main_port, header_value_ok, is_sensitive_header,
-                     literal_value, request_header_rule, response_header_rule)
+from .common import (SourceContext, check_route_budget, choose_main_port, compression_config, header_value_ok,
+                     is_sensitive_header, literal_value, request_header_rule, response_header_rule)
 
 PLATFORM = "nginx"
 
@@ -156,7 +156,7 @@ SAFE_IGNORED = {
     "send_timeout", "resolver", "resolver_timeout", "ssl_session_cache", "ssl_session_timeout",
     "ssl_session_tickets", "ssl_prefer_server_ciphers", "ssl_ciphers", "ssl_protocols", "ssl_dhparam",
     "ssl_ecdh_curve", "ssl_stapling", "ssl_stapling_verify", "ssl_trusted_certificate", "ssl_buffer_size",
-    "gzip", "gzip_types", "gzip_vary", "gzip_proxied", "gzip_comp_level", "gzip_min_length", "gzip_disable",
+    "gzip_vary", "gzip_proxied", "gzip_disable",
     "gzip_http_version", "gzip_buffers", "open_file_cache", "open_file_cache_valid", "open_file_cache_min_uses",
     "open_file_cache_errors", "reset_timedout_connection", "index", "absolute_redirect", "port_in_redirect",
     "server_name_in_redirect", "chunked_transfer_encoding", "merge_slashes", "proxy_ignore_client_abort",
@@ -190,7 +190,7 @@ STRUCTURAL = {"server", "location", "listen", "server_name", "proxy_pass", "grpc
               "auth_basic_user_file", "proxy_ssl_verify", "proxy_ssl_trusted_certificate", "proxy_ssl_certificate",
               "proxy_ssl_certificate_key", "proxy_ssl_name", "proxy_ssl_server_name", "grpc_ssl_verify",
               "grpc_ssl_trusted_certificate", "grpc_ssl_certificate", "grpc_ssl_certificate_key", "grpc_ssl_name",
-              "grpc_ssl_server_name"} | INHERITED_ARRAYS
+              "grpc_ssl_server_name", "gzip", "gzip_types", "gzip_comp_level", "gzip_min_length"} | INHERITED_ARRAYS
 PROXY_PARAMS = [("Host", "$http_host"), ("X-Real-IP", "$remote_addr"),
                 ("X-Forwarded-For", "$proxy_add_x_forwarded_for"), ("X-Forwarded-Proto", "$scheme")]
 
@@ -204,6 +204,10 @@ class _Scope:
     auth_basic_file: str | None = None
     proxy_ssl: dict[str, str] = field(default_factory=dict)
     grpc_ssl: dict[str, str] = field(default_factory=dict)
+    gzip: str | None = None
+    gzip_types: list[str] | None = None
+    gzip_min_length: int | None = None
+    gzip_comp_level: int | None = None
     problems: list[str] = field(default_factory=list)
 
 
@@ -224,6 +228,9 @@ class _Nginx:
         child = _Scope(arrays=dict(parent.arrays), body_size=parent.body_size, timeouts=dict(parent.timeouts),
                        auth_basic=parent.auth_basic, auth_basic_file=parent.auth_basic_file,
                        proxy_ssl=dict(parent.proxy_ssl), grpc_ssl=dict(parent.grpc_ssl),
+                       gzip=parent.gzip,
+                       gzip_types=list(parent.gzip_types) if parent.gzip_types is not None else None,
+                       gzip_min_length=parent.gzip_min_length, gzip_comp_level=parent.gzip_comp_level,
                        problems=list(parent.problems))
         level: dict[str, list[list[str]]] = {}
         for directive in directives:
@@ -263,6 +270,19 @@ class _Nginx:
                 child.proxy_ssl[name.split("_", 2)[2]] = args[0]
             elif name.startswith("grpc_ssl_") and name in STRUCTURAL and args:
                 child.grpc_ssl[name.split("_", 2)[2]] = args[0]
+            elif name == "gzip" and args:
+                if args[0] in ("on", "off"):
+                    child.gzip = args[0]
+            elif name == "gzip_comp_level" and args:
+                level = util.as_int(args[0])
+                if level is not None and 1 <= level <= 9:
+                    child.gzip_comp_level = level
+            elif name == "gzip_min_length" and args:
+                length = util.parse_nginx_size(args[0])
+                if length is not None and length >= 0:
+                    child.gzip_min_length = length
+            elif name == "gzip_types" and args:
+                child.gzip_types = list(args)
             elif name == "satisfy" and args and args[0] == "any":
                 child.problems.append("satisfy any (OR of access and auth) has no Ferrum equivalent")
             elif name in STRUCTURAL or name in SAFE_IGNORED or name in DEFINITIONS:
@@ -1021,6 +1041,32 @@ class _Nginx:
             route.plugins.append(PluginSpec("rate_limiting", config, ref, shared_key=f"zone-{zone_name}"))
             self.report.warning("nginx-limit-req", ref, "limit_req burst/delay semantics differ: Ferrum enforces the "
                                 "same average rate with its own bucket behavior.")
+        if scope.gzip == "on":
+            content_types: list[str] | None = None
+            if scope.gzip_types is not None:
+                if "*" in scope.gzip_types:
+                    self.report.warning("nginx-gzip", ref,
+                                        "gzip_types '*' has no Ferrum equivalent; using Ferrum's default "
+                                        "compressible content types.")
+                else:
+                    candidate = ["text/html"] + [t for t in scope.gzip_types if t.lower() != "text/html"]
+                    built_check, problem = compression_config(["gzip"], content_types=candidate)
+                    if built_check is not None:
+                        content_types = built_check["content_types"]
+                    else:
+                        self.report.warning("nginx-gzip", ref,
+                                            f"gzip_types could not be represented ({problem}); using Ferrum's "
+                                            "default compressible content types.")
+            comp_cfg, comp_problem = compression_config(
+                ["gzip"],
+                min_content_length=scope.gzip_min_length,
+                content_types=content_types,
+                gzip_level=scope.gzip_comp_level,
+            )
+            if comp_cfg is not None:
+                route.plugins.append(PluginSpec("compression", comp_cfg, ref))
+            else:
+                self.report.warning("nginx-gzip", ref, f"gzip omitted ({comp_problem}).")
         size = scope.body_size if scope.body_size is not None else 1024 * 1024
         self.body_sizes.append((route, size))
 

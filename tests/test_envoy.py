@@ -543,6 +543,105 @@ class EnvoyHardeningTest(unittest.TestCase):
         self.assertEqual(len(cors_plugins), 1)
         self.assertFalse(cors_plugins[0]["config"].get("allow_credentials", False))
 
+    def test_grpc_web_compressor_fault_jwt_authn_and_request_mirror_policies(self):
+        doc = minimal_bootstrap({"path_separated_prefix": "/api"})
+        doc["static_resources"]["clusters"].append({
+            "name": "shadow", "type": "STRICT_DNS",
+            "load_assignment": {"endpoints": [{"lb_endpoints": [
+                {"endpoint": {"address": {"socket_address": {"address": "shadow.internal", "port_value": 9000}}}}
+            ]}]},
+        })
+        hcm = doc["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"]
+        hcm["http_filters"] = [
+            {"name": "envoy.filters.http.grpc_web",
+             "typed_config": {"@type": "type.googleapis.com/envoy.extensions.filters.http.grpc_web.v3.GrpcWeb"}},
+            {"name": "envoy.filters.http.compressor",
+             "typed_config": {
+                 "@type": "type.googleapis.com/envoy.extensions.filters.http.compressor.v3.Compressor",
+                 "compressor_library": {"name": "text_optimized", "typed_config": {
+                     "@type": "type.googleapis.com/envoy.extensions.compression.gzip.compressor.v3.Gzip"
+                 }},
+                 "response_direction_config": {"common_config": {
+                     "min_content_length": 512, "content_type": ["application/json", "text/plain"]
+                 }},
+                 "request_direction_config": {"common_config": {"enabled": {"default_value": True}}},
+             }},
+            {"name": "envoy.filters.http.fault",
+             "typed_config": {
+                 "@type": "type.googleapis.com/envoy.extensions.filters.http.fault.v3.HTTPFault",
+                 "delay": {"fixed_delay": "0.5s", "percentage": {"numerator": 10, "denominator": "HUNDRED"}},
+                 "abort": {"http_status": 503, "percentage": {"numerator": 5, "denominator": "HUNDRED"}},
+                 "headers": [{"name": "x-chaos", "exact_match": "1"}],
+             }},
+            {"name": "envoy.filters.http.jwt_authn",
+             "typed_config": {
+                 "@type": "type.googleapis.com/envoy.extensions.filters.http.jwt_authn.v3.JwtAuthentication",
+                 "providers": {
+                     "idp": {
+                         "issuer": "https://idp.example.test",
+                         "audiences": ["api"],
+                         "remote_jwks": {"http_uri": {"uri": "https://idp.example.test/.well-known/jwks.json",
+                                                      "cluster": "jwks", "timeout": "5s"}},
+                         "from_headers": [{"name": "Authorization", "value_prefix": "Bearer "}],
+                         "forward": True,
+                         "claim_to_headers": [{"header_name": "x-jwt-sub", "claim_name": "sub"}],
+                     }
+                 },
+                 "rules": [{"match": {"prefix": "/"}, "requires": {"provider_name": "idp"}}],
+             }},
+            {"name": "envoy.filters.http.router"},
+        ]
+        route = hcm["route_config"]["virtual_hosts"][0]["routes"][0]
+        route["route"]["request_mirror_policies"] = [{
+            "cluster": "shadow",
+            "runtime_fraction": {"default_value": {"numerator": 2500, "denominator": "TEN_THOUSAND"}},
+        }]
+        # Also add a direct_response route to verify fail-closed refusal when jwt_authn is active.
+        hcm["route_config"]["virtual_hosts"][0]["routes"].append({
+            "name": "health", "match": {"path": "/healthz"},
+            "direct_response": {"status": 200, "body": {"inline_string": "ok"}},
+        })
+        result, report, _ = migrate("envoy", yaml.safe_dump(doc))
+        assert_structurally_valid(self, result.config)
+        api = one_proxy(self, result.config, "/api")
+        self.assertEqual(api["labels"]["ferrum-migration/status"], "migrated")
+        self.assertEqual(plugin(self, result.config, api, "grpc_web")["config"], {})
+        self.assertEqual(plugin(self, result.config, api, "compression")["config"], {
+            "algorithms": ["gzip"], "min_content_length": 512,
+            "content_types": ["application/json", "text/plain"], "decompress_request": True,
+        })
+        self.assertEqual(plugin(self, result.config, api, "fault_injection")["config"], {
+            "delay": {"duration_ms": 500, "percentage": 10.0},
+            "abort": {"status_code": 503, "percentage": 5.0},
+            "match": {"headers": {"x-chaos": "1"}},
+        })
+        self.assertEqual(plugin(self, result.config, api, "jwks_auth")["config"], {
+            "providers": [{
+                "jwks_uri": "https://idp.example.test/.well-known/jwks.json",
+                "issuer": "https://idp.example.test",
+                "audiences": ["api"],
+                "from_headers": [{"name": "authorization", "prefix": "Bearer "}],
+                "forward_original_token": True,
+                "output_claim_headers": [{"claim": "sub", "header": "x-jwt-sub"}],
+            }]
+        })
+        self.assertEqual(plugin(self, result.config, api, "request_mirror")["config"], {
+            "mirror_host": "shadow.internal", "mirror_port": 9000, "mirror_protocol": "http",
+            "allow_plaintext": True, "percentage": 25.0,
+        })
+        self.assertIn("envoy-mirror", codes(report, "warning"))
+        # Terminated route under jwt_authn refuses (Ferrum request_termination runs before jwks_auth).
+        self.assertEqual(one_proxy(self, result.config, "=/healthz")["labels"]["ferrum-migration/status"], "refused")
+
+        # Unsupported jwt_authn (path-scoped rule or symmetric JWK) refuses fail-closed.
+        bad_jwt = copy.deepcopy(doc)
+        bad_hcm = bad_jwt["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"]
+        bad_hcm["http_filters"][3]["typed_config"]["rules"] = [
+            {"match": {"prefix": "/admin"}, "requires": {"provider_name": "idp"}}
+        ]
+        bad_res, _bad_rep, _ = migrate("envoy", yaml.safe_dump(bad_jwt))
+        self.assertEqual(one_proxy(self, bad_res.config, "/api")["labels"]["ferrum-migration/status"], "refused")
+
 
 if __name__ == "__main__":
     unittest.main()

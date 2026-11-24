@@ -395,6 +395,84 @@ class FerrumBinaryValidateTest(unittest.TestCase):
             completed = self.validate(binary, directory, result.config, result.basic_auth_used)
             self.assertNotEqual(completed.returncode, 0, completed.stdout + completed.stderr)
 
+    def test_extended_plugins_pass_ferrum_validate(self):
+        """Admission regression: all newly mapped plugins and consumer labels pass real ferrum-edge validate."""
+        binary = os.environ["FERRUM_EDGE_BIN"]
+        kong_text = (
+            '_format_version: "3.0"\n'
+            "consumers:\n"
+            "  - username: alice\n"
+            "    tags: [tier-gold, team-api]\n"
+            "services:\n"
+            "  - name: s\n"
+            "    url: http://s.internal:8080\n"
+            "    routes:\n"
+            "      - name: ok\n"
+            "        paths: [/ok/]\n"
+            "        plugins:\n"
+            "          - name: correlation-id\n"
+            "            config: {header_name: X-Trace-ID, echo_downstream: true}\n"
+            "          - name: bot-detection\n"
+            "            config: {allow: [Googlebot]}\n"
+            "          - name: grpc-web\n"
+            "            config: {}\n"
+            "          - name: proxy-cache\n"
+            "            config: {strategy: memory, request_method: [GET, HEAD], response_code: [200, 301], "
+            "cache_ttl: 120, cache_control: true, vary_headers: [Accept-Encoding]}\n"
+        )
+        traefik_text = yaml.safe_dump({
+            "http": {
+                "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "mirrored",
+                                  "middlewares": ["comp", "gw", "buf"]}},
+                "middlewares": {
+                    "comp": {"compress": {"encodings": ["br", "gzip"], "minResponseBodyBytes": 1024,
+                                          "includedContentTypes": ["application/json", "text/plain"]}},
+                    "gw": {"grpcWeb": {}},
+                    "buf": {"buffering": {"maxRequestBodyBytes": 1048576, "maxResponseBodyBytes": 2097152}},
+                },
+                "services": {
+                    "mirrored": {"mirroring": {"service": "main", "mirrorBody": True, "maxBodySize": 65536,
+                                               "mirrors": [{"name": "shadow", "percent": 20}]}},
+                    "main": {"loadBalancer": {"servers": [{"url": "http://main.internal:8080"}]}},
+                    "shadow": {"loadBalancer": {"servers": [{"url": "http://shadow.internal:9090"}]}},
+                },
+            }
+        })
+        istio_text = (
+            "apiVersion: networking.istio.io/v1\nkind: Gateway\nmetadata: {name: gw, namespace: edge}\nspec:\n"
+            "  selector: {istio: ingressgateway}\n"
+            "  servers: [{port: {number: 80, name: http, protocol: HTTP}, hosts: [api.example.test]}]\n"
+            "---\napiVersion: security.istio.io/v1\nkind: RequestAuthentication\n"
+            "metadata: {name: jwt-policy, namespace: edge}\nspec:\n"
+            "  selector: {matchLabels: {istio: ingressgateway}}\n"
+            "  jwtRules:\n"
+            "    - issuer: https://idp.example.test\n"
+            "      jwksUri: https://idp.example.test/.well-known/jwks.json\n"
+            "      audiences: [api]\n"
+            "      fromHeaders: [{name: Authorization, prefix: 'Bearer '}]\n"
+            "      forwardOriginalToken: true\n"
+            "      outputClaimToHeaders: [{header: x-jwt-sub, claim: sub}]\n"
+            "---\napiVersion: networking.istio.io/v1\nkind: VirtualService\n"
+            "metadata: {name: vs, namespace: edge}\nspec:\n"
+            "  hosts: [api.example.test]\n  gateways: [gw]\n  http:\n"
+            "    - name: api\n      match: [{uri: {exact: /api}}]\n"
+            "      route: [{destination: {host: svc.edge.svc.cluster.local, port: {number: 8080}}}]\n"
+            "      fault:\n        delay: {fixedDelay: 250ms, percentage: {value: 15}}\n"
+            "        abort: {httpStatus: 503, grpcStatus: UNAVAILABLE, percentage: {value: 5}}\n"
+            "      mirror: {host: shadow.edge.svc.cluster.local, port: {number: 9090}}\n"
+            "      mirrorPercentage: {value: 10}\n"
+        )
+        for label, platform, text, kw in (
+            ("kong-extended", "kong", kong_text, {}),
+            ("traefik-extended", "traefik", traefik_text, {"traefik_controls_asserted": True}),
+            ("istio-extended", "istio", istio_text, {}),
+        ):
+            result, _report, _plan = migrate(platform, text, **kw)
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as directory:
+                completed = self.validate(binary, directory, result.config, result.basic_auth_used)
+                self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+                self.assertIn("Validation passed", completed.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

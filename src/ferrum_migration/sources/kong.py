@@ -19,8 +19,8 @@ from ..errors import InputError
 from ..model import BackendRef, ConsumerSpec, Plan, PluginSpec, RouteSpec, Target, TlsSpec, UpstreamSpec
 from ..redact import contains_secret_reference, safe_label
 from ..safe_load import load_structured
-from .common import (SourceContext, check_route_budget, cors_config, header_name_ok, header_value_ok, mapping,
-                     query_rule, request_header_rule, response_header_rule, seq, str_list)
+from .common import (SourceContext, check_route_budget, correlation_id_header_ok, cors_config, header_name_ok,
+                     header_value_ok, mapping, query_rule, request_header_rule, response_header_rule, seq, str_list)
 
 PLATFORM = "kong"
 HTTP_PROTOCOLS = {"http", "https", "grpc", "grpcs", "ws", "wss"}
@@ -31,8 +31,6 @@ OBSERVABILITY_PLUGINS = {
     "syslog", "loggly", "zipkin", "opentelemetry", "kafka-log", "splunk", "app-dynamics",
 }
 COSMETIC_PLUGINS = {
-    "correlation-id": "Ferrum has a correlation_id plugin; configure it manually if needed",
-    "proxy-cache": "response caching is not migrated; Ferrum has a response_caching plugin",
     "acme": "certificate automation is not migrated; Ferrum supports ACME via FERRUM_ACME_* settings",
     "response-ratelimiting": None,
 }
@@ -40,7 +38,9 @@ KNOWN_TOP_LEVEL = {"_format_version", "_transform", "_info", "_workspace", "_kon
                    "upstreams", "consumers", "plugins", "certificates", "ca_certificates", "snis", "vaults",
                    "acls", "consumer_groups", "consumer_group_consumers", "consumer_group_plugins"}
 _REGEX_HINT = re.compile(r"[\\^$*+?()\[\]{}|]")
+_BOT_REGEX_HINT = re.compile(r"[\\^$*+?()\[\]{}|.]")
 _KEY_NAME = re.compile(r"^[A-Za-z0-9!#$%&'*+.^_`|~-]+$")
+_UNCACHEABLE_STATUSES = frozenset({206, 304, 401, 407})
 # Ferrum authentication plugins this translator can emit (from key-auth, basic-auth and jwt).
 AUTH_PLUGINS = frozenset({"key_auth", "basic_auth", "jwt_auth"})
 
@@ -503,6 +503,11 @@ class _Kong:
             ref = f"kong consumer '{safe_label(key)}'"
             spec = ConsumerSpec(ref=ref, key=key, username=key,
                                 custom_id=custom_id if isinstance(custom_id, str) else None)
+            tags = str_list(consumer.get("tags"))
+            if tags:
+                clean_tags = [t.strip() for t in tags if t.strip()]
+                if clean_tags:
+                    spec.labels["ferrum-migration/kong-tags"] = safe_label(",".join(dict.fromkeys(clean_tags)), 255)
             for acl in seq(consumer.get("acls")):
                 group = acl.get("group") if isinstance(acl, dict) else None
                 if isinstance(group, str):
@@ -541,12 +546,24 @@ class _Kong:
                                   f"{len(seq(consumer.get('basicauth_credentials')))} basic-auth credential(s) not "
                                   "migrated: Kong password hashes cannot be converted to Ferrum's hmac_sha256 format.",
                                   "Set new passwords as hmac_sha256 hashes keyed by FERRUM_BASIC_AUTH_HMAC_SECRET.")
-            for kind, label in (("hmacauth_credentials", "HMAC"), ("oauth2_credentials", "OAuth2"),
-                                ("mtls_auth_credentials", "mTLS")):
+            for kind, message, action in (
+                ("hmacauth_credentials",
+                 "HMAC credentials are not migrated: Kong uses Draft-Cavage HTTP Signatures, whereas Ferrum's "
+                 "hmac_auth requires ferrum-hmac-v2 (nonce + Content-Digest/Digest) or RFC 9421.",
+                 "Migrate clients to ferrum-hmac-v2 or RFC 9421 and issue new HMAC secrets in Ferrum."),
+                ("oauth2_credentials",
+                 "OAuth2 client credentials are not migrated: Ferrum does not act as an OAuth 2.0 Authorization "
+                 "Server (no token issuance or token store).",
+                 "Use an external OAuth/OIDC provider with Ferrum's jwks_auth or oauth2_introspection plugin."),
+                ("mtls_auth_credentials",
+                 "mTLS credentials are not migrated: Kong binds subject_name to per-credential ca_certificate and "
+                 "matches CN and all SAN types, whereas Ferrum mtls_auth matches one cert_field against the "
+                 "listener-wide client CA bundle.",
+                 "Configure FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH and mtls_auth credentials manually after "
+                 "confirming cert_field and CA scope."),
+            ):
                 if seq(consumer.get(kind)):
-                    self.report.error("kong-credentials-unsupported", ref,
-                                      f"{label} credentials are not migrated (semantics differ in Ferrum).",
-                                      "Recreate this authentication method manually.")
+                    self.report.error("kong-credentials-unsupported", ref, message, action)
             if spec.quarantined:
                 self.report.error("kong-consumer-quarantined", ref,
                                   "Consumer quarantined: " + "; ".join(spec.quarantined) + ". Its credentials are "
@@ -1357,6 +1374,127 @@ def _kong_redirect(self: _Kong, config: dict, ref: str) -> tuple:
     return ("termination", {"status_code": status, "headers": {"location": location}, "body": ""})
 
 
+def _kong_correlation_id(self: _Kong, config: dict, ref: str) -> tuple:
+    raw_header = config.get("header_name")
+    header_name = "Kong-Request-ID" if raw_header is None else raw_header
+    if not isinstance(header_name, str) or not correlation_id_header_ok(header_name):
+        self.report.warning("kong-correlation-id", ref,
+                            "correlation-id omitted: header_name is invalid or reserved by Ferrum.")
+        return ("omit",)
+    echo = config.get("echo_downstream")
+    if echo is not None and not isinstance(echo, bool):
+        self.report.warning("kong-correlation-id", ref,
+                            "correlation-id omitted: echo_downstream is not a boolean.")
+        return ("omit",)
+    generator = str(config.get("generator") or "uuid#counter")
+    if generator != "uuid":
+        self.report.warning("kong-correlation-id", ref,
+                            f"correlation-id generator '{safe_label(generator, 24)}' is not reproduced; Ferrum "
+                            "always generates UUID v4 identifiers.")
+    return ("plugin", PluginSpec("correlation_id", {
+        "header_name": header_name.strip().lower(),
+        "echo_downstream": bool(echo) if echo is not None else False,
+        "inbound_policy": "preserve",
+    }, ref))
+
+
+def _kong_bot_detection(self: _Kong, config: dict, ref: str) -> tuple:
+    raw_allow = config.get("allow")
+    raw_deny = config.get("deny")
+    allow = str_list(raw_allow)
+    deny = str_list(raw_deny)
+    if (raw_allow is not None and allow is None) or (raw_deny is not None and deny is None):
+        return ("refuse", "bot-detection allow/deny lists have unexpected types")
+    allow = [item.strip() for item in (allow or []) if item.strip()]
+    deny = [item.strip() for item in (deny or []) if item.strip()]
+    if deny:
+        return ("refuse", "Kong bot-detection 'deny' extends Kong's built-in bot list, whereas Ferrum's "
+                          "blocked_patterns replaces Ferrum's built-in defaults (dropping default blocks would weaken "
+                          "protection); configure bot_detection.blocked_patterns explicitly in Ferrum")
+    if any(_BOT_REGEX_HINT.search(pattern) for pattern in allow):
+        return ("refuse", "Kong bot-detection 'allow' contains regex/pattern metacharacters; Ferrum matches "
+                          "allow_list entries as literal word-boundary tokens")
+    plugin_config: dict[str, Any] = {}
+    if allow:
+        plugin_config["allow_list"] = list(dict.fromkeys(allow))
+    self.report.warning("kong-bot-detection", ref,
+                        "bot_detection uses Ferrum's built-in bot User-Agent list (which differs from Kong's); "
+                        "allow_list entries match case-insensitively on word boundaries rather than as regexes.")
+    return ("plugin", PluginSpec("bot_detection", plugin_config, ref))
+
+
+def _kong_grpc_web(self: _Kong, config: dict, ref: str) -> tuple:
+    if config.get("proto"):
+        return ("refuse", "grpc-web .proto JSON transcoding has no Ferrum equivalent")
+    if config.get("allow_origin_header"):
+        self.report.warning("kong-grpc-web", ref,
+                            "grpc-web allow_origin_header is not migrated inside grpc_web; configure CORS via "
+                            "Ferrum's cors plugin if cross-origin browser access is required.")
+    return ("plugin", PluginSpec("grpc_web", {}, ref))
+
+
+def _kong_proxy_cache(self: _Kong, config: dict, ref: str) -> tuple:
+    strategy = config.get("strategy")
+    if strategy is not None and str(strategy) != "memory":
+        self.report.warning("kong-plugin-omitted", ref,
+                            f"proxy-cache with strategy '{safe_label(strategy, 24)}' is not migrated; Ferrum's "
+                            "response_caching is in-memory only.")
+        return ("omit",)
+    plugin_config: dict[str, Any] = {}
+    raw_methods = config.get("request_method")
+    if raw_methods is not None:
+        methods = str_list(raw_methods)
+        if not methods:
+            self.report.warning("kong-plugin-omitted", ref, "proxy-cache omitted: invalid request_method.")
+            return ("omit",)
+        upper = [m.strip().upper() for m in methods if m.strip()]
+        if not upper or any(m not in ("GET", "HEAD") for m in upper):
+            self.report.warning("kong-plugin-omitted", ref,
+                                "proxy-cache omitted: Ferrum response_caching only caches GET and HEAD requests.")
+            return ("omit",)
+        plugin_config["cacheable_methods"] = list(dict.fromkeys(upper))
+    raw_codes = config.get("response_code")
+    if raw_codes is not None:
+        if not isinstance(raw_codes, list) or not raw_codes:
+            self.report.warning("kong-plugin-omitted", ref, "proxy-cache omitted: invalid response_code list.")
+            return ("omit",)
+        codes: list[int] = []
+        for code in raw_codes:
+            parsed = util.as_int(code)
+            if parsed is None or not 200 <= parsed <= 599 or parsed in _UNCACHEABLE_STATUSES:
+                self.report.warning("kong-plugin-omitted", ref,
+                                    "proxy-cache omitted: response_code contains a status Ferrum does not cache.")
+                return ("omit",)
+            if parsed not in codes:
+                codes.append(parsed)
+        plugin_config["cacheable_status_codes"] = codes
+    if config.get("cache_ttl") is not None:
+        ttl = util.as_int(config.get("cache_ttl"))
+        if ttl is None or ttl <= 0:
+            self.report.warning("kong-plugin-omitted", ref, "proxy-cache omitted: invalid cache_ttl.")
+            return ("omit",)
+        plugin_config["ttl_seconds"] = ttl
+    if config.get("cache_control") is not None:
+        if not isinstance(config["cache_control"], bool):
+            self.report.warning("kong-plugin-omitted", ref, "proxy-cache omitted: invalid cache_control.")
+            return ("omit",)
+        plugin_config["respect_cache_control"] = config["cache_control"]
+    raw_vary = config.get("vary_headers")
+    if raw_vary is not None:
+        vary = str_list(raw_vary)
+        if vary is None or any(not header_name_ok(h.strip()) for h in vary):
+            self.report.warning("kong-plugin-omitted", ref, "proxy-cache omitted: invalid vary_headers.")
+            return ("omit",)
+        if vary:
+            plugin_config["vary_by_headers"] = list(dict.fromkeys(h.strip().lower() for h in vary))
+    notes = ["Ferrum response_caching uses RFC 9111 credential/Vary partitioning and ignores Kong's content_type "
+             "allow-list and storage_ttl settings."]
+    if config.get("vary_query_params"):
+        notes.append("Ferrum always partitions by the full query string (stricter than vary_query_params).")
+    self.report.warning("kong-proxy-cache", ref, " ".join(notes))
+    return ("plugin", PluginSpec("response_caching", plugin_config, ref))
+
+
 _PLUGIN_HANDLERS = {
     "key-auth": _kong_key_auth,
     "basic-auth": _kong_basic_auth,
@@ -1370,4 +1508,8 @@ _PLUGIN_HANDLERS = {
     "response-transformer": _kong_response_transformer,
     "request-termination": _kong_request_termination,
     "redirect": _kong_redirect,
+    "correlation-id": _kong_correlation_id,
+    "bot-detection": _kong_bot_detection,
+    "grpc-web": _kong_grpc_web,
+    "proxy-cache": _kong_proxy_cache,
 }

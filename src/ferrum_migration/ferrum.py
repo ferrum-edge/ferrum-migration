@@ -1615,10 +1615,12 @@ class _Builder:
                 self.report.error("consumer-invalid", consumer.ref, "Consumer custom_id is not representable; skipped.")
                 continue
             cid = self.consumer_ids.take(self.plan.platform, "consumer", consumer.key)
+            labels = dict(consumer.labels)
+            labels.update(self.labels(consumer.ref))
             entry: dict[str, Any] = {
                 "id": cid,
                 "username": username,
-                "labels": self.labels(consumer.ref),
+                "labels": labels,
             }
             if custom_id:
                 entry["custom_id"] = custom_id

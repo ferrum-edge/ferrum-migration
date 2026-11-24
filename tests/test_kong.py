@@ -779,5 +779,102 @@ class KongHardeningTest(unittest.TestCase):
                     self.assertNotIn("credentials", c)
 
 
+class KongExtendedPluginsAndConsumersTest(unittest.TestCase):
+    def test_correlation_id_bot_detection_grpc_web_proxy_cache_and_consumer_tags(self):
+        text = textwrap.dedent("""
+            _format_version: "3.0"
+            consumers:
+              - username: alice
+                tags: [tier-gold, team-api, tier-gold]
+                hmacauth_credentials: [{username: alice-hmac, secret: test-only-hmac-secret}]
+                oauth2_credentials: [{name: app, client_id: cid, client_secret: test-only-secret}]
+                mtls_auth_credentials: [{subject_name: alice@example.test}]
+            services:
+              - name: s
+                url: http://s.internal:8080
+                routes:
+                  - name: ok
+                    paths: [/ok/]
+                    plugins:
+                      - name: correlation-id
+                        config: {header_name: X-Trace-ID, echo_downstream: true, generator: uuid#counter}
+                      - name: bot-detection
+                        config: {allow: [Googlebot, Bingbot]}
+                      - name: grpc-web
+                        config: {}
+                      - name: proxy-cache
+                        config:
+                          strategy: memory
+                          request_method: [GET, HEAD]
+                          response_code: [200, 301]
+                          cache_ttl: 120
+                          cache_control: true
+                          vary_headers: [Accept-Encoding]
+                  - name: bot-deny-refused
+                    paths: [/bot-deny/]
+                    plugins:
+                      - name: bot-detection
+                        config: {deny: [EvilBot]}
+                  - name: bot-regex-refused
+                    paths: [/bot-rx/]
+                    plugins:
+                      - name: bot-detection
+                        config: {allow: ["GoodBot.*"]}
+                  - name: grpc-proto-refused
+                    paths: [/grpc-proto/]
+                    plugins:
+                      - name: grpc-web
+                        config: {proto: /etc/kong/service.proto}
+                  - name: cache-redis-omitted
+                    paths: [/cache-redis/]
+                    plugins:
+                      - name: proxy-cache
+                        config: {strategy: redis, cache_ttl: 60}
+        """)
+        result, report, _ = migrate("kong", text)
+        assert_structurally_valid(self, result.config)
+
+        # Consumer tags preserved as label; unsupported credential types produce actionable errors without echoing secrets.
+        alice = result.config["consumers"][0]
+        self.assertEqual(alice["labels"]["ferrum-migration/kong-tags"], "tier-gold,team-api")
+        dumped = json.dumps(result.config) + json.dumps([c.to_dict() for c in report.caveats])
+        self.assertNotIn("test-only-hmac-secret", dumped)
+        self.assertNotIn("test-only-secret", dumped)
+        cred_errs = [c.message for c in report.caveats if c.code == "kong-credentials-unsupported"]
+        self.assertEqual(len(cred_errs), 3)
+        self.assertTrue(any("Draft-Cavage" in m for m in cred_errs))
+        self.assertTrue(any("Authorization Server" in m for m in cred_errs))
+        self.assertTrue(any("cert_field" in m for m in cred_errs))
+
+        # Clean route emits all 4 newly mapped plugins.
+        ok = one_proxy(self, result.config, "/ok")
+        self.assertEqual(ok["labels"]["ferrum-migration/status"], "migrated")
+        self.assertEqual(plugin(self, result.config, ok, "correlation_id")["config"],
+                         {"header_name": "x-trace-id", "echo_downstream": True, "inbound_policy": "preserve"})
+        self.assertEqual(plugin(self, result.config, ok, "bot_detection")["config"],
+                         {"allow_list": ["Googlebot", "Bingbot"]})
+        self.assertEqual(plugin(self, result.config, ok, "grpc_web")["config"], {})
+        self.assertEqual(plugin(self, result.config, ok, "response_caching")["config"], {
+            "cacheable_methods": ["GET", "HEAD"],
+            "cacheable_status_codes": [200, 301],
+            "ttl_seconds": 120,
+            "respect_cache_control": True,
+            "vary_by_headers": ["accept-encoding"],
+        })
+        self.assertIn("kong-correlation-id", codes(report, "warning"))
+        self.assertIn("kong-bot-detection", codes(report, "warning"))
+        self.assertIn("kong-proxy-cache", codes(report, "warning"))
+
+        # Fail-closed refusals for non-equivalent bot-detection / grpc-web configs.
+        for path in ("/bot-deny", "/bot-rx", "/grpc-proto"):
+            self.assertEqual(one_proxy(self, result.config, path)["labels"]["ferrum-migration/status"], "refused", path)
+
+        # Non-memory proxy-cache safely omitted without breaking the route.
+        redis_proxy = one_proxy(self, result.config, "/cache-redis")
+        self.assertEqual(redis_proxy["labels"]["ferrum-migration/status"], "migrated")
+        self.assertEqual(plugins_of(result.config, redis_proxy), [])
+        self.assertIn("kong-plugin-omitted", codes(report, "warning"))
+
+
 if __name__ == "__main__":
     unittest.main()

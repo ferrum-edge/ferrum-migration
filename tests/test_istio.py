@@ -950,6 +950,88 @@ class IstioCaseAndNamesTest(unittest.TestCase):
             r3, _rep3, _ = migrate("istio", hdr_doc)
             self.assertEqual(one_proxy(self, r3.config, "=/ok")["labels"]["ferrum-migration/status"], "refused")
 
+    def test_request_auth_fault_injection_and_mirror_mapping(self):
+        text = textwrap.dedent("""
+            apiVersion: networking.istio.io/v1
+            kind: Gateway
+            metadata: {name: gw, namespace: edge}
+            spec:
+              selector: {istio: ingressgateway}
+              servers:
+                - port: {number: 80, name: http, protocol: HTTP}
+                  hosts: [api.example.test]
+            ---
+            apiVersion: security.istio.io/v1
+            kind: RequestAuthentication
+            metadata: {name: jwt-policy, namespace: edge}
+            spec:
+              selector:
+                matchLabels: {istio: ingressgateway}
+              jwtRules:
+                - issuer: https://idp.example.test
+                  jwksUri: https://idp.example.test/.well-known/jwks.json
+                  audiences: [api]
+                  fromHeaders: [{name: Authorization, prefix: "Bearer "}]
+                  forwardOriginalToken: true
+                  outputClaimToHeaders: [{header: x-jwt-sub, claim: sub}]
+            ---
+            apiVersion: networking.istio.io/v1
+            kind: VirtualService
+            metadata: {name: vs, namespace: edge}
+            spec:
+              hosts: [api.example.test]
+              gateways: [gw]
+              http:
+                - name: api
+                  match: [{uri: {exact: /api}}]
+                  route: [{destination: {host: svc.edge.svc.cluster.local, port: {number: 8080}}}]
+                  fault:
+                    delay: {fixedDelay: 250ms, percentage: {value: 15}}
+                    abort: {httpStatus: 503, grpcStatus: UNAVAILABLE, percentage: {value: 5}}
+                  mirror: {host: shadow.edge.svc.cluster.local, port: {number: 9090}}
+                  mirrorPercentage: {value: 10}
+                - name: health
+                  match: [{uri: {exact: /healthz}}]
+                  directResponse: {status: 200, body: {string: ok}}
+        """)
+        result, report, _ = migrate("istio", text)
+        assert_structurally_valid(self, result.config)
+        api = one_proxy(self, result.config, "=/api", "api.example.test")
+        self.assertEqual(api["labels"]["ferrum-migration/status"], "migrated")
+        self.assertEqual(plugin(self, result.config, api, "jwks_auth")["config"], {
+            "providers": [{
+                "jwks_uri": "https://idp.example.test/.well-known/jwks.json",
+                "issuer": "https://idp.example.test",
+                "audiences": ["api"],
+                "from_headers": [{"name": "authorization", "prefix": "Bearer "}],
+                "forward_original_token": True,
+                "output_claim_headers": [{"claim": "sub", "header": "x-jwt-sub"}],
+            }],
+            "allow_missing_token": True,
+        })
+        self.assertEqual(plugin(self, result.config, api, "fault_injection")["config"], {
+            "delay": {"duration_ms": 250, "percentage": 15.0},
+            "abort": {"status_code": 503, "grpc_status": 14, "percentage": 5.0},
+        })
+        self.assertEqual(plugin(self, result.config, api, "request_mirror")["config"], {
+            "mirror_host": "shadow.edge.svc.cluster.local",
+            "mirror_port": 9090,
+            "mirror_protocol": "http",
+            "allow_plaintext": True,
+            "percentage": 10.0,
+        })
+        self.assertIn("istio-request-auth", codes(report, "warning"))
+        self.assertIn("istio-mirror", codes(report, "warning"))
+        # directResponse under RequestAuthentication refuses fail-closed.
+        self.assertEqual(one_proxy(self, result.config, "=/healthz", "api.example.test")["labels"][
+            "ferrum-migration/status"], "refused")
+
+        # RequestAuthentication with unsupported field (fromCookies) still refuses the Gateway fail-closed.
+        bad = text.replace("forwardOriginalToken: true", "fromCookies: [session]")
+        bad_res, _bad_rep, _ = migrate("istio", bad)
+        self.assertEqual(one_proxy(self, bad_res.config, "=/api", "api.example.test")["labels"][
+            "ferrum-migration/status"], "refused")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -722,6 +722,48 @@ class NginxFrontendScopeTest(unittest.TestCase):
         self.assertEqual(v_res.frontend_protocols, "http")
         self.assertIn("frontend-port-conflict", codes(v_rep, "error"))
 
+    def test_gzip_directives_map_to_compression_plugin_with_inheritance(self):
+        conf = """
+        http {
+            gzip on;
+            gzip_comp_level 6;
+            gzip_min_length 1k;
+            gzip_types application/json text/plain;
+            server {
+                listen 80;
+                server_name app.example.test;
+                location /api/ {
+                    proxy_pass http://api.internal:8080;
+                }
+                location /nogzip/ {
+                    gzip off;
+                    proxy_pass http://raw.internal:8080;
+                }
+                location /wild/ {
+                    gzip_types *;
+                    proxy_pass http://wild.internal:8080;
+                }
+            }
+        }
+        """
+        result, report, _ = nginx(conf)
+        assert_structurally_valid(self, result.config)
+        api = one_proxy(self, result.config, "/api", "app.example.test")
+        comp = plugin(self, result.config, api, "compression")["config"]
+        self.assertEqual(comp, {
+            "algorithms": ["gzip"],
+            "min_content_length": 1024,
+            "content_types": ["text/html", "application/json", "text/plain"],
+            "gzip_level": 6,
+        })
+        nogzip = one_proxy(self, result.config, "/nogzip", "app.example.test")
+        self.assertNotIn("compression", [p["plugin_name"] for p in plugins_of(result.config, nogzip)])
+        wild = one_proxy(self, result.config, "/wild", "app.example.test")
+        wild_comp = plugin(self, result.config, wild, "compression")["config"]
+        self.assertEqual(wild_comp["algorithms"], ["gzip"])
+        self.assertNotIn("content_types", wild_comp)
+        self.assertIn("nginx-gzip", codes(report, "warning"))
+
 
 if __name__ == "__main__":
     unittest.main()
