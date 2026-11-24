@@ -214,6 +214,7 @@ class _Nginx:
         self.upstream_blocks: dict[str, Directive] = {}
         self.zones: dict[str, dict] = {}
         self.body_sizes: list[tuple[RouteSpec, int]] = []
+        self.catch_all_routes: dict[int, list[RouteSpec]] = {}
 
     # --------------------------------------------------------- scope merge
 
@@ -312,6 +313,7 @@ class _Nginx:
         self._elect_ports(infos)
         for info in infos:
             self._translate_server(info)
+        self._refuse_conflicting_defaults()
         check_route_budget(len(self.plan.routes), self.ctx.limits)
         self._finish_body_sizes()
         return self.plan
@@ -423,9 +425,29 @@ class _Nginx:
             self.report.error("nginx-tls-port", ref, "TLS on a non-main port cannot be scoped reliably in Ferrum file "
                               "mode; the server is skipped.", "Move it to the main TLS port or migrate it manually.")
             return
-        is_default = any(self.default_server.get((listen["port"], listen["ssl"])) == info["index"] for listen in listens)
+        # Default ownership is decided on the listeners Ferrum actually serves this server on. Ports dropped above
+        # (extra plaintext/TLS ports) must not make it a catch-all on the main ports, where another server may be
+        # the default.
+        if on_plain or on_tls:
+            selected = [listen for listen in listens
+                        if (not listen["ssl"] and listen["port"] == settings.main_http_port)
+                        or (listen["ssl"] and listen["port"] == settings.main_https_port)]
+        else:
+            selected = [listen for listen in listens if not listen["ssl"] and listen["port"] == listen_port]
+        ownership = {self.default_server.get((listen["port"], listen["ssl"])) == info["index"] for listen in selected}
+        is_default = ownership == {True}
         hosts, host_problem = _server_hosts(info["names"])
-        if is_default and hosts and not host_problem and self._names_covered_elsewhere(info, listens, hosts):
+        if ownership == {True, False}:
+            # Ferrum serves the same port-agnostic routes on every selected listener, so a catch-all would also take
+            # unknown host names from the listener where another server is the default.
+            self.report.error("nginx-default-server-listener", ref,
+                              "This server is the default server on some of the listeners Ferrum serves it on, but "
+                              "not on others. Ferrum cannot scope a catch-all route to one of them, so it is migrated "
+                              "for its own server_name hosts only; requests for unknown host names, which NGINX sent "
+                              "to it on one listener, are not routed to it (fail closed).",
+                              "Give each listener its own default server in the source (or serve them from separate "
+                              "Ferrum frontends), then convert again.")
+        if is_default and hosts and not host_problem and self._names_covered_elsewhere(info, selected, hosts):
             # NGINX picks this server for its own names (exact beats wildcard, longer wildcard beats shorter) and
             # only falls back to it for unknown names. As a Ferrum catch-all, its own names would go to the other
             # server's exact/wildcard tier instead. Keep the named tier; the fallback role is not migrated.
@@ -477,6 +499,7 @@ class _Nginx:
             for problem in scope.problems:
                 route.refuse(problem)
             self.plan.routes.append(route)
+            self._note_catch_all(info, base, [route])
             return
         locations = [d for d in server.block or [] if d.name == "location"]
         if not locations:
@@ -494,8 +517,34 @@ class _Nginx:
             return
         _check_precedence(routes)
         self.plan.routes.extend(routes)
+        self._note_catch_all(info, base, routes)
         if base["hosts"]:
             self.plan.host_scopes.append(HostScope(ref, list(base["hosts"]), listen_port))
+
+    def _note_catch_all(self, info: dict, base: dict, routes: list[RouteSpec]) -> None:
+        """Remember port-agnostic catch-all routes per server (checked for conflicting defaults in run())."""
+        if base["hosts"] == [] and base["listen_port"] is None and routes:
+            self.catch_all_routes.setdefault(info["index"], []).extend(routes)
+
+    def _refuse_conflicting_defaults(self) -> None:
+        """Different default servers on the main plaintext and TLS listeners cannot share one catch-all tier.
+
+        Ferrum serves port-agnostic routes on both listeners, so each server's catch-all routes would also answer
+        unknown host names on the listener where the other server is the default. Neither envelope is kept.
+        """
+        if len(self.catch_all_routes) < 2:
+            return
+        for routes in self.catch_all_routes.values():
+            for route in routes:
+                route.refuse("another server is the default server on the other main listener; Ferrum's port-agnostic "
+                             "catch-all tier cannot keep the two default servers apart")
+        self.report.error("nginx-default-server-conflict", "nginx default servers",
+                          f"{len(self.catch_all_routes)} different servers are default servers on the main plaintext "
+                          "and TLS listeners. Ferrum serves catch-all routes on both listeners, so unknown host names "
+                          "on one listener would reach the other default server's routes. Their catch-all routes were "
+                          "refused (fail closed).",
+                          "Use one default server for both main listeners in the source, or serve them from separate "
+                          "Ferrum frontends, then convert again.")
 
     def _names_covered_elsewhere(self, info: dict, listens: list[dict], hosts: list[str]) -> bool:
         """Whether another server sharing a listen socket has a server name equal to or covering one of ``hosts``."""

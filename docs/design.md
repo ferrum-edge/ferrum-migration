@@ -40,8 +40,10 @@ input file --(safe_load / nginx parser)--> source translator --> Plan (IR) --> e
 | Traefik `tls.options` `clientAuth` is resolved per HTTPS router (named options, or `default`) and becomes that route's client CA; options that are undefined, from another provider, malformed, unverified (`RequestClientCert`/`RequireAnyClientCert`) or not one `caFiles` path refuse the route (`traefik-client-auth`), as do SNI-dependent selections whose candidate options differ in `clientAuth` (no `Host` matcher; one host mapped to different options) | Traefik enforces client certificates in the TLS handshake, chosen by SNI. Treating clientAuth as metadata would drop mandatory client certificates from the migrated route. |
 | Projected backend timeouts carry a `timeout-approximate` warning | Same unit, different semantics: Ferrum's `backend_read_timeout_ms` also bounds header wait, stream idle time and buffered uploads. |
 | Exact 404 route for the bare path of a trailing-slash prefix | Source `/api/` did not match `/api`; Ferrum's `/api` would. |
-| Host-only 404 route per closed host scope (NGINX server, Envoy vhost, Istio host); only a closure for the same host names counts, and a scope that cannot be closed is a `scope-closure-skipped` error | Those sources never fall through to other hosts' routes; Ferrum's host tiers do. Ferrum tries every matching wildcard pattern's exact, prefix and regex routes before any wildcard host-only route, so a covering wildcard closure does not close a narrower scope. |
-| NGINX default server with a `server_name` that another server on the same listener covers keeps its named hosts (`nginx-default-server-named`) | NGINX prefers it for its own names; as a Ferrum catch-all those names would go to the other server's exact/wildcard tier. The fallback role for unknown names is not migrated. |
+| Host-only 404 route per closed host scope (NGINX server, Envoy vhost, Istio host); only a closure for the same host names counts. When an overlapping host-only route blocks it, a `~/.*` regex 404 route appended after the scope's routes closes it. When neither fits, every emitted route that could receive the scope's unmatched requests (catch-all, or a covering wildcard of another scope) is refused (`scope-closure-skipped`) | Those sources never fall through to other hosts' routes; Ferrum's host tiers do. Ferrum tries every matching wildcard pattern's exact, prefix and regex routes before any wildcard host-only route, so a covering wildcard closure does not close a narrower scope. Ferrum rejects overlapping host-only proxies, but a regex route is not host-only; within a tier it runs after exact and prefix routes (regex in config order), so at worst it shadows another route with a 404. |
+| A wildcard host scope covering another scope's narrower wildcard: routes carrying the broader pattern refused (`nested-wildcard-scope`) | The source sends the narrower hosts only to the narrower scope. Ferrum's wildcard tier compares the path routes of every matching pattern, so the broader scope's routes could answer them, and no closure can prevent that. |
+| NGINX default server with a `server_name` that another server on the same listener covers keeps its named hosts (`nginx-default-server-named`). Default roles are taken only from the listeners Ferrum serves the server on: a default on some of them only keeps its named hosts (`nginx-default-server-listener`); different default servers on the main plaintext and TLS listeners have their catch-all routes refused (`nginx-default-server-conflict`) | NGINX prefers it for its own names; as a Ferrum catch-all those names would go to the other server's exact/wildcard tier. The fallback role for unknown names is not migrated. Dropped extra ports must not create a catch-all, and Ferrum's port-agnostic catch-all tier cannot keep two default servers apart. |
+| String-prefix guards consider port-agnostic routes on a port-scoped route's listener, and regex routes that can match a sibling when no ancestor prefix in the same host tier catches it first. A competing regex route the guard cannot scope exactly is guarded anyway (`prefix-divergence`) | The source's priority (NGINX `^~`, Envoy/Istio first match) kept siblings away from those regex routes; Ferrum's tier order (prefix, then regex) does not. |
 | Istio `Server.bind`, MUTUAL client-certificate constraints, and hosts shared by plaintext and HTTPS servers | A restricted bind is never widened to Ferrum's shared address; SAN/SPKI/hash/CRL constraints refuse the server's routes; a shared host's single route set keeps the HTTPS server's client CA or refusal. |
 | `ferrum.conf` values are validated or quoted for Ferrum's parser; unrepresentable values reject the input before writing. A resources file of the other format in the output directory is refused | A setting Ferrum would read differently (or a dropped client CA) must never be written; a stale `resources.yaml` would win Ferrum's spec discovery over a new `resources.json`. |
 | Backend TLS verification always on; every emitted `backend_tls_verify_server_cert` is `true`, checked by a final output invariant; the former opt-out flag is refused (exit 2) | Never downgrade transport security; insecure output is never produced. |
@@ -49,14 +51,16 @@ input file --(safe_load / nginx parser)--> source translator --> Plan (IR) --> e
 | Kong `_transform: false` credentials are never migrated | They are stored (pre-transformed) values, not what clients send. |
 | Static values for credential-like header/query names refuse the route (value never echoed) | They would put secret bytes into the resources file without `--include-secrets`. |
 | Envoy routes/vhosts with non-CORS `typed_per_filter_config` are refused | Per-route config can re-enable a filter disabled at the HCM (for example authentication). |
-| Istio policies whose selector matches the Gateway refuse its routes in any namespace; namespace-wide policies elsewhere are review errors | The gateway pods' namespace is not part of the input. |
+| Istio policies refuse a Gateway's routes in any namespace unless provably unrelated: a `targetRef` to another resource, or a selector pinning one of the Gateway selector's label keys to another value. Extra label keys and namespace-wide policies refuse (outside the Gateway/root namespace also `istio-policy-scope-unknown`) | Neither the gateway pods' namespace nor their labels are part of the input; one pod can carry every label of both selectors. |
+| Istio plaintext/HTTPS servers sharing hosts: merged only for the same host names or a catch-all side; a shared projection keeps both server ports, so `match.port` routes in it are refused; overlap through different names with a stricter HTTPS server or `match.port` routes refuses both projections (`istio-shared-host-scope`) | Ferrum serves port-agnostic routes on both listeners; equality of the strings is not the same as equal host scopes, and one port's view of `match.port` must not serve the other listener. |
 
 ### Precedence analysis
 
 * **First-match sources** (Envoy routes, Istio `http[]`): `apply_first_match_order` drops
   routes fully covered by an earlier unconditional route (unreachable in the source). Coverage is
   definitive and segment-aware: an Envoy `path_separated_prefix` `/api` covers `/api` and
-  `/api/...`, never `/apix`. Overlap stays conservative (string prefixes). When a partial overlap
+  `/api/...`, never `/apix`. Overlap stays conservative (string prefixes), except that a segment
+  prefix and an exact path outside it (`/api` and `/apix`) are disjoint. When a partial overlap
   would be resolved differently by Ferrum's specificity order, both routes are refused.
 * **Traefik**: router priority (explicit, or the default rule length) is compared with
   Ferrum's preference for every overlapping pair. A shadowed route is dropped; a
@@ -74,9 +78,14 @@ input file --(safe_load / nginx parser)--> source translator --> Plan (IR) --> e
   guarded exactly. These cases are reported as `prefix-divergence` errors (for refused routes the
   guard is added anyway: `prefix-divergence-refused`).
 * Nested wildcard host scopes from different source servers (`*.example.com` and
-  `*.a.example.com`) do not keep Ferrum's wildcard tier apart: an exact-path or prefix route of
-  the broader pattern can still answer a narrower-pattern host for paths its own routes do not
-  match more specifically. Closures cannot fix this; `scope-closure-skipped` marks the scopes.
+  `*.a.example.com`) cannot be kept apart in Ferrum's wildcard tier, so the broader scope's routes
+  are refused (`nested-wildcard-scope`). Its own hosts then get 503 placeholders until it is served
+  from a separate frontend.
+* The regex closure (`~/.*`) relies on Ferrum trying regex routes in config order within a tier.
+  If that ever differs, it can only shadow another route with a 404 (fail closed), never forward.
+* Port-agnostic routes are also served on extra `listen_port` listeners. Guards and closures account
+  for that where noted, but a port-scoped server's own paths can still be answered by a main-port
+  route on its listener when the port-scoped server has no more specific route.
 * Client-IP based plugins (`ip_restriction`, IP rate limits) use the socket peer until
   `FERRUM_TRUSTED_PROXIES` is configured. Trusted-proxy settings are only suggested.
 

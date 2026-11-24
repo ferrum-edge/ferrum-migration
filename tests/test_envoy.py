@@ -174,6 +174,20 @@ class EnvoyPrefixSemanticsTest(unittest.TestCase):
         self.assertEqual(one_proxy(self, result.config, "/api")["labels"]["ferrum-migration/status"], "migrated")
         self.assertNotIn("prefix-string-siblings", codes(report))
 
+    def test_disjoint_segment_prefix_and_exact_path_both_migrate(self):
+        # path_separated_prefix /api never matches /apix in Envoy or in Ferrum, so first-match order is irrelevant.
+        doc = minimal_bootstrap({"path_separated_prefix": "/api"})
+        routes = doc["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"][
+            "route_config"]["virtual_hosts"][0]["routes"]
+        routes.append({"name": "apix", "match": {"path": "/apix"}, "route": {"cluster": "c"}})
+        routes.append({"name": "api-child", "match": {"path": "/api/v1"}, "route": {"cluster": "c"}})
+        result, report, _ = migrate("envoy", yaml.safe_dump(doc))
+        self.assertEqual(one_proxy(self, result.config, "/api")["labels"]["ferrum-migration/status"], "migrated")
+        self.assertEqual(one_proxy(self, result.config, "=/apix")["labels"]["ferrum-migration/status"], "migrated")
+        # An exact path under the segment prefix is still covered by it (unreachable in Envoy): not emitted.
+        self.assertEqual(proxies(result.config, "=/api/v1"), [])
+        self.assertNotIn("route-refused", codes(report))
+
 
 if __name__ == "__main__":
     unittest.main()

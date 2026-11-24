@@ -114,7 +114,10 @@ class KongSecretsTest(unittest.TestCase):
         self.assertTrue(all("credentials" not in c for c in result.config["consumers"]))
         self.assertIn("keyauth-duplicate", codes(report, "error"))
 
-    def test_jwt_hmac_credential_mapping(self):
+    def test_jwt_plugin_migrated_but_single_hmac_credential_withheld(self):
+        # Kong selects the credential by its exact key; Ferrum resolves any consumer alias and accepts the
+        # consumer-wide secret. Without a one-to-one selector contract the (synthetic) secret is never written,
+        # while the route keeps jwt_auth (fail closed) and the consumer's key-auth credential is still migrated.
         text = textwrap.dedent("""
             _format_version: "3.0"
             services:
@@ -126,20 +129,32 @@ class KongSecretsTest(unittest.TestCase):
                     config: {claims_to_verify: [exp], uri_param_names: []}
             consumers:
               - username: carol
+                keyauth_credentials: [{key: test-only-key-carol-00000001}]
                 jwt_secrets:
                   - {key: carol-issuer, algorithm: HS256, secret: test-only-jwt-secret-carol-000000000001}
                   - {key: other, algorithm: RS256, rsa_public_key: not-a-real-key}
+              - username: dan
+                jwt_secrets:
+                  - {key: dan, algorithm: HS256, secret: test-only-jwt-secret-dan-00000000000001}
         """)
         result, report, _ = migrate("kong", text, include_secrets=True)
         proxy = one_proxy(self, result.config, "/jwt")
+        self.assertEqual(proxy["labels"]["ferrum-migration/status"], "migrated")
         jwt = plugin(self, result.config, proxy, "jwt_auth")["config"]
         self.assertEqual(jwt["consumer_claim_field"], "iss")
         self.assertEqual(jwt["algorithm"], "HS256")
         self.assertTrue(jwt["require_exp"])
-        carol = result.config["consumers"][0]
-        self.assertEqual(carol["custom_id"], "carol-issuer")
-        self.assertEqual(carol["credentials"]["jwt"], [{"secret": "test-only-jwt-secret-carol-000000000001"}])
+        consumers = {c["username"]: c for c in result.config["consumers"]}
+        self.assertNotIn("custom_id", consumers["carol"])
+        self.assertEqual(consumers["carol"]["credentials"], {"keyauth": [{"key": "test-only-key-carol-00000001"}]})
+        # Even a key equal to the username is withheld: Ferrum would also accept the consumer's other aliases.
+        self.assertNotIn("credentials", consumers["dan"])
+        self.assertEqual(result.secrets_emitted, 1)
+        self.assertNotIn("test-only-jwt-secret", json.dumps(result.config))
         self.assertIn("kong-jwt-credential", codes(report, "error"))
+        withheld = [c.ref for c in report.caveats if c.code == "kong-jwt-credential-withheld"]
+        self.assertEqual(sorted(withheld), ["kong consumer 'carol'", "kong consumer 'dan'"])
+        self.assertNotIn("test-only-jwt-secret", json.dumps([c.to_dict() for c in report.caveats]))
 
     def test_several_jwt_credentials_on_one_consumer_are_withheld(self):
         # Kong binds each key claim to its own credential's secret; Ferrum would accept either secret for either

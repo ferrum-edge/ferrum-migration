@@ -178,11 +178,13 @@ class _Istio:
 
         The namespace the ingress gateway *pods* run in is not part of the input (it is
         often ``istio-system`` or ``istio-ingress``, not the Gateway resource's
-        namespace). A workload selector that matches the Gateway's selector is
-        therefore treated as applying in any namespace (fail closed). A namespace-wide
-        policy (no selector) applies when it lives in the Gateway's or the root
-        namespace; one in another namespace is reported for review, because it applies
-        only if the gateway pods run there.
+        namespace), and neither are the pods' labels. A workload selector is therefore
+        treated as applying in any namespace unless it is provably disjoint from the
+        Gateway's selector: a label key both selectors pin to different values. Extra
+        or different label keys are no proof, because one pod can carry all of them.
+        A namespace-wide policy (no selector) also applies in any namespace (fail
+        closed); outside the Gateway's and the root namespace it is also reported,
+        because it only matters if the gateway pods run there.
         """
         gw_ns, gw_name = _meta(gateway)
         selector = mapping(mapping(gateway.get("spec")).get("selector"))
@@ -202,17 +204,16 @@ class _Istio:
             elif refs:
                 applies = False
             elif labels:
-                applies = bool(selector) and all(selector.get(k) == v for k, v in labels.items())
-            elif ns in (gw_ns, ROOT_NAMESPACE):
-                applies = True
+                applies = not _selectors_disjoint(selector, labels)
             else:
-                applies = False
-                self.report.error("istio-policy-scope-unknown", ref,
-                                  f"{label} has no workload selector, so it applies to every workload in its "
-                                  "namespace. If the ingress gateway pods run in that namespace, its policy is not "
-                                  "migrated and these routes would be less protected.",
-                                  "Confirm the gateway pods' namespace; if it matches, recreate the policy in Ferrum "
-                                  "before serving traffic.")
+                applies = True
+                if ns not in (gw_ns, ROOT_NAMESPACE):
+                    self.report.error("istio-policy-scope-unknown", ref,
+                                      f"{label} has no workload selector, so it applies to every workload in its "
+                                      "namespace. The gateway pods' namespace is not part of the input, so it may "
+                                      "apply to them; this gateway's routes were refused (fail closed).",
+                                      "Confirm the gateway pods' namespace. If the policy does not apply to them, "
+                                      "convert again without it; otherwise recreate its policy in Ferrum first.")
             if applies:
                 reasons.append(f"{label} applies to this gateway's workloads and cannot be translated")
         return reasons
@@ -303,14 +304,18 @@ class _Istio:
             for host in hosts:
                 if host not in group["hosts"]:
                     group["hosts"].append(host)
-        self._merge_shared_hosts(groups, ref)
+        # match.port selects routes per gateway server port; a shared projection must not pick one port's view.
+        port_specific = any(mapping(match).get("port") for entry in seq(spec.get("http"))
+                            for match in seq(mapping(entry).get("match")))
+        self._merge_shared_hosts(groups, ref, port_specific)
         for group in groups.values():
             listen_port, requires_tls = group["listen_port"], group["requires_tls"]
             hosts = [] if group["any"] else group["hosts"]
+            server_ports = group.get("shared_ports") or [group["port"]]
             routes: list[RouteSpec] = []
             for index, entry in enumerate(seq(spec.get("http"))):
                 routes.extend(self._http_route(mapping(entry), index, namespace, name, ref, hosts, listen_port,
-                                               requires_tls, gw_ns, gateway_ref, group["port"]))
+                                               requires_tls, gw_ns, gateway_ref, server_ports))
             for route in routes:
                 route.client_cas = list(group["client_cas"])
                 for reason in group["refusals"] + refusals:
@@ -320,13 +325,20 @@ class _Istio:
             if hosts:
                 self.plan.host_scopes.append(HostScope(f"{ref} via {safe_label(gateway_ref)}", list(hosts), listen_port))
 
-    def _merge_shared_hosts(self, groups: dict, ref: str) -> None:
+    def _merge_shared_hosts(self, groups: dict, ref: str, port_specific: bool) -> None:
         """Keep an HTTPS server's requirements for hosts a plaintext main-port server also binds.
 
         Ferrum serves port-agnostic routes on its plaintext and its HTTPS listener, so such hosts get one route
         set. It must carry the HTTPS server's client CA (Ferrum checks the client CA bundle on the HTTPS listener
         only, so plaintext access stays as in the source) or its refusal; dropping the HTTPS group would serve
         HTTPS without them.
+
+        Overlap is decided on actual host scopes (wildcards included), not on equal strings. A merge is only made
+        where the contract is proven: the same host names, or a catch-all on one side. When the scopes overlap
+        through different names (``*.example.com`` vs ``a.example.com``) and the HTTPS server is stricter or the
+        VirtualService selects routes by ``match.port``, Ferrum would answer some HTTPS requests from the
+        plaintext projection; both projections are refused instead. A shared projection keeps both server ports,
+        so a port-specific match in it is refused rather than silently resolved for one port.
         """
         plain_key = (None, False, None, None)
         for key in [k for k in groups if k[1] is True]:
@@ -335,29 +347,59 @@ class _Istio:
                 return
             secure = groups[key]
             strict = bool(secure["client_cas"] or secure["refusals"])
+            ports = sorted({port for port in (plain["port"], secure["port"]) if port is not None})
+            if not plain["any"] and not secure["any"]:
+                pairs = [(s, p) for s in secure["hosts"] for p in plain["hosts"] if matching.host_overlap(s, p)]
+                if not pairs:
+                    continue
+                if (strict or port_specific) and any(s != p for s, p in pairs):
+                    self._refuse_shared_scope(plain, secure, ref)
+                    continue
             if plain["any"]:
                 # The plaintext catch-all routes already serve every host this HTTPS server binds.
                 del groups[key]
                 if strict:
                     self._carry_tls(plain, secure, ref, whole_catch_all=not secure["any"])
+                if port_specific:
+                    plain["shared_ports"] = ports
                 continue
             if secure["any"]:
-                if strict and plain["hosts"]:
-                    self._carry_tls(plain, secure, ref, whole_catch_all=False)  # every plaintext host is shared
+                if plain["hosts"]:  # every plaintext host is shared
+                    if strict:
+                        self._carry_tls(plain, secure, ref, whole_catch_all=False)
+                    if port_specific:
+                        plain["shared_ports"] = ports
                 continue
             shared = [host for host in secure["hosts"] if host in plain["hosts"]]
             secure["hosts"] = [host for host in secure["hosts"] if host not in shared]
             if not secure["hosts"]:
                 del groups[key]
-            if not shared or not strict:
+            if not shared or not (strict or port_specific):
                 continue
             plain["hosts"] = [host for host in plain["hosts"] if host not in shared]
             split = {"hosts": shared, "any": False, "port": plain["port"], "listen_port": None, "requires_tls": False,
-                     "client_cas": [], "refusals": []}
-            self._carry_tls(split, secure, ref, whole_catch_all=False)
+                     "client_cas": [], "refusals": [], "shared_ports": ports if port_specific else None}
+            if strict:
+                self._carry_tls(split, secure, ref, whole_catch_all=False)
             groups[("shared",) + key] = split
             if not plain["hosts"]:
                 del groups[plain_key]
+
+    def _refuse_shared_scope(self, plain: dict, secure: dict, ref: str) -> None:
+        reason = ("a plaintext and an HTTPS gateway server bind overlapping but different host scopes; Ferrum serves "
+                  "these port-agnostic routes on both listeners, so the HTTPS server's client-certificate requirement, "
+                  "refusal or port-specific routes cannot be proven to apply to every overlapping host")
+        for group in (plain, secure):
+            if reason not in group["refusals"]:
+                group["refusals"].append(reason)
+        self.report.error("istio-shared-host-scope", ref,
+                          "A plaintext and an HTTPS gateway server bind overlapping host scopes through different "
+                          "names (for example a wildcard and a host it covers). The HTTPS server requires client "
+                          "certificates, is refused, or the VirtualService selects routes by match.port, and Ferrum "
+                          "would answer some HTTPS requests from the plaintext projection. Both projections were "
+                          "refused (fail closed).",
+                          "Bind the same host names on both servers (or split them into separate Gateways/Ferrum "
+                          "frontends), then convert again.")
 
     def _carry_tls(self, target: dict, secure: dict, ref: str, whole_catch_all: bool) -> None:
         for ca in secure["client_cas"]:
@@ -376,20 +418,28 @@ class _Istio:
 
     def _http_route(self, entry: dict, index: int, namespace: str, vs_name: str, vs_ref: str, hosts: list[str],
                     listen_port: int | None, requires_tls: bool, gw_ns: str, gateway_ref: str,
-                    server_port: int | None) -> list[RouteSpec]:
+                    server_ports: list[int | None]) -> list[RouteSpec]:
         name = str(entry.get("name") or f"{vs_name}-http-{index + 1}")
         base_ref = f"istio route '{safe_label(name)}' in {vs_ref}"
         blocks: dict[tuple, dict] = {}
         for match in seq(entry.get("match")) or [{}]:
             match = mapping(match)
-            if match.get("port") and util.as_int(match.get("port")) != server_port:
-                continue
+            port_condition = False
+            if match.get("port"):
+                if util.as_int(match.get("port")) not in server_ports:
+                    continue
+                # One projection serves several gateway server ports (plaintext and HTTPS share these hosts):
+                # Ferrum cannot keep a match that only applied on one of them.
+                port_condition = len(server_ports) > 1
             match_gateways = str_list(match.get("gateways"))
             if match_gateways and gateway_ref not in match_gateways:
                 continue
             uri = mapping(match.get("uri"))
             extra = [key for key in ("headers", "queryParams", "authority", "scheme", "sourceLabels",
                                      "sourceNamespace", "withoutHeaders") if match.get(key)]
+            if port_condition:
+                extra.append("one gateway server port (match.port) while Ferrum serves these hosts on both its "
+                             "plaintext and HTTPS listeners")
             if "exact" in uri:
                 kind, path = "exact", uri["exact"]
             elif "prefix" in uri:
@@ -715,6 +765,16 @@ def _bind_address(value: Any) -> str | None:
     if text in ("", "0.0.0.0", "::", "[::]"):
         return None
     return text
+
+
+def _selectors_disjoint(gateway_selector: dict, policy_labels: dict) -> bool:
+    """Whether no pod can match both label selectors: some key is pinned to different values.
+
+    An empty Gateway selector, or labels the Gateway selector does not mention, prove nothing: one pod can
+    carry every label of both selectors.
+    """
+    return any(key in gateway_selector and str(gateway_selector[key]) != str(value)
+               for key, value in policy_labels.items())
 
 
 def _is_ip_literal(value: str) -> bool:

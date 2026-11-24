@@ -72,7 +72,7 @@ def build_parser() -> argparse.ArgumentParser:
             command.add_argument("--out", required=True, help="output directory (created with mode 0700)")
             command.add_argument("--force", action="store_true", help="replace existing output files")
             command.add_argument("--include-secrets", action="store_true",
-                                 help="write migratable plaintext credentials (API keys, HMAC JWT secrets) into the "
+                                 help="write migratable plaintext credentials (Kong key-auth keys) into the "
                                       "resources file; the file is written 0600 and must stay private")
             command.add_argument("--resources-format", choices=("yaml", "json"), default="yaml")
         else:

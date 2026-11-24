@@ -60,7 +60,7 @@ Options:
 |---|---|
 | `--run-mode file\|database\|cp\|dp` | Which Ferrum operating mode `ferrum.conf` targets (default `file`). For database/cp, validate in file mode, then import through Ferrum's documented Admin API. This tool does no network I/O. |
 | `--tls-only` | Disable Ferrum's plaintext listener so routes that were HTTPS-only in the source can be migrated. This is chosen automatically when every migrated route requires HTTPS. |
-| `--include-secrets` | Explicit opt-in to write migratable plaintext credentials (Kong key-auth keys, HMAC JWT secrets) into the resources file. Output files are always mode `0600`; with this flag a `.gitignore` containing `*` is also written. |
+| `--include-secrets` | Explicit opt-in to write migratable plaintext credentials (Kong key-auth keys) into the resources file. Kong JWT secrets are never written (see Safety model). Output files are always mode `0600`; with this flag a `.gitignore` containing `*` is also written. |
 | `--strict` | Treat warnings as "review required" (exit 4). |
 | `--max-input-bytes N` | Input size cap (default 8 MiB). |
 | `--resources-format yaml\|json` | Output format for the resources file. A resources file of the other format already in the output directory is refused (exit 5), even with `--force`, because Ferrum discovers `resources.yaml` before `resources.json`. Pass `--spec` explicitly when you run Ferrum. |
@@ -107,22 +107,36 @@ rather than opening routes or downgrading security:
   matches, or prefixes ending in `/`. A refused route's placeholder is guarded the same way, so
   `/adminx` cannot reach a broader, open route when `/admin` was refused. If the broader route
   serves more hosts, the guard still applies to all of them and a `prefix-divergence-refused`
-  error reports the extra 404s.
+  error reports the extra 404s. Regex routes that the source's priority kept away from such
+  siblings (an NGINX `^~` prefix, an earlier Envoy/Istio prefix) are guarded the same way when no
+  prefix route in the host tier catches the siblings first. A port-agnostic route that also serves
+  a port-scoped route's listener is included. For a refused route, or a competing regex route, a
+  guard that cannot be scoped exactly is still added (fail closed) and reported.
 * **No cross-host fallthrough.** An NGINX server, Envoy virtual host or Istio host never falls
   through to another host's routes. Ferrum can, so a host-only 404 route closes each such scope.
-  When another host-only route overlaps a scope without closing exactly its host names, no closure
-  is emitted and a `scope-closure-skipped` error (exit 4) asks for review. An NGINX default server
-  whose own `server_name` another server on the same listener covers keeps its named routes
-  instead of becoming a catch-all (error `nginx-default-server-named`; unknown host names are then
-  not routed to it).
+  When another host-only route overlaps a scope without closing exactly its host names, a regex
+  route matching every path (`~/.*`, 404, emitted after the scope's own routes) closes it instead.
+  If that is not possible either, the routes that would receive its unmatched requests are refused
+  (`scope-closure-skipped`). A wildcard scope that covers another scope's narrower wildcard
+  (`*.example.com` and `*.team.example.com`) has its routes refused (`nested-wildcard-scope`),
+  because Ferrum's wildcard tier compares the path routes of every matching pattern. An NGINX
+  default server whose own `server_name` another server on the same listener covers keeps its
+  named routes instead of becoming a catch-all (error `nginx-default-server-named`; unknown host
+  names are then not routed to it). Default-server roles are decided on the listeners Ferrum
+  actually serves (dropped extra ports do not count). A server that is the default on only some of
+  them keeps its named hosts (`nginx-default-server-listener`), and different default servers on
+  the main plaintext and TLS listeners have their catch-all routes refused
+  (`nginx-default-server-conflict`).
 * **Credentials are handled narrowly.** The only credentials that can be carried over are Kong
-  key-auth keys and Kong HMAC (HS256/384/512) JWT secrets. They are written only with
-  `--include-secrets`, and only where Ferrum's semantics match: key length minimums,
-  no shared keys or secrets, a JWT identity claim that resolves to the same consumer, and at most
-  one HMAC JWT credential per consumer. Ferrum accepts a signature from any of a consumer's JWT
-  secrets, so it cannot bind a Kong credential key to its own secret: consumers with several are
-  withheld (`kong-jwt-multiple-credentials`). Issue one new secret per consumer in Ferrum instead.
-  No other source's credentials, and no other credential type, are portable.
+  key-auth keys. They are written only with `--include-secrets`, and only where Ferrum's semantics
+  match: key length minimums and no shared keys. Kong HMAC JWT secrets are never written, not even
+  with `--include-secrets` (`kong-jwt-credential-withheld`, or `kong-jwt-multiple-credentials`).
+  Kong selects a JWT credential by its exact `key`. Ferrum's `jwt_auth` resolves the claim against
+  every alias of a consumer (username, id, custom_id) and accepts the consumer-wide secret, so
+  the one-to-one binding between a key and its secret cannot be reproduced. The `jwt_auth`
+  plugin, the consumer and its other credentials are still migrated, so JWT authentication fails
+  closed. Issue a new random secret per consumer in Ferrum, and keep the Kong credential until
+  clients have switched. No other source's credentials, and no other credential type, are portable.
   Password hashes (Kong basic-auth, htpasswd, Traefik `basicAuth`) cannot be converted.
   The matching auth plugin is emitted with no credentials, so nobody can authenticate until
   you create new Ferrum credentials. Consumers with consumer-scoped plugins or consumer groups
@@ -147,7 +161,10 @@ rather than opening routes or downgrading security:
   selection), the route is refused. Istio `MUTUAL` servers with `subjectAltNames`,
   `verifyCertificateSpki`, `verifyCertificateHash` or `caCrl` are refused (`istio-client-ca`).
   When a plaintext and an HTTPS Istio server bind the same host, the shared routes keep the HTTPS
-  server's client CA or refusal.
+  server's client CA or refusal. A `match.port` route in such a shared projection is refused.
+  When the two servers' host scopes overlap through different names (a wildcard and a host it
+  covers) and the HTTPS server is stricter or routes depend on `match.port`, both projections are
+  refused (`istio-shared-host-scope`).
 * **Restricted listeners stay restricted.** NGINX `listen`, Envoy listener and Istio `Server.bind`
   addresses are reproduced only when every server shares one address (`FERRUM_PROXY_BIND_ADDRESS`).
   Otherwise the address-restricted servers (and Unix sockets) are skipped, never exposed on
@@ -155,9 +172,12 @@ rather than opening routes or downgrading security:
 * **Auth is not silently skipped.** Auth plugins, middlewares, directives and HTTP filters the
   tool cannot translate refuse their routes (see above). In addition, an Envoy route or virtual host whose
   `typed_per_filter_config` could enable or change an HTTP filter is refused. An Istio
-  `AuthorizationPolicy`/`RequestAuthentication` whose workload selector matches the Gateway
-  refuses that Gateway's routes, whatever namespace it lives in (the gateway pods' namespace is not
-  part of the input).
+  `AuthorizationPolicy`/`RequestAuthentication`/`EnvoyFilter`/`WasmPlugin` refuses a Gateway's
+  routes unless it provably does not apply to the gateway pods, whatever namespace it lives in
+  (neither the gateway pods' namespace nor their labels are part of the input). Only a `targetRef`
+  to another resource, or a selector that pins one of the Gateway selector's label keys to another
+  value, counts as proof. Extra label keys do not, and namespace-wide policies (no selector) always
+  refuse.
 * **No secrets in diagnostics.** Parser errors keep positions but withhold quoted spans.
   Reports name resources and counts, never values. PEM blocks, vault references and Kubernetes
   Secrets are never read into output.

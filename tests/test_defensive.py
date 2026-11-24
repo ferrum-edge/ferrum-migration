@@ -19,7 +19,7 @@ import unittest
 
 import yaml
 
-from helpers import codes, fixture_path, migrate, one_proxy, read_fixture, upstream_of
+from helpers import codes, fixture_path, migrate, one_proxy, plugins_of, read_fixture, upstream_of
 
 from ferrum_migration.cli import main
 from ferrum_migration.envprofile import next_steps
@@ -231,10 +231,36 @@ class AuthNeverSilentlySkippedTest(unittest.TestCase):
         statuses = {p["labels"]["ferrum-migration/status"] for p in result.config["proxies"] if "listen_path" in p}
         self.assertEqual(statuses, {"refused"})
 
-    def test_istio_namespace_wide_policy_elsewhere_requires_review(self):
+    def test_istio_namespace_wide_policy_elsewhere_refuses_routes_and_requires_review(self):
+        # The Gateway lives in "edge"; the gateway pods' namespace is not part of the input and is commonly
+        # "istio-ingress". A namespace-wide policy there may apply to those pods, so the contract is fail closed:
+        # every route of the Gateway becomes a 503 placeholder, nothing is forwarded, and the unknown scope is a
+        # review error naming the policy.
         result, report, _ = migrate("istio", self.istio_with_policy("istio-ingress", None))
-        self.assertIn("istio-policy-scope-unknown", codes(report, "error"))
-        self.assertEqual(status(self, result.config, "/cart", "shop.example.com"), "migrated")
+        scope_errors = [c for c in report.caveats if c.code == "istio-policy-scope-unknown"]
+        self.assertTrue(scope_errors)
+        self.assertTrue(all(c.severity == "error" for c in scope_errors))
+        self.assertTrue(all("AuthorizationPolicy istio-ingress/gw-policy" in c.message for c in scope_errors))
+        routed = [p for p in result.config["proxies"] if "listen_path" in p]
+        self.assertTrue(routed)
+        self.assertEqual({p["labels"]["ferrum-migration/status"] for p in routed}, {"refused"})
+        cart = one_proxy(self, result.config, "/cart", "shop.example.com")
+        self.assertEqual(cart["labels"]["ferrum-migration/status"], "refused")
+        self.assertNotIn("upstream_id", cart)
+        self.assertEqual([(p["plugin_name"], p["config"]["status_code"]) for p in plugins_of(result.config, cart)],
+                         [("request_termination", 503)])
+        self.assertEqual(result.config["upstreams"], [])
+        self.assertEqual(result.stats["migrated_routes"], 0)
+        refusals = [c.message for c in report.caveats if c.code == "route-refused" and "'cart-canary'" in c.ref]
+        self.assertEqual(len(refusals), 1)
+        self.assertIn("istio-ingress/gw-policy applies to this gateway's workloads", refusals[0])
+        # In the Gateway's own namespace or the root namespace the policy applies too (same refusal), but its scope
+        # is known, so no scope-unknown review error is raised.
+        for namespace in ("edge", "istio-system"):
+            with self.subTest(namespace=namespace):
+                result, report, _ = migrate("istio", self.istio_with_policy(namespace, None))
+                self.assertEqual(status(self, result.config, "/cart", "shop.example.com"), "refused")
+                self.assertNotIn("istio-policy-scope-unknown", codes(report))
 
 
 class ImportGuidanceTest(unittest.TestCase):

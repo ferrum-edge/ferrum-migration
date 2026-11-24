@@ -134,9 +134,32 @@ class EmitterTest(unittest.TestCase):
         plan.host_scopes = [HostScope("scope wide", ["*.example.test"]), HostScope("scope narrow", ["*.a.example.test"])]
         report = Report("test", "synthetic")
         result = emit(plan, EmitOptions(), report)
-        closures = [p["hosts"] for p in result.config["proxies"] if "listen_path" not in p]
-        self.assertEqual(closures, [["*.example.test"]])
-        self.assertIn("scope-closure-skipped", codes(report, "error"))
+        assert_structurally_valid(self, result.config)
+        by_path = {p.get("listen_path"): p for p in result.config["proxies"]}
+        self.assertEqual(sorted(by_path, key=str), ["/n", "/w", None, "~/.*"])
+
+        def status(path):
+            return by_path[path]["labels"]["ferrum-migration/status"]
+
+        def termination(path):
+            return [p["config"]["status_code"] for p in plugins_of(result.config, by_path[path])
+                    if p["plugin_name"] == "request_termination"]
+
+        # The *.example.test closure is the only host-only route; it does not count as closing *.a.example.test.
+        self.assertEqual(by_path[None]["hosts"], ["*.example.test"])
+        # The narrower scope is closed by its own catch-any regex 404 instead (no scope left unclosed).
+        self.assertEqual(by_path["~/.*"]["hosts"], ["*.a.example.test"])
+        self.assertEqual((status("~/.*"), termination("~/.*")), ("scope-default", [404]))
+        self.assertIn("scope-closure-regex", codes(report, "info"))
+        self.assertNotIn("scope-closure-skipped", codes(report))
+        # The broader wildcard's route could still answer narrower-scope hosts in Ferrum's wildcard tier, so it is
+        # a fail-closed placeholder rather than live.
+        self.assertEqual((status("/w"), termination("/w")), ("refused", [503]))
+        self.assertIn("nested-wildcard-scope", codes(report, "error"))
+        self.assertIn("route-refused", codes(report, "error"))
+        # The only forwarding proxy that matches narrower-scope hosts is that scope's own route.
+        live = [p for p in result.config["proxies"] if p["labels"]["ferrum-migration/status"] == "migrated"]
+        self.assertEqual([(p["listen_path"], p["hosts"]) for p in live], [("/n", ["*.a.example.test"])])
 
     def test_one_consumer_never_receives_several_jwt_secrets(self):
         consumer = ConsumerSpec(ref="test consumer", key="c", username="c",

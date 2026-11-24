@@ -28,8 +28,12 @@ Fail-closed rules applied here (see ``docs/design.md``):
    virtual hosts, Istio hosts) get a host-only 404 route so unmatched paths do
    not reach another host tier. Only a closure for the same host names counts:
    a covering wildcard closure does not close a narrower scope (Ferrum tries all
-   wildcard path routes before wildcard host-only routes). When no closure can
-   be added, error ``scope-closure-skipped``.
+   wildcard path routes before wildcard host-only routes). When an overlapping
+   host-only route blocks the closure, a ``~/.*`` regex 404 route closes the
+   scope; when neither fits, the routes that would receive its unmatched
+   requests are refused (error ``scope-closure-skipped``). A wildcard scope
+   covering another scope's narrower wildcard has its routes refused
+   (``nested-wildcard-scope``): Ferrum's wildcard tier mixes their path routes.
 6. Routes that require HTTPS in the source are only emitted when Ferrum runs
    TLS-only (``FERRUM_PROXY_HTTP_PORT=0``); otherwise they are refused.
 7. Backend TLS verification is never disabled. There is no opt-out: a source
@@ -449,7 +453,110 @@ def _components(members: list[_Cand]) -> list[list[_Cand]]:
     return list(grouped.values())
 
 
+REGEX_CLOSURE_PATH = "~/.*"
+
+
+def _fail_close(cand: _Cand, reason: str) -> None:
+    """Turn an emitted candidate into a fail-closed placeholder (same hosts/path/port, HTTP 503)."""
+    cand.route.refuse(reason)
+    cand.route.placeholder_emitted = True
+    cand.placeholder = True
+    cand.termination = REFUSED_TERMINATION
+    cand.kind_label = "refused"
+    cand.guards = []
+
+
+def _scope_hosts(scope) -> list[str]:
+    return [h for h in (util.normalize_host(x) for x in scope.hosts) if h]
+
+
+def _refuse_nested_wildcard_scopes(plan: Plan, candidates: list[_Cand], report: Report) -> None:
+    """Refuse the routes of a wildcard host scope that strictly covers another scope's wildcard.
+
+    The sources pick the most specific server/virtual host for a name (``*.a.example.com`` over
+    ``*.example.com``), and that scope never falls through. Ferrum's wildcard tier instead compares the
+    path routes of every matching pattern, so a route of the broader scope could answer a narrower-scope
+    host for a path the narrower scope does not route more specifically. No closure can prevent that, so
+    every route carrying the broader pattern becomes a fail-closed placeholder.
+    """
+    scopes = [(scope, _scope_hosts(scope)) for scope in plan.host_scopes]
+    leaky: list[tuple[str, int | None, str, str]] = []
+    for outer, outer_hosts in scopes:
+        for inner, inner_hosts in scopes:
+            # Scopes with the same ref come from one source scope (an Istio VirtualService bound through a plaintext
+            # and an HTTPS server) and carry the same route set, so nesting between them changes nothing.
+            if outer is inner or outer.ref == inner.ref \
+                    or not matching.ports_compatible(outer.listen_port, inner.listen_port):
+                continue
+            for pattern in outer_hosts:
+                if not pattern.startswith("*.") or pattern in inner_hosts:
+                    continue
+                if any(other.startswith("*.") and other != pattern and matching.host_cover(pattern, other)
+                       for other in inner_hosts):
+                    leaky.append((pattern, outer.listen_port, outer.ref, inner.ref))
+    if not leaky:
+        return
+    reported: set[str] = set()
+    for cand in candidates:
+        if cand.placeholder:
+            continue
+        for pattern, port, outer_ref, inner_ref in leaky:
+            if pattern in cand.hosts and matching.ports_compatible(cand.listen_port, port):
+                _fail_close(cand, f"its wildcard host {pattern} covers the narrower wildcard scope {inner_ref}; "
+                                  "Ferrum's wildcard tier would let this route answer that scope's hosts")
+                break
+    for pattern, _port, outer_ref, inner_ref in leaky:
+        if outer_ref in reported:
+            continue
+        reported.add(outer_ref)
+        report.error("nested-wildcard-scope", outer_ref,
+                     f"The wildcard host {pattern} covers the narrower wildcard host scope {inner_ref}. The source "
+                     "sends those hosts only to the narrower scope, but Ferrum compares the path routes of every "
+                     "matching wildcard pattern, so this scope's routes could answer them. Its routes were refused "
+                     "(fail closed).",
+                     "Serve the nested wildcard scopes from separate Ferrum frontends, or replace the broader "
+                     "wildcard with explicit host names, then convert again.")
+
+
+def _add_regex_closure(scope, hosts: list[str], candidates: list[_Cand], report: Report) -> bool:
+    """Close a scope whose host-only closure would overlap another host-only route with a catch-any regex 404.
+
+    Within a host tier Ferrum tries exact, prefix and regex routes (regex in config order) before host-only
+    routes. Appended last, ``~/.*`` answers 404 for every path the scope's own exact/prefix/regex routes do not
+    match, and it is not a host-only route, so it does not collide with the overlapping host-only closure. If the
+    regex order assumption were wrong it could only shadow other routes with a 404 (fail closed).
+    """
+    for cand in candidates:
+        if cand.listen_port == scope.listen_port and cand.listen_path == REGEX_CLOSURE_PATH \
+                and matching.hosts_overlap(cand.hosts, hosts):
+            return False
+    synthetic = RouteSpec(ref=scope.ref, name=f"{scope.ref}-default", hosts=hosts, kind="regex",
+                          path=REGEX_CLOSURE_PATH[1:])
+    candidates.append(_Cand(synthetic, True, hosts, REGEX_CLOSURE_PATH, scope.listen_port,
+                            termination=NOT_FOUND_TERMINATION, kind_label="scope-default"))
+    report.info("scope-closure-regex", scope.ref,
+                "A host-only 404 route for this scope would overlap another host-only route, so a regex route "
+                "matching every path (answering 404, tried after the scope's own routes) closes it instead.")
+    return True
+
+
+def _refuse_fallthrough_targets(scope, hosts: list[str], candidates: list[_Cand]) -> int:
+    """Refuse emitted routes that would receive an unclosed scope's unmatched requests from outside its names."""
+    count = 0
+    for cand in candidates:
+        if cand.placeholder or not matching.ports_compatible(cand.listen_port, scope.listen_port):
+            continue
+        if cand.hosts and not any(pattern not in hosts and matching.host_cover(pattern, host)
+                                  for pattern in cand.hosts for host in hosts):
+            continue
+        _fail_close(cand, f"unmatched requests for the hosts of {scope.ref} would fall through to it in Ferrum, "
+                          "which the source never did, and that scope could not be closed")
+        count += 1
+    return count
+
+
 def _add_scope_closures(plan: Plan, candidates: list[_Cand], report: Report) -> None:
+    _refuse_nested_wildcard_scopes(plan, candidates, report)
     scopes = sorted(plan.host_scopes, key=lambda s: matching.host_tier(s.hosts))
     host_only: dict[int | None, list[_Cand]] = {}
     root_hosts: dict[int | None, set[str]] = {}
@@ -473,11 +580,16 @@ def _add_scope_closures(plan: Plan, candidates: list[_Cand], report: Report) -> 
                 all(any(host in c.hosts for c in overlapping) for host in hosts):
             continue
         if overlapping:
+            if _add_regex_closure(scope, hosts, candidates, report):
+                continue
+            refused = _refuse_fallthrough_targets(scope, hosts, candidates)
             report.error("scope-closure-skipped", scope.ref,
                          "Another host-only route overlaps this scope's hosts without closing exactly these host "
                          "names, so no default 404 route could be added (overlapping host-only routes are not "
-                         "emitted). Unmatched paths for these hosts can reach other host scopes' routes in Ferrum "
-                         "(another wildcard pattern or the catch-all tier), which the source never did.",
+                         "emitted), and no regex closure fits either. Unmatched paths for these hosts could reach "
+                         "other host scopes' routes in Ferrum (another wildcard pattern or the catch-all tier), "
+                         f"which the source never did, so the {refused} route(s) that could receive them were "
+                         "refused (fail closed).",
                          "Add explicit routes in the source for paths these hosts must answer, or serve the "
                          "overlapping host scopes from separate Ferrum frontends, then convert again.")
             continue
@@ -537,10 +649,25 @@ def _ancestor_paths(path: str) -> list[str]:
     return result
 
 
+def _regex_reaches_siblings(regex: str | None, prefix: str) -> bool:
+    """Whether a (Ferrum-anchored) regex route can match a string-prefix sibling of ``prefix`` (``/apix`` for ``/api``).
+
+    Siblings start with ``prefix`` but are neither ``prefix`` itself nor under ``prefix + "/"``. Conservative:
+    unknown or alternating patterns count as reaching them.
+    """
+    if not regex or util.has_top_level_alternation(regex):
+        return True
+    literal = util.regex_literal_prefix(regex)
+    return prefix.startswith(literal) or (literal.startswith(prefix) and not literal.startswith(prefix + "/"))
+
+
 def _add_divergence_guards(candidates: list[_Cand], report: Report) -> None:
     by_path: dict[tuple[int | None, str | None], list[_Cand]] = {}
+    regex_by_port: dict[int | None, list[_Cand]] = {}
     for cand in candidates:
         by_path.setdefault((cand.listen_port, cand.listen_path), []).append(cand)
+        if cand.listen_path is not None and cand.listen_path.startswith("~"):
+            regex_by_port.setdefault(cand.listen_port, []).append(cand)
     fingerprints: dict[int, str] = {}
 
     def fp(item: _Cand) -> str:
@@ -558,12 +685,25 @@ def _add_divergence_guards(candidates: list[_Cand], report: Report) -> None:
             continue
         fingerprint = fp(cand)
         tier = matching.host_tier(cand.hosts)
+        # Port-agnostic routes (no listen_port) also receive requests on a port-scoped route's listener.
+        ports = [cand.listen_port] if cand.listen_port is None else [cand.listen_port, None]
         closed = bool(cand.hosts) and any(
             o.placeholder and matching.host_tier(o.hosts) <= tier and matching.hosts_cover(o.hosts, cand.hosts)
-            for o in by_path.get((cand.listen_port, None), []))
-        related: list[_Cand] = list(by_path.get((cand.listen_port, None), []))
-        for ancestor in _ancestor_paths(route.path or "/"):
-            related.extend(by_path.get((cand.listen_port, ancestor), []))
+            for port in ports for o in by_path.get((port, None), []))
+        related: list[_Cand] = []
+        for port in ports:
+            related.extend(by_path.get((port, None), []))
+            for ancestor in _ancestor_paths(route.path or "/"):
+                related.extend(by_path.get((port, ancestor), []))
+        # Regex routes the source's priority kept away from the siblings (an NGINX ^~ prefix stops the regex
+        # search; Envoy/Istio match the earlier prefix first) still receive them in Ferrum unless an ancestor
+        # prefix in this host tier, covering every host of this route, catches them first (prefix beats regex).
+        shield = any(matching.host_tier(o.hosts) == tier and matching.hosts_cover(o.hosts, cand.hosts)
+                     for o in related if o.listen_path is not None)
+        if not shield:
+            for port in ports:
+                related.extend(other for other in regex_by_port.get(port, [])
+                               if _regex_reaches_siblings(other.route.path, route.path or "/"))
         # Where do sibling paths such as /apix (string-prefix matches the source sent to this route) land
         # in Ferrum? They are preserved only if an equivalent route (same forwarding and policy, no strip,
         # covering every host) catches them and nothing more specific intercepts them.
@@ -571,12 +711,15 @@ def _add_divergence_guards(candidates: list[_Cand], report: Report) -> None:
         for other in related:
             if closed and matching.host_tier(other.hosts) > tier:
                 continue  # a host-only 404/placeholder in this host tier intercepts first
-            if other is cand or other.listen_port != cand.listen_port:
+            if other is cand or other.listen_port not in ports:
                 continue
             if not matching.hosts_overlap(cand.hosts, other.hosts):
                 continue
             other_route = other.route
-            if other.listen_path is None:
+            regex_other = other.listen_path is not None and other.listen_path.startswith("~")
+            if regex_other and matching.host_tier(other.hosts) < tier:
+                continue  # a more specific host tier: Ferrum picks it only for host names the source also routed there
+            if other.listen_path is None or regex_other:
                 covers = True
             elif other_route.kind == "prefix":
                 covers = other_route.path == "/" or (route.path or "").startswith((other_route.path or "") + "/")
@@ -588,10 +731,30 @@ def _add_divergence_guards(candidates: list[_Cand], report: Report) -> None:
                 intercepted = True  # siblings get a 404/503/termination, never the source's backend
                 continue
             if fp(other) == fingerprint:
-                if not route.strip and matching.hosts_cover(other.hosts, cand.hosts):
+                # A regex catches only some siblings, so it never proves equivalence on its own.
+                if not regex_other and not route.strip and matching.hosts_cover(other.hosts, cand.hosts):
                     equivalent = True
                 continue
-            if matching.hosts_cover(cand.hosts, other.hosts):
+            # A guard is exact only on a route with the same listener scope whose hosts this route covers: there,
+            # every request the guard blocks is a sibling this route's source owned. A port-agnostic route also
+            # serves the main listeners, where the same paths were never this route's.
+            exact_scope = other.listen_port == cand.listen_port and matching.hosts_cover(cand.hosts, other.hosts)
+            if regex_other and not refused and not exact_scope:
+                # Competing regex coverage on more hosts or listeners: no exact guard exists. Guard anyway (fail
+                # closed) so the siblings never reach a route with another policy, and report the collateral 404s.
+                if route.path not in other.guards:
+                    other.guards.append(route.path or "/")
+                divergence_error = True
+                report.error("prefix-divergence", route.ref,
+                             f"The source sent paths such as {route.path}x to this route, but in Ferrum the regex "
+                             f"route {other_route.ref}, which has a different policy and serves more hosts or "
+                             f"listeners, would receive them. A request_termination guard (trigger.path_prefix "
+                             f"{route.path}) was added to it for all of its hosts, so such paths now answer 404 there "
+                             "(fail closed).",
+                             "Confirm such paths are not needed on the regex route's other hosts or listeners, or add "
+                             "explicit routes for them in the source, then convert again.")
+                continue
+            if exact_scope:
                 guarded = True
                 if route.path not in other.guards:
                     other.guards.append(route.path or "/")
@@ -607,7 +770,7 @@ def _add_divergence_guards(candidates: list[_Cand], report: Report) -> None:
                     other.guards.append(route.path or "/")
                 report.error("prefix-divergence-refused", route.ref,
                              f"The source sent paths such as {route.path}x to this refused route. Ferrum would hand "
-                             f"them to the broader route {other_route.ref}, which serves more hosts, so a "
+                             f"them to the broader route {other_route.ref}, which serves more hosts or listeners, so a "
                              f"request_termination guard (trigger.path_prefix {route.path}) was added to it for all "
                              f"of its hosts: such paths now answer 404 there even on hosts the source forwarded "
                              f"(fail closed).",

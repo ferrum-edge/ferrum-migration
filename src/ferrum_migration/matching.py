@@ -156,9 +156,29 @@ def route_overlaps(a, b) -> bool:
         return False
     if not methods_overlap(a.methods, b.methods):
         return False
+    if a.path_ok and b.path_ok and _segment_exact_disjoint(a, b):
+        return False
     space_a = None if not a.path_ok else path_space(a.kind, a.path)
     space_b = None if not b.path_ok else path_space(b.kind, b.path)
     return spaces_overlap(space_a, space_b)
+
+
+def _segment_exact_disjoint(a, b) -> bool:
+    """A segment prefix (Envoy ``path_separated_prefix``) and a literal exact path that it provably never matches.
+
+    ``/api`` with segment semantics matches ``/api`` and ``/api/...`` only, in the source and in Ferrum alike,
+    so an exact ``/apix`` (or ``/ap``) is disjoint from it. Any other pair keeps the conservative string check.
+    """
+    for seg, exact in ((a, b), (b, a)):
+        if seg.kind != "prefix" or getattr(seg, "prefix_semantics", "string") != "segment" or exact.kind != "exact":
+            continue
+        if seg.path is None or exact.path is None:
+            return False
+        base = seg.path.rstrip("/")
+        if not base:
+            return False  # a segment prefix of "/" matches every path
+        return not (exact.path == base or exact.path.startswith(base + "/"))
+    return False
 
 
 def route_covers(outer, inner) -> bool:

@@ -375,31 +375,24 @@ class _Kong:
             return
         if not candidates:
             return
-        key, secret = candidates[0]
-        if key in (spec.username, spec.custom_id):
-            own = sum(1 for value in (consumer.get("username"), consumer.get("custom_id"), consumer.get("id"))
-                      if value == key)
-            if identities[key] > own:
-                # Ferrum resolves the claim by username, id or custom_id across all consumers.
-                self.report.error("kong-jwt-identity", spec.ref,
-                                  "A JWT credential key also names another consumer's username/custom_id/id, so "
-                                  "Ferrum could resolve the token to a different consumer; not migrated.")
-                return
-        elif spec.custom_id is None and identities[key] == 0:
-            spec.custom_id = key
-            identities[key] += 1
-            self.report.info("kong-jwt-identity", spec.ref,
-                             "The JWT key claim value was mapped to custom_id so Ferrum resolves the same "
-                             "consumer from the token.")
-        else:
-            self.report.error("kong-jwt-identity", spec.ref,
-                              "A JWT credential key does not match the consumer's username/custom_id and "
-                              "cannot be mapped unambiguously; not migrated.")
-            return
-        if self.ctx.include_secrets:
-            spec.jwt.append(secret)
-        else:
-            spec.withheld_secrets += 1
+        # Even a single credential is not portable. Kong selects the credential by its own `key` (read from the
+        # configured claim, or the token header), so only that exact value verifies against this secret. Ferrum
+        # resolves the claim value against every consumer alias it indexes (username, id and custom_id) and then
+        # accepts the consumer-wide JWT secret, so tokens naming another alias of the consumer would verify too.
+        # No one-to-one selector contract between a Kong credential key and a Ferrum secret is verified, so the
+        # secret is never written (not even with --include-secrets) and the consumer is not re-keyed for it.
+        # The consumer, its other credentials and the route's jwt_auth protection are still migrated, so JWT
+        # authentication fails closed until a new secret is issued in Ferrum.
+        self.report.error("kong-jwt-credential-withheld", spec.ref,
+                          "The consumer's HMAC JWT credential was not migrated. Kong only accepts a token whose key "
+                          "claim equals this credential's key, while Ferrum resolves the claim against every alias "
+                          "of a consumer (username, id, custom_id) and accepts the consumer-wide secret, so the "
+                          "credential's selector cannot be reproduced one-to-one. Routes keep jwt_auth, so JWT "
+                          "authentication for this consumer fails closed (fail closed).",
+                          "Issue a new random HMAC secret (at least 32 characters) for this consumer in Ferrum and "
+                          "have clients sign tokens whose configured identity claim names exactly this consumer. "
+                          "Do not reuse the old secret, and keep the Kong credential active until clients have "
+                          "switched.")
 
     # -------------------------------------------------------------- plugins
 

@@ -91,20 +91,62 @@ class IstioSecurityTest(unittest.TestCase):
         self.assertEqual(statuses, {"refused"})
 
     def test_policy_for_other_workloads_does_not_affect_gateway(self):
+        # Provably disjoint: the policy pins the Gateway selector's own label key to another value, so no pod
+        # can match both. A targetRef naming another Gateway is unrelated too.
         text = read_fixture("istio", "istio.yaml") + textwrap.dedent("""
             ---
             apiVersion: security.istio.io/v1
             kind: AuthorizationPolicy
             metadata:
-              name: cart-only
+              name: egress-only
               namespace: shop
             spec:
               selector:
-                matchLabels: {app: cart}
+                matchLabels: {istio: egressgateway, app: cart}
+            ---
+            apiVersion: security.istio.io/v1
+            kind: AuthorizationPolicy
+            metadata:
+              name: other-gateway
+              namespace: edge
+            spec:
+              targetRefs:
+                - {kind: Gateway, group: gateway.networking.k8s.io, name: other-gw}
         """)
-        result, _report, _ = migrate("istio", text)
+        result, report, _ = migrate("istio", text)
         self.assertEqual(one_proxy(self, result.config, "/cart", "shop.example.com")["labels"]["ferrum-migration/status"],
                          "migrated")
+        self.assertNotIn("istio-policy-scope-unknown", codes(report))
+
+    def _policy_statuses(self, policy_yaml):
+        result, report, _ = migrate("istio", read_fixture("istio", "istio.yaml") + textwrap.dedent(policy_yaml))
+        statuses = {p["labels"]["ferrum-migration/status"] for p in result.config["proxies"] if "listen_path" in p}
+        return statuses, report
+
+    def test_policy_selector_not_provably_disjoint_refuses_gateway_routes(self):
+        # Other or extra label keys are no proof of disjointness: one gateway pod can carry all of them.
+        for labels in ("{app: cart}", "{istio: ingressgateway, version: canary}"):
+            statuses, _report = self._policy_statuses("""
+                ---
+                apiVersion: security.istio.io/v1
+                kind: AuthorizationPolicy
+                metadata: {name: maybe-gateway, namespace: shop}
+                spec:
+                  selector:
+                    matchLabels: LABELS
+            """.replace("LABELS", labels))
+            self.assertEqual(statuses, {"refused"}, labels)
+
+    def test_namespace_wide_policy_in_unknown_namespace_refuses_gateway_routes(self):
+        statuses, report = self._policy_statuses("""
+            ---
+            apiVersion: security.istio.io/v1
+            kind: RequestAuthentication
+            metadata: {name: namespace-wide, namespace: payments}
+            spec: {}
+        """)
+        self.assertEqual(statuses, {"refused"})
+        self.assertIn("istio-policy-scope-unknown", codes(report, "error"))
 
     def test_header_match_poisons_only_more_specific_routes(self):
         text = textwrap.dedent("""
@@ -257,6 +299,75 @@ class IstioSecurityTest(unittest.TestCase):
                          "refused")
         self.assertIn("istio-client-ca", codes(report, "error"))
         self.assertEqual(plan.settings.client_ca_paths, [])
+
+    def test_overlapping_but_different_shared_host_scopes_are_refused_not_merged(self):
+        # The HTTPS server's wildcard covers the plaintext server's host. Ferrum would answer HTTPS requests for
+        # that host from the plaintext projection, without the HTTPS server's client certificate requirement.
+        text = textwrap.dedent("""
+            apiVersion: networking.istio.io/v1
+            kind: Gateway
+            metadata: {name: gw, namespace: default}
+            spec:
+              servers:
+                - port: {number: 80, name: http, protocol: HTTP}
+                  hosts: ["a.example.test"]
+                - port: {number: 443, name: https, protocol: HTTPS}
+                  hosts: ["*.example.test"]
+                  tls:
+                    mode: MUTUAL
+                    serverCertificate: /etc/synthetic/server.crt
+                    privateKey: /etc/synthetic/server.key
+                    caCertificates: /etc/synthetic/client-ca.pem
+            ---
+            apiVersion: networking.istio.io/v1
+            kind: VirtualService
+            metadata: {name: app, namespace: default}
+            spec:
+              hosts: ["*.example.test"]
+              gateways: [gw]
+              http:
+                - route: [{destination: {host: web, port: {number: 80}}}]
+        """)
+        result, report, _plan = migrate("istio", text)
+        statuses = {p["labels"]["ferrum-migration/status"] for p in result.config["proxies"] if "listen_path" in p}
+        self.assertEqual(statuses, {"refused"})
+        self.assertEqual(one_proxy(self, result.config, "/", "a.example.test")["labels"]["ferrum-migration/status"],
+                         "refused")
+        self.assertIn("istio-shared-host-scope", codes(report, "error"))
+
+    def test_port_specific_match_is_not_resolved_for_one_shared_listener(self):
+        # The /admin match applies on the HTTPS server port only. The shared projection serves both listeners, so
+        # it is refused (fail closed) instead of being silently dropped for HTTPS or exposed over plaintext.
+        text = textwrap.dedent("""
+            apiVersion: networking.istio.io/v1
+            kind: Gateway
+            metadata: {name: gw, namespace: default}
+            spec:
+              servers:
+                - port: {number: 80, name: http, protocol: HTTP}
+                  hosts: ["app.example.test"]
+                - port: {number: 443, name: https, protocol: HTTPS}
+                  hosts: ["app.example.test"]
+                  tls: {mode: SIMPLE, serverCertificate: /etc/synthetic/server.crt, privateKey: /etc/synthetic/server.key}
+            ---
+            apiVersion: networking.istio.io/v1
+            kind: VirtualService
+            metadata: {name: app, namespace: default}
+            spec:
+              hosts: [app.example.test]
+              gateways: [gw]
+              http:
+                - name: admin-tls-port
+                  match: [{port: 443, uri: {prefix: /admin}}]
+                  route: [{destination: {host: admin, port: {number: 80}}}]
+                - route: [{destination: {host: web, port: {number: 80}}}]
+        """)
+        result, report, _plan = migrate("istio", text)
+        self.assertEqual(one_proxy(self, result.config, "/admin", "app.example.test")["labels"]["ferrum-migration/status"],
+                         "refused")
+        self.assertEqual(one_proxy(self, result.config, "/", "app.example.test")["labels"]["ferrum-migration/status"],
+                         "migrated")
+        self.assertIn("route-refused", codes(report, "error"))
 
     def test_restricted_server_bind_is_not_exposed_on_shared_address(self):
         text = textwrap.dedent("""

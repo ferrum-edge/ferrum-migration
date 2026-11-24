@@ -159,6 +159,107 @@ class NginxSemanticsTest(unittest.TestCase):
         self.assertNotIn("hosts", one_proxy(self, result.config, "/api"))
         self.assertNotIn("nginx-default-server-named", codes(report))
 
+    def test_default_server_on_a_dropped_extra_port_is_not_a_catch_all(self):
+        # side is the default server only on 8080, which Ferrum does not serve for it; on port 80 the main server
+        # is the default. It must keep its own server_name instead of taking every unknown host on port 80.
+        result, _report, _ = nginx("""
+            server { listen 80; server_name main.example.test; location / { proxy_pass http://main.internal:8080; } }
+            server {
+                listen 80;
+                listen 8080 default_server;
+                server_name side.example.test;
+                location /side/ { proxy_pass http://side.internal:8080; }
+            }
+        """)
+        side = one_proxy(self, result.config, "/side", "side.example.test")
+        self.assertEqual(side["hosts"], ["side.example.test"])
+        self.assertEqual([p for p in proxies(result.config, "/side") if "hosts" not in p], [])
+
+    def test_mixed_default_ownership_keeps_named_hosts(self):
+        result, report, _ = nginx("""
+            server {
+                listen 80 default_server;
+                listen 443 ssl;
+                server_name a.example.test;
+                ssl_certificate /etc/synthetic/server.crt;
+                ssl_certificate_key /etc/synthetic/server.key;
+                location /a/ { proxy_pass http://a.internal:8080; }
+            }
+            server {
+                listen 443 ssl default_server;
+                server_name b.example.test;
+                ssl_certificate /etc/synthetic/server.crt;
+                ssl_certificate_key /etc/synthetic/server.key;
+                location /b/ { proxy_pass http://b.internal:8080; }
+            }
+        """, tls_only=True)
+        self.assertEqual(one_proxy(self, result.config, "/a", "a.example.test")["hosts"], ["a.example.test"])
+        self.assertIn("nginx-default-server-listener", codes(report, "error"))
+
+    def test_different_default_servers_on_main_listeners_are_refused(self):
+        result, report, _ = nginx("""
+            server { listen 80; location /a/ { proxy_pass http://a.internal:8080; } }
+            server {
+                listen 443 ssl;
+                ssl_certificate /etc/synthetic/server.crt;
+                ssl_certificate_key /etc/synthetic/server.key;
+                location /b/ { proxy_pass http://b.internal:8080; }
+            }
+        """, tls_only=True)
+        self.assertEqual(one_proxy(self, result.config, "/a")["labels"]["ferrum-migration/status"], "refused")
+        self.assertEqual(one_proxy(self, result.config, "/b")["labels"]["ferrum-migration/status"], "refused")
+        self.assertIn("nginx-default-server-conflict", codes(report, "error"))
+
+    def test_nested_wildcard_scope_routes_are_refused(self):
+        # NGINX sends x.team.example.test only to the narrower wildcard server. Ferrum's wildcard tier would let
+        # the broader server's /api route answer it, so that route is refused instead of only reported.
+        result, report, _ = nginx("""
+            server { listen 80 default_server; return 444; }
+            server { listen 80; server_name *.example.test; location /api/ { proxy_pass http://broad.internal:8080; } }
+            server { listen 80; server_name *.team.example.test; location /app/ { proxy_pass http://team.internal:8080; } }
+        """)
+        broad = one_proxy(self, result.config, "/api", "*.example.test")
+        self.assertEqual(broad["labels"]["ferrum-migration/status"], "refused")
+        team = one_proxy(self, result.config, "/app", "*.team.example.test")
+        self.assertEqual(team["labels"]["ferrum-migration/status"], "migrated")
+        self.assertIn("nested-wildcard-scope", codes(report, "error"))
+        assert_structurally_valid(self, result.config)
+
+    def test_wildcard_scope_with_nested_exact_scope_gets_a_closure(self):
+        # The exact server's host-only closure overlaps the wildcard, so the wildcard scope is closed with a
+        # catch-any regex 404 instead of being left to fall through to the default server.
+        result, report, _ = nginx("""
+            server { listen 80 default_server; return 444; }
+            server { listen 80; server_name api.example.test; location /v1/ { proxy_pass http://api.internal:8080; } }
+            server { listen 80; server_name *.example.test; location /shop/ { proxy_pass http://shop.internal:8080; } }
+        """)
+        closure = one_proxy(self, result.config, "~/.*", "*.example.test")
+        self.assertEqual(plugin(self, result.config, closure, "request_termination")["config"]["status_code"], 404)
+        self.assertNotIn("scope-closure-skipped", codes(report))
+        catch_all = one_proxy(self, result.config, "/")
+        self.assertNotEqual(catch_all["labels"]["ferrum-migration/status"], "refused")
+        self.assertEqual(one_proxy(self, result.config, "/shop", "*.example.test")["labels"]["ferrum-migration/status"],
+                         "migrated")
+        assert_structurally_valid(self, result.config)
+
+    def test_caret_prefix_siblings_cannot_reach_a_regex_location(self):
+        # ^~ /static stops NGINX's regex search for every path starting with /static (also /staticx.php).
+        # In Ferrum such a sibling would reach the regex route, so that route is guarded for /static.
+        result, _report, _ = nginx("""
+            server {
+                listen 80;
+                server_name app.example.test;
+                location ^~ /static { proxy_pass http://static.internal:8080; }
+                location ~ \\.php$ { proxy_pass http://php.internal:9000; }
+            }
+        """)
+        # The only server is the default server, so its routes are catch-all (no hosts).
+        self.assertEqual(one_proxy(self, result.config, "/static")["labels"]["ferrum-migration/status"], "migrated")
+        regex = one_proxy(self, result.config, "~.*\\.php")
+        guards = [p["config"]["trigger"]["path_prefix"] for p in plugins_of(result.config, regex)
+                  if p["plugin_name"] == "request_termination"]
+        self.assertEqual(guards, ["/static"])
+
     def test_loopback_listener_is_not_exposed(self):
         result, report, _ = nginx("""
             server { listen 127.0.0.1:8081; server_name admin.local; location / { proxy_pass http://127.0.0.1:9000; } }
