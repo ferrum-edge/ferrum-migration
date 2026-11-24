@@ -1068,5 +1068,60 @@ class TraefikParentRefsTest(unittest.TestCase):
         self.assertEqual(parent_refs_violations(self._doc({"router-zq": router})), 1)
 
 
+class TraefikHardeningTest(unittest.TestCase):
+    def test_mirroring_external_or_internal_provider_service_is_refused(self):
+        for target in ("svc@docker", "api@internal"):
+            with self.subTest(target=target):
+                doc = {
+                    "http": {
+                        "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "m"}},
+                        "services": {
+                            "svc": {"loadBalancer": {"servers": [{"url": "http://10.0.0.1:8080"}]}},
+                            "m": {"mirroring": {"service": target, "mirrors": []}},
+                        },
+                    }
+                }
+                result, report, _ = asserted(yaml.safe_dump(doc))
+                assert_structurally_valid(self, result.config)
+                self.assertEqual(one_proxy(self, result.config, "/api")["labels"]["ferrum-migration/status"], "refused")
+                self.assertIn("route-refused", codes(report, "error"))
+
+    def test_malformed_chain_middleware_refuses_route(self):
+        for bad_chain in ({"chain": "not-a-dict"}, {"chain": {"middlewares": [123]}}):
+            with self.subTest(chain=bad_chain):
+                doc = {
+                    "http": {
+                        "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "svc",
+                                          "middlewares": ["ch"]}},
+                        "middlewares": {"ch": bad_chain},
+                        "services": {"svc": {"loadBalancer": {"servers": [{"url": "http://10.0.0.1:8080"}]}}},
+                    }
+                }
+                result, report, _ = asserted(yaml.safe_dump(doc))
+                assert_structurally_valid(self, result.config)
+                self.assertEqual(one_proxy(self, result.config, "/api")["labels"]["ferrum-migration/status"], "refused")
+                self.assertIn("route-refused", codes(report, "error"))
+
+    def test_multiple_add_prefix_and_add_before_strip_refused(self):
+        for mws in (["a1", "a2"], ["a1", "sp"]):
+            with self.subTest(mws=mws):
+                doc = {
+                    "http": {
+                        "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "svc",
+                                          "middlewares": mws}},
+                        "middlewares": {
+                            "a1": {"addPrefix": {"prefix": "/v1"}},
+                            "a2": {"addPrefix": {"prefix": "/v2"}},
+                            "sp": {"stripPrefix": {"prefixes": ["/v1/api"]}},
+                        },
+                        "services": {"svc": {"loadBalancer": {"servers": [{"url": "http://10.0.0.1:8080"}]}}},
+                    }
+                }
+                result, report, _ = asserted(yaml.safe_dump(doc))
+                assert_structurally_valid(self, result.config)
+                self.assertEqual(one_proxy(self, result.config, "/api")["labels"]["ferrum-migration/status"], "refused")
+                self.assertIn("route-refused", codes(report, "error"))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -9,6 +9,7 @@ first.
 
 from __future__ import annotations
 
+import math
 import re
 from collections import Counter
 from typing import Any
@@ -18,8 +19,8 @@ from ..errors import InputError
 from ..model import BackendRef, ConsumerSpec, Plan, PluginSpec, RouteSpec, Target, TlsSpec, UpstreamSpec
 from ..redact import contains_secret_reference, safe_label
 from ..safe_load import load_structured
-from .common import (SourceContext, check_route_budget, cors_config, mapping, query_rule, request_header_rule,
-                     response_header_rule, seq, str_list)
+from .common import (SourceContext, check_route_budget, cors_config, header_name_ok, header_value_ok, mapping,
+                     query_rule, request_header_rule, response_header_rule, seq, str_list)
 
 PLATFORM = "kong"
 HTTP_PROTOCOLS = {"http", "https", "grpc", "grpcs", "ws", "wss"}
@@ -86,6 +87,7 @@ class _Kong:
         self.plugins: list[_Plugin] = []
         self.plugins_by_owner: dict[tuple[str, str | None], list[_Plugin]] = {}
         self.consumer_quarantine: dict[str, list[str]] = {}
+        self.consumer_group_members: dict[str, set[str]] = {}
         self.jwt_algorithm = "HS256"
         self.format_version = "3.0"
         self.pretransformed = False
@@ -135,9 +137,9 @@ class _Kong:
                               "not migrated, even with --include-secrets (fail closed).",
                               "Issue new credentials in Ferrum.")
         self._index_upstreams()
+        consumers = self._index_consumers()
         self._index_services()
         self._index_top_routes()
-        consumers = self._index_consumers()
         self._index_top_plugins()
         self._decide_jwt_algorithm(consumers)
         self._translate_globals()
@@ -199,10 +201,21 @@ class _Kong:
 
     def _register_plugin(self, raw: dict, level: str, owner: str | None) -> None:
         consumer = _ref_key(raw.get("consumer"))
+        group = _ref_key(raw.get("consumer_group")) if raw.get("consumer_group") else None
         if consumer or raw.get("consumer_group"):
-            target = consumer or "?"
-            self.consumer_quarantine.setdefault(target, []).append(
-                f"plugin {safe_label(raw.get('name'), 40)} is scoped to this consumer and has no Ferrum equivalent")
+            pname = safe_label(raw.get("name"), 40)
+            if consumer:
+                self.consumer_quarantine.setdefault(consumer, []).append(
+                    f"plugin {pname} is scoped to this consumer and has no Ferrum equivalent")
+            if raw.get("consumer_group"):
+                glabel = safe_label(group or "?", 40)
+                members = self.consumer_group_members.get(group, set()) if group else set()
+                for member in members:
+                    self.consumer_quarantine.setdefault(member, []).append(
+                        f"plugin {pname} is scoped to consumer group {glabel} and has no Ferrum equivalent")
+                self.report.error("kong-consumer-group", f"kong plugin {pname}",
+                                  f"Plugin is scoped to consumer group {glabel}, which is not migrated; members "
+                                  "are quarantined (credentials withheld).")
             return
         plugin = _Plugin(raw, level, owner)
         self.plugins.append(plugin)
@@ -249,10 +262,13 @@ class _Kong:
             if not isinstance(group, dict):
                 continue
             name = safe_label(group.get("name"))
-            if group.get("plugins"):
-                for member in seq(group.get("consumers")):
-                    key = _ref_key(member)
-                    if key:
+            group_ids = [ident for ident in (group.get("name"), group.get("id")) if isinstance(ident, str)]
+            for member in seq(group.get("consumers")):
+                key = _ref_key(member)
+                if key:
+                    for gid in group_ids:
+                        self.consumer_group_members.setdefault(gid, set()).add(key)
+                    if group.get("plugins"):
                         self.consumer_quarantine.setdefault(key, []).append(
                             f"consumer group {name} carries plugin overrides")
             self.report.error("kong-consumer-group", f"kong consumer_group {name}",
@@ -261,9 +277,12 @@ class _Kong:
         for consumer in consumers:
             for group in seq(consumer.get("groups")):
                 key = consumer.get("username") or consumer.get("custom_id")
+                gid = _ref_key(group)
                 if key:
+                    if gid:
+                        self.consumer_group_members.setdefault(gid, set()).add(str(key))
                     self.consumer_quarantine.setdefault(str(key), []).append(
-                        f"member of consumer group {safe_label(_ref_key(group))}")
+                        f"member of consumer group {safe_label(gid)}")
         return consumers
 
     def _decide_jwt_algorithm(self, consumers: list[dict]) -> None:
@@ -608,10 +627,19 @@ class _Kong:
         if interval > 0:
             probe = {"http": "http", "https": "http", "tcp": "tcp", "grpc": "grpc", "grpcs": "grpc"}.get(
                 str(active.get("type") or "http"), "http")
+            raw_timeout = active.get("timeout", 1)
+            timeout_s = 1.0
+            if not isinstance(raw_timeout, bool) and isinstance(raw_timeout, (int, float, str)):
+                try:
+                    parsed_t = float(raw_timeout)
+                    if math.isfinite(parsed_t) and parsed_t > 0:
+                        timeout_s = parsed_t
+                except ValueError:
+                    pass
             entry: dict[str, Any] = {
                 "http_path": active.get("http_path") if isinstance(active.get("http_path"), str) else "/",
                 "interval_seconds": interval,
-                "timeout_ms": int(float(active.get("timeout", 1) or 1) * 1000),
+                "timeout_ms": max(1, int(round(timeout_s * 1000))),
                 "healthy_threshold": max(1, util.as_int(healthy.get("successes")) or 1),
                 "unhealthy_threshold": max(1, util.as_int(unhealthy.get("http_failures"))
                                            or util.as_int(unhealthy.get("tcp_failures")) or 1),
@@ -620,7 +648,9 @@ class _Kong:
             if str(active.get("type")) in ("https", "grpcs"):
                 entry["use_tls"] = True
             statuses = healthy.get("http_statuses")
-            if isinstance(statuses, list) and all(isinstance(code, int) for code in statuses) and statuses:
+            if isinstance(statuses, list) and statuses \
+                    and all(isinstance(code, int) and not isinstance(code, bool) and 100 <= code <= 599
+                            for code in statuses):
                 entry["healthy_status_codes"] = statuses
             result["active"] = entry
         passive = mapping(mapping(checks.get("passive")).get("unhealthy"))
@@ -629,7 +659,9 @@ class _Kong:
         if failures > 0:
             entry = {"unhealthy_threshold": min(failures, 1000)}
             statuses = passive.get("http_statuses")
-            if isinstance(statuses, list) and all(isinstance(code, int) for code in statuses) and statuses:
+            if isinstance(statuses, list) and statuses \
+                    and all(isinstance(code, int) and not isinstance(code, bool) and 100 <= code <= 599
+                            for code in statuses):
                 entry["unhealthy_status_codes"] = statuses
             result["passive"] = entry
         if result:
@@ -639,20 +671,28 @@ class _Kong:
 
     def _build_route(self, route: dict, service_key: str | None, ref: str, index: int) -> None:
         name = str(route.get("name") or route.get("id") or f"route-{index + 1}")
-        protocols = str_list(route.get("protocols")) or ["http", "https"]
-        if not all(protocol in HTTP_PROTOCOLS for protocol in protocols):
+        raw_protocols = route.get("protocols")
+        protocols = str_list(raw_protocols)
+        protocol_invalid = raw_protocols is not None and protocols is None
+        if protocol_invalid:
+            protocols = []
+        elif not protocols:
+            protocols = ["http", "https"]
+        if not protocol_invalid and not all(protocol in HTTP_PROTOCOLS for protocol in protocols):
             skipped = RouteSpec(ref=ref, name=name, skip=True, skip_reason="stream route")
             self.plan.routes.append(skipped)
             self.report.error("kong-stream-route", ref, "TCP/TLS/UDP routes are not migrated (HTTP only).",
                               "Configure a Ferrum stream proxy (tcp/tcps/udp/dtls) manually.")
             return
-        requires_tls = all(protocol in TLS_PROTOCOLS for protocol in protocols)
+        requires_tls = bool(protocols) and all(protocol in TLS_PROTOCOLS for protocol in protocols)
         # Kong matches one route set on its plaintext and its TLS proxy listeners, filtered by the route's protocols.
         frontends = frozenset(("https" if protocol in TLS_PROTOCOLS else "http") for protocol in protocols)
         hosts = str_list(route.get("hosts"))
         methods = str_list(route.get("methods"))
         paths = str_list(route.get("paths"))
         extra = []
+        if protocol_invalid:
+            extra.append("protocols with unexpected types")
         if route.get("headers"):
             extra.append("header matchers")
         if route.get("snis"):
@@ -694,13 +734,18 @@ class _Kong:
                     spec.kind, spec.path = "prefix", "/"
             elif path.startswith("~"):
                 pattern = path[1:]
-                if pattern.startswith("^"):
-                    pattern = pattern[1:]
-                if pattern.endswith("$") and not pattern.endswith("\\$"):
-                    pattern = pattern[:-1]
+                if util.has_top_level_alternation(pattern):
+                    spec.kind, spec.path = "regex", pattern
+                    spec.refuse("regex with top-level alternation cannot be anchored faithfully")
+                    spec.extra_conditions = True
                 else:
-                    pattern += ".*"
-                spec.kind, spec.path = "regex", pattern
+                    if pattern.startswith("^"):
+                        pattern = pattern[1:]
+                    if util.ends_with_unescaped_dollar(pattern):
+                        pattern = pattern[:-1]
+                    else:
+                        pattern += ".*"
+                    spec.kind, spec.path = "regex", pattern
                 if strip:
                     spec.refuse("regex path with strip_path=true: Ferrum strips the whole regex match")
             elif self.format_version != "3.0" and _REGEX_HINT.search(path):
@@ -771,7 +816,11 @@ class _Kong:
 # ------------------------------------------------------------------ plugins
 
 def _kong_key_auth(self: _Kong, config: dict, ref: str) -> tuple:
-    names = str_list(config.get("key_names")) or ["apikey"]
+    raw_names = config.get("key_names")
+    names = str_list(raw_names)
+    if raw_names is not None and names is None:
+        return ("refuse", "key_names has unexpected types")
+    names = names or ["apikey"]
     in_header = config.get("key_in_header", True) is not False
     in_query = config.get("key_in_query", True) is not False
     locations = []
@@ -810,13 +859,23 @@ def _kong_jwt(self: _Kong, config: dict, ref: str) -> tuple:
         return ("refuse", "secret_is_base64 is not supported")
     if util.as_int(config.get("maximum_expiration")):
         return ("refuse", "maximum_expiration (token lifetime cap) has no Ferrum equivalent")
-    headers = [h.lower() for h in (str_list(config.get("header_names")) or ["authorization"])]
+    raw_headers = config.get("header_names")
+    parsed_headers = str_list(raw_headers)
+    if raw_headers is not None and parsed_headers is None:
+        return ("refuse", "header_names has unexpected types")
+    headers = [h.lower() for h in (parsed_headers or ["authorization"])]
     if len(headers) != 1:
         return ("refuse", "several token headers cannot be expressed as one token_lookup")
+    if not header_name_ok(headers[0]):
+        return ("refuse", "token header name is not a valid HTTP header token")
     if config.get("uri_param_names", ["jwt"]) or config.get("cookie_names"):
         self.report.warning("kong-jwt-locations", ref, "Only the header token location is migrated; tokens in "
                             "query parameters or cookies are rejected (stricter).")
-    claims = str_list(config.get("claims_to_verify")) or []
+    raw_claims = config.get("claims_to_verify")
+    claims = str_list(raw_claims)
+    if raw_claims is not None and claims is None:
+        return ("refuse", "claims_to_verify has unexpected types")
+    claims = claims or []
     plugin_config: dict[str, Any] = {
         "token_lookup": f"header:{'Authorization' if headers[0] == 'authorization' else headers[0]}",
         "consumer_claim_field": str(config.get("key_claim_name") or "iss"),
@@ -881,7 +940,13 @@ def _kong_rate_limiting(self: _Kong, config: dict, ref: str) -> tuple:
 
 
 def _kong_cors(self: _Kong, config: dict, ref: str) -> tuple:
-    origins = str_list(config.get("origins")) or ["*"]
+    raw_origins = config.get("origins")
+    origins = str_list(raw_origins)
+    if raw_origins is not None and origins is None:
+        self.report.warning("kong-cors", ref, "CORS omitted (origins has unexpected types); browsers block "
+                            "cross-origin calls.")
+        return ("omit",)
+    origins = origins or ["*"]
     for origin in origins:
         if origin != "*" and _REGEX_HINT.search(origin.replace(".", "")):
             self.report.warning("kong-cors-regex", ref, "Regex CORS origins are not translated; CORS omitted, so "
@@ -950,6 +1015,9 @@ def _kong_request_transformer(self: _Kong, config: dict, ref: str) -> tuple:
     rules: list[dict] = []
     if config.get("http_method"):
         return ("refuse", "changing the HTTP method is not supported")
+    for section in ("replace", "append", "remove", "rename", "add"):
+        if config.get(section) is not None and not isinstance(config.get(section), dict):
+            return ("refuse", f"'{section}' section is not a mapping")
     for section in ("replace", "append"):
         block = mapping(config.get(section))
         if any(block.get(sub) for sub in ("headers", "querystring", "body", "uri")):
@@ -957,12 +1025,19 @@ def _kong_request_transformer(self: _Kong, config: dict, ref: str) -> tuple:
     for section in ("remove", "rename", "add"):
         if mapping(config.get(section)).get("body"):
             return ("refuse", "body transformations are not translated")
-    for name in str_list(mapping(config.get("remove")).get("headers")) or []:
+    remove_block = mapping(config.get("remove"))
+    remove_headers = str_list(remove_block.get("headers"))
+    if remove_block.get("headers") is not None and remove_headers is None:
+        return ("refuse", "remove.headers has unexpected types")
+    for name in remove_headers or []:
         rule, problem = request_header_rule("remove", name)
         if problem:
             return ("refuse", problem)
         rules.append(rule)
-    for name in str_list(mapping(config.get("remove")).get("querystring")) or []:
+    remove_qs = str_list(remove_block.get("querystring"))
+    if remove_block.get("querystring") is not None and remove_qs is None:
+        return ("refuse", "remove.querystring has unexpected types")
+    for name in remove_qs or []:
         rule, problem = query_rule("remove", name)
         if problem:
             return ("refuse", problem)
@@ -1037,7 +1112,10 @@ def _kong_request_termination(self: _Kong, config: dict, ref: str) -> tuple:
         return ("refuse", "status code outside 200-599")
     termination: dict[str, Any] = {"status_code": status}
     if isinstance(config.get("body"), str):
-        termination["content_type"] = str(config.get("content_type") or "application/json")
+        ct = str(config.get("content_type") or "application/json")
+        if not header_value_ok(ct):
+            return ("refuse", "content_type is not a valid header value")
+        termination["content_type"] = ct
         termination["body"] = config["body"]
     else:
         termination["content_type"] = "application/json"
@@ -1047,9 +1125,12 @@ def _kong_request_termination(self: _Kong, config: dict, ref: str) -> tuple:
 
 def _kong_redirect(self: _Kong, config: dict, ref: str) -> tuple:
     location = config.get("location")
-    if config.get("keep_incoming_path") or not isinstance(location, str) or "$" in location:
-        return ("refuse", "only static redirects are translated")
+    if config.get("keep_incoming_path") or not isinstance(location, str) or "$" in location \
+            or not header_value_ok(location):
+        return ("refuse", "only static redirects with valid Location header values are translated")
     status = util.as_int(config.get("status_code", 301)) or 301
+    if not 200 <= status <= 599:
+        return ("refuse", "redirect status code outside 200-599")
     return ("termination", {"status_code": status, "headers": {"location": location}, "body": ""})
 
 

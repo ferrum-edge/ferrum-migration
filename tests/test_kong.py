@@ -441,5 +441,123 @@ class KongPrefixSemanticsTest(unittest.TestCase):
         self.assertFalse(report.has_errors, [c.to_dict() for c in report.caveats if c.severity == "error"])
 
 
+class KongHardeningTest(unittest.TestCase):
+    def test_malformed_healthcheck_timeout_and_bool_statuses_do_not_crash_or_emit_invalid(self):
+        text = textwrap.dedent("""
+            _format_version: "3.0"
+            upstreams:
+              - name: pool
+                targets: [{target: "10.0.0.1:8080", weight: 100}]
+                healthchecks:
+                  active:
+                    timeout: "not-a-number"
+                    healthy: {interval: 5, http_statuses: [true, 999]}
+                  passive:
+                    unhealthy: {http_failures: 3, http_statuses: [false, 502]}
+            services:
+              - name: s
+                host: pool
+                routes: [{name: r, paths: [/api/]}]
+        """)
+        result, _report, _ = migrate("kong", text)
+        assert_structurally_valid(self, result.config)
+        hc = result.config["upstreams"][0]["health_checks"]
+        self.assertEqual(hc["active"]["timeout_ms"], 1000)
+        self.assertNotIn("healthy_status_codes", hc["active"])
+        self.assertNotIn("unhealthy_status_codes", hc["passive"])
+
+    def test_malformed_protocols_and_plugin_lists_fail_closed(self):
+        text = textwrap.dedent("""
+            _format_version: "3.0"
+            services:
+              - name: s
+                url: http://s.internal:8080
+                routes:
+                  - name: bad-proto
+                    paths: [/p/]
+                    protocols: [123]
+                  - name: bad-keyauth
+                    paths: [/k/]
+                    plugins:
+                      - name: key-auth
+                        config: {key_names: [123]}
+                  - name: bad-jwt
+                    paths: [/j/]
+                    plugins:
+                      - name: jwt
+                        config: {claims_to_verify: 123}
+                  - name: bad-rt
+                    paths: [/t/]
+                    plugins:
+                      - name: request-transformer
+                        config: {remove: {headers: [123]}}
+                  - name: bad-redirect
+                    paths: [/r/]
+                    plugins:
+                      - name: redirect
+                        config: {status_code: 999, location: "https://example.test/"}
+        """)
+        result, _report, _ = migrate("kong", text)
+        assert_structurally_valid(self, result.config)
+        for path in ("/p", "/k", "/j", "/t", "/r"):
+            self.assertEqual(one_proxy(self, result.config, path)["labels"]["ferrum-migration/status"], "refused", path)
+        # Top-level alternation regex refuses instead of mis-anchoring only the last branch.
+        alt_text = textwrap.dedent("""
+            _format_version: "3.0"
+            services:
+              - name: s
+                url: http://s.internal:8080
+                routes:
+                  - name: bad-alt-regex
+                    paths: ["~/a|/b"]
+                    strip_path: false
+        """)
+        alt_res, _alt_rep, _ = migrate("kong", alt_text)
+        assert_structurally_valid(self, alt_res.config)
+        self.assertEqual(one_proxy(self, alt_res.config, "~/a|/b")["labels"]["ferrum-migration/status"], "refused")
+        # Malformed CORS origins omits CORS (fail closed in browsers) rather than defaulting to ["*"].
+        cors_text = textwrap.dedent("""
+            _format_version: "3.0"
+            services:
+              - name: s
+                url: http://s.internal:8080
+                routes:
+                  - name: bad-cors
+                    paths: [/c/]
+                    plugins:
+                      - name: cors
+                        config: {origins: [123]}
+        """)
+        cors_res, cors_rep, _ = migrate("kong", cors_text)
+        assert_structurally_valid(self, cors_res.config)
+        cors_proxy = one_proxy(self, cors_res.config, "/c")
+        self.assertEqual(cors_proxy["labels"]["ferrum-migration/status"], "migrated")
+        self.assertEqual(cors_proxy["plugins"], [])
+        self.assertIn("kong-cors", codes(cors_rep, "warning"))
+
+    def test_top_level_consumer_group_plugin_quarantines_group_members(self):
+        text = textwrap.dedent("""
+            _format_version: "3.0"
+            consumer_groups:
+              - name: vip
+                consumers: [alice]
+            consumers:
+              - username: alice
+                keyauth_credentials: [{key: "synthetic-key-at-least-16-chars"}]
+            plugins:
+              - name: rate-limiting
+                consumer_group: vip
+                config: {minute: 100}
+            services:
+              - name: s
+                url: http://s.internal:8080
+                routes: [{name: r, paths: [/api/]}]
+        """)
+        result, report, _ = migrate("kong", text, include_secrets=True)
+        self.assertEqual(result.secrets_emitted, 0)
+        self.assertNotIn("credentials", result.config["consumers"][0])
+        self.assertIn("kong-consumer-group", codes(report, "error"))
+
+
 if __name__ == "__main__":
     unittest.main()

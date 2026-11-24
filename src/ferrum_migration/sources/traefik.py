@@ -420,7 +420,8 @@ class _Acc:
     plugins: list[PluginSpec] = field(default_factory=list)
     refusals: list[str] = field(default_factory=list)
     strip_prefixes: list[list[str]] = field(default_factory=list)
-    add_prefix: str | None = None
+    add_prefixes: list[str] = field(default_factory=list)
+    path_ops: list[str] = field(default_factory=list)
     https_redirect: bool = False
     retry: dict | None = None
     allowed_hosts: list[str] | None = None
@@ -762,6 +763,12 @@ class _Traefik:
         if len(acc.strip_prefixes) > 1:
             spec.refuse("several stripPrefix middlewares cannot be combined")
             return
+        if len(acc.add_prefixes) > 1:
+            spec.refuse("several addPrefix middlewares cannot be combined")
+            return
+        if "add" in acc.path_ops and "strip" in acc.path_ops and acc.path_ops.index("add") < acc.path_ops.index("strip"):
+            spec.refuse("addPrefix before stripPrefix cannot be reproduced in Ferrum")
+            return
         if acc.strip_prefixes:
             prefixes = acc.strip_prefixes[0]
             path = spec.path if spec.kind in ("prefix", "exact") else None
@@ -780,8 +787,8 @@ class _Traefik:
                     spec.refuse("stripPrefix splits a path segment")
                     return
                 spec.backend_path = remainder if remainder not in ("", "/") else None
-        if acc.add_prefix:
-            spec.backend_path = acc.add_prefix.rstrip("/") + (spec.backend_path or "")
+        if acc.add_prefixes:
+            spec.backend_path = acc.add_prefixes[0].rstrip("/") + (spec.backend_path or "")
 
     # ------------------------------------------------- TLS handshake policy
 
@@ -987,7 +994,13 @@ class _Traefik:
                 continue
             mw_type, config = next(iter(definition.items()))
             if mw_type == "chain":
-                children = str_list(mapping(config).get("middlewares")) or []
+                if not isinstance(config, dict):
+                    acc.refusals.append(f"middleware chain {safe_label(base, 48)} config is malformed")
+                    continue
+                children = str_list(config.get("middlewares"))
+                if children is None:
+                    acc.refusals.append(f"middleware chain {safe_label(base, 48)} middlewares list has unexpected types")
+                    continue
                 result.extend(self._resolve_middlewares(children, acc, depth + 1, seen | {base}))
             else:
                 result.append((base, mw_type, mapping(config) if config is not None else {}))
@@ -1001,12 +1014,14 @@ class _Traefik:
                 acc.refusals.append("stripPrefix without prefixes")
             else:
                 acc.strip_prefixes.append(prefixes)
+                acc.path_ops.append("strip")
         elif mw_type == "addPrefix":
             prefix = config.get("prefix")
             if not isinstance(prefix, str) or not prefix.startswith("/"):
                 acc.refusals.append("addPrefix prefix must start with '/'")
             else:
-                acc.add_prefix = prefix
+                acc.add_prefixes.append(prefix)
+                acc.path_ops.append("add")
         elif mw_type == "headers":
             self._headers(config, acc, ref)
         elif mw_type == "basicAuth":
@@ -1193,7 +1208,14 @@ class _Traefik:
         if "mirroring" in raw and depth == 0:
             self.report.warning("traefik-mirroring", ref, "Mirrors are dropped; only the main service is migrated.")
             main = mapping(raw["mirroring"]).get("service")
-            return self._service(str(main).partition("@")[0], depth + 1) if main else {"problems": ["mirroring without service"]}
+            if not isinstance(main, str) or not main:
+                return {"problems": ["mirroring without service"]}
+            main_base, _, main_provider = main.partition("@")
+            if main_provider == "internal":
+                return {"problems": [f"internal service {safe_label(main_base, 32)} (dashboard/API) is not migrated"]}
+            if main_provider not in ("", "file"):
+                return {"problems": [f"service from provider {safe_label(main_provider, 32)} is not in the input"]}
+            return self._service(main_base, depth + 1)
         return {"problems": ["service type (failover or nested weighted) is not supported"]}
 
     def _transport(self, name: Any, ref: str) -> tuple[TlsSpec, dict, list[str]]:

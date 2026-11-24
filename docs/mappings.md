@@ -103,7 +103,7 @@ proxies:
 | `auth_basic` | `basic_auth` without credentials (fail closed) | htpasswd never read |
 | `limit_req` + `limit_req_zone` (`$binary_remote_addr`, `$server_name`) | `rate_limiting` (shared per zone) | burst/delay differ (warning) |
 | `client_max_body_size` (default 1m) | `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` = largest; smaller → `request_size_limiting` | |
-| `ssl_certificate(_key)`, `ssl_client_certificate` + `ssl_verify_client` (server or inherited from `http`) | frontend TLS paths, client CA | one listener-wide client CA only when every mTLS server on the main TLS port uses the same file; different files → affected routes refused (`frontend-client-ca-scope`), never concatenated; `ssl_verify_client` without a client CA file → refused (`nginx-client-ca`) |
+| `ssl_certificate(_key)`, `ssl_client_certificate` + `ssl_verify_client` (server or inherited from `http`), `ssl_crl`/`ssl_ocsp`, `ssl_reject_handshake` | frontend TLS paths, client CA | one listener-wide client CA only when every mTLS server on the main TLS port uses the same file; different files → affected routes refused (`frontend-client-ca-scope`), never concatenated; `ssl_verify_client` without a client CA file or with `ssl_crl`/`ssl_ocsp` → refused (`nginx-client-ca`); `ssl_reject_handshake on` refuses affected HTTPS routes (or all HTTPS routes when set on the default TLS server; `nginx-ssl-reject-handshake`) |
 | `include` (except `mime.types`, Debian `proxy_params`), `if`, `rewrite`, `auth_request`, `satisfy any`, unknown directives | containing location/server refused | |
 
 ## Traefik OSS (file provider)
@@ -141,7 +141,7 @@ proxies:
 | Envoy | Ferrum | Notes |
 |---|---|---|
 | listener port, downstream TLS | main ports, TLS-only, frontend cert paths | inline/SDS material never copied; a plaintext listener on another port is **not migrated** (`extra-listener-refused`). Each route has exactly one source frontend (its listener), so a plan with live plaintext routes gets `FERRUM_PROXY_HTTPS_PORT=0` and no frontend TLS settings, even when the TLS listener itself was skipped (RDS) |
-| `require_client_certificate` with a file `trusted_ca` | frontend client CA | inline/SDS/missing CA or extra validation constraints (SAN/hash/SPKI pins, CRLs) → listener's routes refused (`envoy-client-ca`) |
+| `require_client_certificate` or `validation_context` with a file `trusted_ca` | frontend client CA | optional `validation_context` becomes mandatory (`envoy-mtls-optional`, stricter); inline/SDS/combined/missing CA or extra validation constraints (SAN/hash/SPKI pins, CRLs) → listener's routes refused (`envoy-client-ca`) |
 | HCM with inline `route_config` | routes | RDS/scoped routes/xDS not read |
 | virtual host `domains` | `hosts` (+ host-only 404 closure) | prefix wildcards refused |
 | route `prefix` / `path` / `safe_regex` / `path_separated_prefix` | prefix / exact / regex / prefix (segment, no guard) | header/query/grpc/runtime matchers refused + poisoning. `prefix` is a string prefix (`/api` also matched `/apix`): never widened, `prefix-string-siblings` error when such siblings do not reach an equivalent route |
