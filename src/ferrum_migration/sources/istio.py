@@ -22,8 +22,8 @@ from ..model import BackendRef, HostScope, Plan, PluginSpec, RouteSpec, Target, 
 from ..redact import safe_label
 from ..safe_load import load_structured
 from .common import (SourceContext, apply_first_match_order, check_route_budget, choose_main_port, cors_config,
-                     literal_value, mapping, merge_weighted_targets, request_header_rule, response_header_rule,
-                     retry_from_policy, seq, str_list)
+                     header_value_ok, literal_value, mapping, merge_weighted_targets, request_header_rule,
+                     response_header_rule, retry_from_policy, seq, str_list)
 
 PLATFORM = "istio"
 ROOT_NAMESPACE = "istio-system"
@@ -167,7 +167,7 @@ class _Istio:
                 return "client certificate constraints beyond the CA bundle (" + ", ".join(constraints) + \
                     ") cannot be reproduced"
             ca = tls.get("caCertificates")
-            if isinstance(ca, str):
+            if isinstance(ca, str) and ca.strip():
                 # Recorded per server; the emitter decides whether one listener-wide bundle preserves every scope.
                 server["client_ca"] = ca
             else:
@@ -205,8 +205,11 @@ class _Istio:
             label = f"{kind} {safe_label(ns)}/{safe_label(name)}"
             if targeted:
                 applies = True
-            elif refs:
+            elif refs and all(isinstance(r.get("kind"), str) and r["kind"].strip()
+                              and isinstance(r.get("name"), str) and r["name"].strip() for r in refs):
                 applies = False
+            elif refs:
+                applies = True
             elif labels:
                 applies = not _selectors_disjoint(selector, labels)
             else:
@@ -230,7 +233,16 @@ class _Istio:
         spec = mapping(vs.get("spec"))
         if spec.get("tls") or spec.get("tcp"):
             self.report.error("istio-l4-routes", ref, "tls/tcp routes are not migrated (HTTP only).")
-        gateways = str_list(spec.get("gateways")) or ["mesh"]
+        raw_gateways = spec.get("gateways")
+        if raw_gateways is None:
+            gateways = ["mesh"]
+        else:
+            parsed_gateways = str_list(raw_gateways)
+            if parsed_gateways is None:
+                self.report.error("istio-gateways-invalid", ref,
+                                  "VirtualService spec.gateways has unexpected types; its routes were not migrated.")
+                return
+            gateways = parsed_gateways or ["mesh"]
         vs_hosts = [h.lower() for h in (str_list(spec.get("hosts")) or [])]
         for host in vs_hosts:
             if host != "*" and "." not in host:
@@ -501,11 +513,20 @@ class _Istio:
                 # Ferrum cannot keep a match that only applied on one of them.
                 port_condition = len(server_ports) > 1
             match_gateways = str_list(match.get("gateways"))
-            if match_gateways and gateway_ref not in match_gateways:
-                continue
+            if match.get("gateways") is not None and match_gateways is None:
+                extra = ["gateways matcher with unexpected types"]
+            else:
+                gw_ns_ref, gw_sep, gw_name_ref = gateway_ref.rpartition("/")
+                gw_key = (gw_ns_ref if gw_sep else namespace, gw_name_ref)
+                if match_gateways and not any(
+                    ((g.rpartition("/")[0] if "/" in g else namespace), g.rpartition("/")[2]) == gw_key
+                    for g in match_gateways
+                ):
+                    continue
+                extra = []
             uri = mapping(match.get("uri"))
-            extra = [key for key in ("headers", "queryParams", "authority", "scheme", "sourceLabels",
-                                     "sourceNamespace", "withoutHeaders") if match.get(key)]
+            extra.extend(key for key in ("headers", "queryParams", "authority", "scheme", "sourceLabels",
+                                         "sourceNamespace", "withoutHeaders") if match.get(key))
             if port_condition:
                 extra.append("one gateway server port (match.port) while Ferrum serves these hosts on both its "
                              "plaintext and HTTPS listeners")
@@ -581,10 +602,12 @@ class _Istio:
             scheme = redirect.get("scheme") or ("https" if requires_tls else None)
             authority, uri = redirect.get("authority"), redirect.get("uri")
             code = util.as_int(redirect.get("redirectCode")) or 301
-            if not (scheme and authority and uri) or redirect.get("derivePort"):
-                spec.refuse("only fully static redirects (scheme, authority and uri) are migrated")
+            location = f"{scheme}://{authority}{uri}" if (scheme and authority and uri) else ""
+            if not (scheme and authority and uri) or redirect.get("derivePort") or redirect.get("port") \
+                    or not 200 <= code <= 599 or not header_value_ok(location):
+                spec.refuse("only fully static redirects (scheme, authority and uri without custom port) are migrated")
             else:
-                spec.termination = {"status_code": code, "headers": {"location": f"{scheme}://{authority}{uri}"},
+                spec.termination = {"status_code": code, "headers": {"location": location},
                                     "body": ""}
             return
         destinations = [mapping(d) for d in seq(entry.get("route"))]
@@ -658,7 +681,10 @@ class _Istio:
         for key, value in mapping(request.get("set")).items():
             rule, problem = request_header_rule("update", key, literal_value(str(value)))
             request_rules.append(rule) if rule else spec.refuse(problem or "invalid header")
-        for key in str_list(request.get("remove")) or []:
+        remove_req = str_list(request.get("remove"))
+        if request.get("remove") is not None and remove_req is None:
+            spec.refuse("request header 'remove' list has unexpected types")
+        for key in remove_req or []:
             rule, problem = request_header_rule("remove", key)
             request_rules.append(rule) if rule else spec.refuse(problem or "invalid header")
         for op, section in (("update", "set"), ("add", "add")):
@@ -684,6 +710,9 @@ class _Istio:
     def _destinations(self, spec: RouteSpec, destinations: list[dict], namespace: str, gw_ns: str) -> None:
         resolved = []
         for raw in destinations:
+            if raw.get("headers"):
+                spec.refuse("per-destination header operations are not migrated")
+                return
             destination = mapping(raw.get("destination"))
             host = destination.get("host")
             if not isinstance(host, str):
@@ -802,18 +831,27 @@ class _Istio:
             tls.verify = not tls_policy.get("insecureSkipVerify")
             if tls_policy.get("credentialName"):
                 return tls, scheme, "round_robin", None, "DestinationRule credentialName (Kubernetes Secret) is never read"
+            extra_tls = [k for k in ("caCrl", "verifyCertificateSpki", "verifyCertificateHash") if tls_policy.get(k)]
+            if extra_tls:
+                return tls, scheme, "round_robin", None, (
+                    "DestinationRule TLS validation constraints (" + ", ".join(extra_tls) + ") are not supported")
             if isinstance(tls_policy.get("caCertificates"), str):
                 tls.ca_path = tls_policy["caCertificates"]
             if isinstance(tls_policy.get("sni"), str):
                 tls.sni = tls_policy["sni"]
-            tls.san_allow_list = [str(s) for s in seq(tls_policy.get("subjectAltNames"))]
+            sans = [str(s) for s in seq(tls_policy.get("subjectAltNames"))]
+            if any(not util.valid_backend_tls_san(s) for s in sans):
+                return tls, scheme, "round_robin", None, "DestinationRule subjectAltNames entry is not representable"
+            tls.san_allow_list = sans
             if mode == "MUTUAL":
                 cert, key = tls_policy.get("clientCertificate"), tls_policy.get("privateKey")
-                if not (isinstance(cert, str) and isinstance(key, str)):
+                if not (isinstance(cert, str) and cert.strip() and isinstance(key, str) and key.strip()):
                     return tls, scheme, "round_robin", None, "MUTUAL TLS without client certificate file paths"
                 tls.client_cert_path, tls.client_key_path = cert, key
         elif mode == "ISTIO_MUTUAL":
             return tls, scheme, "round_robin", None, "ISTIO_MUTUAL needs mesh identity; use Ferrum mesh mode"
+        elif mode != "DISABLE":
+            return tls, scheme, "round_robin", None, f"DestinationRule TLS mode {safe_label(mode, 32)} is not supported"
         balancer = mapping(policy.get("loadBalancer"))
         algorithm, hash_on = "round_robin", None
         simple = str(balancer.get("simple", "ROUND_ROBIN")).upper()

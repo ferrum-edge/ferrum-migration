@@ -343,5 +343,82 @@ class EnvoyPrefixSemanticsTest(unittest.TestCase):
         self.assertNotIn("route-refused", codes(report))
 
 
+class EnvoyHardeningTest(unittest.TestCase):
+    def test_optional_downstream_validation_context_is_not_dropped(self):
+        doc = minimal_bootstrap({"path_separated_prefix": "/api"})
+        doc["static_resources"]["listeners"][0]["filter_chains"][0]["transport_socket"] = {
+            "name": "envoy.transport_sockets.tls",
+            "typed_config": {
+                "@type": "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext",
+                "common_tls_context": {
+                    "tls_certificates": [{"certificate_chain": {"filename": "/etc/s.crt"},
+                                          "private_key": {"filename": "/etc/s.key"}}],
+                    "validation_context": {"trusted_ca": {"filename": "/etc/ca.pem"}},
+                },
+            },
+        }
+        result, report, plan = migrate("envoy", yaml.safe_dump(doc))
+        assert_structurally_valid(self, result.config)
+        self.assertEqual(plan.settings.client_ca_paths, ["/etc/ca.pem"])
+        self.assertIn("envoy-mtls-optional", codes(report, "warning"))
+        # Optional validation with extra CRL constraint must refuse rather than silently drop.
+        doc["static_resources"]["listeners"][0]["filter_chains"][0]["transport_socket"]["typed_config"][
+            "common_tls_context"]["validation_context"]["crl"] = {"filename": "/etc/crl.pem"}
+        result2, report2, _ = migrate("envoy", yaml.safe_dump(doc))
+        self.assertEqual(one_proxy(self, result2.config, "/api")["labels"]["ferrum-migration/status"], "refused")
+        self.assertIn("envoy-client-ca", codes(report2, "error"))
+
+    def test_upstream_tls_constraints_and_non_tls_transport_socket_refused(self):
+        for label, patch in (
+            ("crl", {"transport_socket": {"name": "envoy.transport_sockets.tls", "typed_config": {
+                "@type": "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext",
+                "common_tls_context": {"validation_context": {
+                    "trusted_ca": {"filename": "/etc/ca.pem"}, "crl": {"filename": "/etc/crl.pem"}}}}}}),
+            ("email-san", {"transport_socket": {"name": "envoy.transport_sockets.tls", "typed_config": {
+                "@type": "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext",
+                "common_tls_context": {"validation_context": {
+                    "trusted_ca": {"filename": "/etc/ca.pem"},
+                    "match_typed_subject_alt_names": [{"san_type": "EMAIL", "matcher": {"exact": "a@b.test"}}]}}}}}),
+            ("alts", {"transport_socket": {"name": "envoy.transport_sockets.alts", "typed_config": {}}}),
+            ("matches", {"transport_socket_matches": [{"name": "m"}]}),
+        ):
+            with self.subTest(case=label):
+                doc = minimal_bootstrap({"path_separated_prefix": "/api"})
+                doc["static_resources"]["clusters"][0].update(patch)
+                result, report, _ = migrate("envoy", yaml.safe_dump(doc))
+                assert_structurally_valid(self, result.config)
+                self.assertEqual(one_proxy(self, result.config, "/api")["labels"]["ferrum-migration/status"], "refused")
+                self.assertIn("route-refused", codes(report, "error"))
+
+    def test_empty_vhost_domains_refused_not_catch_all(self):
+        doc = minimal_bootstrap({"path_separated_prefix": "/api"})
+        doc["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"][
+            "route_config"]["virtual_hosts"][0]["domains"] = []
+        result, report, _ = migrate("envoy", yaml.safe_dump(doc))
+        assert_structurally_valid(self, result.config)
+        self.assertEqual(live_routes(result.config), [])
+        self.assertIn("envoy-domains", codes(report, "error"))
+
+    def test_weighted_cluster_header_remove_and_connect_timeout_mismatch_refused(self):
+        doc = minimal_bootstrap({"path_separated_prefix": "/api"})
+        doc["static_resources"]["clusters"].append({
+            "name": "c2", "type": "STATIC", "connect_timeout": "2s",
+            "load_assignment": {"endpoints": [{"lb_endpoints": [{"endpoint": {"address": {"socket_address": {
+                "address": "10.0.0.2", "port_value": 8080}}}}]}]},
+        })
+        route = doc["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"][
+            "route_config"]["virtual_hosts"][0]["routes"][0]
+        route["route"] = {"weighted_clusters": {"clusters": [
+            {"name": "c", "weight": 50, "request_headers_to_remove": ["x-auth"]},
+            {"name": "c2", "weight": 50},
+        ]}}
+        result, _report, _ = migrate("envoy", yaml.safe_dump(doc))
+        self.assertEqual(one_proxy(self, result.config, "/api")["labels"]["ferrum-migration/status"], "refused")
+        # Remove header override; differing connect_timeout (5s default vs 2s) still refuses.
+        del route["route"]["weighted_clusters"]["clusters"][0]["request_headers_to_remove"]
+        result2, _report2, _ = migrate("envoy", yaml.safe_dump(doc))
+        self.assertEqual(one_proxy(self, result2.config, "/api")["labels"]["ferrum-migration/status"], "refused")
+
+
 if __name__ == "__main__":
     unittest.main()

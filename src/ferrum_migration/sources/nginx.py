@@ -18,8 +18,8 @@ from ..errors import InputError
 from ..limits import Limits
 from ..model import BackendRef, HostScope, Plan, PluginSpec, RouteSpec, Target, TlsSpec, UpstreamSpec
 from ..redact import safe_label
-from .common import (SourceContext, check_route_budget, choose_main_port, is_sensitive_header, literal_value,
-                     request_header_rule, response_header_rule)
+from .common import (SourceContext, check_route_budget, choose_main_port, header_value_ok, is_sensitive_header,
+                     literal_value, request_header_rule, response_header_rule)
 
 PLATFORM = "nginx"
 
@@ -167,7 +167,7 @@ SAFE_IGNORED = {
     "grpc_buffer_size", "proxy_headers_hash_max_size", "proxy_headers_hash_bucket_size",
     "client_body_temp_path", "fastcgi_temp_path", "uwsgi_temp_path", "scgi_temp_path", "sendfile_max_chunk",
     "log_subrequest", "open_log_file_cache", "limit_req_status", "limit_req_log_level", "ssl_password_file",
-    "ssl_conf_command", "ssl_reject_handshake", "http2_max_concurrent_streams", "client_body_in_file_only",
+    "ssl_conf_command", "http2_max_concurrent_streams", "client_body_in_file_only",
     # main-context directives that may appear in a bare snippet file
     "events", "worker_processes", "pid", "user", "worker_rlimit_nofile", "daemon", "master_process",
     "worker_cpu_affinity", "worker_priority", "pcre_jit", "timer_resolution", "lock_file", "working_directory",
@@ -183,6 +183,7 @@ DEFINITIONS = {"map", "geo", "split_clients", "limit_conn_zone", "proxy_cache_pa
                "log_not_found", "underscores_in_headers", "ignore_invalid_headers"}
 STRUCTURAL = {"server", "location", "listen", "server_name", "proxy_pass", "grpc_pass", "return", "if",
               "ssl_certificate", "ssl_certificate_key", "ssl_client_certificate", "ssl_verify_client",
+              "ssl_crl", "ssl_ocsp", "ssl_reject_handshake",
               "set_real_ip_from", "real_ip_header", "http2", "http3", "quic", "ssl", "include", "satisfy",
               "client_max_body_size", "proxy_connect_timeout", "proxy_read_timeout", "proxy_send_timeout",
               "grpc_connect_timeout", "grpc_read_timeout", "grpc_send_timeout", "auth_basic",
@@ -313,6 +314,7 @@ class _Nginx:
         self._elect_ports(infos)
         for info in infos:
             self._translate_server(info)
+        self._apply_ssl_reject_handshake(infos)
         self._refuse_conflicting_defaults()
         # Each route records the main listeners its server was served on (RouteSpec.protocols). The emitter keeps a
         # plaintext-only server's routes off Ferrum's HTTPS listener (and vice versa) for every host name.
@@ -479,6 +481,14 @@ class _Nginx:
                 if key and "$" not in cert and "$" not in key:
                     settings.frontend_cert_pairs.append((cert, key))
         client_cas, client_ca_problem = self._client_trust(server, ref, on_tls)
+        reject_hs = self._tls_setting(server, "ssl_reject_handshake") if on_tls else None
+        if reject_hs is not None and reject_hs != "off":
+            self.report.error("nginx-ssl-reject-handshake", ref,
+                              "ssl_reject_handshake rejects TLS handshakes before HTTP routing, which Ferrum's HTTPS "
+                              "listener cannot reproduce. Affected routes were refused (fail closed).",
+                              "Keep SNI handshake rejection on a front proxy, or review whether accepting handshakes "
+                              "for unknown SNIs is acceptable before migrating.")
+            scope.problems.append("ssl_reject_handshake cannot be reproduced by Ferrum's HTTPS listener")
         base = {"hosts": None if host_problem else hosts, "listen_port": listen_port, "requires_tls": requires_tls,
                 "server_label": info["label"], "server_ref": ref, "extra": bool(host_problem),
                 "client_cas": client_cas, "client_ca_problem": client_ca_problem,
@@ -529,6 +539,35 @@ class _Nginx:
         """Remember port-agnostic catch-all routes per server (checked for conflicting defaults in run())."""
         if base["hosts"] == [] and base["listen_port"] is None and routes:
             self.catch_all_routes.setdefault(info["index"], []).extend(routes)
+
+    def _apply_ssl_reject_handshake(self, infos: list[dict]) -> None:
+        """If the default server on the main TLS listener enables ssl_reject_handshake, refuse every HTTPS route."""
+        port = self.plan.settings.main_https_port
+        if port is None:
+            return
+        default_index = self.default_server.get((port, True))
+        if default_index is None:
+            return
+        default_info = next((info for info in infos if info["index"] == default_index), None)
+        if default_info is None:
+            return
+        setting = self._tls_setting(default_info["directive"], "ssl_reject_handshake")
+        if setting is None or setting == "off":
+            return
+        https_routes = [r for r in self.plan.routes
+                        if not r.skip and (r.requires_tls or "https" in (r.protocols or ()))]
+        if not https_routes:
+            return
+        for route in https_routes:
+            route.refuse("the default TLS server enables ssl_reject_handshake (SNI admission control), which Ferrum's "
+                         "HTTPS listener cannot reproduce")
+        self.report.error("nginx-ssl-reject-handshake", default_info["ref"],
+                          "The default server on the main TLS listener enables ssl_reject_handshake, rejecting TLS "
+                          "handshakes for unknown SNIs before HTTP routing. Ferrum's HTTPS listener completes every "
+                          f"handshake with its frontend certificate, so all {len(https_routes)} HTTPS route(s) were "
+                          "refused (fail closed).",
+                          "Keep SNI handshake rejection on a front proxy, or remove ssl_reject_handshake only if "
+                          "accepting handshakes for unknown SNIs is acceptable, then convert again.")
 
     def _refuse_conflicting_defaults(self) -> None:
         """Different default servers on the main plaintext and TLS listeners cannot share one catch-all tier.
@@ -606,6 +645,15 @@ class _Nginx:
         verify = self._tls_setting(server, "ssl_verify_client") or "off"
         if verify == "off" or not on_tls:
             return [], None
+        crl = self._tls_setting(server, "ssl_crl")
+        ocsp = self._tls_setting(server, "ssl_ocsp")
+        if crl or (ocsp and ocsp != "off"):
+            self.report.error("nginx-client-ca", ref,
+                              "Client certificate revocation checking (ssl_crl/ssl_ocsp) cannot be reproduced by "
+                              "Ferrum's frontend client CA bundle. The server's routes were refused (fail closed).",
+                              "Enforce client certificate revocation externally or wait for CRL/OCSP support before "
+                              "serving this trust boundary.")
+            return [], "client certificate revocation checking (ssl_crl/ssl_ocsp) cannot be reproduced"
         ca = self._tls_setting(server, "ssl_client_certificate")
         if ca is None and verify == "optional_no_ca":
             return [], None  # the certificate was never verified against a CA: no trust boundary to keep
@@ -709,8 +757,8 @@ class _Nginx:
             route.refuse("return with variables cannot be reproduced statically")
             return
         if code in (301, 302, 303, 307, 308):
-            if not value:
-                route.refuse("redirect without a target")
+            if not value or not header_value_ok(value):
+                route.refuse("redirect target is missing or not a valid header value")
                 return
             route.termination = {"status_code": code, "headers": {"location": value}, "body": ""}
         elif code in (204, 304):
@@ -730,7 +778,10 @@ class _Nginx:
             return
         scheme = "https" if match.group(1).lower() in ("https", "grpcs") else "http"
         hostport, uri = match.group(2), match.group(3)
-        tls = self._tls(scope, grpc)
+        tls, tls_problems = self._tls(scope, grpc)
+        if scheme == "https":
+            for problem in tls_problems:
+                route.refuse(problem)
         if hostport in self.upstream_blocks:
             key = self._upstream(hostport, tls, scheme)
             route.backend = BackendRef(scheme=scheme, upstream_key=key) if key else None
@@ -764,20 +815,30 @@ class _Nginx:
         self._headers(route, scope, grpc, ref)
         self._auth_and_limits(route, scope, ref)
 
-    def _tls(self, scope: _Scope, grpc: bool) -> TlsSpec:
+    def _tls(self, scope: _Scope, grpc: bool) -> tuple[TlsSpec, list[str]]:
         ssl = scope.ssl
         tls = TlsSpec(verify=ssl.get("verify") == "on")
-        if ssl.get("trusted_certificate"):
-            tls.ca_path = ssl["trusted_certificate"]
-        if ssl.get("certificate") and ssl.get("certificate_key"):
-            if "$" in ssl["certificate"] or ssl["certificate_key"].startswith("data:"):
-                tls.client_cert_path = None
+        problems: list[str] = []
+        ca = ssl.get("trusted_certificate")
+        if ca is not None:
+            if "$" in ca or ca.startswith("data:") or not ca.strip():
+                problems.append("backend TLS trusted CA uses a variable or inline data, which cannot be migrated")
             else:
-                tls.client_cert_path = ssl["certificate"]
-                tls.client_key_path = ssl["certificate_key"]
+                tls.ca_path = ca
+        cert, key = ssl.get("certificate"), ssl.get("certificate_key")
+        if cert is not None or key is not None:
+            if not cert or not key:
+                problems.append("backend TLS client certificate requires both certificate and key paths")
+            elif "$" in cert or "$" in key or cert.startswith("data:") or key.startswith("data:") \
+                    or not cert.strip() or not key.strip():
+                problems.append("backend TLS client certificate uses a variable or inline data, which cannot be "
+                                "migrated")
+            else:
+                tls.client_cert_path = cert
+                tls.client_key_path = key
         if ssl.get("server_name") == "on" and ssl.get("name") and "$" not in ssl["name"]:
             tls.sni = ssl["name"]
-        return tls
+        return tls, problems
 
     def _upstream(self, name: str, tls: TlsSpec, scheme: str) -> str | None:
         key = f"{name}|{scheme}|{tls.key()}"
@@ -1027,7 +1088,7 @@ def _nginx_regex(pattern: str, case_insensitive: bool) -> str | None:
     anchored_start = body.startswith("^")
     if anchored_start:
         body = body[1:]
-    anchored_end = body.endswith("$") and not body.endswith("\\$")
+    anchored_end = util.ends_with_unescaped_dollar(body)
     if anchored_end:
         body = body[:-1]
     if not anchored_start:

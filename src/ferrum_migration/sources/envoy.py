@@ -20,12 +20,21 @@ from ..model import BackendRef, HostScope, Plan, PluginSpec, RouteSpec, Target, 
 from ..redact import safe_label
 from ..safe_load import load_structured
 from .common import (SourceContext, apply_first_match_order, check_route_budget, choose_main_port, cors_config,
-                     literal_value, mapping, merge_weighted_targets, request_header_rule, response_header_rule,
-                     retry_from_policy, seq, split_csv, str_list)
+                     header_value_ok, literal_value, mapping, merge_weighted_targets, request_header_rule,
+                     response_header_rule, retry_from_policy, seq, split_csv, str_list)
 
 PLATFORM = "envoy"
 _REDIRECT_CODES = {"MOVED_PERMANENTLY": 301, "FOUND": 302, "SEE_OTHER": 303, "TEMPORARY_REDIRECT": 307,
                    "PERMANENT_REDIRECT": 308}
+
+
+def _proto_bool(value: Any) -> bool | None:
+    """Read a protobuf BoolValue in either JSON bool or ``{value: bool}`` shape."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, dict) and isinstance(value.get("value"), bool):
+        return value["value"]
+    return None
 
 
 def _kind(item: Any) -> str:
@@ -176,18 +185,29 @@ class _Envoy:
             self.report.error("envoy-sds", ref, "SDS certificates are not migrated.")
         self.plan.settings.frontend_tls_expected = True
         validation = mapping(common.get("validation_context"))
-        if not config.get("require_client_certificate"):
+        required = _proto_bool(config.get("require_client_certificate")) is True
+        has_sds_or_combined = bool(common.get("validation_context_sds_secret_config")
+                                   or common.get("combined_validation_context"))
+        has_validation = bool(validation) or has_sds_or_combined
+        if not required and not has_validation:
             return [], None
         ca = mapping(validation.get("trusted_ca"))
-        # Only a bare file-path trusted_ca is reproducible: SAN/hash/SPKI pins, CRLs or custom validators
+        # Only a bare file-path trusted_ca is reproducible: SAN/hash/SPKI pins, CRLs, SDS or custom validators
         # narrow who is trusted, and Ferrum's listener-wide bundle would accept every client of that CA.
         constraints = [key for key in validation if key != "trusted_ca"]
-        if isinstance(ca.get("filename"), str) and not constraints:
+        if not has_sds_or_combined and isinstance(ca.get("filename"), str) and ca["filename"].strip() \
+                and not constraints:
+            if not required:
+                self.report.warning("envoy-mtls-optional", ref,
+                                    "Optional client certificate verification (validation_context without "
+                                    "require_client_certificate) becomes mandatory under Ferrum's frontend client CA "
+                                    "(stricter).")
             return [ca["filename"]], None
         self.report.error("envoy-client-ca", ref,
-                          "The listener required client certificates, but its trust (inline, SDS or missing CA, or "
-                          "extra validation constraints such as SAN, hash or SPKI pinning) cannot be reproduced by "
-                          "Ferrum's frontend client CA bundle. Its routes were refused (fail closed).",
+                          "The listener configured client certificate verification, but its trust (inline, SDS, "
+                          "combined or missing CA, or extra validation constraints such as SAN, hash, SPKI or CRL) "
+                          "cannot be reproduced by Ferrum's frontend client CA bundle. Its routes were refused "
+                          "(fail closed).",
                           "Configure a Ferrum frontend dedicated to this trust boundary with a client CA file "
                           "(FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH), review the dropped constraints, and validate "
                           "it before serving traffic.")
@@ -233,11 +253,13 @@ class _Envoy:
                cors_enabled: bool, filter_refusal: str | None, buffer_limit: int | None, shared: dict) -> None:
         name = str(vhost.get("name") or f"vhost-{index + 1}")
         ref = f"envoy virtual_host '{safe_label(name)}' on {listener_ref}"
-        domains = str_list(vhost.get("domains")) or []
+        raw_domains = str_list(vhost.get("domains"))
         hosts: list[str] | None = []
         host_problem = None
-        if "*" not in domains:
-            for domain in domains:
+        if raw_domains is None or not raw_domains:
+            host_problem = "domains missing or invalid"
+        elif "*" not in raw_domains:
+            for domain in raw_domains:
                 host = domain.lower()
                 if ":" in host:
                     base, _, port_text = host.rpartition(":")
@@ -316,7 +338,7 @@ class _Envoy:
             spec.path_ok = False
             spec.extra_conditions = True
             spec.refuse("route match type is not supported")
-        if match.get("case_sensitive") is False and spec.kind in ("prefix", "exact") and spec.path_ok:
+        if _proto_bool(match.get("case_sensitive")) is False and spec.kind in ("prefix", "exact") and spec.path_ok:
             # Envoy ignores case_sensitive for safe_regex. Ferrum matches literal paths case-sensitively: the route
             # keeps its exact-case path and the emitter refuses every route that could receive the case variants
             # (fail closed), instead of letting them reach an overlapping route with another policy.
@@ -382,7 +404,11 @@ class _Envoy:
         if code is None or not (scheme and host and path):
             spec.refuse("only fully static redirects (scheme, host and path) are migrated")
             return
-        spec.termination = {"status_code": code, "headers": {"location": f"{scheme}://{host}{path}"}, "body": ""}
+        location = f"{scheme}://{host}{path}"
+        if not header_value_ok(location):
+            spec.refuse("redirect location is not a valid header value")
+            return
+        spec.termination = {"status_code": code, "headers": {"location": location}, "body": ""}
 
     def _action(self, spec: RouteSpec, action: dict, vhost: dict, ref: str) -> None:
         hash_on = None
@@ -420,7 +446,7 @@ class _Envoy:
             spec.refuse("regex/path rewrite policies are not supported")
         if action.get("host_rewrite_header") or action.get("host_rewrite_path_regex"):
             spec.refuse("dynamic host rewrites are not supported")
-        if action.get("auto_host_rewrite"):
+        if _proto_bool(action.get("auto_host_rewrite")) is True:
             spec.preserve_host = False
         elif action.get("host_rewrite_literal"):
             spec.preserve_host = False
@@ -597,29 +623,62 @@ class _Envoy:
         return targets, problems
 
     def _upstream_tls(self, raw: dict, ref: str) -> tuple[TlsSpec, str, list[str]]:
+        if raw.get("transport_socket_matches"):
+            return TlsSpec(), "http", ["cluster transport_socket_matches is not migrated"]
         socket = mapping(raw.get("transport_socket"))
-        if not socket or _kind(socket) != "tls":
+        if not socket:
             return TlsSpec(), "http", []
+        kind = _kind(socket)
+        if kind != "tls":
+            raw_text = (str(mapping(socket.get("typed_config")).get("@type", "")) + " "
+                        + str(socket.get("name", ""))).lower()
+            if "raw_buffer" in raw_text:
+                return TlsSpec(), "http", []
+            return TlsSpec(), "http", [f"upstream transport_socket {safe_label(kind, 48)} is not supported"]
         config = mapping(socket.get("typed_config"))
         common = mapping(config.get("common_tls_context"))
         problems: list[str] = []
         tls = TlsSpec(verify=False)
         validation = mapping(common.get("validation_context"))
-        if common.get("validation_context_sds_secret_config") or common.get("tls_certificate_sds_secret_configs"):
-            problems.append("SDS TLS material is not migrated")
+        if common.get("validation_context_sds_secret_config") or common.get("tls_certificate_sds_secret_configs") \
+                or common.get("combined_validation_context"):
+            problems.append("SDS or combined TLS validation material is not migrated")
         if validation:
+            extra_validation = [k for k in validation
+                                if k not in ("trusted_ca", "match_subject_alt_names", "match_typed_subject_alt_names")
+                                and validation.get(k)]
+            if extra_validation:
+                problems.append("upstream TLS validation constraints beyond trusted_ca and exact SANs "
+                                f"({', '.join(sorted(extra_validation)[:4])}) are not supported")
             ca = mapping(validation.get("trusted_ca"))
-            if ca.get("filename"):
+            if isinstance(ca.get("filename"), str) and ca["filename"].strip():
                 tls.verify = True
                 tls.ca_path = str(ca["filename"])
             elif ca:
-                problems.append("inline trusted CA material is not migrated")
+                problems.append("inline or invalid trusted CA material is not migrated")
             sans = []
-            for matcher in seq(validation.get("match_subject_alt_names")) + \
-                    [mapping(m).get("matcher") for m in seq(validation.get("match_typed_subject_alt_names"))]:
+            for matcher in seq(validation.get("match_subject_alt_names")):
                 matcher = mapping(matcher)
                 if "exact" in matcher:
-                    sans.append(str(matcher["exact"]))
+                    san = str(matcher["exact"])
+                    if util.valid_backend_tls_san(san):
+                        sans.append(san)
+                    else:
+                        problems.append("upstream TLS SAN entry is not representable in Ferrum")
+                elif matcher:
+                    problems.append("non-exact SAN matchers are not supported")
+            for typed_matcher in seq(validation.get("match_typed_subject_alt_names")):
+                typed_matcher = mapping(typed_matcher)
+                san_type = str(typed_matcher.get("san_type", "")).upper()
+                matcher = mapping(typed_matcher.get("matcher"))
+                if san_type not in ("DNS", "URI", "IP_ADDRESS"):
+                    problems.append(f"SAN matcher type {safe_label(san_type, 24)} is not supported")
+                elif "exact" in matcher:
+                    san = str(matcher["exact"])
+                    if util.valid_backend_tls_san(san):
+                        sans.append(san)
+                    else:
+                        problems.append("upstream TLS SAN entry is not representable in Ferrum")
                 elif matcher:
                     problems.append("non-exact SAN matchers are not supported")
             tls.san_allow_list = sans
@@ -628,7 +687,8 @@ class _Envoy:
         for cert in seq(common.get("tls_certificates"))[:1]:
             chain = mapping(mapping(cert).get("certificate_chain"))
             key = mapping(mapping(cert).get("private_key"))
-            if chain.get("filename") and key.get("filename"):
+            if isinstance(chain.get("filename"), str) and chain["filename"].strip() \
+                    and isinstance(key.get("filename"), str) and key["filename"].strip():
                 tls.client_cert_path, tls.client_key_path = str(chain["filename"]), str(key["filename"])
             else:
                 problems.append("inline client certificate material is never migrated")
@@ -654,21 +714,27 @@ class _Envoy:
     def _weighted(self, weighted: dict, spec: RouteSpec, hash_on: str | None) -> dict:
         parts: list[tuple[int, list[Target]]] = []
         keys = set()
+        connects = set()
         problems: list[str] = []
         first = None
         for child in seq(weighted.get("clusters")):
             child = mapping(child)
-            if child.get("request_headers_to_add") or child.get("typed_per_filter_config"):
-                problems.append("per-cluster header or filter overrides in weighted clusters")
+            if any(child.get(k) for k in ("request_headers_to_add", "request_headers_to_remove",
+                                          "response_headers_to_add", "response_headers_to_remove",
+                                          "typed_per_filter_config", "host_rewrite_literal")):
+                problems.append("per-cluster header, host-rewrite or filter overrides in weighted clusters")
             result = self._cluster(str(child.get("name")), hash_on)
             problems += result["problems"]
             if result.get("backend") is None:
                 continue
             first = first or result
             keys.add(result["tls_key"])
+            connects.add(result.get("connect"))
             parts.append((util.as_int(child.get("weight")) or 0, result["targets"]))
         if len(keys) > 1:
             problems.append("weighted clusters differ in TLS settings")
+        if len(connects) > 1:
+            problems.append("weighted clusters differ in connect_timeout")
         if problems or first is None:
             return {"problems": problems or ["weighted clusters are empty"]}
         merged = merge_weighted_targets(parts)

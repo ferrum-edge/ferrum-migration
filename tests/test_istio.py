@@ -735,6 +735,122 @@ class IstioCaseAndNamesTest(unittest.TestCase):
                 again, _report, _plan = migrate("istio", text, tls_only=tls_only)
                 self.assertEqual(names, [p["name"] for p in again.config["proxies"]])
 
+    def test_match_gateways_normalizes_namespace_qualified_refs(self):
+        text = textwrap.dedent("""
+            apiVersion: networking.istio.io/v1
+            kind: Gateway
+            metadata: {name: gw, namespace: app}
+            spec:
+              servers:
+                - port: {number: 80, name: http, protocol: HTTP}
+                  hosts: [api.example.test]
+            ---
+            apiVersion: networking.istio.io/v1
+            kind: VirtualService
+            metadata: {name: vs, namespace: app}
+            spec:
+              hosts: [api.example.test]
+              gateways: [gw]
+              http:
+                - name: r1
+                  match: [{gateways: [app/gw], uri: {exact: /ping}}]
+                  route: [{destination: {host: svc.app.svc.cluster.local, port: {number: 8080}}}]
+        """)
+        result, _report, _ = migrate("istio", text)
+        assert_structurally_valid(self, result.config)
+        self.assertEqual(one_proxy(self, result.config, "=/ping")["labels"]["ferrum-migration/status"], "migrated")
+
+    def test_malformed_policy_target_ref_fails_closed(self):
+        text = textwrap.dedent("""
+            apiVersion: networking.istio.io/v1
+            kind: Gateway
+            metadata: {name: gw, namespace: default}
+            spec:
+              selector: {istio: ingressgateway}
+              servers:
+                - port: {number: 80, name: http, protocol: HTTP}
+                  hosts: [api.example.test]
+            ---
+            apiVersion: networking.istio.io/v1
+            kind: VirtualService
+            metadata: {name: vs, namespace: default}
+            spec:
+              hosts: [api.example.test]
+              gateways: [gw]
+              http:
+                - match: [{uri: {exact: /ok}}]
+                  route: [{destination: {host: svc.default.svc.cluster.local, port: {number: 8080}}}]
+            ---
+            apiVersion: security.istio.io/v1
+            kind: AuthorizationPolicy
+            metadata: {name: bad-ref, namespace: default}
+            spec:
+              targetRef: {}
+        """)
+        result, _report, _ = migrate("istio", text)
+        assert_structurally_valid(self, result.config)
+        self.assertEqual(one_proxy(self, result.config, "=/ok")["labels"]["ferrum-migration/status"], "refused")
+
+    def test_per_destination_headers_and_unknown_dr_tls_mode_refused(self):
+        for label, extra in (
+            ("dest-headers",
+             "route: [{destination: {host: svc.default.svc.cluster.local, port: {number: 8080}}, "
+             "headers: {request: {set: {x-env: prod}}}}]"),
+            ("redirect-port",
+             "redirect: {scheme: https, authority: api.example.test, uri: /new, port: 8443}"),
+        ):
+            with self.subTest(case=label):
+                text = textwrap.dedent(f"""
+                    apiVersion: networking.istio.io/v1
+                    kind: Gateway
+                    metadata: {{name: gw, namespace: default}}
+                    spec:
+                      servers:
+                        - port: {{number: 80, name: http, protocol: HTTP}}
+                          hosts: [api.example.test]
+                    ---
+                    apiVersion: networking.istio.io/v1
+                    kind: VirtualService
+                    metadata: {{name: vs, namespace: default}}
+                    spec:
+                      hosts: [api.example.test]
+                      gateways: [gw]
+                      http:
+                        - match: [{{uri: {{exact: /ok}}}}]
+                          {extra}
+                """)
+                result, _report, _ = migrate("istio", text)
+                self.assertEqual(one_proxy(self, result.config, "=/ok")["labels"]["ferrum-migration/status"], "refused")
+        dr_bad = textwrap.dedent("""
+            apiVersion: networking.istio.io/v1
+            kind: Gateway
+            metadata: {name: gw, namespace: default}
+            spec:
+              servers:
+                - port: {number: 80, name: http, protocol: HTTP}
+                  hosts: [api.example.test]
+            ---
+            apiVersion: networking.istio.io/v1
+            kind: VirtualService
+            metadata: {name: vs, namespace: default}
+            spec:
+              hosts: [api.example.test]
+              gateways: [gw]
+              http:
+                - match: [{uri: {exact: /ok}}]
+                  route: [{destination: {host: svc.default.svc.cluster.local, port: {number: 8080}}}]
+            ---
+            apiVersion: networking.istio.io/v1
+            kind: DestinationRule
+            metadata: {name: dr, namespace: default}
+            spec:
+              host: svc.default.svc.cluster.local
+              trafficPolicy:
+                tls: {mode: CUSTOM_TLS}
+        """)
+        result, _report, _ = migrate("istio", dr_bad)
+        self.assertEqual(one_proxy(self, result.config, "=/ok")["labels"]["ferrum-migration/status"], "refused")
+
 
 if __name__ == "__main__":
     unittest.main()

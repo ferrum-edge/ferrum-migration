@@ -533,6 +533,60 @@ class NginxFrontendScopeTest(unittest.TestCase):
         self.assertNotIn("nginx-frontend-scope-conflict", codes(report))
         self.assertEqual(plan.settings.client_ca_paths, [self.CA])
 
+    def test_ssl_reject_handshake_on_default_tls_server_refuses_all_https_routes(self):
+        conf = """
+        server { listen 443 ssl default_server; ssl_reject_handshake on; }
+        server {
+            listen 443 ssl; server_name app.example.test;
+            ssl_certificate /etc/synthetic/server.crt; ssl_certificate_key /etc/synthetic/server.key;
+            location /api/ { proxy_pass http://app.internal:8080; }
+        }
+        """
+        result, report, _ = nginx(conf)
+        assert_structurally_valid(self, result.config)
+        self.assertEqual(self.status(result, "/api", "app.example.test"), "refused")
+        self.assertIn("nginx-ssl-reject-handshake", codes(report, "error"))
+
+    def test_ssl_crl_and_ssl_ocsp_refuse_mtls_server(self):
+        for directive in ("ssl_crl /etc/synthetic/crl.pem;", "ssl_ocsp on;"):
+            with self.subTest(directive=directive):
+                conf = f"""
+                server {{
+                    listen 443 ssl; server_name app.example.test;
+                    ssl_certificate /etc/synthetic/server.crt; ssl_certificate_key /etc/synthetic/server.key;
+                    ssl_client_certificate /etc/synthetic/client-ca.pem; ssl_verify_client on;
+                    {directive}
+                    location /api/ {{ proxy_pass http://app.internal:8080; }}
+                }}
+                """
+                result, report, _ = nginx(conf)
+                assert_structurally_valid(self, result.config)
+                self.assertEqual(self.status(result, "/api"), "refused")
+                self.assertIn("nginx-client-ca", codes(report, "error"))
+
+    def test_inline_or_variable_backend_tls_material_refuses_route(self):
+        cases = (
+            "proxy_ssl_trusted_certificate data:$ca;",
+            "proxy_ssl_certificate /etc/c.pem;",
+            "proxy_ssl_certificate $cert; proxy_ssl_certificate_key /etc/k.key;",
+        )
+        for tls_lines in cases:
+            with self.subTest(tls=tls_lines):
+                conf = f"""
+                server {{
+                    listen 80; server_name app.example.test;
+                    location /api/ {{
+                        proxy_ssl_verify on;
+                        {tls_lines}
+                        proxy_pass https://app.internal:8443;
+                    }}
+                }}
+                """
+                result, report, _ = nginx(conf)
+                assert_structurally_valid(self, result.config)
+                self.assertEqual(self.status(result, "/api"), "refused")
+                self.assertIn("route-refused", codes(report, "error"))
+
 
 if __name__ == "__main__":
     unittest.main()
