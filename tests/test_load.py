@@ -56,11 +56,11 @@ class LoadTest(unittest.TestCase):
                    for i in range(1000)}
         doc = {"http": {"routers": routers,
                         "services": {"s": {"loadBalancer": {"servers": [{"url": "http://s.internal:80"}]}}}}}
-        result = self.timed("traefik", yaml.safe_dump(doc), traefik_entrypoints_asserted=True)
+        result = self.timed("traefik", yaml.safe_dump(doc), traefik_controls_asserted=True)
         self.assertEqual(result.stats["migrated_routes"], 1000)
 
     def test_large_traefik_default_refusal(self):
-        # Without the operator's entryPoint assertion every forwarding router is refused, still bounded.
+        # Without the operator's input-controls statement every forwarding router is refused, still bounded.
         routers = {f"r{i}": {"rule": f"Host(`h{i}.example.com`) && PathPrefix(`/p`)", "service": "s",
                              "entryPoints": ["web"]} for i in range(1000)}
         doc = {"http": {"routers": routers,

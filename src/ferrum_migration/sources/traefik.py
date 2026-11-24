@@ -6,14 +6,19 @@ else (headers, queries, client IPs, regex matchers, negation) refuses the router
 and poisons overlapping routes. Router priorities are compared against Ferrum's
 specificity order; shadowed routes are dropped and contradictory pairs refused.
 
-The file provider input is dynamic configuration only. Every router is attached to static entryPoints (named in
-``entryPoints``, or Traefik's default entryPoints), and those can add TLS, client certificate options, prepended
-middlewares, HTTP redirections, forwarded-header trust and bind restrictions that the input does not contain. A
-missing router ``tls`` block therefore does not prove plaintext, and a ``tls`` block does not prove that nothing
-else applied. Without the operator's explicit assertion (``--assert-traefik-entrypoints-add-no-controls``, given only
-after inspecting the static configuration; it is not verified here) every route that would forward traffic is
-refused. With it, the routers are translated from the dynamic input alone, and everything the input does state
-(router ``tls`` and TLS options, middlewares, explicit ``entryPoints`` lists) still applies.
+The file provider input is dynamic configuration only. Controls outside it can change how the source served a
+router: the static entryPoints it is attached to (named in ``entryPoints``, or Traefik's default entryPoints) can add
+TLS, client certificate options, prepended middlewares, HTTP redirections, forwarded-header trust and bind
+restrictions; TLS options defined elsewhere (a ``default`` set by another provider applies to TLS routers that name
+none) and routers of other providers (competing for the same hosts and paths, or mapping them to other TLS options)
+are not in the input either. A missing router ``tls`` block therefore does not prove plaintext, and a ``tls`` block
+does not prove that nothing else applied. Without the operator's explicit statement
+(``--assert-traefik-input-includes-effective-controls``: after verification, the input includes every effective
+routing, TLS and access control within the converted scope, or no additional control applies; it is the operator's
+scoped representation, never verified here) every route that would forward traffic is refused. With it, the routers
+are translated from the dynamic input alone, and everything the input does state (router ``tls`` and TLS options,
+middlewares, explicit ``entryPoints`` lists) still applies or refuses; unresolved references and controls Ferrum
+cannot reproduce (such as enabled ``sniStrict``) refuse their routes whatever the operator states.
 """
 
 from __future__ import annotations
@@ -39,15 +44,34 @@ DEFAULT_TLS_OPTIONS = "default"
 VERIFYING_CLIENT_AUTH = ("RequireAndVerifyClientCert", "VerifyClientCertIfGiven")
 # clientAuthType values that ask for client certificates without verifying them against a CA.
 UNVERIFIED_CLIENT_AUTH = ("RequestClientCert", "RequireAnyClientCert")
-#: The one CLI opt-in (Traefik only) through which the operator asserts that the static entryPoints used by the
-#: converted routers add no frontend controls missing from the dynamic input. The converter cannot check it.
-ENTRYPOINTS_ASSERTION_FLAG = "--assert-traefik-entrypoints-add-no-controls"
-#: Refusal reason for routes that would forward traffic without that assertion.
-ENTRYPOINTS_UNVERIFIED_REASON = (
-    "the static entryPoints this router is attached to are not part of the input and may add TLS, client "
-    "certificate options, middlewares, redirections, forwarded-header trust or bind restrictions, so how the source "
-    f"served it is unknown (see traefik-entrypoints-unverified; {ENTRYPOINTS_ASSERTION_FLAG} only after inspecting "
-    "the static configuration)")
+#: The one CLI opt-in (Traefik only). With it the operator states, after verifying the Traefik deployment, that the
+#: input includes every effective routing, TLS and access control within the converted scope (static entryPoints,
+#: this dynamic configuration and every other provider), or that no additional control applies. It is the operator's
+#: scoped representation; the converter cannot check it and never treats it as a validation.
+CONTROLS_ASSERTION_FLAG = "--assert-traefik-input-includes-effective-controls"
+#: What the operator states with that flag (shared by the report and refusal texts).
+CONTROLS_ASSERTION_STATEMENT = (
+    "the input includes every effective routing, TLS and access control that applies within the converted scope, "
+    "whether it is set in the static configuration, in this dynamic configuration or by another provider, or no "
+    "additional control applies")
+#: The operator checklist behind that statement (action of the default refusal; mirrored in the docs).
+CONTROLS_CHECKLIST = (
+    "Verify for every router in the input: (1) static entryPoints: the entryPoints it uses (named in entryPoints, or "
+    "the default entryPoints of routers that name none) add no http.tls, http.middlewares, http.redirections, "
+    "forwardedHeaders, proxyProtocol or address restriction, and routers naming no entryPoints share the entryPoint "
+    "the other routers of their protocol use; (2) omitted TLS options: no TLS options from another provider or file "
+    "apply, in particular no 'default' TLS options defined outside the input (Traefik applies them to TLS routers "
+    "that name no options and to connections whose SNI no router claims); (3) SNI option conflicts: no router "
+    "outside the input maps the same host names to other TLS options (Traefik then falls back to the default "
+    "options); (4) competing routers: no router outside the input (another provider or file) matches the same hosts "
+    "and paths on those entryPoints; (5) no middleware, service or serversTransport outside the input applies.")
+#: Refusal reason for routes that would forward traffic without that statement.
+CONTROLS_UNVERIFIED_REASON = (
+    "controls outside the input (the static entryPoints this router is attached to, TLS options such as a 'default' "
+    "set by another provider, competing routers of other providers) may add TLS, client certificate options, SNI "
+    "checks, middlewares, redirections, forwarded-header trust, bind restrictions or other routing, so how the "
+    f"source served it is unknown (see traefik-controls-unverified; {CONTROLS_ASSERTION_FLAG} only after verifying "
+    "that the input includes every effective control)")
 
 
 class RuleError(Exception):
@@ -241,11 +265,13 @@ class _Traefik:
         # for SNI selection (empty when selection depends on the SNI). Plus the per-name client auth verdicts.
         self.tls_option_of: dict[int, tuple[str, list[str]]] = {}
         self.client_auth_cache: dict[str, tuple[tuple[str, ...], str | None]] = {}
+        # Per TLS options name: refusal reason when it enables sniStrict (or states it unreadably), else None.
+        self.sni_strict_cache: dict[str, str | None] = {}
         self.builtin_default_tls_used = False
         # Per route spec (by id): the sorted entryPoint names its router lists, or None when it lists none (Traefik
         # then attaches it to its default entryPoints, which only the static configuration defines).
         self.entrypoints_of: dict[int, tuple[str, ...] | None] = {}
-        self.entrypoints_asserted = ctx.traefik_entrypoints_asserted
+        self.controls_asserted = ctx.traefik_controls_asserted
 
     def run(self) -> Plan:
         for key in self.root:
@@ -259,85 +285,92 @@ class _Traefik:
         check_route_budget(len(self.routers), self.ctx.limits)
         for name, router in self.routers.items():
             self._router(str(name), router)
-        self._client_auth_scopes()
+        self._tls_option_scopes()
         if self.builtin_default_tls_used:
             self.report.info("traefik-tls-default-options", "traefik tls options",
                              "The input defines no 'default' TLS options, so HTTPS routers that use the default were "
-                             "translated with Traefik's built-in default (no client certificates). A default TLS "
-                             "option defined by another provider is not part of the input.",
-                             "If another provider defines default TLS options with clientAuth, add them to the input "
-                             "and convert again.")
+                             "translated with Traefik's built-in default (no client certificates, no sniStrict). That "
+                             "rests on the operator's statement "
+                             f"({CONTROLS_ASSERTION_FLAG}) that no other provider or file defines 'default' TLS "
+                             "options; without it these routes are refused.",
+                             "If another provider or file defines default TLS options, add them to the input and "
+                             "convert again; the statement would otherwise be wrong.")
         self._precedence()
-        self._entrypoints()
+        self._outside_controls()
         check_route_budget(len(self.plan.routes), self.ctx.limits)
         return self.plan
 
-    # ------------------------------------------------------------ entryPoints
+    # ------------------------------------------------- controls outside the input
 
-    def _entrypoints(self) -> None:
-        """Account for the static entryPoints, which the dynamic input does not contain (fail closed).
+    def _outside_controls(self) -> None:
+        """Account for controls the dynamic input does not contain (fail closed).
 
-        Without the operator's assertion nothing proves how the source served a router: its entryPoints may add
-        TLS (a router without ``tls`` is then served over HTTPS), client certificate options, prepended middlewares,
-        redirections, forwarded-header trust or bind restrictions, and an explicit router ``tls`` does not rule any
-        of those out either. Every route that would forward traffic is refused (503 placeholder). Routes already
-        refused stay placeholders, and redirect routers are never emitted, so nothing forwards.
+        Without the operator's statement nothing proves how the source served a router: its static entryPoints may
+        add TLS (a router without ``tls`` is then served over HTTPS), client certificate options, prepended
+        middlewares, redirections, forwarded-header trust or bind restrictions; a ``default`` TLS options set by
+        another provider may apply to it; routers of other providers may compete for its hosts and paths or map
+        them to other TLS options. An explicit router ``tls`` does not rule any of those out either. Every route
+        that would forward traffic is refused (503 placeholder). Routes already refused stay placeholders, and
+        redirect routers are never emitted, so nothing forwards.
 
-        With the assertion the routers keep the translation of the dynamic input. Explicit restrictions in the
+        With the statement the routers keep the translation of the dynamic input. Explicit restrictions in the
         input still apply, including ``entryPoints`` lists: Ferrum serves every route of one protocol on one
         listener, so routers of that protocol whose lists leave out the entryPoint the others share are refused
-        instead of being served where the source never served them.
+        instead of being served where the source never served them. Refusals for unresolved or unreproducible
+        controls (made earlier) are never lifted by the statement.
         """
         present = [spec for spec in self.plan.routes if not spec.skip]
         if not present:
             return
-        if self.entrypoints_asserted and any(str(key).lower() == "entrypoints" for key in self.root):
+        if self.controls_asserted and any(str(key).lower() == "entrypoints" for key in self.root):
             # Static entryPoint definitions in the input are explicit source settings this translator does not read;
-            # the operator's assertion never overrides what the input itself states.
+            # the operator's statement never overrides what the input itself states.
             forwarding = [spec for spec in present if not spec.refusals]
             for spec in forwarding:
                 spec.refuse("the input itself defines static entryPoints, which are not translated, and the operator "
-                            "assertion does not override settings stated in the input")
+                            "statement does not override settings stated in the input")
             if forwarding:
                 self.report.error(
                     "traefik-entrypoints-in-input", "traefik entryPoints",
                     f"The input contains a static entryPoints section, which this converter does not translate. "
-                    f"{ENTRYPOINTS_ASSERTION_FLAG} cannot override settings the input states, so {len(forwarding)} "
+                    f"{CONTROLS_ASSERTION_FLAG} cannot override settings the input states, so {len(forwarding)} "
                     "route(s) that would forward traffic were refused (fail closed).",
-                    "Convert the dynamic configuration on its own. Assert only after checking that those entryPoints "
-                    "add no TLS, client certificate options, middlewares, redirections, forwarded-header trust or "
-                    "bind restrictions, or configure the equivalent controls in Ferrum by hand.")
+                    "Convert the dynamic configuration on its own, and state that it includes every effective "
+                    "control only after verifying that those entryPoints add no TLS, client certificate options, "
+                    "middlewares, redirections, forwarded-header trust or bind restrictions; otherwise configure the "
+                    "equivalent controls in Ferrum by hand.")
             return
-        if not self.entrypoints_asserted:
+        if not self.controls_asserted:
             forwarding = [spec for spec in present if not spec.refusals]
             for spec in forwarding:
-                spec.refuse(ENTRYPOINTS_UNVERIFIED_REASON)
+                spec.refuse(CONTROLS_UNVERIFIED_REASON)
             if forwarding:
                 self.report.error(
-                    "traefik-entrypoints-unverified", "traefik entryPoints",
-                    "The input is Traefik dynamic configuration only. The static entryPoints its routers are "
-                    "attached to (named in entryPoints, or Traefik's default entryPoints) can add TLS, client "
-                    "certificate options, prepended middlewares, HTTP redirections, forwarded-header trust and bind "
-                    "restrictions that are not in the input, so neither a missing router tls block (plaintext) nor a "
-                    f"present one proves how the source served a route. {len(forwarding)} route(s) that would "
-                    "forward traffic were refused (fail closed); they answer 503.",
-                    "Inspect the static configuration (file, CLI flags or environment) of every entryPoint these "
-                    "routers use, including the default entryPoints of routers that name none: http.tls, "
-                    "http.middlewares, http.redirections, forwardedHeaders, proxyProtocol and address. Only if none of "
-                    f"them adds anything, convert again with {ENTRYPOINTS_ASSERTION_FLAG}; the tool cannot verify "
-                    "that statement. Otherwise configure the equivalent controls in Ferrum by hand, or keep the "
-                    "routes refused.")
+                    "traefik-controls-unverified", "traefik input scope",
+                    "The input is Traefik dynamic configuration only. Controls outside it can change how the source "
+                    "served its routers: the static entryPoints they are attached to (named in entryPoints, or "
+                    "Traefik's default entryPoints) can add TLS, client certificate options, prepended middlewares, "
+                    "HTTP redirections, forwarded-header trust and bind restrictions; TLS options defined elsewhere "
+                    "(a 'default' set by another provider applies to TLS routers that name none) and routers of other "
+                    "providers (competing for the same hosts and paths, or mapping them to other TLS options) are not "
+                    "in the input either. Neither a missing router tls block (plaintext) nor a present one proves how "
+                    f"the source served a route. {len(forwarding)} route(s) that would forward traffic were refused "
+                    "(fail closed); they answer 503.",
+                    f"{CONTROLS_CHECKLIST} Only if every such control is in the input or none applies, convert again "
+                    f"with {CONTROLS_ASSERTION_FLAG}. That is your scoped statement; the tool cannot verify it. "
+                    "Otherwise add the missing dynamic configuration to the input, configure the equivalent controls "
+                    "in Ferrum by hand, or keep the routes refused.")
             return
         self.report.warning(
-            "traefik-entrypoints-asserted", "traefik entryPoints",
-            f"Translated on the operator's assertion ({ENTRYPOINTS_ASSERTION_FLAG}) that the static entryPoints these "
-            "routers use (named, or Traefik's default entryPoints for routers that name none) add no TLS, client "
-            "certificate options, middlewares, redirections, forwarded-header trust or bind restrictions. The tool "
-            "did not and cannot verify this. Routers with a tls block are HTTPS-only, the rest plaintext-only, and "
-            "routers that name no entryPoints are taken to share the entryPoint the other routers of their protocol "
-            "use.",
-            "Re-check the static configuration if it changes; a wrong assertion can expose routes on a protocol or "
-            "without a control the source applied.")
+            "traefik-controls-asserted", "traefik input scope",
+            f"Translated on the operator's statement ({CONTROLS_ASSERTION_FLAG}) that {CONTROLS_ASSERTION_STATEMENT} "
+            "(checked by the operator: static entryPoints, TLS options of other providers including 'default', SNI "
+            "option conflicts and competing routers). It is the operator's representation for the converted scope; "
+            "the tool did not and cannot verify it. Routers with a tls block are HTTPS-only, the rest "
+            "plaintext-only, routers that name no entryPoints are taken to share the entryPoint the other routers of "
+            "their protocol use, and every control the input states still applies or refuses its routes.",
+            "Re-verify whenever the static configuration, another provider or this input changes; a wrong statement "
+            "can expose routes on a protocol or without a control the source applied.")
         for tls in (False, True):
             kind = "HTTPS" if tls else "plaintext"
             group = [spec for spec in present if spec.requires_tls is tls and id(spec) in self.entrypoints_of]
@@ -377,11 +410,12 @@ class _Traefik:
                 and "BEGIN" not in default["certFile"] + default["keyFile"]:
             self.plan.settings.frontend_cert_pairs.append((default["certFile"], default["keyFile"]))
         if tls.get("options"):
-            # clientAuth is not part of this note: it is resolved per HTTPS router (see _client_auth) and either
-            # carried over as the route's frontend client CA or refuses the route.
-            self.report.info("traefik-tls-options", "traefik tls", "TLS options other than clientAuth (versions, "
-                             "ciphers, curves, sniStrict, ALPN) are not migrated; set FERRUM_TLS_* settings manually. "
-                             "clientAuth is applied per HTTPS router or refuses it.")
+            # clientAuth and sniStrict are not part of this note: both are admission controls, resolved per HTTPS
+            # router (see _client_auth and _sni_strict), carried over or refusing the route, never dropped.
+            self.report.info("traefik-tls-options", "traefik tls", "TLS options other than clientAuth and sniStrict "
+                             "(versions, ciphers, curves, ALPN) are not migrated; set FERRUM_TLS_* settings manually. "
+                             "clientAuth is applied per HTTPS router or refuses it; enabled sniStrict refuses the "
+                             "HTTPS routers it applies to.")
 
     # ---------------------------------------------------------------- routers
 
@@ -396,8 +430,8 @@ class _Traefik:
         requires_tls = router.get("tls") is not None
         # A Traefik router matches TLS requests only with a tls block and plaintext requests only without one, so
         # each router has exactly one frontend. entryPoint-level TLS (and everything else an entryPoint adds) lives
-        # in the static configuration, which is not part of the input: without the operator's assertion these
-        # routes are refused in _entrypoints, with it the frontend below is taken as stated.
+        # in the static configuration, which is not part of the input: without the operator's statement these
+        # routes are refused in _outside_controls, with it the frontend below is taken as stated.
         frontends = frozenset({"https" if requires_tls else "http"})
         listed = str_list(router.get("entryPoints"))
         entrypoints_problem = None
@@ -606,36 +640,88 @@ class _Traefik:
                                 "Ferrum's frontend client CA (stricter).")
         return (cas[0],), None
 
-    def _client_auth_scopes(self) -> None:
-        """Refuse HTTPS routes whose client certificate requirement depends on the connection's SNI.
+    def _sni_strict(self, name: str) -> str | None:
+        """Refusal reason when the TLS options ``name`` enable sniStrict (or state it unreadably), else None.
+
+        Traefik's sniStrict rejects TLS handshakes without SNI, or for names that match no configured certificate,
+        before any router runs. Ferrum's HTTPS listener completes every handshake with its frontend certificate, so
+        this admission control cannot be reproduced. It is never dropped: the routes it applies to are refused,
+        whatever the operator states about the scope of the input.
+        """
+        if name not in self.sni_strict_cache:
+            problem = self._classify_sni_strict(name)
+            self.sni_strict_cache[name] = problem
+            if problem:
+                self.report.error("traefik-sni-strict", f"traefik tls options '{safe_label(name)}'",
+                                  f"Strict SNI checking cannot be reproduced ({problem}). Every HTTPS router these TLS "
+                                  "options apply to was refused (fail closed); sniStrict is never dropped.",
+                                  "Keep these routes on the source proxy, or remove sniStrict from the source TLS "
+                                  "options only if accepting handshakes without a matching SNI is acceptable there, "
+                                  "and convert again.")
+        return self.sni_strict_cache[name]
+
+    def _classify_sni_strict(self, name: str) -> str | None:
+        option = mapping(mapping(self.root.get("tls")).get("options")).get(name)
+        if not isinstance(option, dict):
+            # Undefined or malformed entries already refuse their routes (_client_auth). Traefik's built-in default
+            # (no 'default' entry in the input, covered by the operator's statement) does not enable sniStrict.
+            return None
+        value = option.get("sniStrict")
+        if value is None or value is False:
+            return None
+        if value is True:
+            return ("sniStrict is enabled, so the source rejected handshakes without SNI or for names matching no "
+                    "certificate")
+        return "sniStrict is not a boolean, so whether the source rejected handshakes by SNI is unknown"
+
+    def _tls_option_scopes(self) -> None:
+        """Refuse HTTPS routes whose TLS admission controls (sniStrict, clientAuth) cannot be reproduced.
 
         Traefik selects TLS options during the handshake by SNI host name, not per router. A router without a
-        Host matcher gets whatever options the SNI selects (the default options for names no router claims), and
-        a host name that routers map to different TLS options falls back to the default options. When the
-        candidate options disagree on clientAuth, the requirement cannot be reproduced, so the route is refused.
+        Host matcher gets whatever options the SNI selects (the default options for names no router claims), a
+        host name that routers map to different TLS options falls back to the default options, and a handshake
+        without SNI always gets the default options. Therefore:
+
+        * enabled sniStrict in the default options refuses every HTTPS route, because those options govern the
+          handshakes without SNI that reach any of them; enabled sniStrict in any other options that can apply to
+          a route (its own explicit reference, or an SNI-dependent candidate) refuses that route;
+        * when the candidate options disagree on clientAuth, the requirement cannot be reproduced, so the route is
+          refused.
         """
         specs = [spec for spec in self.plan.routes if id(spec) in self.tls_option_of and not spec.skip]
+        if not specs:
+            return
         options_by_host: dict[str, set[str]] = {}
         for spec in specs:
             name, sni_hosts = self.tls_option_of[id(spec)]
             for host in sni_hosts:
                 options_by_host.setdefault(host, set()).add(name)
+        default_strict = self._sni_strict(DEFAULT_TLS_OPTIONS)
         for spec in specs:
             name, sni_hosts = self.tls_option_of[id(spec)]
             candidates = {name}
+            reason = None
             if not sni_hosts:
                 candidates.add(DEFAULT_TLS_OPTIONS)
                 reason = ("the router has no Host matcher, so Traefik applied the TLS options selected by each "
                           "connection's SNI (the default options for unclaimed names)")
             else:
                 conflicting = [host for host in sni_hosts if len(options_by_host.get(host, ())) > 1]
-                if not conflicting:
-                    continue
-                for host in conflicting:
-                    candidates |= options_by_host[host]
-                candidates.add(DEFAULT_TLS_OPTIONS)
-                reason = ("routers for the same host reference different TLS options, so Traefik fell back to the "
-                          "default TLS options for that host")
+                if conflicting:
+                    for host in conflicting:
+                        candidates |= options_by_host[host]
+                    candidates.add(DEFAULT_TLS_OPTIONS)
+                    reason = ("routers for the same host reference different TLS options, so Traefik fell back to "
+                              "the default TLS options for that host")
+            if default_strict:
+                spec.refuse("the default TLS options enable sniStrict (or state it unreadably); Traefik applies them "
+                            "to every handshake without SNI, and Ferrum's HTTPS listener cannot reject those "
+                            "handshakes")
+            elif [candidate for candidate in sorted(candidates) if self._sni_strict(candidate)]:
+                spec.refuse("TLS options that apply to this route enable sniStrict (or state it unreadably), an "
+                            "admission control Ferrum's HTTPS listener cannot reproduce")
+            if reason is None:
+                continue
             verdicts = set()
             for name in sorted(candidates):
                 cas, problem = self._client_auth(name)

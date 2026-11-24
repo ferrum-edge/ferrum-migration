@@ -31,7 +31,7 @@ from .report import Report
 from .safe_load import read_input
 from .sources import DESCRIPTIONS, SOURCES
 from .sources.common import SourceContext
-from .sources.traefik import ENTRYPOINTS_ASSERTION_FLAG
+from .sources.traefik import CONTROLS_ASSERTION_FLAG
 from .writer import prepare_output_dir, write_files
 
 EXIT_OK = 0
@@ -65,14 +65,18 @@ def build_parser() -> argparse.ArgumentParser:
                              help="Ferrum operating mode the ferrum.conf profile targets (default: file)")
         command.add_argument("--tls-only", action="store_true",
                              help="disable Ferrum's plaintext listener so HTTPS-only source routes can be migrated")
-        command.add_argument(ENTRYPOINTS_ASSERTION_FLAG, dest="traefik_entrypoints_asserted", action="store_true",
-                             help="Traefik only. Your statement, made after inspecting Traefik's static configuration, "
-                                  "that every static entryPoint the converted routers use (named in entryPoints, or "
-                                  "the default entryPoints of routers that name none) adds no TLS, client certificate "
-                                  "options, middlewares, redirections, forwarded-header trust or bind restriction, and "
-                                  "that routers naming no entryPoints share the entryPoint the other routers of their "
-                                  "protocol use. The tool does not verify it. Without it, Traefik routes that would "
-                                  "forward traffic are refused")
+        command.add_argument(CONTROLS_ASSERTION_FLAG, dest="traefik_controls_asserted", action="store_true",
+                             help="Traefik only. Your scoped statement, made after verifying the Traefik deployment, "
+                                  "that the input includes every effective routing, TLS and access control that "
+                                  "applies to the converted routers (static, dynamic or from another provider), or "
+                                  "that no additional control applies. Verify at least: static entryPoints (TLS, "
+                                  "middlewares, redirections, forwarded headers, PROXY protocol, address; routers "
+                                  "naming no entryPoints share the entryPoint of the others), TLS options defined "
+                                  "outside the input (including a 'default' from another provider), SNI option "
+                                  "conflicts, and competing routers of other providers. The tool does not verify it. "
+                                  "Without it, Traefik routes that would forward traffic are refused; unresolved or "
+                                  "unreproducible controls in the input (such as enabled sniStrict) are refused "
+                                  "either way")
         # Removed option, kept only to refuse it explicitly: insecure backend TLS is never emitted.
         command.add_argument("--allow-insecure-backend-tls", action="store_true", help=argparse.SUPPRESS)
         command.add_argument("--strict", action="store_true", help="exit 4 on warnings too")
@@ -121,18 +125,18 @@ INSECURE_TLS_REFUSAL = ("ferrum-migrate: --allow-insecure-backend-tls is not sup
                         "backend_tls_server_ca_cert_path instead. Nothing was written.")
 
 
-ENTRYPOINTS_ASSERTION_SCOPE = (f"ferrum-migrate: {ENTRYPOINTS_ASSERTION_FLAG} applies only to --from traefik "
-                               "(Traefik static entryPoints); it changes nothing for other sources. Nothing was "
-                               "written.")
+CONTROLS_ASSERTION_SCOPE = (f"ferrum-migrate: {CONTROLS_ASSERTION_FLAG} applies only to --from traefik "
+                            "(controls outside Traefik dynamic configuration); it changes nothing for other sources. "
+                            "Nothing was written.")
 
 
 def _run(args: argparse.Namespace) -> int:
     if args.allow_insecure_backend_tls:
         print(INSECURE_TLS_REFUSAL, file=sys.stderr)
         return EXIT_USAGE
-    if args.traefik_entrypoints_asserted and args.platform != "traefik":
+    if args.traefik_controls_asserted and args.platform != "traefik":
         # Refused rather than ignored, so the statement is never mistaken for one about another source.
-        print(ENTRYPOINTS_ASSERTION_SCOPE, file=sys.stderr)
+        print(CONTROLS_ASSERTION_SCOPE, file=sys.stderr)
         return EXIT_USAGE
     if args.max_input_bytes <= 0 or args.max_input_bytes > ABSOLUTE_MAX_INPUT_BYTES:
         print(f"ferrum-migrate: --max-input-bytes must be between 1 and {ABSOLUTE_MAX_INPUT_BYTES}", file=sys.stderr)
@@ -144,7 +148,7 @@ def _run(args: argparse.Namespace) -> int:
     fmt = _detect_format(args.input, args.platform, args.input_format)
     text = read_input(args.input, limits)
     context = SourceContext(report=report, limits=limits, include_secrets=include_secrets,
-                            traefik_entrypoints_asserted=args.traefik_entrypoints_asserted)
+                            traefik_controls_asserted=args.traefik_controls_asserted)
     plan = SOURCES[args.platform].translate(text, fmt, context)
     options = EmitOptions(include_secrets=include_secrets, tls_only=args.tls_only)
     result = emit(plan, options, report)

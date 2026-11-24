@@ -23,10 +23,10 @@ FIXTURES = {
     "istio": ("istio", "istio.yaml"),
 }
 EXPECTED_EXIT = {"kong": 4, "nginx": 0, "traefik": 4, "envoy": 4, "istio": 4}
-# The synthetic Traefik fixture stands for a source whose static entryPoints add no frontend controls, so its
-# end-to-end run passes the operator assertion explicitly (the default refusal is tested separately below).
-EXTRA_ARGS = {"traefik": ("--assert-traefik-entrypoints-add-no-controls",)}
-TRAEFIK_ASSERTION = "--assert-traefik-entrypoints-add-no-controls"
+# The synthetic Traefik fixture stands for a deployment whose every effective routing, TLS and access control is in
+# the input, so its end-to-end run passes the operator statement explicitly (the default refusal is tested below).
+TRAEFIK_ASSERTION = "--assert-traefik-input-includes-effective-controls"
+EXTRA_ARGS = {"traefik": (TRAEFIK_ASSERTION,)}
 FIXTURE_SECRETS = ("test-only-key-alice-0001", "test-only-password-hash-bob", "short-key",
                    "dGVzdC1vbmx5LW5vdC1hLXJlYWwta2V5LWZpeHR1cmU=")
 
@@ -102,24 +102,30 @@ class CliTest(unittest.TestCase):
         for name in OUTPUT_FILES:
             self.assertEqual(self.read(first, name), self.read(second, name), name)
 
-    def test_traefik_default_refuses_forwarding_until_the_operator_asserts_entrypoints(self):
+    def test_traefik_default_refuses_forwarding_until_the_operator_asserts_input_controls(self):
         path = fixture_path("traefik", "dynamic.toml")
         code, stdout, _stderr = run_cli("check", path, "--from", "traefik", "--json")
         self.assertEqual(code, 4)
         report = json.loads(stdout)
         found = {c["code"] for c in report["caveats"]}
-        self.assertIn("traefik-entrypoints-unverified", found)
-        self.assertNotIn("traefik-entrypoints-asserted", found)
+        self.assertIn("traefik-controls-unverified", found)
+        self.assertNotIn("traefik-controls-asserted", found)
         self.assertEqual(report["summary"]["migrated_routes"], 0)
         code, stdout, _stderr = run_cli("check", path, "--from", "traefik", "--json", TRAEFIK_ASSERTION)
         self.assertEqual(code, 4)  # the remaining review item is the string-prefix sibling report
         report = json.loads(stdout)
         found = {c["code"] for c in report["caveats"]}
-        self.assertNotIn("traefik-entrypoints-unverified", found)
-        self.assertIn("traefik-entrypoints-asserted", found)
+        self.assertNotIn("traefik-controls-unverified", found)
+        self.assertIn("traefik-controls-asserted", found)
         self.assertEqual(report["summary"]["migrated_routes"], 1)
 
-    def test_traefik_entrypoint_assertion_is_refused_for_other_sources(self):
+    def test_former_traefik_entrypoint_flag_is_not_accepted(self):
+        # Renamed before release; the narrower statement is not kept as an alias.
+        code, _stdout, _stderr = run_cli("check", fixture_path("traefik", "dynamic.toml"), "--from", "traefik",
+                                         "--assert-traefik-entrypoints-add-no-controls")
+        self.assertEqual(code, 2)
+
+    def test_traefik_controls_assertion_is_refused_for_other_sources(self):
         for platform, parts in (("nginx", ("nginx", "nginx.conf")), ("kong", ("kong", "kong.yaml"))):
             out = self.out_dir(platform)
             for command in (("convert", fixture_path(*parts), "--from", platform, "--out", out),

@@ -19,10 +19,11 @@ class SourceContext:
     report: Report
     limits: Limits
     include_secrets: bool = False
-    #: Traefik only (``--assert-traefik-entrypoints-add-no-controls``): the operator states, after inspecting the
-    #: Traefik static configuration, that the static entryPoints the routers use add no frontend controls that are
-    #: not part of the dynamic input. An unverified assertion, never a validation; every other adapter ignores it.
-    traefik_entrypoints_asserted: bool = False
+    #: Traefik only (``--assert-traefik-input-includes-effective-controls``): the operator states, after verifying the
+    #: Traefik deployment, that the input includes every effective static, dynamic and provider routing, TLS and
+    #: access control within the converted scope, or that no additional control applies. The operator's scoped
+    #: representation, never a validation; every other adapter ignores it.
+    traefik_controls_asserted: bool = False
 
 
 def expect_mapping(value: Any, what: str) -> dict:

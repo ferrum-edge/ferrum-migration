@@ -7,17 +7,19 @@ import yaml
 from helpers import assert_structurally_valid, codes, live_routes, migrate, one_proxy, plugin, plugins_of, proxies, \
     read_fixture, upstream_of
 
-from ferrum_migration.sources.traefik import ENTRYPOINTS_ASSERTION_FLAG, RuleError, evaluate_term, rule_to_dnf
+from ferrum_migration.sources.traefik import CONTROLS_ASSERTION_FLAG, RuleError, evaluate_term, rule_to_dnf
 
 
 def asserted(text, **kwargs):
-    """Convert with the operator's entryPoint assertion (``--assert-traefik-entrypoints-add-no-controls``).
+    """Convert with the operator's statement (``--assert-traefik-input-includes-effective-controls``).
 
-    Used for the mapping tests below: their synthetic inputs stand for sources whose static entryPoints (named, or
-    the defaults) add no TLS, client options, middlewares, redirections, forwarded-header trust or bind restriction.
-    Default behavior without the assertion is covered by TraefikEntryPointsTest.
+    Used for the mapping tests below: their synthetic inputs stand for deployments whose every effective routing, TLS
+    and access control within the converted scope is in the input: static entryPoints (named, or the defaults) add
+    no TLS, client options, middlewares, redirections, forwarded-header trust or bind restriction, and no other
+    provider adds TLS options (no 'default' outside the input), SNI option conflicts or competing routers. Default
+    behavior without the statement is covered by TraefikInputControlsTest.
     """
-    return migrate("traefik", text, traefik_entrypoints_asserted=True, **kwargs)
+    return migrate("traefik", text, traefik_controls_asserted=True, **kwargs)
 
 
 class TraefikRuleTest(unittest.TestCase):
@@ -344,8 +346,87 @@ class TraefikClientAuthTest(unittest.TestCase):
                 self.assertNotIn("traefik-client-auth", codes(report))
 
 
-class TraefikEntryPointsTest(unittest.TestCase):
-    """Static entryPoints are not in the dynamic input: no forwarding without the operator's explicit assertion."""
+class TraefikSniStrictTest(unittest.TestCase):
+    """Enabled tls.options sniStrict is an admission control: the HTTPS routes it applies to are refused, with or
+    without the operator's statement; it is never dropped as a TLS tuning setting."""
+
+    SERVICE = {"s": {"loadBalancer": {"servers": [{"url": "http://s.internal:80"}]}}}
+
+    def _doc(self, routers, options):
+        return yaml.safe_dump({"http": {"routers": routers, "services": self.SERVICE}, "tls": {"options": options}})
+
+    def _status(self, result, path, host):
+        return one_proxy(self, result.config, path, host)["labels"]["ferrum-migration/status"]
+
+    @staticmethod
+    def _router(host, path, tls):
+        return {"rule": f"Host(`{host}`) && Path(`{path}`)", "service": "s", "tls": tls}
+
+    def test_explicit_strict_options_refuse_the_route_even_with_the_statement(self):
+        for reference in ("strict", "strict@file"):
+            with self.subTest(reference=reference):
+                result, report, plan = asserted(self._doc(
+                    {"r": self._router("s.example.test", "/s", {"options": reference})},
+                    {"strict": {"sniStrict": True, "minVersion": "VersionTLS12"}}))
+                self.assertEqual(self._status(result, "=/s", "s.example.test"), "refused")
+                self.assertEqual(live_routes(result.config), [])
+                self.assertIn("traefik-sni-strict", codes(report, "error"))
+                self.assertIn("route-refused", codes(report, "error"))
+                self.assertTrue(any("sniStrict" in reason for reason in plan.routes[0].refusals))
+
+    def test_strict_default_options_refuse_every_https_route(self):
+        # Routers naming no options and routers referencing 'default' explicitly use it; a router with other,
+        # non-strict options is refused too, because 'default' governs every handshake without SNI.
+        result, report, _plan = asserted(self._doc({
+            "implicit": self._router("d.example.test", "/implicit", {}),
+            "explicit": self._router("d.example.test", "/explicit", {"options": "default"}),
+            "other": self._router("o.example.test", "/other", {"options": "relaxed"}),
+        }, {"default": {"sniStrict": True}, "relaxed": {"minVersion": "VersionTLS12"}}))
+        for path, host in (("=/implicit", "d.example.test"), ("=/explicit", "d.example.test"),
+                           ("=/other", "o.example.test")):
+            self.assertEqual(self._status(result, path, host), "refused", path)
+        self.assertEqual(live_routes(result.config), [])
+        self.assertIn("traefik-sni-strict", codes(report, "error"))
+
+    def test_conflicting_sni_selection_with_a_strict_candidate_is_refused(self):
+        # Two routers map one host to different options; the selection is SNI-dependent, so a strict candidate
+        # refuses both (fail closed).
+        result, report, _plan = asserted(self._doc({
+            "a": self._router("c.example.test", "/a", {"options": "strict"}),
+            "b": self._router("c.example.test", "/b", {}),
+        }, {"strict": {"sniStrict": True}}))
+        for path in ("=/a", "=/b"):
+            self.assertEqual(self._status(result, path, "c.example.test"), "refused", path)
+        self.assertIn("traefik-sni-strict", codes(report, "error"))
+
+    def test_unreadable_sni_strict_is_refused(self):
+        result, report, _plan = asserted(self._doc({"r": self._router("u.example.test", "/u", {})},
+                                                   {"default": {"sniStrict": "yes"}}))
+        self.assertEqual(self._status(result, "=/u", "u.example.test"), "refused")
+        self.assertIn("traefik-sni-strict", codes(report, "error"))
+
+    def test_ordinary_tls_options_without_strict_sni_stay_migrated(self):
+        options_cases = {
+            "sniStrict false": {"default": {"sniStrict": False, "minVersion": "VersionTLS12"}},
+            "sniStrict absent": {"default": {"minVersion": "VersionTLS12"}},
+            "strict options unused": {"strict": {"sniStrict": True}},
+        }
+        for label, options in options_cases.items():
+            with self.subTest(label):
+                result, report, _plan = asserted(self._doc({"r": self._router("t.example.test", "/t", {})}, options))
+                self.assertEqual(self._status(result, "=/t", "t.example.test"), "migrated")
+                self.assertNotIn("traefik-sni-strict", codes(report))
+
+    def test_plaintext_routers_are_not_subject_to_sni_strict(self):
+        router = {"rule": "Host(`p.example.test`) && Path(`/p`)", "service": "s"}
+        result, report, _plan = asserted(self._doc({"r": router}, {"default": {"sniStrict": True}}))
+        self.assertEqual(self._status(result, "=/p", "p.example.test"), "migrated")
+        self.assertNotIn("traefik-sni-strict", codes(report))
+
+
+class TraefikInputControlsTest(unittest.TestCase):
+    """Controls outside the dynamic input (static entryPoints, other providers' TLS options and routers): no
+    forwarding without the operator's explicit statement that the input includes every effective control."""
 
     SERVICE = {"s": {"loadBalancer": {"servers": [{"url": "http://s.internal:80"}]}}}
     ROUTERS = {
@@ -376,18 +457,35 @@ class TraefikEntryPointsTest(unittest.TestCase):
                                   for p in plugins_of(result.config, proxy)], [("request_termination", 503)])
                 self.assertEqual(live_routes(result.config), [])
                 self.assertEqual(result.stats["migrated_routes"], 0)
-                self.assertIn("traefik-entrypoints-unverified", codes(report, "error"))
-                self.assertNotIn("traefik-entrypoints-asserted", codes(report))
+                self.assertIn("traefik-controls-unverified", codes(report, "error"))
+                self.assertNotIn("traefik-controls-asserted", codes(report))
                 self.assertTrue(any("static entryPoints" in reason for reason in plan.routes[0].refusals))
 
     def test_default_refusal_names_the_remediation_without_calling_it_validation(self):
         _result, report, _plan = migrate("traefik", self._doc({"r": self.ROUTERS["plaintext, no entryPoints"]}))
-        [caveat] = [c for c in report.caveats if c.code == "traefik-entrypoints-unverified"]
+        [caveat] = [c for c in report.caveats if c.code == "traefik-controls-unverified"]
         self.assertEqual(caveat.severity, "error")
-        self.assertIn(ENTRYPOINTS_ASSERTION_FLAG, caveat.action)
-        self.assertIn("Inspect the static configuration", caveat.action)
+        self.assertIn(CONTROLS_ASSERTION_FLAG, caveat.action)
         self.assertIn("cannot verify", caveat.action)
+        # The operator checklist names every kind of control outside the input, not only static entryPoints.
+        for item in ("static entryPoints", "omitted TLS options", "'default' TLS options", "SNI option conflicts",
+                     "competing routers"):
+            self.assertIn(item, caveat.action)
         self.assertNotIn("p.example.test", caveat.message + caveat.action)
+
+    def test_tls_router_without_options_requires_the_statement(self):
+        # A TLS router that names no options uses the 'default' TLS options, which another provider may define
+        # outside the input. Without the statement it is refused; with it Traefik's built-in default is taken, and
+        # the report says that rests on the operator's statement.
+        router = {"r": self.ROUTERS["explicit tls"]}
+        result, report, _plan = migrate("traefik", self._doc(router))
+        self.assertEqual(self._status(one_proxy(self, result.config, "=/p", "p.example.test")), "refused")
+        self.assertIn("traefik-controls-unverified", codes(report, "error"))
+        result, report, plan = asserted(self._doc(router))
+        self.assertEqual(self._status(one_proxy(self, result.config, "=/p", "p.example.test")), "migrated")
+        self.assertEqual(plan.settings.client_ca_paths, [])
+        [note] = [c for c in report.caveats if c.code == "traefik-tls-default-options"]
+        self.assertIn(CONTROLS_ASSERTION_FLAG, note.message)
 
     def test_default_refuses_the_real_fixtures(self):
         for name, fmt in (("dynamic.yaml", "yaml"), ("dynamic.toml", "toml")):
@@ -396,23 +494,24 @@ class TraefikEntryPointsTest(unittest.TestCase):
                 assert_structurally_valid(self, result.config)
                 self.assertEqual(live_routes(result.config), [])
                 self.assertEqual(result.config["upstreams"], [])
-                self.assertIn("traefik-entrypoints-unverified", codes(report, "error"))
+                self.assertIn("traefik-controls-unverified", codes(report, "error"))
 
     def test_assertion_restores_the_dynamic_mapping(self):
         for label, router in self.ROUTERS.items():
             with self.subTest(label):
                 result, report, _plan = asserted(self._doc({"r": router}))
                 self.assertEqual(self._status(one_proxy(self, result.config, "=/p", "p.example.test")), "migrated")
-                self.assertNotIn("traefik-entrypoints-unverified", codes(report))
-                self.assertIn("traefik-entrypoints-asserted", codes(report, "warning"))
+                self.assertNotIn("traefik-controls-unverified", codes(report))
+                self.assertIn("traefik-controls-asserted", codes(report, "warning"))
                 # The router's own tls block still decides the frontend: HTTPS-only output for the tls router.
                 self.assertEqual(result.tls_only, "tls" in router)
 
     def test_assertion_is_reported_as_unverified(self):
         _result, report, _plan = asserted(self._doc({"r": self.ROUTERS["plaintext, no entryPoints"]}))
-        [caveat] = [c for c in report.caveats if c.code == "traefik-entrypoints-asserted"]
-        self.assertIn(ENTRYPOINTS_ASSERTION_FLAG, caveat.message)
+        [caveat] = [c for c in report.caveats if c.code == "traefik-controls-asserted"]
+        self.assertIn(CONTROLS_ASSERTION_FLAG, caveat.message)
         self.assertIn("cannot verify", caveat.message)
+        self.assertIn("includes every effective routing, TLS and access control", caveat.message)
 
     def test_assertion_never_overrides_restrictions_stated_in_the_input(self):
         base = {"rule": "Host(`p.example.test`) && Path(`/p`)", "service": "s"}
@@ -440,7 +539,7 @@ class TraefikEntryPointsTest(unittest.TestCase):
         self.assertEqual(self._status(one_proxy(self, result.config, "=/p", "p.example.test")), "refused")
         self.assertEqual(live_routes(result.config), [])
         self.assertIn("traefik-entrypoints-in-input", codes(report, "error"))
-        self.assertNotIn("traefik-entrypoints-asserted", codes(report))
+        self.assertNotIn("traefik-controls-asserted", codes(report))
 
     def test_assertion_keeps_router_tls_as_https_only(self):
         result, report, _plan = asserted(self._doc({

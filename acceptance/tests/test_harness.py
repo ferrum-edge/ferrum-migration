@@ -101,13 +101,14 @@ class FixtureTests(unittest.TestCase):
             self.assertTrue(any(p.deny for p in case.probes), case_id)
         self.assertEqual(adapters, {"kong-dbless", "kong-deck", "nginx", "traefik", "envoy", "istio"})
 
-    def test_traefik_cases_pass_the_entrypoint_assertion_explicitly(self):
-        # The converter refuses forwarding Traefik routes unless the operator asserts the static entryPoints add no
-        # controls; each Traefik case states that it passes it (its source is served on the harness's plain
-        # loopback entryPoint), and no other adapter's case does.
+    def test_traefik_cases_pass_the_input_controls_statement_explicitly(self):
+        # The converter refuses forwarding Traefik routes unless the operator states that the input includes every
+        # effective routing, TLS and access control; each Traefik case states that it passes it (its source is
+        # served by the file provider alone on the harness's plain loopback entryPoint), and no other adapter's
+        # case does.
         for case in load_cases(ROOT / "fixtures"):
             with self.subTest(case=case.id):
-                expected = ["traefik-entrypoints-add-no-controls"] if case.adapter == "traefik" else []
+                expected = ["traefik-input-includes-effective-controls"] if case.adapter == "traefik" else []
                 self.assertEqual(case.converter_assertions, expected)
 
     def test_canaries_are_unique_per_run(self):
@@ -128,7 +129,8 @@ class ConverterContractTests(unittest.TestCase):
         self.assertEqual(self.profile.platform("kong-dbless"), "kong")
         self.assertEqual(self.profile.outputs["report"], ["migration-report.json"])
         self.assertEqual(self.profile.assertion_argv,
-                         {"traefik-entrypoints-add-no-controls": ["--assert-traefik-entrypoints-add-no-controls"]})
+                         {"traefik-input-includes-effective-controls":
+                          ["--assert-traefik-input-includes-effective-controls"]})
 
     def test_unmapped_converter_assertion_is_a_template_error(self):
         with tempfile.TemporaryDirectory() as tmp:

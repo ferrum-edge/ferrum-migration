@@ -59,9 +59,9 @@ class BackendTlsNeverInsecureTest(unittest.TestCase):
     def test_every_fixture_emits_only_verified_backend_tls(self):
         for platform, parts, fmt in ALL_FIXTURES:
             with self.subTest(fixture="/".join(parts)):
-                # Traefik fixtures run with the operator's entryPoint assertion so their backends are emitted at all.
+                # Traefik fixtures run with the operator's input-controls statement so their backends are emitted.
                 result, _report, _plan = migrate(platform, read_fixture(*parts), fmt=fmt,
-                                                 traefik_entrypoints_asserted=platform == "traefik")
+                                                 traefik_controls_asserted=platform == "traefik")
                 for kind in ("proxies", "upstreams"):
                     for item in result.config[kind]:
                         self.assertIs(item.get("backend_tls_verify_server_cert", True), True, item["id"])
@@ -73,7 +73,7 @@ class BackendTlsNeverInsecureTest(unittest.TestCase):
                                                 "serversTransport": "t"}}},
             "serversTransports": {"t": {"insecureSkipVerify": True}},
         }})
-        result, report, _ = migrate("traefik", doc, traefik_entrypoints_asserted=True)
+        result, report, _ = migrate("traefik", doc, traefik_controls_asserted=True)
         proxy = one_proxy(self, result.config, "/s")
         self.assertIs(proxy["backend_tls_verify_server_cert"], True)
         self.assertIn("backend-tls-verify-enabled", codes(report, "warning"))
@@ -173,8 +173,8 @@ class CredentialHandlingTest(unittest.TestCase):
             "middlewares": {"h": {"headers": {"customRequestHeaders": {"X-Api-Key": "test-only-static-key-0002"}}}},
             "services": {"s": {"loadBalancer": {"servers": [{"url": "http://s.internal:80"}]}}},
         }})
-        # With the entryPoint assertion, so the refusal shown is the credential rule's, not the default one.
-        result, report, plan = migrate("traefik", doc, traefik_entrypoints_asserted=True)
+        # With the input-controls statement, so the refusal shown is the credential rule's, not the default one.
+        result, report, plan = migrate("traefik", doc, traefik_controls_asserted=True)
         self.assertEqual(status(self, result.config, "/h"), "refused")
         self.assertTrue(any("credential" in reason for reason in plan.routes[0].refusals))
         self.assertFalse(any("static entryPoints" in reason for reason in plan.routes[0].refusals))

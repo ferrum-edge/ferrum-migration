@@ -4,7 +4,7 @@
   "title": "Traefik default rule-length priority, stripPrefix, Host matcher",
   "source": "dynamic.yaml",
   "allow_rejection": false,
-  "converter_assertions": ["traefik-entrypoints-add-no-controls"],
+  "converter_assertions": ["traefik-input-includes-effective-controls"],
   "claims": [
     "with default priorities the longer rule (PathPrefix /a/b) wins for /a/b/c",
     "the shorter rule still serves /a/c",
@@ -16,7 +16,7 @@
     "PathPrefix string-prefix matching of /a against /ab (not probed)",
     "entryPoints, TLS, and non-HTTP routers"
   ],
-  "source_semantics": "Traefik router priority defaults to the rule string length, so the longer, more specific rule wins here; stripPrefix removes the matching prefix before forwarding; no matching router yields 404. Documentation-inferred unless the upstream differential runs. The static configuration is the harness's own (upstream.example.json): one plaintext loopback entryPoint `web` with no TLS, middlewares, redirections or forwarded-header settings, and no router names entryPoints, so the case passes the converter's operator assertion traefik-entrypoints-add-no-controls (without it every forwarding router is refused).",
+  "source_semantics": "Traefik router priority defaults to the rule string length, so the longer, more specific rule wins here; stripPrefix removes the matching prefix before forwarding; no matching router yields 404. Documentation-inferred unless the upstream differential runs. The static configuration is the harness's own (upstream.example.json): the file provider alone, one plaintext loopback entryPoint `web` with no TLS, middlewares, redirections or forwarded-header settings, no router names entryPoints, and no TLS options or routers exist outside the input, so the input includes every effective routing, TLS and access control and the case passes the converter's operator statement traefik-input-includes-effective-controls (without it every forwarding router is refused).",
   "probes": [
     {"id": "short-rule", "path": "/a/c",
      "expect": {"forward": {"backend": "a", "path": "/a/c"}}},

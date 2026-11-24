@@ -32,13 +32,15 @@ def read_fixture(*parts: str) -> str:
 
 
 def migrate(platform: str, text: str, fmt: str = "yaml", include_secrets: bool = False, tls_only: bool = False,
-            limits: Limits | None = None, traefik_entrypoints_asserted: bool = False):
-    """Translate and emit like the CLI. ``traefik_entrypoints_asserted`` mirrors
-    ``--assert-traefik-entrypoints-add-no-controls``: pass it only for synthetic Traefik inputs whose (notional)
-    static entryPoints are known to add nothing; by default Traefik routes that would forward are refused."""
+            limits: Limits | None = None, traefik_controls_asserted: bool = False):
+    """Translate and emit like the CLI. ``traefik_controls_asserted`` mirrors
+    ``--assert-traefik-input-includes-effective-controls``: pass it only for synthetic Traefik inputs that stand for a
+    (notional) deployment whose every effective routing, TLS and access control within the converted scope is in the
+    input (no static entryPoint controls, TLS options including a 'default', SNI option conflicts or competing routers
+    outside it); by default Traefik routes that would forward are refused."""
     report = Report(platform, "test-input")
     context = SourceContext(report=report, limits=limits or Limits(), include_secrets=include_secrets,
-                            traefik_entrypoints_asserted=traefik_entrypoints_asserted)
+                            traefik_controls_asserted=traefik_controls_asserted)
     plan = SOURCES[platform].translate(text, fmt, context)
     result = emit(plan, EmitOptions(include_secrets=include_secrets, tls_only=tls_only), report)
     return result, report, plan

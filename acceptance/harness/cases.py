@@ -80,7 +80,7 @@ class Case:
     secret_free: list[str]
     mesh_policy: bool = False
     #: Operator assertions passed to the converter (profile ``assertion_argv``), e.g.
-    #: ``traefik-entrypoints-add-no-controls``. Never implied: absent means the converter's default.
+    #: ``traefik-input-includes-effective-controls``. Never implied: absent means the converter's default.
     converter_assertions: list[str] = field(default_factory=list)
     extra: dict = field(default_factory=dict)
 
