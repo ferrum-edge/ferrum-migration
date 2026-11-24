@@ -1,0 +1,33 @@
+{
+  "id": "kong-deck-smoke",
+  "adapter": "kong-deck",
+  "title": "decK dump smoke: decK metadata is accepted and key-auth with an explicitly included key works",
+  "source": "deck.yaml",
+  "include_secrets": true,
+  "allow_rejection": false,
+  "claims": [
+    "a decK dump (with _info metadata) converts with --from kong; no decK-specific flag is needed",
+    "with explicit credential inclusion, a request carrying the consumer's API key in the apikey header reaches backend a unchanged",
+    "a request with a wrong API key is not forwarded",
+    "a request without an API key is not forwarded",
+    "the synthetic API key appears only in the private resources file, never in the report, settings or converter output"
+  ],
+  "not_claimed": [
+    "replaying the dump into Kong with decK (decK fixtures stay documentation-inferred; see profiles/upstream.example.json)",
+    "API keys passed as query parameters",
+    "consumer identity headers sent upstream"
+  ],
+  "source_semantics": "Kong key-auth: the key is read from the configured key name (header or query); a matching keyauth credential authenticates the consumer and the request is proxied, otherwise Kong answers 401. strip_path false forwards the path unchanged. The synthetic key is random per run and authorizes nothing outside the harness.",
+  "probes": [
+    {"id": "valid-key", "host": "api.example.test", "path": "/keyed/item?x=1",
+     "headers": {"apikey": "${CANARY_KEY}"},
+     "expect": {"forward": {"backend": "a", "path": "/keyed/item?x=1"}}},
+    {"id": "wrong-key", "host": "api.example.test", "path": "/keyed/item",
+     "headers": {"apikey": "${WRONG_KEY}"},
+     "expect": {"deny": true, "status": [401, 403]}},
+    {"id": "no-key", "host": "api.example.test", "path": "/keyed/item",
+     "expect": {"deny": true, "status": [401]}},
+    {"id": "unrouted", "host": "api.example.test", "path": "/other",
+     "expect": {"deny": true, "status": [404]}}
+  ]
+}

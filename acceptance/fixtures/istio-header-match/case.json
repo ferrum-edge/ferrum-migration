@@ -1,0 +1,28 @@
+{
+  "id": "istio-header-match",
+  "adapter": "istio",
+  "title": "Istio header-conditioned route over a shared prefix (preserve or refuse, never drop the condition)",
+  "source": "istio.yaml",
+  "allow_rejection": true,
+  "backend_host_rewrite": {
+    "acc-a.acceptance.svc.cluster.local": "127.0.0.1",
+    "acc-b.acceptance.svc.cluster.local": "127.0.0.1"
+  },
+  "claims": [
+    "a request carrying x-acceptance-variant: beta reaches the header-gated backend",
+    "the same path without the header reaches the fallback backend"
+  ],
+  "not_claimed": [
+    "regex/prefix header matchers, query matchers, sourceLabels"
+  ],
+  "not_established": [
+    "Istio full mesh behavior; ingress projection only"
+  ],
+  "source_semantics": "Istio evaluates http[] in order; the first entry matches only with the header. Dropping the header condition would send every request to the gated backend, so the converter must preserve it (e.g. ordered dispatch) or refuse both overlapping routes with a report error.",
+  "probes": [
+    {"id": "no-header", "path": "/h/x",
+     "expect": {"forward": {"backend": "a", "path": "/h/x"}}},
+    {"id": "with-header", "path": "/h/x", "headers": {"x-acceptance-variant": "beta"},
+     "expect": {"forward": {"backend": "b", "path": "/h/x"}}}
+  ]
+}

@@ -1,0 +1,20 @@
+# Synthetic Traefik v3 dynamic config: explicit priority inverts specificity.
+http:
+  routers:
+    r-broad:
+      rule: "Host(`app.example.test`) && PathPrefix(`/p`)"
+      priority: 100
+      service: svc-a
+    r-narrow:
+      rule: "Host(`app.example.test`) && PathPrefix(`/p/q`)"
+      priority: 1
+      service: svc-b
+  services:
+    svc-a:
+      loadBalancer:
+        servers:
+          - url: "http://127.0.0.1:${ECHO_A_PORT}"
+    svc-b:
+      loadBalancer:
+        servers:
+          - url: "http://127.0.0.1:${ECHO_B_PORT}"

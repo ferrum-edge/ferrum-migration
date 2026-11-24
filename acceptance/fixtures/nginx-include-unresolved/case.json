@@ -1,0 +1,23 @@
+{
+  "id": "nginx-include-unresolved",
+  "adapter": "nginx",
+  "title": "NGINX include is reported, never followed or widened into a fallback",
+  "source": "nginx.conf",
+  "allow_rejection": true,
+  "report": {"min_findings": 1, "mentions_any": ["include"]},
+  "claims": [
+    "an unresolved include is reported as an error or warning",
+    "paths the include might have defined are not forwarded",
+    "the explicitly declared /known/ location keeps routing when emitted"
+  ],
+  "not_claimed": [
+    "resolution of includes inside the input directory (input is a single file)"
+  ],
+  "source_semantics": "nginx 'include' with a glob that matches no file contributes nothing; /extra/x therefore has no location and answers 404. The converter reads only the given file, so the include is unknown content that must be surfaced rather than guessed.",
+  "probes": [
+    {"id": "known", "path": "/known/x",
+     "expect": {"forward": {"backend": "a", "path": "/known/x"}}},
+    {"id": "unknown-included", "path": "/extra/x",
+     "expect": {"deny": true, "status": [404]}}
+  ]
+}

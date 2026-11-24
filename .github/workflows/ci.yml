@@ -1,0 +1,140 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (${{ matrix.os }}, python ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04]
+        python: ["3.11", "3.12", "3.13"]
+        include:
+          - os: macos-14
+            python: "3.12"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-ci.txt
+          python -m pip install --no-deps -e .
+
+      - name: Byte-compile
+        run: python -m compileall -q src tests acceptance
+
+      - name: Unit, fail-closed, CLI and load tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Runtime harness self-tests (fake converter and fake gateway, loopback only)
+        run: python -m unittest discover -s acceptance/tests -v
+
+      - name: CLI smoke (all platforms, offline)
+        shell: bash
+        run: |
+          set -u
+          python -m ferrum_migration platforms
+          for pair in kong:kong/kong.yaml nginx:nginx/nginx.conf traefik:traefik/dynamic.yaml \
+                      traefik:traefik/dynamic.toml envoy:envoy/envoy.yaml istio:istio/istio.yaml; do
+            platform="${pair%%:*}"; file="${pair#*:}"
+            set +e
+            python -m ferrum_migration check "tests/fixtures/$file" --from "$platform" > /dev/null
+            code=$?
+            set -e
+            if [ "$code" -ne 0 ] && [ "$code" -ne 4 ]; then
+              echo "unexpected exit $code for $file"; exit 1
+            fi
+          done
+
+  ferrum-runtime:
+    # Real Ferrum Edge admission and loopback runtime acceptance against the pinned published
+    # release. No secrets are used. The binary is fetched from the public release and verified
+    # against the release's .sha256 sidecar AND a digest pinned here. Nothing is uploaded as an
+    # artifact: failed-case work dirs can contain per-run synthetic credentials and are deleted.
+    name: ferrum-edge v0.9.21 admission + runtime acceptance (linux)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      FERRUM_EDGE_VERSION: v0.9.21
+      FERRUM_EDGE_ASSET: ferrum-edge-linux-x86_64
+      # SHA-256 of ferrum-edge-linux-x86_64 in the v0.9.21 release, cross-checked against the
+      # GitHub release asset metadata and the release's published checksum file.
+      FERRUM_EDGE_SHA256: 06fc247a35c49c5be160e947fd8284be4c5f594d331fce71cba1b87b87acce00
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-ci.txt
+          python -m pip install --no-deps -e .
+
+      - name: Fetch and verify pinned ferrum-edge release binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "$FERRUM_EDGE_SHA256" | grep -Eq '^[0-9a-f]{64}$'; then
+            echo "::error::FERRUM_EDGE_SHA256 is not pinned to a 64-hex digest of ${FERRUM_EDGE_ASSET} ${FERRUM_EDGE_VERSION}"
+            exit 1
+          fi
+          dir="$RUNNER_TEMP/ferrum-edge"
+          mkdir -p "$dir"
+          cd "$dir"
+          base="https://github.com/ferrum-edge/ferrum-edge/releases/download/${FERRUM_EDGE_VERSION}"
+          curl --proto '=https' --tlsv1.2 -fsSL --retry 3 -o "$FERRUM_EDGE_ASSET" "$base/$FERRUM_EDGE_ASSET"
+          curl --proto '=https' --tlsv1.2 -fsSL --retry 3 -o "$FERRUM_EDGE_ASSET.sha256" "$base/$FERRUM_EDGE_ASSET.sha256"
+          sha256sum -c "$FERRUM_EDGE_ASSET.sha256"
+          echo "$FERRUM_EDGE_SHA256  $FERRUM_EDGE_ASSET" | sha256sum -c -
+          chmod 0755 "$FERRUM_EDGE_ASSET"
+          ./"$FERRUM_EDGE_ASSET" version --json
+          echo "FERRUM_EDGE_BIN=$dir/$FERRUM_EDGE_ASSET" >> "$GITHUB_ENV"
+
+      - name: Converter output passes ferrum-edge validate (synthetic CA for operator-CA fixtures)
+        run: python -m unittest discover -s tests -p 'test_ferrum_reference.py' -v
+
+      - name: Runtime smoke gate (one working migration per source, loopback)
+        run: >-
+          python acceptance/run.py --ferrum-bin "$FERRUM_EDGE_BIN" --strict --require-behavioral
+          --converter-env "PYTHONPATH=$GITHUB_WORKSPACE/src" --work-root "$RUNNER_TEMP/acceptance-smoke"
+          --case kong-dbless-smoke --case kong-deck-smoke --case nginx-proxy-pass-uri
+          --case traefik-smoke --case envoy-smoke --case istio-smoke
+
+      - name: Full runtime acceptance (loopback)
+        run: >-
+          python acceptance/run.py --ferrum-bin "$FERRUM_EDGE_BIN"
+          --converter-env "PYTHONPATH=$GITHUB_WORKSPACE/src" --work-root "$RUNNER_TEMP/acceptance-full"
+
+      - name: Remove work dirs (may hold per-run synthetic credentials)
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/acceptance-smoke" "$RUNNER_TEMP/acceptance-full" "$RUNNER_TEMP/ferrum-edge"

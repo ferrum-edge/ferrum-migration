@@ -1,0 +1,23 @@
+{
+  "id": "nginx-string-prefix",
+  "adapter": "nginx",
+  "title": "NGINX string-prefix location /api also matches /apix (preserve or refuse)",
+  "source": "nginx.conf",
+  "allow_rejection": true,
+  "claims": [
+    "location /api (no trailing slash) keeps nginx string-prefix semantics: /api/x and /apix both reach the backend",
+    "a shorter path (/ap) is not forwarded"
+  ],
+  "not_claimed": [
+    "behavior of a bare /api request with a URI-bearing proxy_pass"
+  ],
+  "source_semantics": "nginx prefix locations are plain string prefixes, not path-segment prefixes, so /api matches /apix. Ferrum's literal prefix routes walk segment boundaries (docs/routing.md, 'segment-boundary HashMap walk'; inferred from docs, not observed), so emitting listen_path /api alone may route /apix to 404. That must be preserved or refused with a report error.",
+  "probes": [
+    {"id": "segment-child", "path": "/api/x",
+     "expect": {"forward": {"backend": "a", "path": "/api/x"}}},
+    {"id": "string-prefix-sibling", "path": "/apix",
+     "expect": {"forward": {"backend": "a", "path": "/apix"}}},
+    {"id": "shorter", "path": "/ap",
+     "expect": {"deny": true, "status": [404]}}
+  ]
+}

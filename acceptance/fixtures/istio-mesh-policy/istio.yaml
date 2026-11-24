@@ -1,0 +1,41 @@
+# Synthetic Istio mesh-mode policy only (no ingress Gateway). These resources
+# govern sidecar/workload traffic, not ingress routing.
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: acc-deny-admin
+  namespace: acceptance
+spec:
+  selector:
+    matchLabels:
+      app: acc-a
+  action: DENY
+  rules:
+    - to:
+        - operation:
+            paths:
+              - /admin/*
+---
+apiVersion: security.istio.io/v1
+kind: PeerAuthentication
+metadata:
+  name: default
+  namespace: acceptance
+spec:
+  mtls:
+    mode: STRICT
+---
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: acc-mesh-internal
+  namespace: acceptance
+spec:
+  hosts:
+    - acc-a.acceptance.svc.cluster.local
+  http:
+    - route:
+        - destination:
+            host: acc-a.acceptance.svc.cluster.local
+            port:
+              number: ${ECHO_A_PORT}

@@ -1,0 +1,906 @@
+"""Emit Ferrum Edge file-mode resources from a :class:`~ferrum_migration.model.Plan`.
+
+Fail-closed rules applied here (see ``docs/design.md``):
+
+1. A route the tool cannot translate faithfully is *refused*. If its match is
+   representable, a placeholder proxy with the same hosts/path/port is emitted
+   whose only plugin is ``request_termination`` (HTTP 503). Ferrum runs that
+   plugin before authentication, so the refused match can never fall through
+   to a broader, possibly less protected, route.
+2. A refused route whose match is *not* representable (header/query/SNI
+   matchers, unrepresentable hosts or paths) poisons every overlapping route:
+   those are refused too and replaced by placeholders.
+3. Routes Ferrum would consider duplicates (same port/path, overlapping hosts)
+   are all refused and replaced by one placeholder.
+4. Source prefixes use plain string matching, Ferrum matches by path segment.
+   Where ``/api`` and a broader route differ in policy, a ``request_termination``
+   guard with ``trigger.path_prefix`` is added to the broader route so
+   ``/apix`` cannot reach it; a trailing-slash prefix gets an exact 404 route
+   for its bare path. Routes are never widened to cover ``/apix``. For sources
+   that opt in (NGINX), sibling paths that no equivalent route catches are
+   reported as a ``prefix-string-siblings`` error instead of becoming silent 404s.
+5. Source scopes that do not fall through between hosts (NGINX servers, Envoy
+   virtual hosts, Istio hosts) get a host-only 404 route so unmatched paths do
+   not reach another host tier.
+6. Routes that require HTTPS in the source are only emitted when Ferrum runs
+   TLS-only (``FERRUM_PROXY_HTTP_PORT=0``); otherwise they are refused.
+7. Backend TLS verification is never disabled. There is no opt-out: a source
+   that did not verify gets verification turned on (warning), and every emitted
+   ``backend_tls_verify_server_cert`` is literally ``true``.
+"""
+
+from __future__ import annotations
+
+import copy
+import json
+from dataclasses import dataclass, field
+from typing import Any
+
+from . import matching, util
+from .model import BackendRef, Plan, PluginSpec, RouteSpec, TlsSpec, UpstreamSpec
+from .redact import safe_label
+from .report import Report
+
+PLACEHOLDER_HOST = "ferrum-migration-refused.invalid"
+PLACEHOLDER_PORT = 9
+REFUSED_TERMINATION = {"status_code": 503, "content_type": "application/json", "message": "Route not migrated"}
+NOT_FOUND_TERMINATION = {"status_code": 404, "content_type": "application/json", "message": "Not found"}
+LABEL_SOURCE = "ferrum-migration/source"
+LABEL_REF = "ferrum-migration/ref"
+LABEL_STATUS = "ferrum-migration/status"
+MIN_KEYAUTH_KEY_LENGTH = 16
+MIN_JWT_SECRET_LENGTH = 32
+MAX_CREDENTIAL_VALUE_LENGTH = 4096
+MAX_PLUGIN_CONFIG_BYTES = 1_048_576
+
+
+@dataclass
+class EmitOptions:
+    include_secrets: bool = False
+    tls_only: bool = False
+
+
+@dataclass
+class EmitResult:
+    config: dict[str, Any]
+    stats: dict[str, Any]
+    tls_only: bool
+    basic_auth_used: bool
+    secrets_emitted: int
+
+
+@dataclass
+class _Cand:
+    route: RouteSpec
+    placeholder: bool
+    hosts: list[str]
+    listen_path: str | None
+    listen_port: int | None
+    termination: dict | None = None
+    guards: list[str] = field(default_factory=list)
+    kind_label: str = "migrated"
+
+
+def emit(plan: Plan, options: EmitOptions, report: Report) -> EmitResult:
+    routes = plan.routes
+    for reason in plan.global_refusals:
+        for route in routes:
+            if not route.skip:
+                route.refuse(f"a global plugin could not be translated ({reason})")
+    for route in routes:
+        _validate_route(route, plan, options, report)
+    tls_only = _decide_tls(routes, options, report)
+    _poison(routes)
+    candidates = _build_candidates(routes)
+    candidates = _resolve_conflicts(candidates)
+    _add_scope_closures(plan, candidates, report)
+    _add_trailing_slash_placeholders(candidates, report)
+    _add_divergence_guards(candidates, report)
+    builder = _Builder(plan, options, report)
+    config = builder.build(candidates)
+    _assert_backend_tls_verified(config)
+    _report_routes(routes, report)
+    _report_timeout_semantics(plan, routes, report)
+    stats = builder.stats(routes, candidates)
+    stats["tls_only"] = tls_only
+    return EmitResult(config=config, stats=stats, tls_only=tls_only,
+                      basic_auth_used=builder.basic_auth_used, secrets_emitted=builder.secrets_emitted)
+
+
+def _assert_backend_tls_verified(config: dict[str, Any]) -> None:
+    """Hard invariant: no emitted proxy or upstream disables backend TLS verification.
+
+    A violation is a tool bug, so it raises (the CLI reports an internal error and
+    writes nothing) instead of emitting insecure output.
+    """
+    for kind in ("proxies", "upstreams"):
+        for item in config.get(kind, []):
+            if item.get("backend_tls_verify_server_cert", True) is not True:
+                raise AssertionError("backend TLS verification must never be disabled in emitted output")
+
+
+# ------------------------------------------------------------------ validation
+
+def _validate_route(route: RouteSpec, plan: Plan, options: EmitOptions, report: Report) -> None:
+    if route.skip:
+        return
+    if route.hosts is not None:
+        normalized: list[str] = []
+        for host in route.hosts:
+            value = util.normalize_host(host)
+            if value is None:
+                route.refuse(f"host {safe_label(host)} is not representable in Ferrum")
+                route.hosts = None
+                route.extra_conditions = True
+                break
+            if value not in normalized:
+                normalized.append(value)
+        else:
+            if len(normalized) > util.MAX_HOSTS_PER_PROXY:
+                route.refuse("more than 100 hosts on one route")
+            route.hosts = normalized
+    if route.kind == "hostonly" and not route.hosts:
+        if route.hosts == []:
+            route.kind, route.path = "prefix", "/"
+        else:
+            route.path_ok = False
+    if route.kind in ("prefix", "exact"):
+        path = route.path or "/"
+        if route.kind == "prefix" and path != "/" and path.endswith("/"):
+            route.trailing_slash = True
+            path = path[:-1]
+        problem = util.canonical_path_problem(path)
+        if problem:
+            route.refuse(f"path is not representable ({problem})")
+            route.path_ok = False
+            route.extra_conditions = True
+        else:
+            route.path = path
+    elif route.kind == "regex":
+        problem = util.regex_problem(route.path)
+        if problem:
+            route.refuse(f"path regex is not representable ({problem})")
+            route.path_ok = False
+            route.extra_conditions = True
+    elif route.kind == "hostonly":
+        route.path = None
+    if route.methods is not None:
+        methods: list[str] = []
+        for method in route.methods:
+            upper = str(method).strip().upper()
+            if upper not in util.VALID_HTTP_METHODS:
+                route.refuse(f"HTTP method {safe_label(method, 16)} is not supported by Ferrum")
+                break
+            if upper not in methods:
+                methods.append(upper)
+        route.methods = methods or None
+    if route.termination is None:
+        _validate_backend(route, plan, options, report)
+    if route.backend_path:
+        path = route.backend_path.rstrip("/")
+        if not path:
+            route.backend_path = None
+        else:
+            problem = util.canonical_path_problem(path)
+            if problem or len(path) > util.MAX_BACKEND_PATH_LENGTH:
+                route.refuse(f"backend path is not representable ({problem or 'too long'})")
+            else:
+                route.backend_path = path
+    for attr in ("connect_timeout_ms", "read_timeout_ms", "write_timeout_ms"):
+        value, clamped = util.clamp_timeout(getattr(route, attr))
+        setattr(route, attr, value)
+        if clamped:
+            report.warning("timeout-clamped", route.ref,
+                           "A timeout above Ferrum's 24h maximum (or a disabled timeout) was set to 24h.")
+    for plugin in route.plugins:
+        if len(json.dumps(plugin.config, sort_keys=True)) > MAX_PLUGIN_CONFIG_BYTES:
+            route.refuse(f"plugin {plugin.name} config exceeds Ferrum's 1 MiB limit")
+
+
+def _validate_backend(route: RouteSpec, plan: Plan, options: EmitOptions, report: Report) -> None:
+    backend = route.backend
+    if backend is None:
+        route.refuse("no usable backend")
+        return
+    if backend.scheme not in ("http", "https"):
+        route.refuse("backend protocol is not HTTP(S)")
+        return
+    if backend.upstream_key:
+        upstream = plan.upstreams.get(backend.upstream_key)
+        if upstream is None or not upstream.targets:
+            route.refuse("upstream has no usable targets")
+            return
+        if len(upstream.targets) > util.MAX_TARGETS_PER_UPSTREAM:
+            route.refuse("upstream has more than 1000 targets")
+            return
+        for target in upstream.targets:
+            host = util.normalize_backend_host(target.host)
+            if host is None or util.parse_port(target.port) is None:
+                route.refuse(f"upstream target {safe_label(target.host)} is not a valid host/port")
+                return
+            target.host = host
+            target.weight = max(1, min(int(target.weight), util.MAX_TARGET_WEIGHT))
+        if backend.scheme == "https":
+            _apply_tls_policy(upstream.tls, upstream.ref, options, report)
+        return
+    host = util.normalize_backend_host(backend.host)
+    if host is None or util.parse_port(backend.port) is None:
+        route.refuse(f"backend {safe_label(backend.host)} is not a valid host/port")
+        return
+    backend.host = host
+    if backend.scheme == "https":
+        _apply_tls_policy(backend.tls, route.ref, options, report)
+        if backend.tls.sni or backend.tls.san_allow_list:
+            report.warning("backend-sni-dropped", route.ref,
+                           "Backend TLS SNI/SAN overrides are only representable on upstreams; Ferrum will "
+                           "use the backend host name for SNI and certificate verification.")
+
+
+def _apply_tls_policy(tls: TlsSpec, ref: str, options: EmitOptions, report: Report) -> None:
+    if tls.ca_path or tls.client_cert_path:
+        report.info("backend-tls-files", ref,
+                    "Backend TLS refers to CA/client certificate file paths from the source. Ferrum checks these "
+                    "files when it loads the config, so `ferrum-edge validate` fails until they exist on the "
+                    "Ferrum host at the same paths. The files are never read or copied by this tool.",
+                    "Provide the CA bundle (and client cert/key) at those paths, or edit the paths.")
+    if tls.verify:
+        return
+    # There is deliberately no opt-out: insecure backend TLS is never emitted.
+    tls.verify = True
+    report.warning("backend-tls-verify-enabled", ref,
+                   "The source did not verify the backend TLS certificate; Ferrum will verify it. Requests "
+                   "fail closed if the backend certificate is self-signed or does not match the host.",
+                   "Provide the backend CA (backend_tls_server_ca_cert_path) if the backend uses a private CA.")
+
+
+def _decide_tls(routes: list[RouteSpec], options: EmitOptions, report: Report) -> bool:
+    active = [route for route in routes if not route.skip and not route.refusals]
+    needs_tls = [route for route in active if route.requires_tls]
+    tls_only = options.tls_only or (bool(active) and len(needs_tls) == len(active))
+    if tls_only:
+        if not options.tls_only:
+            report.info("tls-only", "-",
+                        "Every migrated route requires HTTPS in the source, so the profile disables Ferrum's "
+                        "plaintext listener (FERRUM_PROXY_HTTP_PORT=0).")
+        for route in active:
+            if route.listen_port is not None:
+                route.refuse("served on an extra plaintext port, which cannot exist in TLS-only mode")
+    else:
+        for route in needs_tls:
+            route.refuse("the source serves this route over HTTPS only, but other routes are plaintext and "
+                         "Ferrum would expose it on the plaintext listener too (re-run with --tls-only)")
+    return tls_only
+
+
+def _poison(routes: list[RouteSpec]) -> None:
+    """Refuse routes that could receive traffic the source sent to an unrepresentable route.
+
+    When the unrepresentable route's envelope (hosts + path) is itself
+    representable, a placeholder is emitted for it, and Ferrum sends every
+    request in that envelope to the placeholder unless the other route is
+    more specific. Only such more-specific (or ambiguous) routes are refused.
+    """
+    unrepresentable = [r for r in routes if not r.skip and r.refusals and r.extra_conditions]
+    for bad in unrepresentable:
+        envelope_ok = bad.hosts is not None and bad.path_ok
+        for other in routes:
+            if other is bad or other.skip:
+                continue
+            if not matching.route_overlaps(bad, other):
+                continue
+            if envelope_ok and other.path_ok and other.hosts is not None:
+                if matching.ferrum_prefers(bad, other) is True:
+                    continue
+                if bad.kind == other.kind and bad.path == other.path and bad.listen_port == other.listen_port:
+                    continue  # identical slot: conflict resolution merges them into one placeholder
+            other.refuse(f"its match overlaps {bad.ref}, whose match conditions Ferrum cannot express")
+
+
+# ------------------------------------------------------------------ candidates
+
+def _listen_path(route: RouteSpec) -> str | None:
+    if route.kind == "hostonly":
+        return None
+    if route.kind == "exact":
+        return "=" + (route.path or "/")
+    if route.kind == "regex":
+        return "~" + (route.path or "")
+    return route.path or "/"
+
+
+def _build_candidates(routes: list[RouteSpec]) -> list[_Cand]:
+    candidates: list[_Cand] = []
+    for route in routes:
+        if route.skip:
+            continue
+        representable = route.hosts is not None and route.path_ok
+        if route.refusals:
+            if not representable:
+                continue
+            route.placeholder_emitted = True
+            candidates.append(_Cand(route, True, list(route.hosts or []), _listen_path(route), route.listen_port,
+                                    termination=REFUSED_TERMINATION, kind_label="refused"))
+        else:
+            candidates.append(_Cand(route, False, list(route.hosts or []), _listen_path(route), route.listen_port,
+                                    termination=route.termination,
+                                    kind_label="terminated" if route.termination else "migrated"))
+    return candidates
+
+
+def _resolve_conflicts(candidates: list[_Cand]) -> list[_Cand]:
+    groups: dict[tuple[int | None, str | None], list[_Cand]] = {}
+    for cand in candidates:
+        groups.setdefault((cand.listen_port, cand.listen_path), []).append(cand)
+    replacement: dict[int, _Cand | None] = {}
+    for (port, path), members in groups.items():
+        if len(members) < 2:
+            continue
+        for component in _components(members):
+            if len(component) < 2:
+                continue
+            refs = [m.route.ref for m in component]
+            for member in component:
+                others = ", ".join(safe_label(ref) for ref in refs if ref != member.route.ref)[:400]
+                member.route.refuse(f"Ferrum requires one route per host/path/port and it conflicts with {others}")
+                member.route.placeholder_emitted = True
+            hosts: list[str] = []
+            if not any(not m.hosts for m in component):
+                for member in component:
+                    for host in member.hosts:
+                        if host not in hosts:
+                            hosts.append(host)
+            if len(hosts) > util.MAX_HOSTS_PER_PROXY:
+                hosts = []
+            first = component[0]
+            replacement[id(first)] = _Cand(first.route, True, hosts, path, port,
+                                           termination=REFUSED_TERMINATION, kind_label="refused")
+            for member in component[1:]:
+                replacement[id(member)] = None
+    result: list[_Cand] = []
+    for cand in candidates:
+        if id(cand) in replacement:
+            new = replacement[id(cand)]
+            if new is not None:
+                result.append(new)
+        else:
+            result.append(cand)
+    return result
+
+
+def _components(members: list[_Cand]) -> list[list[_Cand]]:
+    parent = list(range(len(members)))
+
+    def find(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    for i in range(len(members)):
+        for j in range(i + 1, len(members)):
+            if matching.hosts_overlap(members[i].hosts, members[j].hosts):
+                parent[find(i)] = find(j)
+    grouped: dict[int, list[_Cand]] = {}
+    for index, member in enumerate(members):
+        grouped.setdefault(find(index), []).append(member)
+    return list(grouped.values())
+
+
+def _add_scope_closures(plan: Plan, candidates: list[_Cand], report: Report) -> None:
+    scopes = sorted(plan.host_scopes, key=lambda s: matching.host_tier(s.hosts))
+    host_only: dict[int | None, list[_Cand]] = {}
+    root_hosts: dict[int | None, set[str]] = {}
+    for cand in candidates:
+        if cand.listen_path is None:
+            host_only.setdefault(cand.listen_port, []).append(cand)
+        elif cand.listen_path == "/":
+            root_hosts.setdefault(cand.listen_port, set()).update(cand.hosts)
+    for scope in scopes:
+        hosts = [h for h in (util.normalize_host(x) for x in scope.hosts) if h]
+        if not hosts:
+            continue
+        overlapping = [c for c in host_only.get(scope.listen_port, []) if matching.hosts_overlap(c.hosts, hosts)]
+        if overlapping and all(c.kind_label == "scope-default" for c in overlapping) and \
+                any(matching.hosts_cover(c.hosts, hosts) for c in overlapping):
+            continue
+        if overlapping:
+            report.warning("scope-closure-skipped", scope.ref,
+                           "Another host-only route overlaps this scope's hosts, so no default 404 route was added; "
+                           "unmatched paths for these hosts may reach that route.")
+            continue
+        if all(host in root_hosts.get(scope.listen_port, set()) for host in hosts):
+            continue
+        synthetic = RouteSpec(ref=scope.ref, name=f"{scope.ref}-default", hosts=hosts, kind="hostonly", path=None)
+        closure = _Cand(synthetic, True, hosts, None, scope.listen_port,
+                        termination=NOT_FOUND_TERMINATION, kind_label="scope-default")
+        candidates.append(closure)
+        host_only.setdefault(scope.listen_port, []).append(closure)
+        report.info("scope-closure", scope.ref,
+                    "Added a host-only route answering 404 for paths this scope does not route, because the "
+                    "source never falls through to other hosts' routes but Ferrum does.")
+
+
+def _add_trailing_slash_placeholders(candidates: list[_Cand], report: Report) -> None:
+    slots: dict[tuple[int | None, str | None], list[_Cand]] = {}
+    for cand in candidates:
+        slots.setdefault((cand.listen_port, cand.listen_path), []).append(cand)
+    for cand in list(candidates):
+        route = cand.route
+        if cand.placeholder or route.kind != "prefix" or not route.trailing_slash \
+                or route.prefix_semantics != "string":
+            continue
+        exact = "=" + (route.path or "/")
+        if any(matching.hosts_overlap(o.hosts, cand.hosts) for o in slots.get((cand.listen_port, exact), [])):
+            continue
+        synthetic = RouteSpec(ref=route.ref, name=f"{route.name}-bare", hosts=list(cand.hosts), kind="exact",
+                              path=route.path)
+        guard = _Cand(synthetic, True, list(cand.hosts), exact, cand.listen_port,
+                      termination=NOT_FOUND_TERMINATION, kind_label="exact-guard")
+        candidates.append(guard)
+        slots.setdefault((cand.listen_port, exact), []).append(guard)
+        report.info("trailing-slash-prefix", route.ref,
+                    f"The source prefix ends with '/', so the bare path {route.path} did not match it. Ferrum "
+                    f"matches {route.path} itself; an exact route answering 404 was added for the bare path.")
+
+
+def _fingerprint(cand: _Cand) -> str:
+    route = cand.route
+    backend = route.backend
+    data = {
+        "backend": None if backend is None else [backend.scheme, backend.host, backend.port, backend.upstream_key,
+                                                 backend.tls.key()],
+        "backend_path": route.backend_path, "strip": route.strip, "preserve_host": route.preserve_host,
+        "plugins": [[p.name, p.config, p.shared_key] for p in route.plugins],
+        "termination": cand.termination, "methods": route.methods, "retry": route.retry,
+        "timeouts": [route.connect_timeout_ms, route.read_timeout_ms, route.write_timeout_ms],
+    }
+    return json.dumps(data, sort_keys=True, default=str)
+
+
+def _ancestor_paths(path: str) -> list[str]:
+    """``/a/b/c`` -> ``["/", "/a", "/a/b"]`` (segment-boundary ancestors)."""
+    parts = path.split("/")[1:]
+    result = ["/"]
+    for index in range(1, len(parts)):
+        result.append("/" + "/".join(parts[:index]))
+    return result
+
+
+def _add_divergence_guards(candidates: list[_Cand], report: Report) -> None:
+    by_path: dict[tuple[int | None, str | None], list[_Cand]] = {}
+    for cand in candidates:
+        by_path.setdefault((cand.listen_port, cand.listen_path), []).append(cand)
+    fingerprints: dict[int, str] = {}
+
+    def fp(item: _Cand) -> str:
+        if id(item) not in fingerprints:
+            fingerprints[id(item)] = _fingerprint(item)
+        return fingerprints[id(item)]
+
+    for cand in candidates:
+        route = cand.route
+        if cand.placeholder or route.kind != "prefix" or route.prefix_semantics != "string" \
+                or route.trailing_slash or route.path in (None, "/"):
+            continue
+        fingerprint = fp(cand)
+        tier = matching.host_tier(cand.hosts)
+        closed = bool(cand.hosts) and any(
+            o.placeholder and matching.host_tier(o.hosts) <= tier and matching.hosts_cover(o.hosts, cand.hosts)
+            for o in by_path.get((cand.listen_port, None), []))
+        related: list[_Cand] = list(by_path.get((cand.listen_port, None), []))
+        for ancestor in _ancestor_paths(route.path or "/"):
+            related.extend(by_path.get((cand.listen_port, ancestor), []))
+        # Where do sibling paths such as /apix (string-prefix matches the source sent to this route) land
+        # in Ferrum? They are preserved only if an equivalent route (same forwarding and policy, no strip,
+        # covering every host) catches them and nothing more specific intercepts them.
+        equivalent = intercepted = guarded = divergence_error = False
+        for other in related:
+            if closed and matching.host_tier(other.hosts) > tier:
+                continue  # a host-only 404/placeholder in this host tier intercepts first
+            if other is cand or other.listen_port != cand.listen_port:
+                continue
+            if not matching.hosts_overlap(cand.hosts, other.hosts):
+                continue
+            other_route = other.route
+            if other.listen_path is None:
+                covers = True
+            elif other_route.kind == "prefix":
+                covers = other_route.path == "/" or (route.path or "").startswith((other_route.path or "") + "/")
+            else:
+                covers = False
+            if not covers:
+                continue
+            if other.placeholder or other.termination is not None:
+                intercepted = True  # siblings get a 404/503/termination, never the source's backend
+                continue
+            if fp(other) == fingerprint:
+                if not route.strip and matching.hosts_cover(other.hosts, cand.hosts):
+                    equivalent = True
+                continue
+            if matching.hosts_cover(cand.hosts, other.hosts):
+                guarded = True
+                if route.path not in other.guards:
+                    other.guards.append(route.path or "/")
+                    report.info("prefix-divergence-guard", other_route.ref,
+                                f"Added a request_termination guard (trigger.path_prefix {route.path}) so paths "
+                                f"like {route.path}x, which the source routed to {route.ref}, cannot reach this "
+                                f"broader route under Ferrum's segment-based prefix matching.")
+            else:
+                divergence_error = True
+                report.error("prefix-divergence", route.ref,
+                             f"The source matched any path starting with {route.path} (for example {route.path}x); "
+                             f"Ferrum matches by path segment, so on some hosts those paths reach "
+                             f"{other_route.ref}, which has a different policy, and no exact guard could be added.",
+                             "Confirm such paths are not reachable or add an explicit route for them.")
+        if route.report_prefix_siblings and not divergence_error \
+                and not (equivalent and not intercepted and not guarded):
+            report.error("prefix-string-siblings", route.ref,
+                         f"The source matched every path that starts with {route.path}, including paths such as "
+                         f"{route.path}x or {route.path}.json that do not continue at a '/' boundary. Ferrum prefix "
+                         f"routes match only {route.path} and {route.path}/..., and in this output those sibling "
+                         f"paths do not reach the same backend and policy: they get a 404, a fail-closed response "
+                         f"or another route's termination instead of being forwarded. The route was not widened.",
+                         "If clients use such paths, add explicit locations for them and convert again, or "
+                         "confirm they are unused.")
+
+
+# ------------------------------------------------------------------ building
+
+class _Builder:
+    def __init__(self, plan: Plan, options: EmitOptions, report: Report) -> None:
+        self.plan = plan
+        self.options = options
+        self.report = report
+        self.proxy_ids = util.IdAllocator()
+        self.plugin_ids = util.IdAllocator()
+        self.upstream_ids = util.IdAllocator()
+        self.consumer_ids = util.IdAllocator()
+        self.plugin_configs: list[dict[str, Any]] = []
+        self.group_ids: dict[str, str] = {}
+        self.upstream_id_by_key: dict[str, str] = {}
+        self.basic_auth_used = False
+        self.secrets_emitted = 0
+        self.guard_count = 0
+
+    def labels(self, ref: str, status: str | None = None) -> dict[str, str]:
+        labels = {LABEL_SOURCE: self.plan.platform, LABEL_REF: safe_label(ref, 500)}
+        if status:
+            labels[LABEL_STATUS] = status
+        return labels
+
+    def build(self, candidates: list[_Cand]) -> dict[str, Any]:
+        for plugin in self.plan.global_plugins:
+            self._note_plugin(plugin.name)
+            pid = self.plugin_ids.take(self.plan.platform, "global", plugin.name)
+            self.plugin_configs.append(self._plugin_entry(pid, plugin.name, plugin.config, "global", None, plugin.ref))
+        upstreams = self._build_upstreams(candidates)
+        proxies = [self._build_proxy(cand) for cand in candidates]
+        consumers = self._build_consumers()
+        return {
+            "version": "1",
+            "resource_counts": {
+                "proxies": len(proxies),
+                "consumers": len(consumers),
+                "plugin_configs": len(self.plugin_configs),
+                "upstreams": len(upstreams),
+            },
+            "proxies": proxies,
+            "upstreams": upstreams,
+            "consumers": consumers,
+            "plugin_configs": self.plugin_configs,
+        }
+
+    def _note_plugin(self, name: str) -> None:
+        if name == "basic_auth":
+            self.basic_auth_used = True
+
+    def _plugin_entry(self, pid: str, name: str, config: dict, scope: str, proxy_id: str | None,
+                      ref: str) -> dict[str, Any]:
+        entry: dict[str, Any] = {"id": pid, "plugin_name": name, "scope": scope}
+        if proxy_id:
+            entry["proxy_id"] = proxy_id
+        entry["enabled"] = True
+        entry["config"] = copy.deepcopy(config)
+        entry["labels"] = self.labels(ref)
+        return entry
+
+    def _build_upstreams(self, candidates: list[_Cand]) -> list[dict[str, Any]]:
+        result: list[dict[str, Any]] = []
+        for cand in candidates:
+            backend = cand.route.backend
+            if cand.placeholder or backend is None or not backend.upstream_key or cand.route.termination:
+                continue
+            if backend.upstream_key in self.upstream_id_by_key:
+                continue
+            spec = self.plan.upstreams[backend.upstream_key]
+            uid = self.upstream_ids.take(self.plan.platform, "up", spec.name)
+            self.upstream_id_by_key[backend.upstream_key] = uid
+            result.append(self._upstream_entry(uid, spec, backend.scheme == "https"))
+        return result
+
+    def _upstream_entry(self, uid: str, spec: UpstreamSpec, https: bool) -> dict[str, Any]:
+        algorithm = spec.algorithm
+        weights = {t.weight for t in spec.targets}
+        if algorithm == "round_robin" and len(weights) > 1:
+            algorithm = "weighted_round_robin"
+        entry: dict[str, Any] = {
+            "id": uid,
+            "name": safe_label(spec.name, util.MAX_NAME_LENGTH),
+            "labels": self.labels(spec.ref),
+            "targets": [{"host": t.host, "port": int(t.port), "weight": int(t.weight)} for t in spec.targets],
+            "algorithm": algorithm,
+        }
+        if spec.hash_on:
+            entry["hash_on"] = spec.hash_on
+        if spec.hash_on_cookie_config:
+            entry["hash_on_cookie_config"] = copy.deepcopy(spec.hash_on_cookie_config)
+        if spec.health_checks:
+            entry["health_checks"] = copy.deepcopy(spec.health_checks)
+        if https:
+            tls = spec.tls
+            entry["backend_tls_verify_server_cert"] = True
+            if tls.ca_path:
+                entry["backend_tls_server_ca_cert_path"] = tls.ca_path
+            if tls.client_cert_path and tls.client_key_path:
+                entry["backend_tls_client_cert_path"] = tls.client_cert_path
+                entry["backend_tls_client_key_path"] = tls.client_key_path
+            if tls.sni:
+                entry["backend_tls_sni"] = tls.sni
+            if tls.san_allow_list:
+                entry["backend_tls_san_allow_list"] = list(tls.san_allow_list)
+        return entry
+
+    def _termination_plugin(self, proxy_id: str, config: dict, ref: str, label: str) -> str:
+        pid = self.plugin_ids.take(proxy_id, label)
+        self.plugin_configs.append(self._plugin_entry(pid, "request_termination", config, "proxy", proxy_id, ref))
+        return pid
+
+    def _build_proxy(self, cand: _Cand) -> dict[str, Any]:
+        route = cand.route
+        name_suffix = {"refused": "refused", "scope-default": "", "exact-guard": ""}.get(cand.kind_label, "")
+        proxy_id = self.proxy_ids.take(self.plan.platform, route.name, name_suffix)
+        proxy: dict[str, Any] = {
+            "id": proxy_id,
+            "name": safe_label(route.name, util.MAX_NAME_LENGTH),
+            "labels": self.labels(route.ref, cand.kind_label),
+        }
+        if cand.hosts:
+            proxy["hosts"] = list(cand.hosts)
+        if cand.listen_path is not None:
+            proxy["listen_path"] = cand.listen_path
+        if cand.listen_port is not None:
+            proxy["listen_port"] = cand.listen_port
+        associations: list[str] = []
+        if cand.placeholder or route.backend is None or route.termination is not None:
+            proxy.update({"backend_scheme": "http", "backend_host": PLACEHOLDER_HOST,
+                          "backend_port": PLACEHOLDER_PORT, "strip_listen_path": False})
+            termination = cand.termination or REFUSED_TERMINATION
+            associations.append(self._termination_plugin(proxy_id, termination, route.ref, "terminate"))
+            if not cand.placeholder and route.methods:
+                proxy["allowed_methods"] = list(route.methods)
+            proxy["plugins"] = [{"plugin_config_id": pid} for pid in associations]
+            return proxy
+        if route.methods:
+            proxy["allowed_methods"] = list(route.methods)
+        backend: BackendRef = route.backend
+        proxy["backend_scheme"] = backend.scheme
+        if backend.upstream_key:
+            proxy["upstream_id"] = self.upstream_id_by_key[backend.upstream_key]
+        else:
+            proxy["backend_host"] = backend.host
+            proxy["backend_port"] = int(backend.port)
+        if route.backend_path:
+            proxy["backend_path"] = route.backend_path
+        proxy["strip_listen_path"] = bool(route.strip)
+        proxy["preserve_host_header"] = bool(route.preserve_host)
+        if route.connect_timeout_ms:
+            proxy["backend_connect_timeout_ms"] = route.connect_timeout_ms
+        if route.read_timeout_ms:
+            proxy["backend_read_timeout_ms"] = route.read_timeout_ms
+        if route.write_timeout_ms:
+            proxy["backend_write_timeout_ms"] = route.write_timeout_ms
+        if backend.scheme == "https" and not backend.upstream_key:
+            proxy["backend_tls_verify_server_cert"] = True
+            if backend.tls.ca_path:
+                proxy["backend_tls_server_ca_cert_path"] = backend.tls.ca_path
+            if backend.tls.client_cert_path and backend.tls.client_key_path:
+                proxy["backend_tls_client_cert_path"] = backend.tls.client_cert_path
+                proxy["backend_tls_client_key_path"] = backend.tls.client_key_path
+        if route.retry:
+            proxy["retry"] = copy.deepcopy(route.retry)
+        for guard in cand.guards:
+            config = dict(NOT_FOUND_TERMINATION)
+            config["trigger"] = {"path_prefix": guard}
+            associations.append(self._termination_plugin(proxy_id, config, route.ref, "guard"))
+            self.guard_count += 1
+        for plugin in route.plugins:
+            associations.append(self._attach_plugin(proxy_id, plugin))
+        proxy["plugins"] = [{"plugin_config_id": pid} for pid in associations]
+        return proxy
+
+    def _attach_plugin(self, proxy_id: str, plugin: PluginSpec) -> str:
+        self._note_plugin(plugin.name)
+        if plugin.shared_key:
+            key = json.dumps([plugin.shared_key, plugin.name, plugin.config], sort_keys=True)
+            if key not in self.group_ids:
+                pid = self.plugin_ids.take(self.plan.platform, "group", plugin.shared_key, plugin.name)
+                self.group_ids[key] = pid
+                self.plugin_configs.append(self._plugin_entry(pid, plugin.name, plugin.config, "proxy_group",
+                                                              None, plugin.ref))
+            return self.group_ids[key]
+        pid = self.plugin_ids.take(proxy_id, plugin.name)
+        self.plugin_configs.append(self._plugin_entry(pid, plugin.name, plugin.config, "proxy", proxy_id, plugin.ref))
+        return pid
+
+    def _build_consumers(self) -> list[dict[str, Any]]:
+        consumers = self.plan.consumers
+        usernames: dict[str, int] = {}
+        custom_ids: dict[str, int] = {}
+        for consumer in consumers:
+            usernames[consumer.username] = usernames.get(consumer.username, 0) + 1
+            if consumer.custom_id:
+                custom_ids[consumer.custom_id] = custom_ids.get(consumer.custom_id, 0) + 1
+        key_owners: dict[str, int] = {}
+        jwt_owners: dict[str, int] = {}
+        if self.options.include_secrets:
+            for consumer in consumers:
+                for key in set(consumer.keyauth):
+                    key_owners[key] = key_owners.get(key, 0) + 1
+                for secret in set(consumer.jwt):
+                    jwt_owners[secret] = jwt_owners.get(secret, 0) + 1
+        withheld = 0
+        result: list[dict[str, Any]] = []
+        for consumer in consumers:
+            if usernames[consumer.username] > 1:
+                consumer.quarantined.append("its username is not unique")
+            if consumer.custom_id and custom_ids[consumer.custom_id] > 1:
+                consumer.quarantined.append("its custom_id is not unique")
+            username = consumer.username
+            if not username or len(username) > util.MAX_NAME_LENGTH or any(ord(ch) < 0x20 for ch in username):
+                self.report.error("consumer-invalid", consumer.ref, "Consumer username is not representable; skipped.")
+                continue
+            entry: dict[str, Any] = {
+                "id": self.consumer_ids.take(self.plan.platform, "consumer", consumer.key),
+                "username": username,
+                "labels": self.labels(consumer.ref),
+            }
+            if consumer.custom_id:
+                entry["custom_id"] = consumer.custom_id
+            groups = [g for g in consumer.acl_groups if isinstance(g, str) and g and len(g) <= 255
+                      and not any(ord(ch) < 0x20 for ch in g)]
+            if len(groups) != len(consumer.acl_groups) or len(groups) > 500:
+                self.report.error("consumer-acl-groups", consumer.ref,
+                                  "Some ACL group names were not representable and were dropped; ACL decisions "
+                                  "for this consumer fail closed for those groups.")
+                groups = groups[:500]
+            if groups:
+                entry["acl_groups"] = groups
+            secret_count = len(consumer.keyauth) + len(consumer.jwt) + consumer.withheld_secrets
+            if consumer.quarantined:
+                if secret_count:
+                    self.report.error("consumer-quarantined", consumer.ref,
+                                      "Credentials withheld (fail closed) because " + "; ".join(consumer.quarantined) + ".",
+                                      "Recreate this consumer's policy in Ferrum, then issue new credentials.")
+            elif self.options.include_secrets:
+                credentials = self._credentials(consumer, key_owners, jwt_owners)
+                if credentials:
+                    entry["credentials"] = credentials
+            else:
+                withheld += secret_count
+            result.append(entry)
+        if withheld:
+            self.report.warning("credentials-withheld", "consumers",
+                                f"{withheld} migratable credential(s) were not written because plaintext secrets are "
+                                "only emitted with explicit --include-secrets. Authentication on migrated routes "
+                                "fails closed until credentials exist.",
+                                "Re-run with --include-secrets into a private directory, or issue new credentials "
+                                "in Ferrum.")
+        return result
+
+    def _credentials(self, consumer, key_owners: dict[str, int], jwt_owners: dict[str, int]) -> dict[str, Any]:
+        credentials: dict[str, Any] = {}
+        keys = []
+        for key in consumer.keyauth:
+            stripped = sum(1 for ch in key if not ch.isspace())
+            if key_owners.get(key, 0) > 1:
+                self.report.error("keyauth-duplicate", consumer.ref,
+                                  "An API key is shared with another consumer; it was not migrated (fail closed).")
+            elif stripped < MIN_KEYAUTH_KEY_LENGTH or len(key) > MAX_CREDENTIAL_VALUE_LENGTH \
+                    or any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in key):
+                self.report.error("keyauth-weak", consumer.ref,
+                                  "An API key is shorter than Ferrum's 16-character minimum or not representable; "
+                                  "it was not migrated (fail closed).",
+                                  "Issue a new random key of at least 16 characters.")
+            elif key not in keys:
+                keys.append(key)
+        if keys:
+            credentials["keyauth"] = [{"key": key} for key in keys]
+            self.secrets_emitted += len(keys)
+        secrets = []
+        for secret in consumer.jwt:
+            stripped = sum(1 for ch in secret if not ch.isspace())
+            if jwt_owners.get(secret, 0) > 1:
+                self.report.error("jwt-secret-duplicate", consumer.ref,
+                                  "A JWT secret is shared with another consumer; Ferrum refuses shared secrets, so it "
+                                  "was not migrated (fail closed).")
+            elif stripped < MIN_JWT_SECRET_LENGTH or len(secret) > MAX_CREDENTIAL_VALUE_LENGTH:
+                self.report.error("jwt-secret-weak", consumer.ref,
+                                  "A JWT secret is shorter than Ferrum's 32-character minimum; it was not migrated "
+                                  "(fail closed).", "Rotate to a random secret of at least 32 characters.")
+            elif secret not in secrets:
+                secrets.append(secret)
+        if secrets:
+            credentials["jwt"] = [{"secret": secret} for secret in secrets]
+            self.secrets_emitted += len(secrets)
+        return credentials
+
+    def stats(self, routes: list[RouteSpec], candidates: list[_Cand]) -> dict[str, Any]:
+        source_routes = [r for r in routes if not r.skip]
+        return {
+            "source_routes": len(source_routes),
+            "migrated_routes": sum(1 for c in candidates if not c.placeholder),
+            "refused_routes": sum(1 for r in source_routes if r.refusals),
+            "fail_closed_placeholders": sum(1 for c in candidates if c.placeholder and c.kind_label == "refused"),
+            "synthetic_404_routes": sum(1 for c in candidates if c.kind_label in ("scope-default", "exact-guard")),
+            "prefix_guards": self.guard_count,
+            "skipped_source_routes": sum(1 for r in routes if r.skip),
+            "proxies": len(candidates),
+            "upstreams": len(self.upstream_id_by_key),
+            "consumers": len(self.plan.consumers),
+            "plugin_configs": len(self.plugin_configs),
+            "credentials_emitted": self.secrets_emitted,
+        }
+
+
+def _report_routes(routes: list[RouteSpec], report: Report) -> None:
+    for route in routes:
+        if route.skip:
+            continue
+        if route.refusals:
+            outcome = ("A fail-closed placeholder answering HTTP 503 was emitted for its match."
+                       if route.placeholder_emitted else
+                       "No route was emitted; overlapping routes were refused with it.")
+            reasons = "; ".join(route.refusals[:6])
+            if len(route.refusals) > 6:
+                reasons += f"; and {len(route.refusals) - 6} more"
+            report.error("route-refused", route.ref, f"Not migrated: {reasons}. {outcome}",
+                         "Recreate this route manually in Ferrum after reviewing the reasons.")
+
+
+# What each source's projected read timeout meant there (only values the translators actually copy).
+_SOURCE_READ_TIMEOUT = {
+    "nginx": "proxy_read_timeout/grpc_read_timeout only bound the idle time between two successive reads from the "
+             "upstream",
+    "kong": "a service read_timeout only bounds the idle time between two successive reads from the upstream",
+    "traefik": "forwardingTimeouts.responseHeaderTimeout only bounds the wait for response headers after the request "
+               "has been written",
+    "envoy": "the route timeout (15s when unset) bounds the complete upstream response; Ferrum's value is not a "
+             "total deadline, so a response that keeps streaming can outlive it",
+    "istio": "the VirtualService http timeout bounds the complete upstream response; Ferrum's value is not a total "
+             "deadline, so a response that keeps streaming can outlive it",
+}
+_EDGE_READ_TIMEOUT = ("In Ferrum Edge v0.9.21, backend_read_timeout_ms is one budget covering the wait for response "
+                      "headers, idle time between streamed response frames, and the total time to send a buffered "
+                      "client request body to the backend.")
+
+
+def _report_timeout_semantics(plan: Plan, routes: list[RouteSpec], report: Report) -> None:
+    """Label projected backend timeouts as approximations: equal units do not mean equal semantics."""
+    live = [r for r in routes if not r.skip and not r.refusals and r.termination is None and r.backend is not None]
+    has_read = any(r.read_timeout_ms for r in live)
+    has_other = any(r.connect_timeout_ms or r.write_timeout_ms for r in live)
+    if not (has_read or has_other):
+        return
+    parts: list[str] = []
+    if has_read:
+        source = _SOURCE_READ_TIMEOUT.get(plan.platform, "the source's read timeout has its own semantics")
+        parts.append(f"Source read timeouts were copied into backend_read_timeout_ms, but {source}. "
+                     f"{_EDGE_READ_TIMEOUT}")
+    if has_other:
+        parts.append("Source connect and write timeouts were copied by name into backend_connect_timeout_ms and "
+                     "backend_write_timeout_ms; their exact timing points in Ferrum were not runtime-verified.")
+    parts.append("The numbers carry over, but the timing behavior is only an approximation: long pauses in "
+                 "streamed responses, slow uploads or long-running responses can time out differently than in the "
+                 "source.")
+    report.warning("timeout-approximate", "backend timeouts", " ".join(parts),
+                   "Review backend_*_timeout_ms on routes with streaming, long-polling or large uploads.")

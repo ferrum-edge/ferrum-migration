@@ -1,0 +1,27 @@
+{
+  "id": "kong-deck-routing",
+  "adapter": "kong-deck",
+  "title": "Kong decK dump: nested routes, service path prepend, methods",
+  "source": "deck.yaml",
+  "allow_rejection": false,
+  "claims": [
+    "decK-shaped input (with _info/select_tags) converts to the same routing as DB-less input",
+    "strip_path=true with service path /internal forwards /orders/42 as /internal/42",
+    "a GET/HEAD route forwards GET unchanged and does not forward DELETE"
+  ],
+  "not_claimed": [
+    "select_tags ownership semantics (decK sync scoping) - informational only",
+    "Database-backed Kong / live Admin API export: the input is a normal file"
+  ],
+  "source_semantics": "Same Kong 3.x path rules as the DB-less case; decK dumps differ in envelope (_info, tags), not routing semantics. Documentation-inferred; no differential runner is provided for decK (see profiles/upstream.example.json).",
+  "probes": [
+    {"id": "strip-prepend", "host": "shop.example.test", "path": "/orders/42?expand=1",
+     "expect": {"forward": {"backend": "a", "path": "/internal/42?expand=1"}}},
+    {"id": "get-catalog", "host": "shop.example.test", "path": "/catalog/items",
+     "expect": {"forward": {"backend": "b", "path": "/catalog/items"}}},
+    {"id": "delete-catalog", "method": "DELETE", "host": "shop.example.test", "path": "/catalog/items",
+     "expect": {"deny": true, "status": [404, 405]}},
+    {"id": "wrong-host", "host": "api.example.test", "path": "/orders/42",
+     "expect": {"deny": true, "status": [404]}}
+  ]
+}

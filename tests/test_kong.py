@@ -1,0 +1,267 @@
+import json
+import textwrap
+import unittest
+
+import yaml
+
+from helpers import assert_structurally_valid, codes, migrate, one_proxy, plugin, plugins_of, read_fixture, upstream_of
+
+
+class KongFixtureTest(unittest.TestCase):
+    def setUp(self):
+        self.result, self.report, self.plan = migrate("kong", read_fixture("kong", "kong.yaml"))
+        self.config = self.result.config
+
+    def test_structure(self):
+        assert_structurally_valid(self, self.config)
+
+    def test_service_route_backend_and_timeouts(self):
+        proxy = one_proxy(self, self.config, "/orders")
+        self.assertEqual(proxy["allowed_methods"], ["GET", "POST"])
+        self.assertEqual((proxy["backend_scheme"], proxy["backend_host"], proxy["backend_port"]),
+                         ("http", "orders.internal", 8080))
+        self.assertEqual(proxy["backend_path"], "/v1")
+        self.assertTrue(proxy["strip_listen_path"])
+        self.assertFalse(proxy["preserve_host_header"])
+        self.assertEqual(proxy["backend_connect_timeout_ms"], 5000)
+        self.assertEqual(proxy["backend_read_timeout_ms"], 30000)
+        self.assertEqual(proxy["retry"]["max_retries"], 3)
+
+    def test_service_plugins_are_shared_route_plugin_is_scoped(self):
+        proxy = one_proxy(self, self.config, "/orders")
+        key_auth = plugin(self, self.config, proxy, "key_auth")
+        self.assertEqual(key_auth["scope"], "proxy_group")
+        self.assertEqual(key_auth["config"], {"key_location": "header:apikey", "hide_credentials": True})
+        acl = plugin(self, self.config, proxy, "access_control")
+        self.assertEqual(acl["config"], {"allowed_groups": ["engineering"]})
+        rate = plugin(self, self.config, proxy, "rate_limiting")
+        self.assertEqual(rate["scope"], "proxy")
+        self.assertEqual(rate["config"]["limit_by"], "consumer")
+        self.assertEqual(rate["config"]["limits"], [{"scope": "default", "requests_per_minute": 100}])
+
+    def test_upstream_weights_health_and_trailing_slash(self):
+        proxy = one_proxy(self, self.config, "/catalog", "shop.example.com")
+        self.assertFalse(proxy["strip_listen_path"])
+        upstream = upstream_of(self.config, proxy)
+        self.assertEqual(upstream["algorithm"], "weighted_round_robin")
+        self.assertEqual([(t["host"], t["port"], t["weight"]) for t in upstream["targets"]],
+                         [("catalog-a.internal", 8080, 100), ("catalog-b.internal", 8080, 50)])
+        self.assertEqual(upstream["health_checks"]["active"]["http_path"], "/healthz")
+        bare = one_proxy(self, self.config, "=/catalog", "shop.example.com")
+        self.assertEqual(plugin(self, self.config, bare, "request_termination")["config"]["status_code"], 404)
+
+    def test_cors_and_transformer(self):
+        proxy = one_proxy(self, self.config, "/catalog", "shop.example.com")
+        cors = plugin(self, self.config, proxy, "cors")["config"]
+        self.assertEqual(cors["allowed_origins"], ["https://shop.example.com"])
+        self.assertEqual(cors["max_age"], 600)
+        rules = plugin(self, self.config, proxy, "request_transformer")["config"]["rules"]
+        self.assertIn({"operation": "remove", "target": "header", "key": "x-debug"}, rules)
+        self.assertIn({"operation": "add", "target": "header", "key": "x-gateway", "value": "ferrum"}, rules)
+
+    def test_untranslatable_plugin_becomes_fail_closed_placeholder(self):
+        proxy = one_proxy(self, self.config, "/admin")
+        self.assertEqual(proxy["labels"]["ferrum-migration/status"], "refused")
+        names = [p["plugin_name"] for p in plugins_of(self.config, proxy)]
+        self.assertEqual(names, ["request_termination"])
+        self.assertEqual(plugins_of(self.config, proxy)[0]["config"]["status_code"], 503)
+        self.assertIn("route-refused", codes(self.report, "error"))
+
+    def test_prefix_divergence_guard_on_catch_all(self):
+        root = one_proxy(self, self.config, "/")
+        guards = [p for p in plugins_of(self.config, root) if p["plugin_name"] == "request_termination"]
+        self.assertEqual([g["config"]["trigger"]["path_prefix"] for g in guards], ["/orders"])
+
+    def test_consumers_without_secrets(self):
+        consumers = {c["username"]: c for c in self.config["consumers"]}
+        self.assertEqual(consumers["alice"]["acl_groups"], ["engineering"])
+        self.assertEqual(consumers["alice"]["custom_id"], "alice-001")
+        self.assertNotIn("credentials", consumers["alice"])
+        self.assertIn("credentials-withheld", codes(self.report, "warning"))
+        self.assertIn("kong-basicauth-credentials", codes(self.report, "error"))
+        dumped = yaml.safe_dump(self.config)
+        self.assertNotIn("test-only-key-alice-0001", dumped)
+        self.assertNotIn("test-only-password-hash-bob", dumped)
+
+    def test_observability_plugin_omitted_safely(self):
+        self.assertIn("kong-plugin-observability", codes(self.report, "info"))
+        self.assertEqual([p for p in self.config["plugin_configs"] if p["scope"] == "global"], [])
+
+
+class KongSecretsTest(unittest.TestCase):
+    def test_include_secrets_only_in_resources_never_in_report(self):
+        result, report, _plan = migrate("kong", read_fixture("kong", "kong.yaml"), include_secrets=True)
+        consumers = {c["username"]: c for c in result.config["consumers"]}
+        self.assertEqual(consumers["alice"]["credentials"], {"keyauth": [{"key": "test-only-key-alice-0001"}]})
+        self.assertNotIn("credentials", consumers["bob"])
+        self.assertIn("keyauth-weak", codes(report, "error"))
+        self.assertEqual(result.secrets_emitted, 1)
+        text = json.dumps([c.to_dict() for c in report.caveats])
+        self.assertNotIn("test-only-key-alice-0001", text)
+        self.assertNotIn("short-key", text)
+
+    def test_duplicate_keys_are_not_migrated(self):
+        text = textwrap.dedent("""
+            _format_version: "3.0"
+            consumers:
+              - username: a
+                keyauth_credentials: [{key: shared-test-key-000000001}]
+              - username: b
+                keyauth_credentials: [{key: shared-test-key-000000001}]
+        """)
+        result, report, _ = migrate("kong", text, include_secrets=True)
+        self.assertTrue(all("credentials" not in c for c in result.config["consumers"]))
+        self.assertIn("keyauth-duplicate", codes(report, "error"))
+
+    def test_jwt_hmac_credential_mapping(self):
+        text = textwrap.dedent("""
+            _format_version: "3.0"
+            services:
+              - name: s
+                url: http://s.internal:80
+                routes: [{name: r, paths: [/jwt]}]
+                plugins:
+                  - name: jwt
+                    config: {claims_to_verify: [exp], uri_param_names: []}
+            consumers:
+              - username: carol
+                jwt_secrets:
+                  - {key: carol-issuer, algorithm: HS256, secret: test-only-jwt-secret-carol-000000000001}
+                  - {key: other, algorithm: RS256, rsa_public_key: not-a-real-key}
+        """)
+        result, report, _ = migrate("kong", text, include_secrets=True)
+        proxy = one_proxy(self, result.config, "/jwt")
+        jwt = plugin(self, result.config, proxy, "jwt_auth")["config"]
+        self.assertEqual(jwt["consumer_claim_field"], "iss")
+        self.assertEqual(jwt["algorithm"], "HS256")
+        self.assertTrue(jwt["require_exp"])
+        carol = result.config["consumers"][0]
+        self.assertEqual(carol["custom_id"], "carol-issuer")
+        self.assertEqual(carol["credentials"]["jwt"], [{"secret": "test-only-jwt-secret-carol-000000000001"}])
+        self.assertIn("kong-jwt-credential", codes(report, "error"))
+
+
+class KongFailClosedTest(unittest.TestCase):
+    def test_header_matched_route_poisons_more_specific_overlaps(self):
+        text = textwrap.dedent("""
+            _format_version: "3.0"
+            services:
+              - name: s
+                url: http://s.internal:8080
+                routes:
+                  - {name: special, paths: [/api], headers: {x-tenant: [gold]}}
+                  - {name: deep, paths: [/api/v2]}
+                  - {name: other, paths: [/other]}
+        """)
+        result, report, _ = migrate("kong", text)
+        api = one_proxy(self, result.config, "/api")
+        deep = one_proxy(self, result.config, "/api/v2")
+        self.assertEqual(api["labels"]["ferrum-migration/status"], "refused")
+        self.assertEqual(deep["labels"]["ferrum-migration/status"], "refused")
+        other = one_proxy(self, result.config, "/other")
+        self.assertEqual(other["labels"]["ferrum-migration/status"], "migrated")
+
+    def test_global_untranslatable_plugin_refuses_everything(self):
+        text = textwrap.dedent("""
+            _format_version: "3.0"
+            services:
+              - name: s
+                url: http://s.internal:8080
+                routes: [{name: r, paths: [/x]}]
+            plugins:
+              - name: openid-connect
+                config: {issuer: https://idp.example}
+        """)
+        result, report, _ = migrate("kong", text)
+        proxy = one_proxy(self, result.config, "/x")
+        self.assertEqual(proxy["labels"]["ferrum-migration/status"], "refused")
+        self.assertIn("kong-plugin-refused", codes(report, "error"))
+
+    def test_https_only_route_needs_tls_only(self):
+        text = textwrap.dedent("""
+            _format_version: "3.0"
+            services:
+              - name: s
+                url: http://s.internal:8080
+                routes:
+                  - {name: secure, paths: [/secure], protocols: [https]}
+                  - {name: plain, paths: [/plain]}
+        """)
+        result, report, _ = migrate("kong", text)
+        self.assertEqual(one_proxy(self, result.config, "/secure")["labels"]["ferrum-migration/status"], "refused")
+        self.assertFalse(result.tls_only)
+        result, report, _ = migrate("kong", text, tls_only=True)
+        self.assertEqual(one_proxy(self, result.config, "/secure")["labels"]["ferrum-migration/status"], "migrated")
+        self.assertTrue(result.tls_only)
+
+    def test_consumer_scoped_plugin_quarantines_consumer(self):
+        text = textwrap.dedent("""
+            _format_version: "3.0"
+            consumers:
+              - username: dave
+                keyauth_credentials: [{key: test-only-key-dave-000001}]
+                plugins:
+                  - name: rate-limiting
+                    config: {minute: 1000}
+        """)
+        result, report, _ = migrate("kong", text, include_secrets=True)
+        self.assertNotIn("credentials", result.config["consumers"][0])
+        self.assertIn("kong-consumer-quarantined", codes(report, "error"))
+
+    def test_vault_reference_refuses_plugin(self):
+        text = textwrap.dedent("""
+            _format_version: "3.0"
+            services:
+              - name: s
+                url: http://s.internal:8080
+                routes: [{name: r, paths: [/v]}]
+                plugins:
+                  - name: request-transformer
+                    config: {add: {headers: ["x-token:{vault://env/token}"]}}
+        """)
+        result, report, _ = migrate("kong", text)
+        self.assertEqual(one_proxy(self, result.config, "/v")["labels"]["ferrum-migration/status"], "refused")
+        self.assertNotIn("vault://env/token", json.dumps([c.to_dict() for c in report.caveats]))
+
+    def test_replace_operation_is_refused_not_downgraded(self):
+        text = textwrap.dedent("""
+            _format_version: "3.0"
+            services:
+              - name: s
+                url: http://s.internal:8080
+                routes: [{name: r, paths: [/r]}]
+                plugins:
+                  - name: request-transformer
+                    config: {replace: {headers: ["x-user:anonymous"]}}
+        """)
+        result, _report, _ = migrate("kong", text)
+        self.assertEqual(one_proxy(self, result.config, "/r")["labels"]["ferrum-migration/status"], "refused")
+
+    def test_rate_limit_day_window_refused(self):
+        text = textwrap.dedent("""
+            _format_version: "3.0"
+            services:
+              - name: s
+                url: http://s.internal:8080
+                routes: [{name: r, paths: [/d]}]
+                plugins: [{name: rate-limiting, config: {minute: 10, day: 1000}}]
+        """)
+        result, _report, _ = migrate("kong", text)
+        self.assertEqual(one_proxy(self, result.config, "/d")["labels"]["ferrum-migration/status"], "refused")
+
+    def test_https_backend_verification_is_enabled_by_default(self):
+        text = textwrap.dedent("""
+            _format_version: "3.0"
+            services:
+              - name: s
+                url: https://secure.internal:8443
+                routes: [{name: r, paths: [/t]}]
+        """)
+        result, report, _ = migrate("kong", text)
+        self.assertIs(one_proxy(self, result.config, "/t")["backend_tls_verify_server_cert"], True)
+        self.assertIn("backend-tls-verify-enabled", codes(report, "warning"))
+        self.assertNotIn("backend-tls-unverified", codes(report))
+
+
+if __name__ == "__main__":
+    unittest.main()

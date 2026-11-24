@@ -1,0 +1,31 @@
+{
+  "id": "nginx-proxy-pass-uri",
+  "adapter": "nginx",
+  "title": "NGINX proxy_pass URI replacement vs pass-through, exact location, no fallback",
+  "source": "nginx.conf",
+  "allow_rejection": false,
+  "claims": [
+    "proxy_pass with URI /inner/ under location /svc/ forwards /svc/x/y?q=1 as /inner/x/y?q=1",
+    "proxy_pass without URI forwards /raw/z?k=v unchanged",
+    "location = /exact forwards only the exact path",
+    "a server without location / does not gain a broad fallback route"
+  ],
+  "not_claimed": [
+    "default_server / server_name fallback for other Host values (all probes use the configured name)",
+    "the automatic 301 for /svc without a trailing slash",
+    "upstream Host header ($proxy_host vs Ferrum target authority)"
+  ],
+  "source_semantics": "nginx http_proxy: when proxy_pass carries a URI, the part of the normalized request URI matching the location is replaced by it; without a URI the original request URI is passed; '=' locations match exactly; with no matching location nginx serves from root and answers 404. Documentation-inferred unless the upstream differential runs.",
+  "probes": [
+    {"id": "uri-replaced", "path": "/svc/x/y?q=1",
+     "expect": {"forward": {"backend": "a", "path": "/inner/x/y?q=1"}}},
+    {"id": "uri-passthrough", "path": "/raw/z?k=v",
+     "expect": {"forward": {"backend": "b", "path": "/raw/z?k=v"}}},
+    {"id": "exact-hit", "path": "/exact",
+     "expect": {"forward": {"backend": "a", "path": "/exact"}}},
+    {"id": "exact-miss", "path": "/exact/sub",
+     "expect": {"deny": true, "status": [404]}},
+    {"id": "no-fallback", "path": "/elsewhere",
+     "expect": {"deny": true, "status": [404]}}
+  ]
+}

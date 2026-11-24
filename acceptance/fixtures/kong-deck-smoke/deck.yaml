@@ -1,0 +1,29 @@
+# Synthetic decK dump. Loopback only; the harness fills its upper-case placeholders.
+# The API key is random per run, used only against the harness's own gateway.
+_format_version: "3.0"
+_info:
+  select_tags:
+    - acceptance
+services:
+  - name: svc-keyed
+    host: 127.0.0.1
+    port: ${ECHO_A_PORT}
+    protocol: http
+    routes:
+      - name: r-keyed
+        paths:
+          - /keyed
+        hosts:
+          - api.example.test
+        strip_path: false
+        plugins:
+          - name: key-auth
+            config:
+              key_names:
+                - apikey
+              key_in_header: true
+              key_in_query: false
+consumers:
+  - username: synthetic-acceptance-keyed
+    keyauth_credentials:
+      - key: ${CANARY_KEY}

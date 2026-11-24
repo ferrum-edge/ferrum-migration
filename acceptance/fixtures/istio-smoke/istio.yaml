@@ -1,0 +1,64 @@
+# Synthetic Istio networking resources. Loopback only; the harness fills its upper-case placeholders.
+apiVersion: networking.istio.io/v1
+kind: Gateway
+metadata:
+  name: smoke-gw
+  namespace: edge
+spec:
+  selector:
+    istio: ingressgateway
+  servers:
+    - port: {number: ${LISTEN_PORT}, name: http, protocol: HTTP}
+      hosts: ["*/app.example.test"]
+---
+apiVersion: networking.istio.io/v1
+kind: ServiceEntry
+metadata:
+  name: echo-a
+  namespace: edge
+spec:
+  hosts: [echo-a.acceptance.test]
+  location: MESH_EXTERNAL
+  resolution: STATIC
+  ports:
+    - {number: 8080, name: http, protocol: HTTP}
+  endpoints:
+    - address: 127.0.0.1
+      ports: {http: ${ECHO_A_PORT}}
+---
+apiVersion: networking.istio.io/v1
+kind: ServiceEntry
+metadata:
+  name: echo-b
+  namespace: edge
+spec:
+  hosts: [echo-b.acceptance.test]
+  location: MESH_EXTERNAL
+  resolution: STATIC
+  ports:
+    - {number: 8080, name: http, protocol: HTTP}
+  endpoints:
+    - address: 127.0.0.1
+      ports: {http: ${ECHO_B_PORT}}
+---
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: app
+  namespace: edge
+spec:
+  hosts: [app.example.test]
+  gateways: [smoke-gw]
+  http:
+    - name: rewrite
+      match:
+        - uri: {prefix: /api/}
+      rewrite:
+        uri: /v1/
+      route:
+        - destination: {host: echo-a.acceptance.test, port: {number: 8080}}
+    - name: exact
+      match:
+        - uri: {exact: /status}
+      route:
+        - destination: {host: echo-b.acceptance.test, port: {number: 8080}}

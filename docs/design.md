@@ -1,0 +1,89 @@
+# Design
+
+## Pipeline
+
+```
+input file --(safe_load / nginx parser)--> source translator --> Plan (IR) --> emitter --> resources + profile + report
+```
+
+1. **Loading** (`safe_load.py`, `sources/nginx.py`). Reads at most `max_input_bytes + 1` bytes
+   from one regular file and rejects NUL bytes and invalid UTF-8. YAML uses a `SafeLoader`
+   subclass that rejects duplicate keys, merge keys and binary/set/omap/pairs tags, keeps
+   timestamps as strings, and bounds aliases and composed nodes. Every decoded tree is then
+   walked once under a visit budget, in which shared aliases count on each visit. This
+   defeats alias-expansion bombs before any translator iterates the data. The NGINX tokenizer
+   is bounded by token count and block depth and refuses embedded script blocks.
+2. **Translation** (`sources/*.py`). Each source produces a platform-neutral `Plan`:
+   `RouteSpec`s (hosts, path kind, methods, port, TLS requirement, backend, plugins,
+   termination, refusal reasons, and an `extra_conditions` flag), `UpstreamSpec`s,
+   `ConsumerSpec`s, global plugins and settings hints. Translators never emit anything they
+   cannot justify. They call `route.refuse(reason)` instead.
+3. **Emission** (`ferrum.py`). Applies the fail-closed rules below and produces Ferrum
+   resources with deterministic ids and ordering.
+4. **Output** (`writer.py`). The output directory is created `0700`. Each file goes through
+   `mkstemp` (`0600`), `fsync` and an atomic rename. Collisions are checked before anything is
+   written, and symlinks are refused.
+
+## Fail-closed rules in the emitter
+
+| Rule | Why |
+|---|---|
+| Refused route with a representable match: placeholder proxy (same hosts/path/port) with `request_termination` 503 | Ferrum runs `request_termination` in `on_request_received` (priority 125), before auth. The refused traffic cannot reach a broader route. |
+| Refused route with an unrepresentable match (`extra_conditions`): refuse every overlapping route Ferrum would prefer over its placeholder | Requests the source sent to the refused route must not land on a different backend or policy. |
+| Duplicate Ferrum slot (same port, same listen path, overlapping hosts): refuse all, emit one merged placeholder | Ferrum rejects duplicates. Picking one would silently drop another source route's policy. |
+| HTTPS-only routes are emitted only with `FERRUM_PROXY_HTTP_PORT=0` | Otherwise Ferrum would serve them on its plaintext listener as well. |
+| String-prefix guard (`request_termination` + `trigger.path_prefix`) on broader routes with different policy | Source `/api` matched `/apix`; Ferrum's segment matching would hand `/apix` to the broader route. |
+| NGINX string-prefix siblings that no equivalent route catches (no fallback, a guard, a placeholder or a termination): `prefix-string-siblings` error, route not widened | `/apix` was forwarded by the source but gets a 404 or fail-closed answer in Ferrum; that must be reviewed, not dropped silently. A regex or broader route would change precedence or expose more. |
+| Projected backend timeouts carry a `timeout-approximate` warning | Same unit, different semantics: Ferrum's `backend_read_timeout_ms` also bounds header wait, stream idle time and buffered uploads. |
+| Exact 404 route for the bare path of a trailing-slash prefix | Source `/api/` did not match `/api`; Ferrum's `/api` would. |
+| Host-only 404 route per closed host scope (NGINX server, Envoy vhost, Istio host) | Those sources never fall through to other hosts' routes; Ferrum's host tiers do. |
+| Backend TLS verification always on; every emitted `backend_tls_verify_server_cert` is `true`, checked by a final output invariant; the former opt-out flag is refused (exit 2) | Never downgrade transport security; insecure output is never produced. |
+| Credentials only with `--include-secrets`; key/secret strength and uniqueness checks; quarantined consumers get none | Plaintext secrets are explicit and private. Ferrum would reject or quarantine weak or shared secrets anyway. |
+| Kong `_transform: false` credentials are never migrated | They are stored (pre-transformed) values, not what clients send. |
+| Static values for credential-like header/query names refuse the route (value never echoed) | They would put secret bytes into the resources file without `--include-secrets`. |
+| Envoy routes/vhosts with non-CORS `typed_per_filter_config` are refused | Per-route config can re-enable a filter disabled at the HCM (for example authentication). |
+| Istio policies whose selector matches the Gateway refuse its routes in any namespace; namespace-wide policies elsewhere are review errors | The gateway pods' namespace is not part of the input. |
+
+### Precedence analysis
+
+* **First-match sources** (Envoy routes, Istio `http[]`): `apply_first_match_order` drops
+  routes fully covered by an earlier unconditional route (unreachable in the source). When a
+  partial overlap would be resolved differently by Ferrum's specificity order, both routes are
+  refused.
+* **Traefik**: router priority (explicit, or the default rule length) is compared with
+  Ferrum's preference for every overlapping pair. A shadowed route is dropped; a
+  contradictory or equal-priority pair is refused.
+* **NGINX**: a server mixing regex locations with overlapping non-`^~` prefix locations is
+  refused entirely, because NGINX lets the regex win and Ferrum lets the prefix win.
+* **Kong**: regex paths overlapping prefix paths are refused and poison their overlaps.
+
+### Residual risks (documented, not hidden)
+
+* A host-level refusal (regex `server_name`, unrepresentable Envoy domains) poisons only
+  catch-all routes. A backend that is virtual-host aware could still receive such hosts
+  through the catch-all route.
+* Divergent string-prefix paths on a narrower host set than the broader route cannot be
+  guarded exactly. These cases are reported as `prefix-divergence` errors.
+* Client-IP based plugins (`ip_restriction`, IP rate limits) use the socket peer until
+  `FERRUM_TRUSTED_PROXIES` is configured. Trusted-proxy settings are only suggested.
+
+## Determinism
+
+Output contains no timestamps or random values. IDs derive from source names with stable
+de-duplication, and plugin, upstream and consumer order follows source order. Running twice
+produces byte-identical files (tested).
+
+## Resource ceilings (defaults)
+
+| Limit | Default |
+|---|---|
+| Input bytes | 8 MiB (max 256 MiB) |
+| Structured node visits | 500,000 |
+| Depth | 64 |
+| YAML aliases | 64 |
+| YAML documents (Istio) | 2,000 |
+| String size | 1 MiB |
+| Routes | 20,000 |
+| NGINX tokens / block depth | 1,000,000 / 32 |
+| Traefik pairwise precedence routes | 4,000 |
+| Rule DNF alternatives | 32 |

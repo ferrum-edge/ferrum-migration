@@ -1,0 +1,12 @@
+# Synthetic Traefik dynamic configuration in TOML (v2 multi-argument rule syntax).
+[http.routers.api]
+  rule = "Host(`a.example.com`, `b.example.com`) && PathPrefix(`/api`)"
+  service = "api"
+  middlewares = ["office-only"]
+
+[http.middlewares.office-only.ipAllowList]
+  sourceRange = ["192.0.2.0/24", "2001:db8::/32"]
+
+[http.services.api.loadBalancer]
+  [[http.services.api.loadBalancer.servers]]
+    url = "http://api.internal:8080"

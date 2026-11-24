@@ -1,0 +1,31 @@
+{
+  "id": "traefik-default-priority",
+  "adapter": "traefik",
+  "title": "Traefik default rule-length priority, stripPrefix, Host matcher",
+  "source": "dynamic.yaml",
+  "allow_rejection": false,
+  "claims": [
+    "with default priorities the longer rule (PathPrefix /a/b) wins for /a/b/c",
+    "the shorter rule still serves /a/c",
+    "stripPrefix /strip forwards /strip/x?q=1 as /x?q=1",
+    "Host() restricts routing; another Host is not forwarded",
+    "unmatched paths are not forwarded"
+  ],
+  "not_claimed": [
+    "PathPrefix string-prefix matching of /a against /ab (not probed)",
+    "entryPoints, TLS, and non-HTTP routers"
+  ],
+  "source_semantics": "Traefik router priority defaults to the rule string length, so the longer, more specific rule wins here; stripPrefix removes the matching prefix before forwarding; no matching router yields 404. Documentation-inferred unless the upstream differential runs.",
+  "probes": [
+    {"id": "short-rule", "path": "/a/c",
+     "expect": {"forward": {"backend": "a", "path": "/a/c"}}},
+    {"id": "long-rule-wins", "path": "/a/b/c",
+     "expect": {"forward": {"backend": "b", "path": "/a/b/c"}}},
+    {"id": "strip-prefix", "path": "/strip/x?q=1",
+     "expect": {"forward": {"backend": "a", "path": "/x?q=1"}}},
+    {"id": "host-mismatch", "host": "other.example.test", "path": "/a/c",
+     "expect": {"deny": true, "status": [404]}},
+    {"id": "unmatched", "path": "/zzz",
+     "expect": {"deny": true, "status": [404]}}
+  ]
+}

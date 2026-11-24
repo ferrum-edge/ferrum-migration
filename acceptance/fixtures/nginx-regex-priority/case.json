@@ -1,0 +1,24 @@
+{
+  "id": "nginx-regex-priority",
+  "adapter": "nginx",
+  "title": "NGINX regex location beats an overlapping plain prefix (or is refused)",
+  "source": "nginx.conf",
+  "allow_rejection": true,
+  "claims": [
+    "an overlapping regex location keeps nginx precedence: /img/a.png goes to the regex backend",
+    "the plain prefix still serves non-matching paths under it"
+  ],
+  "not_claimed": [
+    "case-insensitive (~*) regexes, ^~ prefixes, nested locations",
+    "regex captures used inside proxy_pass"
+  ],
+  "source_semantics": "nginx location selection: exact '=' first, then longest plain prefix is remembered; unless it is '^~', regex locations are checked in config order and the first match wins. Ferrum ranks prefix above regex (docs/routing.md), so a naive translation would route /img/a.png to the prefix backend; that must be preserved or refused. Documentation-inferred unless the upstream differential runs.",
+  "probes": [
+    {"id": "regex-beats-prefix", "path": "/img/a.png",
+     "expect": {"forward": {"backend": "b", "path": "/img/a.png"}}},
+    {"id": "prefix-only", "path": "/img/a.jpg",
+     "expect": {"forward": {"backend": "a", "path": "/img/a.jpg"}}},
+    {"id": "regex-outside-prefix", "path": "/top.png",
+     "expect": {"forward": {"backend": "b", "path": "/top.png"}}}
+  ]
+}

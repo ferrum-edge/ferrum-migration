@@ -1,0 +1,28 @@
+# Synthetic Traefik v3 file-provider dynamic configuration (HTTP only).
+http:
+  routers:
+    r-short:
+      rule: "Host(`app.example.test`) && PathPrefix(`/a`)"
+      service: svc-a
+    r-long:
+      rule: "Host(`app.example.test`) && PathPrefix(`/a/b`)"
+      service: svc-b
+    r-strip:
+      rule: "Host(`app.example.test`) && PathPrefix(`/strip`)"
+      middlewares:
+        - strip-mw
+      service: svc-a
+  middlewares:
+    strip-mw:
+      stripPrefix:
+        prefixes:
+          - "/strip"
+  services:
+    svc-a:
+      loadBalancer:
+        servers:
+          - url: "http://127.0.0.1:${ECHO_A_PORT}"
+    svc-b:
+      loadBalancer:
+        servers:
+          - url: "http://127.0.0.1:${ECHO_B_PORT}"

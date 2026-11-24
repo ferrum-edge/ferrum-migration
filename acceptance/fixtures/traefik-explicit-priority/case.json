@@ -1,0 +1,21 @@
+{
+  "id": "traefik-explicit-priority",
+  "adapter": "traefik",
+  "title": "Traefik explicit priority overriding specificity (preserve or refuse)",
+  "source": "dynamic.yaml",
+  "allow_rejection": true,
+  "claims": [
+    "an explicit higher priority on the broader rule keeps /p/q/x on the broad router's backend",
+    "the broad router serves its other paths"
+  ],
+  "not_claimed": [
+    "priority ties, negative priorities, and cross-entryPoint ordering"
+  ],
+  "source_semantics": "Traefik evaluates routers by priority (explicit values override the rule-length default), so r-broad (100) shadows r-narrow (1) for /p/q/x. Ferrum's longest-prefix rule would choose the narrow route, so the converter must preserve this ordering or refuse with a report error.",
+  "probes": [
+    {"id": "explicit-priority-wins", "path": "/p/q/x",
+     "expect": {"forward": {"backend": "a", "path": "/p/q/x"}}},
+    {"id": "broad-other", "path": "/p/z",
+     "expect": {"forward": {"backend": "a", "path": "/p/z"}}}
+  ]
+}

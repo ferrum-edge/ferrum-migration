@@ -1,0 +1,35 @@
+{
+  "id": "istio-smoke",
+  "adapter": "istio",
+  "title": "Istio ingress projection smoke: Gateway-bound VirtualService, ServiceEntry endpoints, uri rewrite, exact match",
+  "source": "istio.yaml",
+  "allow_rejection": false,
+  "claims": [
+    "a Gateway-bound http route with uri prefix /api/ and rewrite.uri /v1/ forwards /api/x?q=1 to backend a as /v1/x?q=1",
+    "an exact uri match /status forwards exactly /status to backend b",
+    "a sub-path of the exact match is not forwarded",
+    "a request for a Host the VirtualService does not serve through the Gateway is not forwarded",
+    "an unrouted path is not forwarded"
+  ],
+  "not_claimed": [
+    "any Istio mesh behavior: sidecars, workload mTLS, mesh-internal routing (this is an ingress projection only)",
+    "Istio's implicit default retry policy",
+    "Kubernetes service discovery (ServiceEntry static endpoints point at loopback instead)"
+  ],
+  "not_established": [
+    "Behavior under a real Istio ingress gateway (no upstream differential exists for Istio in this harness)"
+  ],
+  "source_semantics": "Istio networking v1: a VirtualService bound to a Gateway serves its hosts on that Gateway's servers; http routes are evaluated in order; rewrite.uri replaces the matched prefix; uri exact matches exactly; ServiceEntry STATIC endpoints supply the destination addresses and per-port endpoint ports; unmatched requests get 404. Documentation-inferred.",
+  "probes": [
+    {"id": "uri-rewrite", "host": "app.example.test", "path": "/api/x?q=1",
+     "expect": {"forward": {"backend": "a", "path": "/v1/x?q=1"}}},
+    {"id": "exact", "host": "app.example.test", "path": "/status",
+     "expect": {"forward": {"backend": "b", "path": "/status"}}},
+    {"id": "exact-sub-path", "host": "app.example.test", "path": "/status/x",
+     "expect": {"deny": true, "status": [404]}},
+    {"id": "other-host", "host": "other.example.test", "path": "/status",
+     "expect": {"deny": true, "status": [404]}},
+    {"id": "unrouted", "host": "app.example.test", "path": "/nothing",
+     "expect": {"deny": true, "status": [404]}}
+  ]
+}

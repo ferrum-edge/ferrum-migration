@@ -1,0 +1,17 @@
+{
+  "id": "selftest-basic",
+  "adapter": "selftest",
+  "title": "Harness self-test against the fake converter and fake gateway",
+  "source": "resources.json",
+  "allow_rejection": false,
+  "secret_free": ["CANARY_KEY"],
+  "claims": ["harness plumbing: render, convert, validate, run, probe, classify"],
+  "source_semantics": "Self-test only; proves nothing about Ferrum or any source product.",
+  "probes": [
+    {"id": "strip-prepend", "path": "/api/items?x=1",
+     "expect": {"forward": {"backend": "a", "path": "/v1/items?x=1"}}},
+    {"id": "plain", "path": "/b/z", "expect": {"forward": {"backend": "b", "path": "/b/z"}}},
+    {"id": "method", "method": "POST", "path": "/b/z", "expect": {"deny": true, "status": [405]}},
+    {"id": "unmatched", "path": "/none", "expect": {"deny": true, "status": [404]}}
+  ]
+}

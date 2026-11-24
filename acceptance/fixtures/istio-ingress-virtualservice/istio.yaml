@@ -1,0 +1,47 @@
+# Synthetic Istio ingress resources (multi-document). Destination hosts are
+# synthetic acc-*.svc.cluster.local names; ports are harness echo ports.
+apiVersion: networking.istio.io/v1
+kind: Gateway
+metadata:
+  name: acc-gateway
+  namespace: acceptance
+spec:
+  selector:
+    istio: ingressgateway
+  servers:
+    - port:
+        number: ${LISTEN_PORT}
+        name: http
+        protocol: HTTP
+      hosts:
+        - "bookinfo.example.test"
+---
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: acc-bookinfo
+  namespace: acceptance
+spec:
+  hosts:
+    - "bookinfo.example.test"
+  gateways:
+    - acc-gateway
+  http:
+    - match:
+        - uri:
+            prefix: /reviews
+      route:
+        - destination:
+            host: acc-a.acceptance.svc.cluster.local
+            port:
+              number: ${ECHO_A_PORT}
+    - match:
+        - uri:
+            prefix: /ratings/
+      rewrite:
+        uri: /v1/
+      route:
+        - destination:
+            host: acc-b.acceptance.svc.cluster.local
+            port:
+              number: ${ECHO_B_PORT}

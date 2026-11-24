@@ -1,0 +1,24 @@
+# Synthetic Kong 3.x DB-less declarative config (kong.yaml). Loopback only.
+_format_version: "3.0"
+services:
+  - name: svc-a
+    url: http://127.0.0.1:${ECHO_A_PORT}/v1
+    routes:
+      - name: r-api
+        paths: ["/api"]
+        hosts: ["api.example.test"]
+        strip_path: true
+  - name: svc-b
+    host: 127.0.0.1
+    port: ${ECHO_B_PORT}
+    protocol: http
+    routes:
+      - name: r-keep
+        paths: ["/keep"]
+        hosts: ["api.example.test"]
+        strip_path: false
+      - name: r-readonly
+        paths: ["/ro"]
+        hosts: ["api.example.test"]
+        methods: ["GET"]
+        strip_path: false

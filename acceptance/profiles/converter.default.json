@@ -1,0 +1,22 @@
+{
+  "description": "Real ferrum-migrate CLI contract (src/ferrum_migration/cli.py): `convert INPUT --from kong|nginx|traefik|envoy|istio --out DIR [--include-secrets]`. DB-less kong.yml and decK dumps share one schema and both use `--from kong`; there is no --kong-format flag, and the report's `kong-input-flavor` caveat states which flavor was detected. Output names are fixed: resources.yaml (or resources.json with --resources-format json), ferrum.conf, migration-report.json/.md, plus .gitignore when credentials were written. Exit codes: 0 migrated without error findings, 4 written but review required (the report has error findings), 3 input rejected (nothing written), 1 internal error, 2 usage error, 5 output not writable safely.",
+  "assumed": false,
+  "argv": ["{python}", "-m", "ferrum_migration", "convert", "{source}", "--from", "{platform}", "--out", "{outdir}"],
+  "include_secrets_argv": ["--include-secrets"],
+  "platform_names": {
+    "kong-dbless": "kong",
+    "kong-deck": "kong",
+    "nginx": "nginx",
+    "traefik": "traefik",
+    "envoy": "envoy",
+    "istio": "istio"
+  },
+  "env": {},
+  "outputs": {
+    "resources": ["resources.yaml", "resources.json"],
+    "settings": ["ferrum.conf"],
+    "report": ["migration-report.json"]
+  },
+  "exit_codes": {"ok": [0], "review": [4], "input_rejected": [3]},
+  "timeout_seconds": 120
+}

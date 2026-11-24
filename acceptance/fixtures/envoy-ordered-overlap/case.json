@@ -1,0 +1,26 @@
+{
+  "id": "envoy-ordered-overlap",
+  "adapter": "envoy",
+  "title": "Envoy ordered route list with overlaps (preserve order or refuse)",
+  "source": "envoy.yaml",
+  "allow_rejection": true,
+  "claims": [
+    "a regex route listed before an overlapping prefix keeps precedence (/api/x.json to the regex cluster)",
+    "the prefix after it serves the rest (/api/x)",
+    "a broader prefix listed first shadows a later, more specific prefix (/legacy/v2/x stays on the first route)"
+  ],
+  "not_claimed": [
+    "RE2 vs Rust regex dialect differences beyond this simple pattern"
+  ],
+  "source_semantics": "Envoy evaluates a virtual host's routes in order and uses the first match; safe_regex matches the full path. Ferrum ranks exact > longest prefix > regex (docs/routing.md), which differs for both overlaps, so order must be preserved, shadowed routes dropped, or the overlap refused with a report error.",
+  "probes": [
+    {"id": "regex-first", "path": "/api/x.json",
+     "expect": {"forward": {"backend": "b", "path": "/api/x.json"}}},
+    {"id": "prefix-after-regex", "path": "/api/x",
+     "expect": {"forward": {"backend": "a", "path": "/api/x"}}},
+    {"id": "broad-prefix-shadows", "path": "/legacy/v2/x",
+     "expect": {"forward": {"backend": "a", "path": "/legacy/v2/x"}}},
+    {"id": "broad-prefix", "path": "/legacy/x",
+     "expect": {"forward": {"backend": "a", "path": "/legacy/x"}}}
+  ]
+}

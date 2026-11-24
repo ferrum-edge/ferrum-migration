@@ -1,0 +1,27 @@
+{
+  "id": "kong-key-auth-withheld",
+  "adapter": "kong-dbless",
+  "title": "Kong key-auth converted without credential inclusion fails closed",
+  "source": "kong.yaml",
+  "include_secrets": false,
+  "allow_rejection": true,
+  "secret_free": ["CANARY_KEY"],
+  "report": {"min_findings": 1, "mentions_any": ["key", "credential", "secret", "withheld"]},
+  "claims": [
+    "without explicit credential inclusion the synthetic key is absent from every output file and stream",
+    "the protected route never forwards a request, even one presenting the original key",
+    "the report flags that credentials were withheld and need re-provisioning"
+  ],
+  "not_claimed": [
+    "How operators re-provision keys after migration (outside the converter)"
+  ],
+  "source_semantics": "Kong would admit the original key; refusing it here is the migration policy (credentials withheld by default), so the valid-key probe is ferrum_only and is never replayed against Kong.",
+  "probes": [
+    {"id": "no-key", "host": "api.example.test", "path": "/protected/r",
+     "expect": {"deny": true, "status": [401, 403, 404]}},
+    {"id": "original-key", "host": "api.example.test", "path": "/protected/r",
+     "headers": {"apikey": "${CANARY_KEY}"}, "ferrum_only": true,
+     "note": "migration policy, not Kong behavior",
+     "expect": {"deny": true, "status": [401, 403, 404]}}
+  ]
+}

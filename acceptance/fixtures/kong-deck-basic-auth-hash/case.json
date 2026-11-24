@@ -1,0 +1,28 @@
+{
+  "id": "kong-deck-basic-auth-hash",
+  "adapter": "kong-deck",
+  "title": "decK basic-auth stored hash is never translated into a usable credential",
+  "source": "deck.yaml",
+  "include_secrets": true,
+  "allow_rejection": true,
+  "secret_free": ["CANARY_HASH"],
+  "report": {"min_errors": 1, "mentions_any": ["basic", "password", "hash", "credential", "re-provision"]},
+  "claims": [
+    "even with credential inclusion enabled, a dumped basic-auth hash appears in no output, report or log",
+    "the basic-auth route never forwards an unauthenticated request",
+    "presenting the stored hash as a password is not accepted",
+    "the report raises an error requiring credential re-provisioning"
+  ],
+  "not_claimed": [
+    "Any working basic-auth login after migration (requires re-provisioning outside the converter)"
+  ],
+  "source_semantics": "Kong stores basic-auth passwords hashed; decK dumps the hash. A hash is not a password, and replaying a dump re-hashes it, so equivalence cannot be preserved from file input alone. The stored-hash probe is migration policy (ferrum_only).",
+  "probes": [
+    {"id": "no-credentials", "host": "api.example.test", "path": "/basic/x",
+     "expect": {"deny": true, "status": [401, 403, 404]}},
+    {"id": "hash-as-password", "host": "api.example.test", "path": "/basic/x",
+     "headers": {"Authorization": "${BASIC_HASH_AS_PASSWORD}"}, "ferrum_only": true,
+     "note": "migration policy: a stored hash must never act as a password",
+     "expect": {"deny": true, "status": [401, 403, 404]}}
+  ]
+}

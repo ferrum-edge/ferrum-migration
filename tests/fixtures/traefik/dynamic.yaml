@@ -1,0 +1,87 @@
+# Synthetic Traefik dynamic configuration (file provider) for ferrum-migration tests.
+http:
+  routers:
+    web-redirect:
+      rule: "Host(`app.example.com`)"
+      entryPoints: [web]
+      middlewares: [to-https]
+      service: app
+    app:
+      rule: "Host(`app.example.com`) && PathPrefix(`/api`)"
+      entryPoints: [websecure]
+      tls: {}
+      middlewares: [strip-api, secure-headers, api-ratelimit]
+      service: app
+    app-root:
+      rule: "Host(`app.example.com`)"
+      entryPoints: [websecure]
+      tls: {}
+      service: frontend
+    canary:
+      rule: "Host(`app.example.com`) && (PathPrefix(`/v2`) || PathPrefix(`/beta`))"
+      tls: {}
+      service: canary-split
+    admin:
+      rule: "Host(`app.example.com`) && PathPrefix(`/admin`) && Header(`X-Admin`, `1`)"
+      tls: {}
+      service: app
+    dashboard:
+      rule: "Host(`traefik.example.com`)"
+      tls: {}
+      service: api@internal
+  middlewares:
+    to-https:
+      redirectScheme:
+        scheme: https
+        permanent: true
+    strip-api:
+      stripPrefix:
+        prefixes: ["/api"]
+    secure-headers:
+      headers:
+        stsSeconds: 31536000
+        stsIncludeSubdomains: true
+        frameDeny: true
+        contentTypeNosniff: true
+        customRequestHeaders:
+          X-Gateway: ferrum
+          X-Debug: ""
+    api-ratelimit:
+      rateLimit:
+        average: 50
+        period: 1m
+        burst: 20
+  services:
+    app:
+      loadBalancer:
+        servers:
+          - url: "http://app-1.internal:8080"
+          - url: "http://app-2.internal:8080"
+        healthCheck:
+          path: /health
+          interval: 10s
+          timeout: 3s
+    frontend:
+      loadBalancer:
+        passHostHeader: false
+        servers:
+          - url: "http://frontend.internal:3000"
+    canary-split:
+      weighted:
+        services:
+          - name: app-stable
+            weight: 90
+          - name: app-next
+            weight: 10
+    app-stable:
+      loadBalancer:
+        servers:
+          - url: "http://stable.internal:8080"
+    app-next:
+      loadBalancer:
+        servers:
+          - url: "http://next.internal:8080"
+tls:
+  certificates:
+    - certFile: /etc/traefik/certs/app.crt
+      keyFile: /etc/traefik/certs/app.key

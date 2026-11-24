@@ -1,0 +1,28 @@
+{
+  "id": "kong-key-auth-included",
+  "adapter": "kong-dbless",
+  "title": "Kong key-auth (header only) with explicit credential inclusion",
+  "source": "kong.yaml",
+  "include_secrets": true,
+  "allow_rejection": true,
+  "claims": [
+    "with explicit credential inclusion, a synthetic key-auth key admits exactly the matching apikey header",
+    "a missing or wrong key is not forwarded",
+    "the synthetic key never appears in the report, settings or converter output streams"
+  ],
+  "not_claimed": [
+    "key_in_query/key_in_body lookups (disabled in the fixture)",
+    "hide_credentials, anonymous consumers, ACL group mapping"
+  ],
+  "source_semantics": "Kong key-auth with key_names=[apikey], header lookup only: a missing key and an invalid key both return 401 in Kong 3.x without contacting the upstream; a valid key is proxied. Documentation-inferred unless the upstream differential runs.",
+  "probes": [
+    {"id": "no-key", "host": "api.example.test", "path": "/protected/r",
+     "expect": {"deny": true, "status": [401, 403]}},
+    {"id": "wrong-key", "host": "api.example.test", "path": "/protected/r",
+     "headers": {"apikey": "${WRONG_KEY}"},
+     "expect": {"deny": true, "status": [401, 403]}},
+    {"id": "valid-key", "host": "api.example.test", "path": "/protected/r",
+     "headers": {"apikey": "${CANARY_KEY}"},
+     "expect": {"forward": {"backend": "a", "path": "/protected/r"}}}
+  ]
+}

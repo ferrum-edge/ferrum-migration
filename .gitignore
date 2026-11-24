@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.coverage
+htmlcov/
+.mypy_cache/
+.pytest_cache/
+# Migration output may contain opted-in secrets; never commit it.
+out/
+ferrum-migration-output/
+*.secrets.yaml
+*.secrets.json
