@@ -20,10 +20,11 @@ from ..errors import InputError
 from ..model import BackendRef, HostScope, Plan, PluginSpec, RouteSpec, Target, TlsSpec, UpstreamSpec
 from ..redact import contains_secret_reference, safe_label
 from ..safe_load import load_structured
-from .common import (SourceContext, apply_first_match_order, check_route_budget, choose_main_port, compression_config,
-                     cors_config, fault_injection_config, fold, header_value_ok, jwks_provider_config, literal_value,
-                     mapping, merge_weighted_targets, request_header_rule, request_mirror_config, response_header_rule,
-                     retry_from_policy, seq, split_csv, str_list, validate_jwks_providers)
+from .common import (MAX_JWKS_MAX_STALE_SECONDS, SourceContext, apply_first_match_order, check_route_budget,
+                     choose_main_port, compression_config, cors_config, fault_injection_config, fold, header_value_ok,
+                     jwks_provider_config, literal_value, mapping, merge_weighted_targets, request_header_rule,
+                     request_mirror_config, response_header_rule, retry_from_policy, seq, split_csv, str_list,
+                     validate_jwks_providers)
 
 PLATFORM = "envoy"
 _REDIRECT_CODES = {"MOVED_PERMANENTLY": 301, "FOUND": 302, "SEE_OTHER": 303, "TEMPORARY_REDIRECT": 307,
@@ -39,30 +40,74 @@ def _proto_bool(value: Any) -> bool | None:
     return None
 
 
+_EXACT_TYPE_KINDS = {
+    "envoy.extensions.filters.network.http_connection_manager.v3.httpconnectionmanager": "hcm",
+    "envoy.config.filter.network.http_connection_manager.v2.httpconnectionmanager": "hcm",
+    "envoy.extensions.filters.http.router.v3.router": "router",
+    "envoy.config.filter.http.router.v2.router": "router",
+    "envoy.extensions.filters.http.cors.v3.cors": "cors",
+    "envoy.config.filter.http.cors.v2.cors": "cors",
+    "envoy.extensions.filters.http.grpc_web.v3.grpcweb": "grpc_web",
+    "envoy.config.filter.http.grpc_web.v2.grpcweb": "grpc_web",
+    "envoy.extensions.filters.http.compressor.v3.compressor": "compressor",
+    "envoy.extensions.filters.http.fault.v3.httpfault": "fault",
+    "envoy.config.filter.http.fault.v2.httpfault": "fault",
+    "envoy.extensions.filters.http.jwt_authn.v3.jwtauthentication": "jwt_authn",
+    "envoy.config.filter.http.jwt_authn.v2alpha.jwtauthentication": "jwt_authn",
+    "envoy.extensions.filters.http.buffer.v3.buffer": "buffer",
+    "envoy.config.filter.http.buffer.v2.buffer": "buffer",
+    "envoy.extensions.filters.http.grpc_stats.v3.filterconfig": "grpc_stats",
+    "envoy.extensions.filters.http.health_check.v3.healthcheck": "health_check",
+    "envoy.config.filter.http.health_check.v2.healthcheck": "health_check",
+    "envoy.extensions.transport_sockets.tls.v3.downstreamtlscontext": "tls",
+    "envoy.extensions.transport_sockets.tls.v3.upstreamtlscontext": "tls",
+    "envoy.api.v2.auth.downstreamtlscontext": "tls",
+    "envoy.api.v2.auth.upstreamtlscontext": "tls",
+    "envoy.extensions.filters.listener.proxy_protocol.v3.proxyprotocol": "proxy_protocol",
+    "envoy.extensions.filters.listener.tls_inspector.v3.tlsinspector": "tls_inspector",
+    "envoy.extensions.filters.listener.http_inspector.v3.httpinspector": "http_inspector",
+    "envoy.extensions.filters.listener.original_dst.v3.originaldst": "original_dst",
+}
+_EXACT_NAME_KINDS = {
+    "envoy.filters.network.http_connection_manager": "hcm",
+    "envoy.http_connection_manager": "hcm",
+    "envoy.filters.http.router": "router",
+    "envoy.router": "router",
+    "envoy.filters.http.cors": "cors",
+    "envoy.cors": "cors",
+    "envoy.filters.http.grpc_web": "grpc_web",
+    "envoy.grpc_web": "grpc_web",
+    "envoy.filters.http.compressor": "compressor",
+    "envoy.filters.http.fault": "fault",
+    "envoy.fault": "fault",
+    "envoy.filters.http.jwt_authn": "jwt_authn",
+    "envoy.filters.http.buffer": "buffer",
+    "envoy.buffer": "buffer",
+    "envoy.filters.http.grpc_stats": "grpc_stats",
+    "envoy.filters.http.health_check": "health_check",
+    "envoy.health_check": "health_check",
+    "envoy.transport_sockets.tls": "tls",
+    "envoy.filters.listener.proxy_protocol": "proxy_protocol",
+    "envoy.listener.proxy_protocol": "proxy_protocol",
+    "envoy.filters.listener.tls_inspector": "tls_inspector",
+    "envoy.listener.tls_inspector": "tls_inspector",
+    "envoy.filters.listener.http_inspector": "http_inspector",
+    "envoy.listener.http_inspector": "http_inspector",
+    "envoy.filters.listener.original_dst": "original_dst",
+    "envoy.listener.original_dst": "original_dst",
+}
+
+
 def _kind(item: Any) -> str:
-    """Normalize a filter/transport identity from ``typed_config['@type']`` (authoritative) or ``name``."""
+    """Normalize a filter/transport identity using exact ``@type`` message names or canonical filter aliases."""
     item = mapping(item)
     raw_type = mapping(item.get("typed_config")).get("@type")
     type_url = raw_type.strip() if isinstance(raw_type, str) else ""
-    name = str(item.get("name", ""))
-    # Envoy selects extensions strictly by typed_config['@type'] when present; never let a free-form filter name
-    # masquerade as a harmless filter when typed_config names a different extension.
-    text = type_url.lower() if type_url else name.lower()
-    for token, kind in (("http_connection_manager", "hcm"), ("filters.http.router", "router"),
-                        ("router.v3.router", "router"), ("filters.http.cors", "cors"), ("cors.v3.cors", "cors"),
-                        ("filters.http.grpc_web", "grpc_web"), ("grpc_web.v3.grpcweb", "grpc_web"),
-                        ("filters.http.compressor", "compressor"), ("compressor.v3.compressor", "compressor"),
-                        ("filters.http.fault", "fault"), ("fault.v3.httpfault", "fault"),
-                        ("filters.http.jwt_authn", "jwt_authn"), ("jwt_authn.v3.jwtauthentication", "jwt_authn"),
-                        ("grpc_stats", "grpc_stats"), ("health_check", "health_check"),
-                        ("filters.http.buffer", "buffer"), ("buffer.v3.buffer", "buffer"),
-                        ("downstreamtlscontext", "tls"), ("upstreamtlscontext", "tls"),
-                        ("transport_sockets.tls", "tls"), ("proxy_protocol", "proxy_protocol"),
-                        ("tls_inspector", "tls_inspector"), ("http_inspector", "http_inspector"),
-                        ("original_dst", "original_dst")):
-        if token in text:
-            return kind
-    return type_url or name or "unknown"
+    name = str(item.get("name", "")).strip()
+    if type_url:
+        msg_type = type_url.rsplit("/", 1)[-1].lower()
+        return _EXACT_TYPE_KINDS.get(msg_type, type_url)
+    return _EXACT_NAME_KINDS.get(name.lower(), name or "unknown")
 
 
 class _Envoy:
@@ -248,8 +293,11 @@ class _Envoy:
         hcm_jwt: PluginSpec | None = None
         hcm_filter_kinds: dict[str, str] = {}
         for http_filter in seq(config.get("http_filters")):
-            kind = _kind(http_filter)
             raw_filter = mapping(http_filter)
+            if raw_filter.get("config_discovery") is not None:
+                filter_refusal = "HTTP filter uses dynamic config_discovery, which is not migrated"
+                continue
+            kind = _kind(http_filter)
             fname = raw_filter.get("name")
             if isinstance(fname, str) and fname:
                 hcm_filter_kinds[fname] = kind
@@ -279,11 +327,14 @@ class _Envoy:
                 else:
                     filter_refusal = f"HTTP filter compressor cannot be migrated ({comp_val})"
             elif kind == "fault":
-                fault_cfg, fault_err = _parse_envoy_fault(typed)
-                if fault_cfg is not None:
-                    hcm_fault = PluginSpec("fault_injection", fault_cfg, ref)
+                fault_status, fault_val = _parse_envoy_fault(typed)
+                if fault_status == "plugin":
+                    hcm_fault = PluginSpec("fault_injection", fault_val, ref)
+                elif fault_status == "omit":
+                    self.report.info("envoy-fault-noop", ref,
+                                     "Envoy fault filter has 0% abort/delay probability (inert); omitted.")
                 else:
-                    filter_refusal = f"HTTP filter fault cannot be migrated ({fault_err})"
+                    filter_refusal = f"HTTP filter fault cannot be migrated ({fault_val})"
             elif kind == "jwt_authn":
                 jwt_cfg, jwt_err = self._parse_jwt_authn(typed, ref)
                 if jwt_cfg is not None:
@@ -438,22 +489,39 @@ class _Envoy:
             for key, raw_override in per_filter.items():
                 key_str = str(key)
                 override = mapping(raw_override)
-                override_type = str(override.get("@type", "")).lower()
+                override_type = str(override.get("@type", "")).strip().lower()
+                override_msg = override_type.rsplit("/", 1)[-1] if override_type else ""
                 filter_kind = hcm_filter_kinds.get(key_str)
-                is_filter_config = "filterconfig" in override_type
-                if filter_kind == "cors" and not is_filter_config \
-                        and (not override_type or "cors.v3.cors" in override_type):
+                is_filter_config = override_msg in (
+                    "envoy.config.route.v3.filterconfig",
+                    "envoy.api.v2.route.filterconfig",
+                )
+                if filter_kind == "cors" and not is_filter_config and (
+                    not override_msg or override_msg in (
+                        "envoy.extensions.filters.http.cors.v3.corspolicy",
+                        "envoy.extensions.filters.http.cors.v3.cors",
+                        "envoy.config.filter.http.cors.v2.corspolicy",
+                        "envoy.config.filter.http.cors.v2.cors",
+                    )
+                ):
                     continue
                 if filter_kind == "fault":
-                    if override.get("disabled") is True and (not override_type or is_filter_config):
+                    if override.get("disabled") is True and (not override_msg or is_filter_config):
                         effective_fault = None
                         continue
-                    if not is_filter_config and (not override_type or "fault.v3.httpfault" in override_type):
-                        parsed_fault, fault_err = _parse_envoy_fault(override)
-                        if parsed_fault is not None:
-                            effective_fault = PluginSpec("fault_injection", parsed_fault, ref)
+                    if not is_filter_config and (
+                        not override_msg or override_msg in (
+                            "envoy.extensions.filters.http.fault.v3.httpfault",
+                            "envoy.config.filter.http.fault.v2.httpfault",
+                        )
+                    ):
+                        fault_status, fault_val = _parse_envoy_fault(override)
+                        if fault_status == "plugin":
+                            effective_fault = PluginSpec("fault_injection", fault_val, ref)
+                        elif fault_status == "omit":
+                            effective_fault = None
                         else:
-                            spec.refuse(f"{label} typed_per_filter_config for fault cannot be migrated ({fault_err})")
+                            spec.refuse(f"{label} typed_per_filter_config for fault cannot be migrated ({fault_val})")
                         continue
                 others.append(key_str)
             if others:
@@ -985,6 +1053,9 @@ class _Envoy:
         cluster_type = str(cluster_raw.get("type", "STATIC")).upper()
         if cluster_raw.get("cluster_type") or cluster_type not in ("STATIC", "STRICT_DNS", "LOGICAL_DNS"):
             return "remote_jwks cluster uses dynamic or custom discovery"
+        if any(cluster_raw.get(k) is not None
+               for k in ("dns_resolvers", "dns_resolution_config", "typed_dns_resolver_config")):
+            return "remote_jwks cluster configures custom DNS resolvers that Ferrum jwks_auth cannot reproduce"
         targets, ep_problems = self._endpoints(cluster_raw, ref)
         if ep_problems or len(targets) != 1:
             return "remote_jwks cluster must resolve to a single endpoint matching jwks_uri"
@@ -994,7 +1065,9 @@ class _Envoy:
         parts = urlsplit(uri)
         uri_scheme = parts.scheme.lower()
         uri_host = (parts.hostname or "").lower()
-        uri_port = parts.port or (443 if uri_scheme == "https" else 80)
+        if parts.port == 0:
+            return "remote_jwks jwks_uri port must be 1-65535"
+        uri_port = parts.port if parts.port is not None else (443 if uri_scheme == "https" else 80)
         if scheme != uri_scheme:
             return "remote_jwks cluster transport scheme disagrees with jwks_uri"
         if targets[0].host.strip("[]").lower() != uri_host or targets[0].port != uri_port:
@@ -1026,14 +1099,29 @@ class _Envoy:
             jwks_uri = None
             inline_jwks = None
             cluster_name = None
+            cache_secs: int | None = None
             if praw.get("remote_jwks") is not None:
                 rjwks = mapping(praw["remote_jwks"])
+                unknown_rj = [str(k) for k in rjwks if k not in ("http_uri", "cache_duration")]
+                if unknown_rj:
+                    return None, f"unsupported remote_jwks field(s): {', '.join(sorted(unknown_rj)[:4])}"
                 http_uri = mapping(rjwks.get("http_uri"))
                 uri = http_uri.get("uri")
                 if not isinstance(uri, str) or not uri.strip():
                     return None, "remote_jwks.http_uri.uri is missing or invalid"
                 jwks_uri = uri.strip()
                 cluster_name = http_uri.get("cluster")
+                raw_cd = rjwks.get("cache_duration")
+                if raw_cd is None:
+                    # Envoy defaults remote_jwks.cache_duration to 600s; bound Ferrum staleness/refresh within 600s.
+                    cache_secs = 600
+                else:
+                    cd_ms = util.proto_duration_ms(raw_cd)
+                    if cd_ms is None or cd_ms < 1000 or cd_ms % 1000 != 0:
+                        return None, "remote_jwks.cache_duration must be a positive whole number of seconds"
+                    cache_secs = cd_ms // 1000
+                    if cache_secs > MAX_JWKS_MAX_STALE_SECONDS:
+                        return None, f"remote_jwks.cache_duration exceeds Ferrum's {MAX_JWKS_MAX_STALE_SECONDS}s limit"
             if praw.get("local_jwks") is not None:
                 ljwks = mapping(praw["local_jwks"])
                 if set(ljwks) - {"inline_string"} or not isinstance(ljwks.get("inline_string"), str):
@@ -1080,6 +1168,8 @@ class _Envoy:
                 cluster_err = self._verify_jwks_cluster(cluster_name, jwks_uri, ref)
                 if cluster_err is not None:
                     return None, cluster_err
+                if cache_secs is not None:
+                    prov_cfg["jwks_max_stale_seconds"] = cache_secs
             if praw.get("clock_skew_seconds") is not None:
                 skew = util.as_int(praw.get("clock_skew_seconds"))
                 if skew is None or not 0 <= skew <= 300:
@@ -1133,10 +1223,13 @@ class _Envoy:
             if pname not in deduped_names and not dests <= emitted_dests:
                 return None, (f"unselected provider {safe_label(pname, 40)} declares claim_to_headers destinations "
                               "absent from selected providers (sanitization would be dropped)")
-        bound_err = validate_jwks_providers(providers_out)
+        bound_err = validate_jwks_providers(providers_out, allow_missing_token=allow_missing)
         if bound_err is not None:
             return None, bound_err
         result: dict[str, Any] = {"providers": providers_out}
+        stale_bounds = [p["jwks_max_stale_seconds"] for p in providers_out if "jwks_max_stale_seconds" in p]
+        if stale_bounds:
+            result["jwks_refresh_interval_secs"] = min(min(stale_bounds), 900)
         if allow_missing:
             result["allow_missing_token"] = True
         return result, None
@@ -1215,60 +1308,66 @@ def _parse_envoy_compressor(typed: dict) -> tuple[str, Any]:
     return ("plugin", cfg) if cfg is not None else ("refuse", err)
 
 
-def _parse_envoy_fault(typed: dict) -> tuple[dict | None, str | None]:
-    for unsupported in ("response_rate_limit", "max_active_faults", "downstream_nodes", "upstream_cluster"):
-        if typed.get(unsupported):
-            return None, f"{unsupported} is not supported"
+def _parse_envoy_fault(typed: dict) -> tuple[str, Any]:
+    unknown_root = [str(k) for k in typed if k not in ("@type", "delay", "abort", "headers")]
+    if unknown_root:
+        return "refuse", f"unsupported fault field(s): {', '.join(sorted(unknown_root)[:4])}"
     delay_cfg: dict[str, Any] | None = None
     abort_cfg: dict[str, Any] | None = None
     raw_delay = typed.get("delay")
     if raw_delay is not None:
         if not isinstance(raw_delay, dict):
-            return None, "delay must be a mapping"
-        if raw_delay.get("header_delay") is not None:
-            return None, "header_delay is not supported"
+            return "refuse", "delay must be a mapping"
+        unknown_d = [str(k) for k in raw_delay if k not in ("fixed_delay", "percentage")]
+        if unknown_d:
+            return "refuse", f"unsupported fault delay field(s): {', '.join(sorted(unknown_d)[:4])}"
         duration_ms = util.proto_duration_ms(raw_delay.get("fixed_delay"))
         if duration_ms is None:
-            return None, "delay.fixed_delay is missing or invalid"
+            return "refuse", "delay.fixed_delay is missing or invalid"
         pct = _envoy_fractional_percent(raw_delay.get("percentage")) if raw_delay.get("percentage") is not None else 0.0
         if pct is None:
-            return None, "delay.percentage is invalid"
-        delay_cfg = {"duration_ms": duration_ms, "percentage": pct}
+            return "refuse", "delay.percentage is invalid"
+        if pct > 0.0:
+            delay_cfg = {"duration_ms": duration_ms, "percentage": pct}
     raw_abort = typed.get("abort")
     if raw_abort is not None:
         if not isinstance(raw_abort, dict):
-            return None, "abort must be a mapping"
-        if raw_abort.get("header_abort") is not None:
-            return None, "header_abort is not supported"
+            return "refuse", "abort must be a mapping"
+        unknown_a = [str(k) for k in raw_abort if k not in ("http_status", "grpc_status", "percentage")]
+        if unknown_a:
+            return "refuse", f"unsupported fault abort field(s): {', '.join(sorted(unknown_a)[:4])}"
         http_status = util.as_int(raw_abort.get("http_status"))
         grpc_status = util.as_int(raw_abort.get("grpc_status")) if raw_abort.get("grpc_status") is not None else None
         if raw_abort.get("grpc_status") is not None and grpc_status is None:
-            return None, "abort.grpc_status is invalid"
+            return "refuse", "abort.grpc_status is invalid"
         if http_status is None and grpc_status is not None:
             http_status = 503
         if http_status is None:
-            return None, "abort.http_status is missing or invalid"
+            return "refuse", "abort.http_status is missing or invalid"
         pct = _envoy_fractional_percent(raw_abort.get("percentage")) if raw_abort.get("percentage") is not None else 0.0
         if pct is None:
-            return None, "abort.percentage is invalid"
-        abort_cfg = {"status_code": http_status, "percentage": pct}
-        if grpc_status is not None:
-            abort_cfg["grpc_status"] = grpc_status
+            return "refuse", "abort.percentage is invalid"
+        if pct > 0.0:
+            abort_cfg = {"status_code": http_status, "percentage": pct}
+            if grpc_status is not None:
+                abort_cfg["grpc_status"] = grpc_status
+    if delay_cfg is None and abort_cfg is None:
+        return "omit", None
     match_headers: dict[str, str] | None = None
     raw_headers = typed.get("headers")
     if raw_headers is not None:
         if not isinstance(raw_headers, list):
-            return None, "fault headers matcher must be a list"
+            return "refuse", "fault headers matcher must be a list"
         if raw_headers:
             match_headers = {}
             for hm in raw_headers:
                 if not isinstance(hm, dict) or not isinstance(hm.get("name"), str):
-                    return None, "fault header matcher is malformed"
+                    return "refuse", "fault header matcher is malformed"
                 if hm.get("invert_match"):
-                    return None, "inverted fault header matchers are not supported"
+                    return "refuse", "inverted fault header matchers are not supported"
                 unsupported_hm = [k for k in hm if k not in ("name", "exact_match", "string_match", "invert_match")]
                 if unsupported_hm:
-                    return None, f"fault header matcher field {unsupported_hm[0]} is not supported"
+                    return "refuse", f"fault header matcher field {unsupported_hm[0]} is not supported"
                 if isinstance(hm.get("exact_match"), str):
                     val = hm["exact_match"]
                 elif isinstance(hm.get("string_match"), dict) \
@@ -1277,12 +1376,13 @@ def _parse_envoy_fault(typed: dict) -> tuple[dict | None, str | None]:
                                     for k in hm["string_match"]):
                     val = hm["string_match"]["exact"]
                 else:
-                    return None, "only exact fault header matchers are supported"
+                    return "refuse", "only exact fault header matchers are supported"
                 lower_name = hm["name"].lower()
                 if lower_name in match_headers:
-                    return None, f"duplicate fault header matcher for {lower_name} is not supported"
+                    return "refuse", f"duplicate fault header matcher for {lower_name} is not supported"
                 match_headers[lower_name] = val
-    return fault_injection_config(abort=abort_cfg, delay=delay_cfg, match_headers=match_headers)
+    cfg, err = fault_injection_config(abort=abort_cfg, delay=delay_cfg, match_headers=match_headers)
+    return ("plugin", cfg) if cfg is not None else ("refuse", err)
 
 
 _ENVOY_JWT_PROVIDER_KEYS = frozenset({

@@ -726,6 +726,7 @@ class NginxFrontendScopeTest(unittest.TestCase):
         conf = """
         http {
             gzip on;
+            gzip_proxied any;
             gzip_comp_level 6;
             gzip_min_length 1k;
             gzip_types application/json text/plain;
@@ -743,6 +744,14 @@ class NginxFrontendScopeTest(unittest.TestCase):
                     gzip_types *;
                     proxy_pass http://wild.internal:8080;
                 }
+                location /typewild/ {
+                    gzip_types text/*;
+                    proxy_pass http://typewild.internal:8080;
+                }
+                location /disabled-ua/ {
+                    gzip_disable "msie6";
+                    proxy_pass http://ua.internal:8080;
+                }
             }
         }
         """
@@ -756,15 +765,13 @@ class NginxFrontendScopeTest(unittest.TestCase):
             "content_types": ["text/html", "application/json", "text/plain"],
             "gzip_level": 6,
         })
-        nogzip = one_proxy(self, result.config, "/nogzip", "app.example.test")
-        self.assertNotIn("compression", [p["plugin_name"] for p in plugins_of(result.config, nogzip)])
-        # Wildcard gzip_types * omits compression rather than widening to Ferrum's defaults.
-        wild = one_proxy(self, result.config, "/wild", "app.example.test")
-        self.assertNotIn("compression", [p["plugin_name"] for p in plugins_of(result.config, wild)])
+        for path in ("/nogzip", "/wild", "/typewild", "/disabled-ua"):
+            p = one_proxy(self, result.config, path, "app.example.test")
+            self.assertNotIn("compression", [pl["plugin_name"] for pl in plugins_of(result.config, p)], path)
         self.assertIn("nginx-gzip", codes(report, "warning"))
 
-        # Default gzip on without gzip_types compresses ONLY text/html (matching NGINX default).
-        default_conf = """
+        # Default gzip_proxied (off) omits compression rather than widening to proxied requests with a Via header.
+        default_proxied_conf = """
         server {
             listen 80;
             server_name def.example.test;
@@ -772,7 +779,22 @@ class NginxFrontendScopeTest(unittest.TestCase):
             location /html/ { proxy_pass http://html.internal:8080; }
         }
         """
-        def_res, _def_rep, _ = nginx(default_conf)
+        dp_res, dp_rep, _ = nginx(default_proxied_conf)
+        dp_p = one_proxy(self, dp_res.config, "/html", "def.example.test")
+        self.assertNotIn("compression", [pl["plugin_name"] for pl in plugins_of(dp_res.config, dp_p)])
+        self.assertIn("nginx-gzip", codes(dp_rep, "warning"))
+
+        # Explicit gzip_proxied any without gzip_types compresses ONLY text/html (matching NGINX default).
+        html_only_conf = """
+        server {
+            listen 80;
+            server_name def.example.test;
+            gzip on;
+            gzip_proxied any;
+            location /html/ { proxy_pass http://html.internal:8080; }
+        }
+        """
+        def_res, _def_rep, _ = nginx(html_only_conf)
         html_p = one_proxy(self, def_res.config, "/html", "def.example.test")
         self.assertEqual(plugin(self, def_res.config, html_p, "compression")["config"], {
             "algorithms": ["gzip"], "content_types": ["text/html"],

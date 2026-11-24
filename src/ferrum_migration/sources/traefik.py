@@ -1070,11 +1070,9 @@ class _Traefik:
         elif mw_type == "compress":
             self._compress(config, acc, ref)
         elif mw_type == "grpcWeb":
-            acc.plugins.append(PluginSpec("grpc_web", {}, ref))
-            if config.get("allowOrigins"):
-                self.report.warning("traefik-grpc-web", ref,
-                                    "grpcWeb.allowOrigins is not configured inside Ferrum's grpc_web plugin; "
-                                    "configure Ferrum's cors plugin if cross-origin browser access is required.")
+            acc.refusals.append("grpcWeb enforces local CORS preflight handling and allowOrigins (including an empty "
+                                "allow-list), whereas Ferrum grpc_web forwards unhandled preflights upstream; "
+                                "configure grpc_web and cors manually in Ferrum")
         elif mw_type == "redirectScheme":
             if config.get("scheme") == "https":
                 acc.https_redirect = True

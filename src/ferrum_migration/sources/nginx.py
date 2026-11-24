@@ -156,7 +156,7 @@ SAFE_IGNORED = {
     "send_timeout", "resolver", "resolver_timeout", "ssl_session_cache", "ssl_session_timeout",
     "ssl_session_tickets", "ssl_prefer_server_ciphers", "ssl_ciphers", "ssl_protocols", "ssl_dhparam",
     "ssl_ecdh_curve", "ssl_stapling", "ssl_stapling_verify", "ssl_trusted_certificate", "ssl_buffer_size",
-    "gzip_vary", "gzip_proxied", "gzip_disable",
+    "gzip_vary",
     "gzip_http_version", "gzip_buffers", "open_file_cache", "open_file_cache_valid", "open_file_cache_min_uses",
     "open_file_cache_errors", "reset_timedout_connection", "index", "absolute_redirect", "port_in_redirect",
     "server_name_in_redirect", "chunked_transfer_encoding", "merge_slashes", "proxy_ignore_client_abort",
@@ -190,7 +190,8 @@ STRUCTURAL = {"server", "location", "listen", "server_name", "proxy_pass", "grpc
               "auth_basic_user_file", "proxy_ssl_verify", "proxy_ssl_trusted_certificate", "proxy_ssl_certificate",
               "proxy_ssl_certificate_key", "proxy_ssl_name", "proxy_ssl_server_name", "grpc_ssl_verify",
               "grpc_ssl_trusted_certificate", "grpc_ssl_certificate", "grpc_ssl_certificate_key", "grpc_ssl_name",
-              "grpc_ssl_server_name", "gzip", "gzip_types", "gzip_comp_level", "gzip_min_length"} | INHERITED_ARRAYS
+              "grpc_ssl_server_name", "gzip", "gzip_types", "gzip_comp_level", "gzip_min_length",
+              "gzip_proxied", "gzip_disable"} | INHERITED_ARRAYS
 PROXY_PARAMS = [("Host", "$http_host"), ("X-Real-IP", "$remote_addr"),
                 ("X-Forwarded-For", "$proxy_add_x_forwarded_for"), ("X-Forwarded-Proto", "$scheme")]
 
@@ -208,6 +209,8 @@ class _Scope:
     gzip_types: list[str] | None = None
     gzip_min_length: int | None = None
     gzip_comp_level: int | None = None
+    gzip_proxied: list[str] | None = None
+    gzip_disable: list[str] = field(default_factory=list)
     problems: list[str] = field(default_factory=list)
 
 
@@ -231,6 +234,8 @@ class _Nginx:
                        gzip=parent.gzip,
                        gzip_types=list(parent.gzip_types) if parent.gzip_types is not None else None,
                        gzip_min_length=parent.gzip_min_length, gzip_comp_level=parent.gzip_comp_level,
+                       gzip_proxied=list(parent.gzip_proxied) if parent.gzip_proxied is not None else None,
+                       gzip_disable=list(parent.gzip_disable),
                        problems=list(parent.problems))
         level: dict[str, list[list[str]]] = {}
         for directive in directives:
@@ -283,6 +288,10 @@ class _Nginx:
                     child.gzip_min_length = length
             elif name == "gzip_types" and args:
                 child.gzip_types = list(args)
+            elif name == "gzip_proxied" and args:
+                child.gzip_proxied = list(args)
+            elif name == "gzip_disable" and args:
+                child.gzip_disable = list(args)
             elif name == "satisfy" and args and args[0] == "any":
                 child.problems.append("satisfy any (OR of access and auth) has no Ferrum equivalent")
             elif name in STRUCTURAL or name in SAFE_IGNORED or name in DEFINITIONS:
@@ -1044,10 +1053,22 @@ class _Nginx:
         if scope.gzip == "on":
             content_types: list[str] | None = ["text/html"]
             omit_gzip = False
-            if scope.gzip_types is not None:
-                if "*" in scope.gzip_types:
+            if scope.gzip_proxied != ["any"]:
+                self.report.warning("nginx-gzip", ref,
+                                    "gzip omitted: NGINX gzip_proxied defaults to 'off' (skipping requests with a "
+                                    "Via header) and Ferrum compression cannot reproduce proxied-request exclusions "
+                                    "(only explicit 'gzip_proxied any' is migrated).")
+                omit_gzip = True
+            elif scope.gzip_disable:
+                self.report.warning("nginx-gzip", ref,
+                                    "gzip omitted: gzip_disable User-Agent exclusions have no Ferrum equivalent.")
+                omit_gzip = True
+            elif scope.gzip_types is not None:
+                if any("*" in item for item in scope.gzip_types):
                     self.report.warning("nginx-gzip", ref,
-                                        "gzip omitted: gzip_types '*' has no Ferrum equivalent (Ferrum rejects '*/*').")
+                                        "gzip omitted: wildcard gzip_types entries ('*' or 'type/*') cannot be "
+                                        "mapped safely (NGINX treats 'type/*' as a literal MIME key whereas Ferrum "
+                                        "treats it as a range, and rejects '*/*').")
                     omit_gzip = True
                 else:
                     candidate = ["text/html"] + [t for t in scope.gzip_types if t.lower() != "text/html"]

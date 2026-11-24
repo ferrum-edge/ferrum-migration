@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import ipaddress
 import json
 import math
@@ -266,7 +267,8 @@ def cors_config(origins: Any, methods: Any = None, headers: Any = None, exposed:
 
 # ------------------------------------------- shared plugin config builders
 
-_MEDIA_TYPE_RULE_RE = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+/(?:\*|[!#$%&'*+.^_`|~0-9A-Za-z-]+)$")
+_MEDIA_TYPE_RULE_RE = re.compile(r"^[!#$%&'+.^_`|~0-9A-Za-z-]+/(?:\*|[!#$%&'+.^_`|~0-9A-Za-z-]+)$")
+_B64URL_NO_PAD_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 _CORRELATION_ID_RESERVED_HEADERS = frozenset({
     "api-key", "authentication-info", "authorization", "connection", "content-encoding", "content-length",
     "cookie", "early-data", "expect", "forwarded", "grpc-message", "grpc-status", "grpc-status-details-bin",
@@ -303,6 +305,21 @@ MAX_MIRROR_BODY_BYTES = 10 * 1024 * 1024
 MAX_JWKS_KEYS = 256
 MAX_JWKS_PROVIDERS = 64
 MAX_JWKS_CANDIDATE_PROVIDERS = 8
+MAX_JWK_ID_BYTES = 1024
+MAX_JWK_COMPONENT_BYTES = 4096
+MAX_JWK_KEY_OPS = 16
+MAX_JWKS_MAX_STALE_SECONDS = 86_400
+
+
+def _decode_b64url_no_pad(raw: Any) -> bytes | None:
+    if not isinstance(raw, str) or not raw or len(raw.encode("utf-8")) > MAX_JWK_COMPONENT_BYTES \
+            or not _B64URL_NO_PAD_RE.fullmatch(raw) or len(raw) % 4 == 1:
+        return None
+    pad = "=" * ((4 - len(raw) % 4) % 4)
+    try:
+        return base64.urlsafe_b64decode(raw + pad)
+    except ValueError:
+        return None
 
 
 def is_loopback_ip_literal(host: str) -> bool:
@@ -416,8 +433,8 @@ def fault_injection_config(
         if status is None or not 200 <= status <= 599:
             return None, "abort.status_code must be an integer in 200-599"
         pct = _parse_percentage(abort.get("percentage"))
-        if pct is None:
-            return None, "abort.percentage must be in 0-100"
+        if pct is None or pct <= 0.0:
+            return None, "abort.percentage must be > 0 and <= 100"
         entry: dict[str, Any] = {"status_code": status, "percentage": pct}
         if abort.get("grpc_status") is not None:
             grpc = util.as_int(abort.get("grpc_status"))
@@ -434,8 +451,8 @@ def fault_injection_config(
         if duration_ms is None or not 1 <= duration_ms <= MAX_FAULT_DELAY_MS:
             return None, f"delay.duration_ms must be 1-{MAX_FAULT_DELAY_MS}"
         pct = _parse_percentage(delay.get("percentage"))
-        if pct is None:
-            return None, "delay.percentage must be in 0-100"
+        if pct is None or pct <= 0.0:
+            return None, "delay.percentage must be > 0 and <= 100"
         config["delay"] = {"duration_ms": duration_ms, "percentage": pct}
     if not config:
         return None, "fault_injection requires at least one of abort or delay"
@@ -451,6 +468,8 @@ def fault_injection_config(
             if lower in _GATEWAY_ASSERTION_HEADERS or folded in _GATEWAY_ASSERTION_HEADERS \
                     or folded.startswith(("x-consumer-", "x-ferrum-", "x-path-param-")):
                 return None, f"match.headers cannot name gateway-asserted header {lower}"
+            if is_sensitive_header(lower):
+                return None, f"match.headers cannot copy credential-like header {lower} into output"
             if lower in clean_headers:
                 return None, f"match.headers repeats header {lower}"
             if not header_value_ok(raw_value):
@@ -532,11 +551,15 @@ def jwks_provider_config(
             return None, "jwks_uri contains whitespace or control characters"
         try:
             parts = urlsplit(uri)
-            _ = parts.port
+            port_val = parts.port
         except ValueError:
             return None, "jwks_uri is not a valid URL"
         if parts.username is not None or parts.password is not None or not parts.hostname:
             return None, "jwks_uri must have a host and no userinfo"
+        if port_val == 0:
+            return None, "jwks_uri port must be 1-65535"
+        if parts.query or parts.fragment:
+            return None, "jwks_uri must not contain query parameters or fragments"
         scheme = parts.scheme.lower()
         if scheme == "https":
             pass
@@ -570,20 +593,61 @@ def jwks_provider_config(
                     or any(secret_field in key_entry for secret_field in ("d", "p", "q", "dp", "dq", "qi", "k", "oth")):
                 return None, "inline jwks contains unsupported, private, or symmetric key material"
             kid = key_entry.get("kid")
-            if not isinstance(kid, str) or not kid.strip():
-                return None, "every inline jwks key must declare a non-empty kid"
+            if not isinstance(kid, str) or not kid or len(kid.encode("utf-8")) > MAX_JWK_ID_BYTES:
+                return None, f"every inline jwks key must declare a non-empty kid <= {MAX_JWK_ID_BYTES} bytes"
             if kid in seen_kids:
                 return None, "inline jwks contains duplicate kid values"
             seen_kids.add(kid)
+            for comp_name in ("alg", "use", "n", "e", "crv", "x", "y"):
+                comp_val = key_entry.get(comp_name)
+                if comp_val is not None and (not isinstance(comp_val, str)
+                                             or len(comp_val.encode("utf-8")) > MAX_JWK_COMPONENT_BYTES):
+                    return None, f"inline jwks {comp_name} field is invalid or exceeds size limit"
             use = key_entry.get("use")
             if use is not None and use != "sig":
                 return None, "inline jwks keys must have use 'sig' when specified"
             key_ops = key_entry.get("key_ops")
-            if key_ops is not None and (not isinstance(key_ops, list) or "verify" not in key_ops):
-                return None, "inline jwks key_ops must include 'verify' when specified"
-            required_fields = {"RSA": ("n", "e"), "EC": ("crv", "x", "y"), "OKP": ("crv", "x")}[kty]
-            if any(not isinstance(key_entry.get(f), str) or not key_entry[f].strip() for f in required_fields):
-                return None, f"inline jwks {kty} key is missing required public key fields"
+            if key_ops is not None:
+                if not isinstance(key_ops, list) or len(key_ops) > MAX_JWK_KEY_OPS \
+                        or not all(isinstance(op, str) and len(op.encode("utf-8")) <= MAX_JWK_COMPONENT_BYTES
+                                   for op in key_ops):
+                    return None, "inline jwks key_ops must be a bounded list of strings"
+                if "verify" not in key_ops:
+                    return None, "inline jwks key_ops must include 'verify' when specified"
+                if use == "sig" and any(op not in ("sign", "verify") for op in key_ops):
+                    return None, "inline jwks use 'sig' conflicts with key_ops"
+            alg = key_entry.get("alg")
+            if kty == "RSA":
+                if alg is not None and alg not in ("RS256", "RS384", "RS512", "PS256", "PS384", "PS512"):
+                    return None, "inline jwks RSA key has unsupported alg"
+                n_bytes = _decode_b64url_no_pad(key_entry.get("n"))
+                e_bytes = _decode_b64url_no_pad(key_entry.get("e"))
+                if not n_bytes or not e_bytes:
+                    return None, "inline jwks RSA key has invalid base64url n/e"
+                n_int = int.from_bytes(n_bytes, "big")
+                e_int = int.from_bytes(e_bytes, "big")
+                if n_int.bit_length() < 2048 or e_int < 3 or e_int % 2 == 0:
+                    return None, "inline jwks RSA key fails Ferrum modulus/exponent requirements"
+            elif kty == "EC":
+                crv = key_entry.get("crv")
+                expected_len = {"P-256": 32, None: 32, "P-384": 48}.get(crv)
+                expected_alg = "ES384" if crv == "P-384" else "ES256"
+                if expected_len is None:
+                    return None, "inline jwks EC key uses an unsupported curve"
+                if alg is not None and alg != expected_alg:
+                    return None, "inline jwks EC key alg disagrees with curve"
+                x_bytes = _decode_b64url_no_pad(key_entry.get("x"))
+                y_bytes = _decode_b64url_no_pad(key_entry.get("y"))
+                if not x_bytes or not y_bytes or len(x_bytes) != expected_len or len(y_bytes) != expected_len:
+                    return None, "inline jwks EC key has invalid x/y coordinates"
+            else:  # OKP
+                if key_entry.get("crv") != "Ed25519":
+                    return None, "inline jwks OKP key must use Ed25519 curve"
+                if alg is not None and alg != "EdDSA":
+                    return None, "inline jwks OKP key alg must be EdDSA when specified"
+                x_bytes = _decode_b64url_no_pad(key_entry.get("x"))
+                if not x_bytes or len(x_bytes) != 32:
+                    return None, "inline jwks OKP Ed25519 key x must decode to 32 bytes"
         provider["jwks"] = parsed_jwks
     if issuer is not None:
         if not isinstance(issuer, str) or not issuer.strip() \
@@ -660,8 +724,8 @@ def jwks_provider_config(
     return provider, None
 
 
-def validate_jwks_providers(providers: list[dict[str, Any]]) -> str | None:
-    """Enforce Ferrum v0.9.21 aggregate provider bounds and single-location extraction equivalence."""
+def validate_jwks_providers(providers: list[dict[str, Any]], *, allow_missing_token: bool = False) -> str | None:
+    """Enforce Ferrum v0.9.21 aggregate provider bounds and extraction equivalence."""
     if not providers:
         return "jwks_auth requires at least one provider"
     if len(providers) > MAX_JWKS_PROVIDERS:
@@ -677,20 +741,27 @@ def validate_jwks_providers(providers: list[dict[str, Any]]) -> str | None:
             per_issuer[iss] = per_issuer.get(iss, 0) + 1
         fh = prov.get("from_headers") or []
         fp = prov.get("from_params") or []
-        if len(fh) + len(fp) != 1:
-            return ("every provider must declare exactly one explicit token location (from_headers or from_params); "
-                    "multi-location and implicit default (Authorization + access_token) extraction cannot be proven "
-                    "equivalent because Ferrum selects only the first matching location")
-        if fh:
-            location_sigs.add(("header", fh[0]["name"], fh[0].get("prefix")))
-        else:
-            location_sigs.add(("param", fp[0]))
+        if fp:
+            return ("query-parameter JWT extraction (from_params) is not migrated: Envoy reads the first matching "
+                    "query parameter while Ferrum reads the last")
+        if len(fh) != 1:
+            return ("every provider must declare exactly one explicit from_headers location; multi-location and "
+                    "implicit default (Authorization + access_token) extraction cannot be proven equivalent")
+        hname = fh[0]["name"]
+        prefix = fh[0].get("prefix")
+        if hname == "authorization" and prefix != "Bearer ":
+            return "unprefixed or non-Bearer Authorization header extraction differs in Ferrum"
+        if allow_missing_token and (hname == "authorization" or prefix is not None):
+            return ("with allow_missing_token enabled, prefixed or Authorization header extraction differs from "
+                    "Envoy/Istio (Envoy searches for prefix anywhere in the field while Ferrum uses strip_prefix, "
+                    "which can treat an invalid token as missing)")
+        location_sigs.add((hname, prefix))
     if open_count > MAX_JWKS_CANDIDATE_PROVIDERS:
         return f"at most {MAX_JWKS_CANDIDATE_PROVIDERS} jwks_auth providers may omit issuer"
     if any(count + open_count > MAX_JWKS_CANDIDATE_PROVIDERS for count in per_issuer.values()):
         return f"at most {MAX_JWKS_CANDIDATE_PROVIDERS} candidate jwks_auth providers may match any issuer"
     if len(location_sigs) > 1:
-        return "all providers in one jwks_auth instance must share the same single explicit token location"
+        return "all providers in one jwks_auth instance must share the same single explicit from_headers location"
     return None
 
 

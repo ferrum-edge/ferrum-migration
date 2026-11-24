@@ -971,7 +971,7 @@ class IstioCaseAndNamesTest(unittest.TestCase):
                 - issuer: https://idp.example.test
                   jwksUri: https://idp.example.test/.well-known/jwks.json
                   audiences: [api]
-                  fromHeaders: [{name: Authorization, prefix: "Bearer "}]
+                  fromHeaders: [{name: X-Jwt-Assertion}]
                   outputClaimToHeaders: [{header: x-jwt-sub, claim: sub}]
             ---
             apiVersion: networking.istio.io/v1
@@ -997,6 +997,11 @@ class IstioCaseAndNamesTest(unittest.TestCase):
                     abort: {httpStatus: 503, grpcStatus: UNAVAILABLE, percentage: {value: 5}}
                   mirror: {host: shadow.edge.svc.cluster.local, port: {number: 9090}}
                   mirrorPercentage: {value: 10}
+                - name: zero-fault
+                  match: [{uri: {exact: /zero}}]
+                  route: [{destination: {host: svc.edge.svc.cluster.local, port: {number: 8080}}}]
+                  fault:
+                    delay: {fixedDelay: 250ms, percentage: {value: 0}}
                 - name: health
                   match: [{uri: {exact: /healthz}}]
                   directResponse: {status: 200, body: {string: ok}}
@@ -1011,7 +1016,7 @@ class IstioCaseAndNamesTest(unittest.TestCase):
                 "jwks_uri": "https://idp.example.test/.well-known/jwks.json",
                 "issuer": "https://idp.example.test",
                 "audiences": ["api"],
-                "from_headers": [{"name": "authorization", "prefix": "Bearer "}],
+                "from_headers": [{"name": "x-jwt-assertion"}],
                 "forward_original_token": False,
                 "output_claim_headers": [{"claim": "sub", "header": "x-jwt-sub"}],
             }],
@@ -1028,23 +1033,42 @@ class IstioCaseAndNamesTest(unittest.TestCase):
             "allow_plaintext": True,
             "percentage": 10.0,
         })
+        # 0%-probability fault is inert and omitted rather than emitting percentage: 0.0.
+        zero_p = one_proxy(self, result.config, "=/zero", "api.example.test")
+        self.assertNotIn("fault_injection", [p["plugin_name"] for p in plugins_of(result.config, zero_p)])
+        self.assertIn("istio-fault-noop", codes(report, "info"))
         self.assertIn("istio-request-auth", codes(report, "warning"))
         self.assertIn("istio-mirror", codes(report, "warning"))
         # directResponse under RequestAuthentication refuses fail-closed.
         self.assertEqual(one_proxy(self, result.config, "=/healthz", "api.example.test")["labels"][
             "ferrum-migration/status"], "refused")
 
-        # Non-root namespace RequestAuthentication selector (unknown gateway pod namespace) refuses fail-closed.
-        non_root = text.replace("namespace: istio-system", "namespace: edge")
-        nr_res, _nr_rep, _ = migrate("istio", non_root)
-        self.assertEqual(one_proxy(self, nr_res.config, "=/api", "api.example.test")["labels"][
-            "ferrum-migration/status"], "refused")
+        # Non-root namespace, prefixed Authorization under allow_missing_token, targetRef, and fromCookies refuse.
+        for mutate in (
+            lambda s: s.replace("namespace: istio-system", "namespace: edge"),
+            lambda s: s.replace("fromHeaders: [{name: X-Jwt-Assertion}]",
+                                'fromHeaders: [{name: Authorization, prefix: "Bearer "}]'),
+            lambda s: s.replace("selector:\n    matchLabels: {istio: ingressgateway}",
+                                "targetRef: {kind: Gateway, group: networking.istio.io, name: gw}"),
+            lambda s: s.replace("fromHeaders: [{name: X-Jwt-Assertion}]", "fromCookies: [session]"),
+        ):
+            bad_res, _bad_rep, _ = migrate("istio", mutate(text))
+            self.assertEqual(one_proxy(self, bad_res.config, "=/api", "api.example.test")["labels"][
+                "ferrum-migration/status"], "refused")
 
-        # RequestAuthentication with unsupported field (fromCookies) refuses fail-closed.
-        bad = text.replace('fromHeaders: [{name: Authorization, prefix: "Bearer "}]', "fromCookies: [session]")
-        bad_res, _bad_rep, _ = migrate("istio", bad)
-        self.assertEqual(one_proxy(self, bad_res.config, "=/api", "api.example.test")["labels"][
-            "ferrum-migration/status"], "refused")
+        # Mirror DestinationRule with restricted exportTo or portLevelSettings omitting tls drops the mirror.
+        for dr_patch in (
+            "  host: shadow.edge.svc.cluster.local\n  exportTo: ['.']\n  trafficPolicy:\n    tls: {mode: DISABLE}",
+            "  host: shadow.edge.svc.cluster.local\n  trafficPolicy:\n    tls: {mode: DISABLE}\n"
+            "    portLevelSettings:\n      - port: {number: 9090}",
+        ):
+            m_text = text.replace(
+                "  host: shadow.edge.svc.cluster.local\n  trafficPolicy:\n    tls: {mode: DISABLE}",
+                dr_patch,
+            )
+            m_res, _m_rep, _ = migrate("istio", m_text)
+            m_api = one_proxy(self, m_res.config, "=/api", "api.example.test")
+            self.assertNotIn("request_mirror", [p["plugin_name"] for p in plugins_of(m_res.config, m_api)])
 
 
 if __name__ == "__main__":

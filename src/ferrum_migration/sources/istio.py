@@ -192,14 +192,14 @@ class _Istio:
         closed); outside the Gateway's and the root namespace it is also reported,
         because it only matters if the gateway pods run there.
 
-        A ``RequestAuthentication`` that is provably bound to this Gateway (explicit
-        ``targetRef``/``targetRefs`` naming this ``networking.istio.io`` Gateway, or a
-        root-namespace ``istio-system`` policy with no selector or a workload selector
-        whose labels are a non-empty subset of the Gateway's selector) and whose
-        ``jwtRules`` all map cleanly to Ferrum ``jwks_auth`` providers is translated to
-        a shared ``jwks_auth`` plugin with ``allow_missing_token: true`` (matching
-        Istio semantics). Any unprovable scope or untranslatable rule refuses the
-        Gateway's routes (fail closed).
+        A ``RequestAuthentication`` in the mesh root namespace (``istio-system``) with
+        no ``targetRef``/``targetRefs`` and either no workload selector (mesh-wide) or
+        a workload selector whose labels are a non-empty subset of the Gateway's
+        selector, whose ``jwtRules`` all map cleanly to Ferrum ``jwks_auth`` providers,
+        is translated to a shared ``jwks_auth`` plugin with ``allow_missing_token: true``
+        (matching Istio semantics). Any unprovable scope (including ``targetRef`` on a
+        legacy Istio Gateway or non-root namespace policies) or untranslatable rule
+        refuses the Gateway's routes (fail closed).
         """
         gw_ns, gw_name = _meta(gateway)
         selector = mapping(mapping(gateway.get("spec")).get("selector"))
@@ -213,19 +213,14 @@ class _Istio:
             refs = [mapping(r) for r in seq(spec.get("targetRefs")) + seq(spec.get("targetRef"))]
             targeted = any(r.get("kind") == "Gateway" and r.get("name") == gw_name and
                            (r.get("namespace") or ns) == gw_ns for r in refs)
-            targeted_istio_gw = any(
-                r.get("kind") == "Gateway" and r.get("name") == gw_name
-                and (r.get("namespace") or ns) == gw_ns
-                and r.get("group") in (None, "", "networking.istio.io")
-                for r in refs
-            )
             labels = mapping(mapping(spec.get("selector")).get("matchLabels")) or \
                 mapping(mapping(spec.get("workloadSelector")).get("labels"))
             label = f"{kind} {safe_label(ns)}/{safe_label(name)}"
             provably_bound = False
             if targeted:
                 applies = True
-                provably_bound = targeted_istio_gw
+                # Istio targetRef/targetRefs attaches to Kubernetes Gateway API Gateways, not legacy
+                # networking.istio.io/v1 Gateways; never assume attachment when translating RequestAuthentication.
             elif refs and all(isinstance(r.get("kind"), str) and r["kind"].strip()
                               and isinstance(r.get("name"), str) and r["name"].strip() for r in refs):
                 applies = False
@@ -263,7 +258,7 @@ class _Istio:
             reasons.append(f"{label} applies to this gateway's workloads and cannot be translated")
         gw_plugins: list[PluginSpec] = []
         if jwks_providers and not reasons:
-            bound_err = validate_jwks_providers(jwks_providers)
+            bound_err = validate_jwks_providers(jwks_providers, allow_missing_token=True)
             if bound_err is not None:
                 reasons.append(f"{', '.join(jwks_refs)} cannot be translated ({bound_err})")
             else:
@@ -707,11 +702,14 @@ class _Istio:
         else:
             self.report.info("istio-default-retries", ref, "Istio's implicit default retry policy is not reproduced.")
         if entry.get("fault"):
-            fault_cfg, fault_err = _translate_istio_fault(entry["fault"])
-            if fault_cfg is not None:
-                spec.plugins.append(PluginSpec("fault_injection", fault_cfg, ref))
+            fault_status, fault_val = _translate_istio_fault(entry["fault"])
+            if fault_status == "plugin":
+                spec.plugins.append(PluginSpec("fault_injection", fault_val, ref))
+            elif fault_status == "omit":
+                self.report.info("istio-fault-noop", ref,
+                                 "fault injection has 0% abort/delay probability (inert); omitted.")
             else:
-                self.report.warning("istio-dropped", ref, f"fault injection is dropped ({fault_err}).")
+                self.report.warning("istio-dropped", ref, f"fault injection is dropped ({fault_val}).")
         if entry.get("mirror") or entry.get("mirrors"):
             self._mirrors(spec, entry, namespace, gw_ns, ref)
         self._cors(spec, mapping(entry.get("corsPolicy")))
@@ -753,27 +751,37 @@ class _Istio:
                 continue
             fqdn = _fqdn(dest_raw["host"], namespace)
             port = util.parse_port(mapping(dest_raw.get("port")).get("number"))
-            targets, resolved_port, se_sans, ep_err = self._service_entry(fqdn, port)
+            targets, resolved_port, se_sans, ep_err = self._service_entry_targets(fqdn, port)
             if ep_err or len(targets) != 1:
                 dropped += 1
                 continue
             rule = self._destination_rule(fqdn, gw_ns)
+            # Only trust a DestinationRule for mirror transport when it applies globally (no workloadSelector and
+            # no restricted exportTo), and treat matching portLevelSettings as replacing destination-level tls
+            # (never inheriting DISABLE if the port-level entry omits tls).
+            rule_spec = mapping(rule.get("spec")) if rule is not None else {}
+            raw_export = rule_spec.get("exportTo")
+            export_global = raw_export is None or raw_export == ["*"]
+            rule_unscoped = rule is not None and not rule_spec.get("workloadSelector") and export_global
+            if rule is not None and not rule_unscoped:
+                dropped += 1
+                continue
             tls, scheme, _algo, _hash, tls_err = self._traffic_policy(rule, resolved_port, ref, se_sans)
             if tls_err or (scheme == "https" and (tls.ca_path or tls.client_cert_path or tls.sni or tls.san_allow_list)):
                 dropped += 1
                 continue
-            # Without an explicit DestinationRule TLS policy (e.g. mode: DISABLE), Istio Auto mTLS may encrypt
-            # mirror traffic; never opt into cleartext allow_plaintext for non-loopback targets unless proven plaintext.
             if scheme == "http" and not is_loopback_ip_literal(targets[0].host):
                 explicit_disable = False
-                if rule is not None:
-                    pol = mapping(mapping(rule.get("spec")).get("trafficPolicy"))
-                    for lvl in seq(pol.get("portLevelSettings")):
-                        lvl = mapping(lvl)
-                        if util.parse_port(mapping(lvl.get("port")).get("number")) == resolved_port:
-                            pol = {**pol, **{k: v for k, v in lvl.items() if k != "port"}}
-                    tls_pol = mapping(pol.get("tls"))
-                    explicit_disable = str(tls_pol.get("mode", "")).upper() == "DISABLE"
+                if rule_unscoped:
+                    pol = mapping(rule_spec.get("trafficPolicy"))
+                    matched_port = next(
+                        (mapping(lvl) for lvl in seq(pol.get("portLevelSettings"))
+                         if util.parse_port(mapping(mapping(lvl).get("port")).get("number")) == resolved_port),
+                        None,
+                    )
+                    effective_tls = mapping(matched_port.get("tls")) if matched_port is not None \
+                        else mapping(pol.get("tls"))
+                    explicit_disable = str(effective_tls.get("mode", "")).upper() == "DISABLE"
                 if not explicit_disable:
                     dropped += 1
                     continue
@@ -1115,33 +1123,39 @@ def _translate_request_auth(spec: dict) -> tuple[list[dict[str, Any]] | None, st
     return providers, None
 
 
-def _translate_istio_fault(raw: Any) -> tuple[dict[str, Any] | None, str | None]:
+def _translate_istio_fault(raw: Any) -> tuple[str, Any]:
     if not isinstance(raw, dict):
-        return None, "fault must be a mapping"
+        return "drop", "fault must be a mapping"
     delay_cfg: dict[str, Any] | None = None
     abort_cfg: dict[str, Any] | None = None
     if raw.get("delay") is not None:
         delay = raw.get("delay")
         if not isinstance(delay, dict) or delay.get("exponentialDelay") is not None:
-            return None, "unsupported fault delay shape"
+            return "drop", "unsupported fault delay shape"
         duration_ms = util.parse_go_duration_ms(delay.get("fixedDelay"))
         if duration_ms is None:
-            return None, "delay.fixedDelay is missing or invalid"
+            return "drop", "delay.fixedDelay is missing or invalid"
         pct_obj = delay.get("percentage")
         if isinstance(pct_obj, dict) and pct_obj.get("value") is not None:
             pct = pct_obj["value"]
         elif delay.get("percent") is not None:
             pct = delay["percent"]
         else:
-            return None, "delay requires an explicit percentage"
-        delay_cfg = {"duration_ms": duration_ms, "percentage": pct}
+            return "drop", "delay requires an explicit percentage"
+        if isinstance(pct, bool) or not isinstance(pct, (int, float)):
+            return "drop", "delay percentage is invalid"
+        if float(pct) > 0.0:
+            delay_cfg = {"duration_ms": duration_ms, "percentage": pct}
     if raw.get("abort") is not None:
         abort = raw.get("abort")
         if not isinstance(abort, dict) or abort.get("http2Error") is not None:
-            return None, "unsupported fault abort shape"
+            return "drop", "unsupported fault abort shape"
         pct_obj = abort.get("percentage")
         if not isinstance(pct_obj, dict) or pct_obj.get("value") is None:
-            return None, "abort requires an explicit percentage"
+            return "drop", "abort requires an explicit percentage"
+        pct = pct_obj["value"]
+        if isinstance(pct, bool) or not isinstance(pct, (int, float)):
+            return "drop", "abort percentage is invalid"
         http_status = util.as_int(abort.get("httpStatus"))
         grpc_raw = abort.get("grpcStatus")
         grpc_code: int | None = None
@@ -1151,15 +1165,19 @@ def _translate_istio_fault(raw: Any) -> tuple[dict[str, Any] | None, str | None]
             else:
                 grpc_code = util.as_int(grpc_raw)
             if grpc_code is None:
-                return None, "abort.grpcStatus is not representable"
+                return "drop", "abort.grpcStatus is not representable"
             if http_status is None:
                 http_status = 503
         if http_status is None:
-            return None, "abort.httpStatus is missing or invalid"
-        abort_cfg = {"status_code": http_status, "percentage": pct_obj["value"]}
-        if grpc_code is not None:
-            abort_cfg["grpc_status"] = grpc_code
-    return fault_injection_config(abort=abort_cfg, delay=delay_cfg)
+            return "drop", "abort.httpStatus is missing or invalid"
+        if float(pct) > 0.0:
+            abort_cfg = {"status_code": http_status, "percentage": pct}
+            if grpc_code is not None:
+                abort_cfg["grpc_status"] = grpc_code
+    if delay_cfg is None and abort_cfg is None:
+        return "omit", None
+    cfg, err = fault_injection_config(abort=abort_cfg, delay=delay_cfg)
+    return ("plugin", cfg) if cfg is not None else ("drop", err)
 
 
 def _bind_address(value: Any) -> str | None:

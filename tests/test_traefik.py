@@ -1146,7 +1146,12 @@ class TraefikHardeningTest(unittest.TestCase):
                     "r": {
                         "rule": "Host(`a.example.test`) && PathPrefix(`/api/`)",
                         "service": "mirrored",
-                        "middlewares": ["comp", "gw", "buf"],
+                        "middlewares": ["comp", "buf"],
+                    },
+                    "r_gw": {
+                        "rule": "Host(`a.example.test`) && PathPrefix(`/grpc/`)",
+                        "service": "main",
+                        "middlewares": ["gw"],
                     },
                     "r_excl": {
                         "rule": "Host(`a.example.test`) && PathPrefix(`/excl/`)",
@@ -1201,7 +1206,6 @@ class TraefikHardeningTest(unittest.TestCase):
             "min_content_length": 2048,
             "content_types": ["application/json", "text/plain"],
         })
-        self.assertEqual(plugin(self, result.config, proxy, "grpc_web")["config"], {})
         self.assertEqual(plugin(self, result.config, proxy, "request_size_limiting")["config"], {"max_bytes": 1048576})
         self.assertEqual(plugin(self, result.config, proxy, "response_size_limiting")["config"],
                          {"max_bytes": 4194304, "require_buffered_check": True})
@@ -1214,12 +1218,28 @@ class TraefikHardeningTest(unittest.TestCase):
             "mirror_request_body": True,
             "max_mirrored_request_body_bytes": 65536,
         })
+        # Traefik grpcWeb is refused fail-closed (local CORS preflight + allowOrigins boundary).
+        gw_proxy = one_proxy(self, result.config, "/grpc", "a.example.test")
+        self.assertEqual(gw_proxy["labels"]["ferrum-migration/status"], "refused")
         # excludedContentTypes omits compression; maxBodySize=0 drops mirror rather than mirroring 10 MiB.
         excl = one_proxy(self, result.config, "/excl", "a.example.test")
         self.assertEqual(plugins_of(result.config, excl), [])
         self.assertIn("traefik-compress", codes(report, "warning"))
-        self.assertIn("traefik-grpc-web", codes(report, "warning"))
         self.assertIn("traefik-mirroring", codes(report, "warning"))
+        # Invalid media type wildcards (*/*, */json, application/vnd.*+json) are rejected by media-type validator.
+        for bad_ct in ("*/*", "*/json", "application/vnd.*+json"):
+            bad_ct_doc = yaml.safe_dump({
+                "http": {
+                    "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "main",
+                                      "middlewares": ["c"]}},
+                    "middlewares": {"c": {"compress": {"includedContentTypes": [bad_ct]}}},
+                    "services": {"main": {"loadBalancer": {"servers": [{"url": "http://main.internal:8080"}]}}},
+                }
+            })
+            ct_res, ct_rep, _ = asserted(bad_ct_doc)
+            ct_p = one_proxy(self, ct_res.config, "/api", "a.example.test")
+            self.assertEqual(plugins_of(ct_res.config, ct_p), [], bad_ct)
+            self.assertIn("traefik-compress", codes(ct_rep, "warning"))
         # Canonical schema gate checks newly supported compress/grpcWeb/mirror fields.
         bad = yaml.safe_dump({"http": {"middlewares": {"c": {"compress": {"Encodings": ["gzip"]}}}}})
         with self.assertRaises(InputError):

@@ -629,7 +629,8 @@ class EnvoyHardeningTest(unittest.TestCase):
             "abort": {"status_code": 503, "percentage": 5.0},
             "match": {"headers": {"x-chaos": "1"}},
         })
-        # Omitted `forward` explicitly emits forward_original_token: False (matching Envoy strip default).
+        # Omitted `forward` explicitly emits forward_original_token: False (matching Envoy strip default)
+        # and omitted remote_jwks.cache_duration bounds Ferrum staleness/refresh to Envoy's 600s default.
         self.assertEqual(plugin(self, result.config, api, "jwks_auth")["config"], {
             "providers": [{
                 "jwks_uri": "https://idp.example.test/.well-known/jwks.json",
@@ -638,7 +639,9 @@ class EnvoyHardeningTest(unittest.TestCase):
                 "from_headers": [{"name": "authorization", "prefix": "Bearer "}],
                 "forward_original_token": False,
                 "output_claim_headers": [{"claim": "sub", "header": "x-jwt-sub"}],
-            }]
+                "jwks_max_stale_seconds": 600,
+            }],
+            "jwks_refresh_interval_secs": 600,
         })
         self.assertEqual(plugin(self, result.config, api, "request_mirror")["config"], {
             "mirror_host": "shadow.internal", "mirror_port": 9000, "mirror_protocol": "http",
@@ -649,16 +652,18 @@ class EnvoyHardeningTest(unittest.TestCase):
         self.assertEqual(one_proxy(self, result.config, "=/healthz")["labels"]["ferrum-migration/status"], "refused")
 
         # Fail-closed regressions:
-        # 1) Misnamed ext_authz masquerading as grpc_web name must refuse via @type.
-        misnamed = minimal_bootstrap({"path_separated_prefix": "/api"})
-        misnamed["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"][
-            "http_filters"] = [
+        # 1) Misnamed ext_authz masquerading as grpc_web name, or dynamic config_discovery, must refuse.
+        for bad_filter in (
             {"name": "envoy.filters.http.grpc_web",
              "typed_config": {"@type": "type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthz"}},
-            {"name": "envoy.filters.http.router"},
-        ]
-        self.assertEqual(one_proxy(self, migrate("envoy", yaml.safe_dump(misnamed))[0].config, "/api")[
-            "labels"]["ferrum-migration/status"], "refused")
+            {"name": "envoy.filters.http.grpc_web",
+             "config_discovery": {"config_source": {"ads": {}}}},
+        ):
+            misnamed = minimal_bootstrap({"path_separated_prefix": "/api"})
+            misnamed["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"][
+                "http_filters"] = [bad_filter, {"name": "envoy.filters.http.router"}]
+            self.assertEqual(one_proxy(self, migrate("envoy", yaml.safe_dump(misnamed))[0].config, "/api")[
+                "labels"]["ferrum-migration/status"], "refused")
         # 2) Disabled jwt_authn named with "cors" enabled via typed_per_filter_config must refuse.
         cors_jwt = minimal_bootstrap({"path_separated_prefix": "/api"})
         chcm = cors_jwt["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"]
@@ -672,17 +677,58 @@ class EnvoyHardeningTest(unittest.TestCase):
         }
         self.assertEqual(one_proxy(self, migrate("envoy", yaml.safe_dump(cors_jwt))[0].config, "/api")[
             "labels"]["ferrum-migration/status"], "refused")
-        # 3) Reserved claim destination (x-forwarded-user) or implicit default locations refuse fail-closed.
+        # 3) Reserved claim destination, implicit locations, from_params, query in jwks_uri, and custom DNS resolvers refuse.
         for mutate in (
-            lambda p: p["claim_to_headers"].append({"header_name": "x-forwarded-user", "claim_name": "sub"}),
-            lambda p: p.pop("from_headers"),
+            lambda d: d["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"][
+                "http_filters"][3]["typed_config"]["providers"]["idp"]["claim_to_headers"].append(
+                    {"header_name": "x-forwarded-user", "claim_name": "sub"}),
+            lambda d: d["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"][
+                "http_filters"][3]["typed_config"]["providers"]["idp"].pop("from_headers"),
+            lambda d: d["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"][
+                "http_filters"][3]["typed_config"]["providers"]["idp"].update(
+                    {"from_headers": [], "from_params": ["access_token"]}),
+            lambda d: d["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"][
+                "http_filters"][3]["typed_config"]["providers"]["idp"]["remote_jwks"]["http_uri"].update(
+                    {"uri": "https://idp.example.test/.well-known/jwks.json?api_key=secret"}),
+            lambda d: d["static_resources"]["clusters"][2].update(
+                {"dns_resolvers": [{"socket_address": {"address": "10.0.0.53", "port_value": 53}}]}),
         ):
             bad_jwt = copy.deepcopy(doc)
-            bad_p = bad_jwt["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"][
-                "http_filters"][3]["typed_config"]["providers"]["idp"]
-            mutate(bad_p)
+            mutate(bad_jwt)
             self.assertEqual(one_proxy(self, migrate("envoy", yaml.safe_dump(bad_jwt))[0].config, "/api")[
                 "labels"]["ferrum-migration/status"], "refused")
+        # 4) Fault filter regressions: max_active_faults: 0 and sensitive match.headers refuse; 0% fault is omitted.
+        for bad_fault in (
+            {"@type": "type.googleapis.com/envoy.extensions.filters.http.fault.v3.HTTPFault",
+             "abort": {"http_status": 503, "percentage": {"numerator": 5, "denominator": "HUNDRED"}},
+             "max_active_faults": 0},
+            {"@type": "type.googleapis.com/envoy.extensions.filters.http.fault.v3.HTTPFault",
+             "abort": {"http_status": 503, "percentage": {"numerator": 5, "denominator": "HUNDRED"}},
+             "headers": [{"name": "Authorization", "exact_match": "Bearer secret-tok"}]},
+        ):
+            bf = minimal_bootstrap({"path_separated_prefix": "/api"})
+            bf["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"][
+                "http_filters"] = [
+                {"name": "envoy.filters.http.fault", "typed_config": bad_fault},
+                {"name": "envoy.filters.http.router"},
+            ]
+            bf_res = migrate("envoy", yaml.safe_dump(bf))[0]
+            self.assertEqual(one_proxy(self, bf_res.config, "/api")["labels"]["ferrum-migration/status"], "refused")
+            self.assertNotIn("secret-tok", json.dumps(bf_res.config))
+        zero_fault = minimal_bootstrap({"path_separated_prefix": "/api"})
+        zero_fault["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"][
+            "http_filters"] = [
+            {"name": "envoy.filters.http.fault",
+             "typed_config": {
+                 "@type": "type.googleapis.com/envoy.extensions.filters.http.fault.v3.HTTPFault",
+                 "abort": {"http_status": 503, "percentage": {"numerator": 0, "denominator": "HUNDRED"}},
+             }},
+            {"name": "envoy.filters.http.router"},
+        ]
+        zf_res, zf_rep, _ = migrate("envoy", yaml.safe_dump(zero_fault))
+        self.assertEqual(one_proxy(self, zf_res.config, "/api")["labels"]["ferrum-migration/status"], "migrated")
+        self.assertEqual(zf_res.config["plugin_configs"], [])
+        self.assertIn("envoy-fault-noop", codes(zf_rep, "info"))
 
 
 if __name__ == "__main__":

@@ -416,11 +416,10 @@ class FerrumBinaryValidateTest(unittest.TestCase):
         traefik_text = yaml.safe_dump({
             "http": {
                 "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "mirrored",
-                                  "middlewares": ["comp", "gw", "buf"]}},
+                                  "middlewares": ["comp", "buf"]}},
                 "middlewares": {
                     "comp": {"compress": {"encodings": ["br", "gzip"], "minResponseBodyBytes": 1024,
                                           "includedContentTypes": ["application/json", "text/plain"]}},
-                    "gw": {"grpcWeb": {}},
                     "buf": {"buffering": {"maxRequestBodyBytes": 1048576, "maxResponseBodyBytes": 2097152}},
                 },
                 "services": {
@@ -429,6 +428,101 @@ class FerrumBinaryValidateTest(unittest.TestCase):
                     "main": {"loadBalancer": {"servers": [{"url": "http://main.internal:8080"}]}},
                     "shadow": {"loadBalancer": {"servers": [{"url": "http://shadow.internal:9090"}]}},
                 },
+            }
+        })
+        nginx_text = (
+            "http {\n"
+            "  gzip on;\n"
+            "  gzip_proxied any;\n"
+            "  gzip_comp_level 6;\n"
+            "  gzip_min_length 1024;\n"
+            "  gzip_types application/json text/plain;\n"
+            "  server {\n"
+            "    listen 80;\n"
+            "    server_name api.example.test;\n"
+            "    location /api/ { proxy_pass http://svc.internal:8080; }\n"
+            "  }\n"
+            "}\n"
+        )
+        envoy_text = yaml.safe_dump({
+            "static_resources": {
+                "listeners": [{
+                    "name": "http",
+                    "address": {"socket_address": {"address": "0.0.0.0", "port_value": 8080}},
+                    "filter_chains": [{"filters": [{
+                        "name": "envoy.filters.network.http_connection_manager",
+                        "typed_config": {
+                            "@type": "type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager",
+                            "route_config": {"virtual_hosts": [{
+                                "name": "v", "domains": ["api.example.test"],
+                                "routes": [{
+                                    "name": "r",
+                                    "match": {"path_separated_prefix": "/api"},
+                                    "route": {
+                                        "cluster": "app",
+                                        "request_mirror_policies": [{
+                                            "cluster": "shadow",
+                                            "runtime_fraction": {"default_value": {"numerator": 20, "denominator": "HUNDRED"}},
+                                        }],
+                                    },
+                                }],
+                            }]},
+                            "http_filters": [
+                                {"name": "envoy.filters.http.grpc_web",
+                                 "typed_config": {"@type": "type.googleapis.com/envoy.extensions.filters.http.grpc_web.v3.GrpcWeb"}},
+                                {"name": "envoy.filters.http.compressor",
+                                 "typed_config": {
+                                     "@type": "type.googleapis.com/envoy.extensions.filters.http.compressor.v3.Compressor",
+                                     "compressor_library": {"name": "gzip", "typed_config": {
+                                         "@type": "type.googleapis.com/envoy.extensions.compression.gzip.compressor.v3.Gzip"}},
+                                     "response_direction_config": {
+                                         "common_config": {"min_content_length": 512, "content_type": ["application/json"]}},
+                                 }},
+                                {"name": "envoy.filters.http.fault",
+                                 "typed_config": {
+                                     "@type": "type.googleapis.com/envoy.extensions.filters.http.fault.v3.HTTPFault",
+                                     "delay": {"fixed_delay": "0.25s", "percentage": {"numerator": 10, "denominator": "HUNDRED"}},
+                                     "abort": {"http_status": 503, "percentage": {"numerator": 5, "denominator": "HUNDRED"}},
+                                     "headers": [{"name": "x-chaos", "exact_match": "1"}],
+                                 }},
+                                {"name": "envoy.filters.http.jwt_authn",
+                                 "typed_config": {
+                                     "@type": "type.googleapis.com/envoy.extensions.filters.http.jwt_authn.v3.JwtAuthentication",
+                                     "providers": {
+                                         "idp": {
+                                             "issuer": "https://idp.example.test",
+                                             "audiences": ["api"],
+                                             "remote_jwks": {"http_uri": {
+                                                 "uri": "https://idp.example.test/.well-known/jwks.json",
+                                                 "cluster": "jwks", "timeout": "5s",
+                                             }},
+                                             "from_headers": [{"name": "Authorization", "value_prefix": "Bearer "}],
+                                             "claim_to_headers": [{"header_name": "x-jwt-sub", "claim_name": "sub"}],
+                                         }
+                                     },
+                                     "rules": [{"match": {"prefix": "/"}, "requires": {"provider_name": "idp"}}],
+                                 }},
+                                {"name": "envoy.filters.http.router"},
+                            ],
+                        },
+                    }]}],
+                }],
+                "clusters": [
+                    {"name": "app", "type": "STRICT_DNS", "load_assignment": {"endpoints": [{"lb_endpoints": [
+                        {"endpoint": {"address": {"socket_address": {"address": "app.internal", "port_value": 8080}}}}]}]}},
+                    {"name": "shadow", "type": "STRICT_DNS", "load_assignment": {"endpoints": [{"lb_endpoints": [
+                        {"endpoint": {"address": {"socket_address": {"address": "shadow.internal", "port_value": 9090}}}}]}]}},
+                    {"name": "jwks", "type": "STRICT_DNS",
+                     "load_assignment": {"endpoints": [{"lb_endpoints": [
+                         {"endpoint": {"address": {"socket_address": {"address": "idp.example.test", "port_value": 443}}}}]}]},
+                     "transport_socket": {
+                         "name": "envoy.transport_sockets.tls",
+                         "typed_config": {
+                             "@type": "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext",
+                             "sni": "idp.example.test",
+                         },
+                     }},
+                ],
             }
         })
         istio_text = (
@@ -442,7 +536,7 @@ class FerrumBinaryValidateTest(unittest.TestCase):
             "    - issuer: https://idp.example.test\n"
             "      jwksUri: https://idp.example.test/.well-known/jwks.json\n"
             "      audiences: [api]\n"
-            "      fromHeaders: [{name: Authorization, prefix: 'Bearer '}]\n"
+            "      fromHeaders: [{name: X-Jwt-Assertion}]\n"
             "      outputClaimToHeaders: [{header: x-jwt-sub, claim: sub}]\n"
             "---\napiVersion: networking.istio.io/v1\nkind: DestinationRule\n"
             "metadata: {name: shadow-plain, namespace: edge}\nspec:\n"
@@ -459,7 +553,9 @@ class FerrumBinaryValidateTest(unittest.TestCase):
         )
         for label, platform, text, kw in (
             ("kong-extended", "kong", kong_text, {}),
+            ("nginx-extended", "nginx", nginx_text, {"fmt": "nginx"}),
             ("traefik-extended", "traefik", traefik_text, {"traefik_controls_asserted": True}),
+            ("envoy-extended", "envoy", envoy_text, {}),
             ("istio-extended", "istio", istio_text, {}),
         ):
             result, _report, _plan = migrate(platform, text, **kw)
