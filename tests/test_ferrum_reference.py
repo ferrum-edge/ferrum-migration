@@ -316,15 +316,18 @@ class FerrumBinaryValidateTest(unittest.TestCase):
         """Admission regression: Traefik handshake-policy refusals under the operator statement load as placeholders.
 
         Ordinary synthetic HTTPS routers are converted with the statement: under named TLS options (outside the one
-        global 'default' policy, traefik-tls-options-scope) and under 'default' options that enable sniStrict
-        (traefik-sni-strict). Each becomes a fail-closed 503 placeholder. Only the resources are validated; no
-        traffic is sent.
+        global 'default' policy, traefik-tls-options-scope), under a provider-qualified 'default@file' reference
+        (not the unqualified global default, traefik-tls-options-scope) and under 'default' options that enable
+        sniStrict (traefik-sni-strict). Each becomes a fail-closed 503 placeholder. Only the resources are validated;
+        no traffic is sent.
         """
         binary = os.environ["FERRUM_EDGE_BIN"]
         service = {"s": {"loadBalancer": {"servers": [{"url": "http://s.internal:80"}]}}}
         router = {"rule": "Host(`t.example.test`) && Path(`/t`)", "service": "s"}
         cases = {"named": ({**router, "tls": {"options": "relaxed"}}, {"relaxed": {"minVersion": "VersionTLS12"}},
                            "traefik-tls-options-scope"),
+                 "qualified default": ({**router, "tls": {"options": "default@file"}},
+                                       {"default": {"minVersion": "VersionTLS12"}}, "traefik-tls-options-scope"),
                  "default": ({**router, "tls": {}}, {"default": {"sniStrict": True}}, "traefik-sni-strict")}
         for label, (spec, options, code) in cases.items():
             text = yaml.safe_dump({"http": {"routers": {"r": spec}, "services": service}, "tls": {"options": options}})

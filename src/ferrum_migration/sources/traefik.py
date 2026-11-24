@@ -23,7 +23,17 @@ cannot reproduce (such as enabled ``sniStrict``) refuse their routes whatever th
 HTTPS is translated only under one global handshake policy: the ``default`` TLS options (or Traefik's built-in
 default) used by every TLS router. Traefik chooses TLS options per handshake from the SNI, for every path of the
 frontend at once, and Ferrum's HTTPS listener applies one policy to every connection, so per-route SNI selection is
-not reconstructed: any other TLS options in the input refuse every HTTPS route (see ``_handshake_scope``).
+not reconstructed: any other TLS options in the input refuse every HTTPS route (see ``_handshake_scope``). Traefik
+stores the special ``default`` options globally, without a provider qualifier, so only an unset or empty router
+reference, or exactly ``default``, uses them; a qualified reference such as ``default@file`` is a different name.
+
+Typed fields must be spelled canonically. Traefik's file provider decodes into typed structs and matches field names
+case-insensitively, so ``TLS`` or ``clientauth`` select the same controls as ``tls`` and ``clientAuth``, while this
+translator reads the canonical spelling only. Any typed field at the structural boundaries listed in
+``_TYPED_FIELDS`` that is spelled in another letter case, or given more than once in different letter case, rejects
+the whole input before any route or profile is built (``_canonical_schema_gate``). Keys that name resources
+(routers, services, middlewares, serversTransports, TLS options, certificate stores) are case-sensitive identifiers
+in Traefik and are never checked or folded.
 """
 
 from __future__ import annotations
@@ -77,6 +87,130 @@ CONTROLS_UNVERIFIED_REASON = (
     "checks, middlewares, redirections, forwarded-header trust, bind restrictions or other routing, so how the "
     f"source served it is unknown (see traefik-controls-unverified; {CONTROLS_ASSERTION_FLAG} only after verifying "
     "that the input includes every effective control)")
+
+#: Canonical typed field names (the json/yaml/toml tags of Traefik v3.6's dynamic configuration structs) at the
+#: structural boundaries that select routing, TLS and access controls. Traefik's file provider (paerser) matches
+#: field names case-insensitively; this translator reads the canonical spelling only, so any other spelling is
+#: refused (see ``_canonical_schema_gate``). Each field maps to None (not descended), the name of a nested typed
+#: struct, ("list", struct) or ("map", struct). The keys of a "map" are resource names (routers, services,
+#: middlewares, serversTransports, TLS options, certificate stores): case-sensitive identifiers that are never
+#: checked or folded; only the typed fields of each entry are.
+_TYPED_FIELDS: dict[str, dict[str, Any]] = {
+    "configuration": {"http": "http", "tcp": None, "udp": None, "tls": "tls"},
+    "http": {"routers": ("map", "router"), "services": ("map", "service"), "middlewares": ("map", "middleware"),
+             "models": None, "serversTransports": ("map", "serversTransport")},
+    "router": {"entryPoints": None, "middlewares": None, "service": None, "rule": None, "ruleSyntax": None,
+               "priority": None, "tls": "routerTls", "observability": None, "parentRefs": None},
+    "routerTls": {"options": None, "certResolver": None, "domains": ("list", "domain")},
+    "domain": {"main": None, "sans": None},
+    "tls": {"certificates": ("list", "certAndStores"), "options": ("map", "tlsOptions"),
+            "stores": ("map", "tlsStore")},
+    "certAndStores": {"certFile": None, "keyFile": None, "stores": None},
+    "tlsStore": {"defaultCertificate": "certificate", "defaultGeneratedCert": "generatedCert"},
+    "certificate": {"certFile": None, "keyFile": None},
+    "generatedCert": {"resolver": None, "domain": "domain"},
+    "tlsOptions": {"minVersion": None, "maxVersion": None, "cipherSuites": None, "curvePreferences": None,
+                   "clientAuth": "clientAuth", "sniStrict": None, "alpnProtocols": None,
+                   "disableSessionTickets": None, "preferServerCipherSuites": None},
+    "clientAuth": {"caFiles": None, "clientAuthType": None},
+    "service": {"loadBalancer": "loadBalancer", "weighted": "weighted", "mirroring": "mirroring", "failover": None,
+                "highestRandomWeight": None},
+    "loadBalancer": {"sticky": "sticky", "servers": ("list", "server"), "strategy": None, "healthCheck": "healthCheck",
+                     "passiveHealthCheck": None, "passHostHeader": None, "responseForwarding": None,
+                     "serversTransport": None},
+    "server": {"url": None, "weight": None, "preservePath": None},
+    "sticky": {"cookie": "cookie"},
+    "cookie": {"name": None, "secure": None, "httpOnly": None, "sameSite": None, "maxAge": None, "path": None,
+               "domain": None},
+    "healthCheck": {"scheme": None, "mode": None, "path": None, "method": None, "status": None, "port": None,
+                    "interval": None, "unhealthyInterval": None, "timeout": None, "hostname": None,
+                    "followRedirects": None, "headers": None},
+    "weighted": {"services": ("list", "weightedService"), "sticky": "sticky", "healthCheck": None},
+    "weightedService": {"name": None, "weight": None},
+    "mirroring": {"service": None, "mirrorBody": None, "maxBodySize": None, "mirrors": None, "healthCheck": None},
+    "serversTransport": {"serverName": None, "insecureSkipVerify": None, "rootCAs": None,
+                         "certificates": ("list", "certificate"), "maxIdleConnsPerHost": None,
+                         "forwardingTimeouts": "forwardingTimeouts", "disableHTTP2": None, "peerCertURI": None,
+                         "spiffe": None},
+    "forwardingTimeouts": {"dialTimeout": None, "responseHeaderTimeout": None, "idleConnTimeout": None,
+                           "readIdleTimeout": None, "pingTimeout": None},
+    # The middleware envelope: its one key names the middleware type. Types this translator reads get their config
+    # checked; the others are refused or omitted by type and their configs are not read.
+    "middleware": {"addPrefix": "addPrefix", "stripPrefix": "stripPrefix", "stripPrefixRegex": None,
+                   "replacePath": None, "replacePathRegex": None, "chain": "chain", "ipWhiteList": "ipAllowList",
+                   "ipAllowList": "ipAllowList", "headers": "headers", "errors": None, "rateLimit": "rateLimit",
+                   "redirectRegex": None, "redirectScheme": "redirectScheme", "basicAuth": "basicAuth",
+                   "digestAuth": None, "forwardAuth": None, "inFlightReq": None, "buffering": "buffering",
+                   "circuitBreaker": None, "compress": None, "passTLSClientCert": None, "retry": "retry",
+                   "contentType": None, "grpcWeb": None, "plugin": None},
+    "addPrefix": {"prefix": None},
+    "stripPrefix": {"prefixes": None, "forceSlash": None},
+    "chain": {"middlewares": None},
+    "ipAllowList": {"sourceRange": None, "ipStrategy": "ipStrategy", "rejectStatusCode": None},
+    "ipStrategy": {"depth": None, "excludedIPs": None, "ipv6Subnet": None},
+    "headers": {"customRequestHeaders": None, "customResponseHeaders": None, "accessControlAllowCredentials": None,
+                "accessControlAllowHeaders": None, "accessControlAllowMethods": None,
+                "accessControlAllowOriginList": None, "accessControlAllowOriginListRegex": None,
+                "accessControlExposeHeaders": None, "accessControlMaxAge": None, "addVaryHeader": None,
+                "allowedHosts": None, "hostsProxyHeaders": None, "sslProxyHeaders": None, "stsSeconds": None,
+                "stsIncludeSubdomains": None, "stsPreload": None, "forceSTSHeader": None, "frameDeny": None,
+                "customFrameOptionsValue": None, "contentTypeNosniff": None, "browserXssFilter": None,
+                "customBrowserXSSValue": None, "contentSecurityPolicy": None,
+                "contentSecurityPolicyReportOnly": None, "publicKey": None, "referrerPolicy": None,
+                "permissionsPolicy": None, "isDevelopment": None, "featurePolicy": None, "sslRedirect": None,
+                "sslTemporaryRedirect": None, "sslHost": None, "sslForceHost": None},
+    "basicAuth": {"users": None, "usersFile": None, "realm": None, "removeHeader": None, "headerField": None},
+    "rateLimit": {"average": None, "period": None, "burst": None, "sourceCriterion": "sourceCriterion",
+                  "redis": None},
+    "sourceCriterion": {"ipStrategy": "ipStrategy", "requestHeaderName": None, "requestHost": None},
+    "buffering": {"maxRequestBodyBytes": None, "memRequestBodyBytes": None, "maxResponseBodyBytes": None,
+                  "memResponseBodyBytes": None, "retryExpression": None},
+    "redirectScheme": {"scheme": None, "port": None, "permanent": None},
+    "retry": {"attempts": None, "initialInterval": None},
+}
+# Case-folded field name -> canonical field name, per typed struct. str.casefold() folds at least every pair Go's
+# strings.EqualFold treats as equal for these ASCII names (including the Kelvin sign and the long s), so every
+# spelling Traefik would accept is caught; anything it folds beyond that is refused too (stricter).
+_TYPED_FOLDS: dict[str, dict[str, str]] = {
+    struct: {name.casefold(): name for name in fields} for struct, fields in _TYPED_FIELDS.items()}
+
+
+def typed_field_problems(value: Any, struct: str = "configuration", path: str = "") -> list[str]:
+    """Value-free paths of typed fields spelled other than canonically, or given in several letter cases.
+
+    Only the typed fields of ``struct`` and its nested typed structs (``_TYPED_FIELDS``) are checked, and only
+    beneath canonically spelled parents (a non-canonical parent already rejects the input). Map keys that name
+    resources are case-sensitive identifiers and are never compared or folded. Values that are not mappings are left
+    to the translator, which refuses them where it reads them. Paths use canonical names, ``<name>`` for resource
+    names and ``[]`` for list items, so they never echo input.
+    """
+    problems: list[str] = []
+    if not isinstance(value, dict):
+        return problems
+    fields, folds = _TYPED_FIELDS[struct], _TYPED_FOLDS[struct]
+    spellings: dict[str, list[Any]] = {}
+    for key in value:
+        canonical = folds.get(key.casefold()) if isinstance(key, str) else None
+        if canonical is not None:
+            spellings.setdefault(canonical, []).append(key)
+    for canonical, keys in spellings.items():
+        where = f"{path}.{canonical}" if path else canonical
+        if keys != [canonical]:
+            problems.append(where)
+            continue
+        child = fields[canonical]
+        item = value[canonical]
+        if child is None:
+            continue
+        if isinstance(child, str):
+            problems.extend(typed_field_problems(item, child, where))
+        elif child[0] == "map":
+            for entry in mapping(item).values():  # keys are resource names: never folded
+                problems.extend(typed_field_problems(entry, child[1], f"{where}.<name>"))
+        else:
+            for entry in seq(item):
+                problems.extend(typed_field_problems(entry, child[1], f"{where}[]"))
+    return problems
 
 
 class RuleError(Exception):
@@ -273,6 +407,9 @@ class _Traefik:
         self.controls_asserted = ctx.traefik_controls_asserted
 
     def run(self) -> Plan:
+        # Before anything else: no section, route or profile setting is built from an input whose typed fields
+        # Traefik would read differently from this translator.
+        self._canonical_schema_gate()
         for key in self.root:
             if key in ("tcp", "udp"):
                 self.report.error("traefik-l4", f"traefik {key}", "TCP/UDP routers are not migrated (HTTP only).",
@@ -301,6 +438,31 @@ class _Traefik:
         self._outside_controls()
         check_route_budget(len(self.plan.routes), self.ctx.limits)
         return self.plan
+
+    # ------------------------------------------------- canonical typed fields
+
+    def _canonical_schema_gate(self) -> None:
+        """Reject the whole input when a typed field is spelled other than canonically (fail closed, exit 3).
+
+        Traefik's file provider decodes into typed structs and matches field names case-insensitively (paerser,
+        ``strings.EqualFold``): ``TLS``, ``Options`` or ``clientauth`` select the same TLS, routing and access
+        controls as ``tls``, ``options`` and ``clientAuth``. This translator reads the canonical spelling only, so a
+        control under another spelling would be missed (an HTTPS router taken for plaintext, a dropped client
+        certificate requirement or middleware). Rather than guessing which of several case-equivalent keys Traefik
+        used, any such spelling, at any checked level (parent sections included), refuses the entire plan before
+        any route or profile is built, whatever the operator states. Resource names are never folded.
+        """
+        problems = list(dict.fromkeys(typed_field_problems(self.root)))
+        if not problems:
+            return
+        shown = ", ".join(problems[:6]) + (f" and {len(problems) - 6} more" if len(problems) > 6 else "")
+        raise InputError(
+            "Traefik typed field(s) spelled in another letter case than Traefik's canonical name, or given more than "
+            f"once in different letter case: {shown}. Traefik matches these field names case-insensitively, so they "
+            "can select routing, TLS or access controls that this converter reads only under the canonical spelling; "
+            "nothing was converted (fail closed). Spell each field exactly as Traefik documents it (for example "
+            "'tls', 'options', 'clientAuth', 'middlewares') and convert again. Names of routers, services, "
+            "middlewares, serversTransports, TLS options and stores are case-sensitive and are not affected.")
 
     # ------------------------------------------------- controls outside the input
 
@@ -568,11 +730,14 @@ class _Traefik:
         * a ``tls.options`` section that cannot be read;
         * any TLS options definition other than ``default`` (whether a router reaches it is not analysed);
         * a router that is not a mapping, or whose ``tls`` block or ``tls.options`` reference cannot be read;
-        * a TLS router referencing anything other than ``default``/``default@file`` (named options, options of
-          another provider, undefined names).
+        * a TLS router whose reference is anything other than unset, empty or exactly ``default`` (named options,
+          any provider-qualified name, ``default@file`` and a malformed ``default@`` included, undefined names).
 
-        Any of them refuses every HTTPS route, whatever the hosts or paths and whatever the operator states.
-        Reasons are value-free.
+        Traefik stores the special ``default`` options globally, without a provider qualifier, and resolves a router
+        reference to them only when it is unset, empty or exactly ``default``; any other reference is qualified by
+        provider and looked up by that name, so ``default@file`` does not name the global default. Any of the above
+        refuses every HTTPS route, whatever the hosts or paths and whatever the operator states. Reasons are
+        value-free.
         """
         problems: list[str] = []
         tls_root = self.root.get("tls")
@@ -595,18 +760,19 @@ class _Traefik:
                 continue
             reference = tls.get("options")
             if reference is None or reference == "":
-                continue  # Traefik applies 'default'
+                continue  # unset: Traefik applies the global 'default' options
             if not isinstance(reference, str):
                 unreadable = True
                 continue
-            base, _, provider = reference.partition("@")
-            if base != DEFAULT_TLS_OPTIONS or provider not in ("", "file"):
+            if reference != DEFAULT_TLS_OPTIONS:
+                # Only the exact unqualified literal names the global default. Any '@' qualifier (default@file, an
+                # empty suffix, another provider) or any other name is a different, possibly undefined, set.
                 other = True
         if unreadable:
             problems.append("a router or its tls block or tls.options reference cannot be read")
         if other:
-            problems.append("a TLS router references TLS options other than 'default' (named, from another provider "
-                            "or undefined)")
+            problems.append("a TLS router references TLS options other than the unqualified 'default' (named, "
+                            "provider-qualified such as default@file, malformed or undefined)")
         return problems
 
     def _https_handshake_policy(self, scope_problems: list[str]) -> None:
@@ -631,8 +797,8 @@ class _Traefik:
                 "HTTPS route(s) were refused (fail closed), whatever their hosts or paths; plaintext routes are not "
                 "affected.",
                 "Keep these HTTPS routes on the source proxy, or move the handshake requirements into one 'default' "
-                "TLS options entry used by every TLS router, remove the other TLS options and references, and "
-                "convert again. For separate handshake policies, convert each policy's routers separately for "
+                "TLS options entry used by every TLS router (naming no options, or exactly 'default' without a "
+                "provider qualifier), remove the other TLS options and references, and convert again. For separate handshake policies, convert each policy's routers separately for "
                 "separately configured Ferrum frontends.")
             return
         cas, client_auth_problem = self._default_client_auth()

@@ -119,6 +119,28 @@ class CliTest(unittest.TestCase):
         self.assertIn("traefik-controls-asserted", found)
         self.assertEqual(report["summary"]["migrated_routes"], 1)
 
+    def test_traefik_noncanonical_field_spelling_writes_nothing(self):
+        # Traefik matches typed field names case-insensitively; a router 'TLS' block would be HTTPS there but is not
+        # read here, so the whole input is rejected (exit 3) before any route or profile is built, even with the
+        # operator statement. The message names the canonical path only, never input values.
+        path = os.path.join(self.temp.name, "dynamic.yaml")
+        with open(path, "w", encoding="utf-8") as handle:
+            yaml.safe_dump({"http": {
+                "routers": {"router-zq": {"rule": "Host(`c.example.test`) && Path(`/c`)", "service": "svc-zq",
+                                          "TLS": {}}},
+                "services": {"svc-zq": {"loadBalancer": {"servers": [{"url": "http://s.internal:80"}]}}},
+            }}, handle)
+        out = self.out_dir()
+        for command in (("convert", path, "--from", "traefik", "--out", out), ("check", path, "--from", "traefik")):
+            with self.subTest(command=command[0]):
+                code, _stdout, stderr = run_cli(*command, TRAEFIK_ASSERTION)
+                self.assertEqual(code, 3)
+                self.assertIn("input rejected", stderr)
+                self.assertIn("http.routers.<name>.tls", stderr)
+                for value in ("router-zq", "svc-zq", "c.example.test", "s.internal"):
+                    self.assertNotIn(value, stderr)
+        self.assertFalse(os.path.exists(out))
+
     def test_former_traefik_entrypoint_flag_is_not_accepted(self):
         # Renamed before release; the narrower statement is not kept as an alias.
         code, _stdout, _stderr = run_cli("check", fixture_path("traefik", "dynamic.toml"), "--from", "traefik",

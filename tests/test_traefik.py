@@ -7,7 +7,9 @@ import yaml
 from helpers import assert_structurally_valid, codes, live_routes, migrate, one_proxy, plugin, plugins_of, proxies, \
     read_fixture, upstream_of
 
-from ferrum_migration.sources.traefik import CONTROLS_ASSERTION_FLAG, RuleError, evaluate_term, rule_to_dnf
+from ferrum_migration.errors import InputError
+from ferrum_migration.sources.traefik import CONTROLS_ASSERTION_FLAG, RuleError, evaluate_term, rule_to_dnf, \
+    typed_field_problems
 
 
 def asserted(text, **kwargs):
@@ -280,14 +282,15 @@ class TraefikClientAuthTest(unittest.TestCase):
         return one_proxy(self, result.config, path, host)["labels"]["ferrum-migration/status"]
 
     def test_default_client_auth_is_preserved_for_every_https_route(self):
-        # One homogeneous handshake policy: routers naming no options and routers naming 'default' explicitly (with
-        # or without @file), on different hosts and paths, all get the default options' client CA.
+        # One homogeneous handshake policy: routers naming no options, an empty reference (Traefik treats it as
+        # unset) and routers naming exactly 'default', on different hosts and paths, all get the default options'
+        # client CA. (A qualified 'default@file' is a different name: see TraefikHandshakeScopeTest.)
         routers = {
             "implicit": {"rule": "Host(`m.example.test`) && Path(`/m`)", "service": "s", "tls": {}},
             "explicit": {"rule": "Host(`n.example.test`) && Path(`/n`)", "service": "s",
                          "tls": {"options": "default"}},
-            "file": {"rule": "Host(`o.example.test`) && Path(`/o`)", "service": "s",
-                     "tls": {"options": "default@file"}},
+            "empty": {"rule": "Host(`o.example.test`) && Path(`/o`)", "service": "s",
+                      "tls": {"options": ""}},
         }
         result, report, plan = asserted(self._doc(routers, {"default": {"clientAuth": {
             "caFiles": [self.CA], "clientAuthType": "RequireAndVerifyClientCert"}}}))
@@ -363,7 +366,9 @@ class TraefikSniStrictTest(unittest.TestCase):
         return {"rule": f"Host(`{host}`) && Path(`{path}`)", "service": "s", "tls": tls}
 
     def test_explicit_reference_to_strict_default_refuses_the_route_even_with_the_statement(self):
-        for reference in ("default", "default@file"):
+        # Only the exact unqualified reference reaches the strict default; 'default@file' refuses through the
+        # handshake scope instead (TraefikHandshakeScopeTest).
+        for reference in ("default",):
             with self.subTest(reference=reference):
                 result, report, plan = asserted(self._doc(
                     {"r": self._router("s.example.test", "/s", {"options": reference})},
@@ -483,6 +488,12 @@ class TraefikHandshakeScopeTest(unittest.TestCase):
         cases = {
             "other provider": ({"options": "mtls@kubernetescrd"}, None),
             "default of another provider": ({"options": "default@kubernetescrd"}, None),
+            # Traefik stores the global default unqualified, so a qualified reference names another set.
+            "default qualified by the file provider": ({"options": "default@file"}, None),
+            "default with an empty provider suffix": ({"options": "default@"}, None),
+            "qualifier without a name": ({"options": "@file"}, None),
+            # TLS options names are case-sensitive: this is not the global default.
+            "default in another letter case": ({"options": "Default"}, None),
             "undefined name": ({"options": "missing"}, None),
             "non-string reference": ({"options": ["default"]}, None),
             "unreadable tls block": ("yes", None),
@@ -496,6 +507,25 @@ class TraefikHandshakeScopeTest(unittest.TestCase):
                 }, options))
                 self._assert_https_refused(result, report, plan, (("=/o", "o.example.test"),
                                                                   ("=/n", "n.example.test")))
+
+    def test_qualified_default_reference_never_inherits_the_default_options(self):
+        # The input's 'default' options carry an ordinary client CA. Routers naming none or exactly 'default' would use
+        # it, but 'default@file' does not name the global default, so every HTTPS route is refused instead and no
+        # client CA is configured; the plaintext router is unaffected.
+        ca = "/etc/test-only/client-ca.pem"  # synthetic path; never read by the tool
+        for options in ({"default": {"clientAuth": {"caFiles": [ca]}}}, None):
+            with self.subTest(default_defined=options is not None):
+                result, report, plan = asserted(self._doc({
+                    "implicit": self._router("a.example.test", "/a", {}),
+                    "qualified": self._router("b.example.test", "/b", {"options": "default@file"}),
+                    "plain": self._router("p.example.test", "/p"),
+                }, options))
+                self._assert_https_refused(result, report, plan, (("=/a", "a.example.test"),
+                                                                  ("=/b", "b.example.test")))
+                self.assertEqual(plan.settings.client_ca_paths, [])
+                self.assertEqual(live_routes(result.config), [("=/p", ["p.example.test"])])
+                self.assertEqual(result.frontend_protocols, "http")
+                self.assertNotIn("traefik-client-auth", codes(report))
 
     def test_scope_is_decided_on_routers_before_parsing_early_exits_and_shadowing(self):
         # Routers that never become routes still name the TLS options Traefik loaded for the frontend.
@@ -543,7 +573,7 @@ class TraefikHandshakeScopeTest(unittest.TestCase):
     def test_builtin_default_without_tls_options_stays_supported(self):
         result, report, plan = asserted(self._doc({
             "a": self._router("a.example.test", "/a", {}),
-            "b": self._router("b.example.test", "/b", {"options": "default@file"}),
+            "b": self._router("b.example.test", "/b", {"options": "default"}),
         }))
         self.assertEqual(sorted(live_routes(result.config)),
                          [("=/a", ["a.example.test"]), ("=/b", ["b.example.test"])])
@@ -702,6 +732,194 @@ class TraefikInputControlsTest(unittest.TestCase):
         self.assertIn("traefik-entrypoint-scope", codes(report, "error"))
         refused = next(spec for spec in plan.routes if spec.name == "c")
         self.assertTrue(any("leave out web" in reason for reason in refused.refusals))
+
+
+class TraefikCanonicalSchemaTest(unittest.TestCase):
+    """Traefik matches typed field names case-insensitively; this converter reads canonical spellings only.
+
+    A typed field spelled in another letter case, or given in several letter cases, rejects the whole input (exit 3,
+    nothing built), with or without the operator's statement. Resource names stay case-sensitive and are never folded.
+
+    Benign synthetic inputs only: one ordinary HTTPS router under the default TLS options (client CA, sniStrict off),
+    reached through a chain to a headers middleware and a load balancer with a serversTransport.
+    """
+
+    CA = "/etc/test-only/client-ca.pem"  # synthetic paths; never read by the tool
+    BACKEND_CA = "/etc/test-only/backend-ca.pem"
+
+    def _base(self):
+        return {
+            "http": {
+                "routers": {"router-zq": {"rule": "Host(`c.example.test`) && Path(`/c`)", "service": "svc-zq",
+                                          "middlewares": ["guard-zq"], "tls": {"options": "default"}}},
+                "middlewares": {"guard-zq": {"chain": {"middlewares": ["hosts-zq"]}},
+                                "hosts-zq": {"headers": {"allowedHosts": ["c.example.test"]}}},
+                "services": {"svc-zq": {"loadBalancer": {"servers": [{"url": "https://s.internal:443"}],
+                                                         "serversTransport": "transport-zq"}}},
+                "serversTransports": {"transport-zq": {"rootCAs": [self.BACKEND_CA]}},
+            },
+            "tls": {
+                "certificates": [{"certFile": "/etc/test-only/server.crt", "keyFile": "/etc/test-only/server.key"}],
+                "options": {"default": {"clientAuth": {"caFiles": [self.CA],
+                                                       "clientAuthType": "RequireAndVerifyClientCert"},
+                                        "sniStrict": False}},
+            },
+        }
+
+    @staticmethod
+    def _parent(doc, path):
+        node = doc
+        for key in path:  # mapping keys, or list indexes
+            node = node[key]
+        return node
+
+    # (label, path to the mapping holding the field, canonical key, other spelling, expected value-free path)
+    RESPELLED = (
+        ("top-level http section", (), "http", "HTTP", "http"),
+        ("top-level tls section", (), "tls", "Tls", "tls"),
+        ("http routers", ("http",), "routers", "Routers", "http.routers"),
+        ("http middlewares", ("http",), "middlewares", "Middlewares", "http.middlewares"),
+        ("http services", ("http",), "services", "Services", "http.services"),
+        ("http serversTransports", ("http",), "serversTransports", "serverstransports", "http.serversTransports"),
+        ("router rule", ("http", "routers", "router-zq"), "rule", "Rule", "http.routers.<name>.rule"),
+        ("router tls", ("http", "routers", "router-zq"), "tls", "TLS", "http.routers.<name>.tls"),
+        ("router middlewares", ("http", "routers", "router-zq"), "middlewares", "Middlewares",
+         "http.routers.<name>.middlewares"),
+        ("router tls options", ("http", "routers", "router-zq", "tls"), "options", "Options",
+         "http.routers.<name>.tls.options"),
+        ("tls options section", ("tls",), "options", "Options", "tls.options"),
+        ("tls certificate file", ("tls", "certificates", 0), "certFile", "CertFile", "tls.certificates[].certFile"),
+        ("default clientAuth", ("tls", "options", "default"), "clientAuth", "ClientAuth",
+         "tls.options.<name>.clientAuth"),
+        ("clientAuth caFiles", ("tls", "options", "default", "clientAuth"), "caFiles", "CAFiles",
+         "tls.options.<name>.clientAuth.caFiles"),
+        ("clientAuth type", ("tls", "options", "default", "clientAuth"), "clientAuthType", "clientauthtype",
+         "tls.options.<name>.clientAuth.clientAuthType"),
+        ("default sniStrict", ("tls", "options", "default"), "sniStrict", "SniStrict", "tls.options.<name>.sniStrict"),
+        ("service loadBalancer", ("http", "services", "svc-zq"), "loadBalancer", "LoadBalancer",
+         "http.services.<name>.loadBalancer"),
+        ("loadBalancer servers", ("http", "services", "svc-zq", "loadBalancer"), "servers", "Servers",
+         "http.services.<name>.loadBalancer.servers"),
+        ("loadBalancer serversTransport", ("http", "services", "svc-zq", "loadBalancer"), "serversTransport",
+         "ServersTransport", "http.services.<name>.loadBalancer.serversTransport"),
+        ("transport rootCAs", ("http", "serversTransports", "transport-zq"), "rootCAs", "RootCAs",
+         "http.serversTransports.<name>.rootCAs"),
+        ("middleware type chain", ("http", "middlewares", "guard-zq"), "chain", "Chain",
+         "http.middlewares.<name>.chain"),
+        ("chain middlewares", ("http", "middlewares", "guard-zq", "chain"), "middlewares", "Middlewares",
+         "http.middlewares.<name>.chain.middlewares"),
+        ("middleware type headers", ("http", "middlewares", "hosts-zq"), "headers", "Headers",
+         "http.middlewares.<name>.headers"),
+        ("headers allowedHosts", ("http", "middlewares", "hosts-zq", "headers"), "allowedHosts", "AllowedHosts",
+         "http.middlewares.<name>.headers.allowedHosts"),
+    )
+
+    def _assert_rejected(self, doc, expected_path):
+        text = yaml.safe_dump(doc)
+        for controls_asserted in (True, False):
+            with self.subTest(controls_asserted=controls_asserted):
+                with self.assertRaises(InputError) as caught:
+                    migrate("traefik", text, traefik_controls_asserted=controls_asserted)
+                message = str(caught.exception)
+                self.assertIn(expected_path, message)
+                # Value-free: canonical names and placeholders only, never input values or resource names.
+                for value in (self.CA, self.BACKEND_CA, "c.example.test", "-zq"):
+                    self.assertNotIn(value, message)
+
+    def test_canonical_input_converts_with_every_control(self):
+        doc = self._base()
+        self.assertEqual(typed_field_problems(doc), [])
+        result, report, plan = asserted(yaml.safe_dump(doc))
+        proxy = one_proxy(self, result.config, "=/c", "c.example.test")
+        self.assertEqual(proxy["labels"]["ferrum-migration/status"], "migrated")
+        self.assertEqual(proxy["backend_tls_server_ca_cert_path"], self.BACKEND_CA)
+        self.assertEqual(plan.settings.client_ca_paths, [self.CA])
+        self.assertTrue(result.tls_only)
+        self.assertNotIn("traefik-tls-options-scope", codes(report))
+
+    def test_existing_fixtures_use_canonical_spellings(self):
+        self.assertEqual(typed_field_problems(yaml.safe_load(read_fixture("traefik", "dynamic.yaml"))), [])
+
+    def test_other_letter_case_rejects_the_whole_input(self):
+        for label, path, canonical, other, expected in self.RESPELLED:
+            with self.subTest(label):
+                doc = self._base()
+                parent = self._parent(doc, path)
+                parent[other] = parent.pop(canonical)
+                self.assertIn(expected, typed_field_problems(doc))
+                self._assert_rejected(doc, expected)
+
+    def test_case_equivalent_duplicates_reject_the_whole_input(self):
+        cases = (
+            ("router tls given twice", ("http", "routers", "router-zq"), "TLS", {}, "http.routers.<name>.tls"),
+            ("sniStrict given twice", ("tls", "options", "default"), "SniStrict", True,
+             "tls.options.<name>.sniStrict"),
+            ("http section given twice", (), "Http", {}, "http"),
+            ("middleware type given twice", ("http", "middlewares", "hosts-zq"), "Headers", {},
+             "http.middlewares.<name>.headers"),
+        )
+        for label, path, other, value, expected in cases:
+            with self.subTest(label):
+                doc = self._base()
+                self._parent(doc, path)[other] = value
+                self._assert_rejected(doc, expected)
+
+    def test_resource_names_stay_case_sensitive(self):
+        # Router, service, middleware and serversTransport names that differ only in letter case are separate
+        # resources: none is folded, rejected or merged, and references resolve by exact name only.
+        doc = {"http": {
+            "routers": {
+                "Api": {"rule": "Host(`u.example.test`) && Path(`/u`)", "service": "Backend"},
+                "api": {"rule": "Host(`l.example.test`) && Path(`/l`)", "service": "backend",
+                        "middlewares": ["Tag-Request"]},
+                "mismatch": {"rule": "Host(`m.example.test`) && Path(`/m`)", "service": "backend",
+                             "middlewares": ["tag-request"]},
+            },
+            "middlewares": {"Tag-Request": {"headers": {"customRequestHeaders": {"X-Migration-Test": "lower"}}}},
+            "services": {
+                "Backend": {"loadBalancer": {"servers": [{"url": "https://upper.internal:443"}],
+                                             "serversTransport": "Pinned"}},
+                "backend": {"loadBalancer": {"servers": [{"url": "http://lower.internal:80"}]}},
+            },
+            "serversTransports": {"Pinned": {"rootCAs": [self.BACKEND_CA]}},
+        }}
+        self.assertEqual(typed_field_problems(doc), [])
+        result, _report, _plan = asserted(yaml.safe_dump(doc))
+        upper = one_proxy(self, result.config, "=/u", "u.example.test")
+        lower = one_proxy(self, result.config, "=/l", "l.example.test")
+        self.assertEqual([p["labels"]["ferrum-migration/status"] for p in (upper, lower)], ["migrated", "migrated"])
+        self.assertEqual((upper["backend_host"], upper["backend_tls_server_ca_cert_path"]),
+                         ("upper.internal", self.BACKEND_CA))
+        self.assertEqual(lower["backend_host"], "lower.internal")
+        rules = plugin(self, result.config, lower, "request_transformer")["config"]["rules"]
+        self.assertIn({"operation": "update", "target": "header", "key": "x-migration-test", "value": "lower"}, rules)
+        # 'tag-request' is not 'Tag-Request': the reference is undefined, so that router is refused.
+        mismatch = one_proxy(self, result.config, "=/m", "m.example.test")
+        self.assertEqual(mismatch["labels"]["ferrum-migration/status"], "refused")
+
+    def test_tls_option_and_store_names_stay_case_sensitive(self):
+        router = {"rule": "Host(`t.example.test`) && Path(`/t`)", "service": "s", "tls": {}}
+        service = {"s": {"loadBalancer": {"servers": [{"url": "http://s.internal:80"}]}}}
+        # 'Default' is a named TLS options set, not the global default: HTTPS is refused through the handshake scope,
+        # and its settings are not read as the default's.
+        doc = {"http": {"routers": {"r": router}, "services": service},
+               "tls": {"options": {"Default": {"sniStrict": True}}}}
+        self.assertEqual(typed_field_problems(doc), [])
+        result, report, _plan = asserted(yaml.safe_dump(doc))
+        self.assertEqual(one_proxy(self, result.config, "=/t", "t.example.test")["labels"]["ferrum-migration/status"],
+                         "refused")
+        self.assertIn("traefik-tls-options-scope", codes(report, "error"))
+        self.assertNotIn("traefik-sni-strict", codes(report))
+        # Only the store named exactly 'default' supplies the default certificate.
+        pair = {"certFile": "/etc/test-only/server.crt", "keyFile": "/etc/test-only/server.key"}
+        for store, expected in (("default", [("/etc/test-only/server.crt", "/etc/test-only/server.key")]),
+                                ("Default", [])):
+            with self.subTest(store=store):
+                doc = {"http": {"routers": {"r": router}, "services": service},
+                       "tls": {"stores": {store: {"defaultCertificate": pair}}}}
+                self.assertEqual(typed_field_problems(doc), [])
+                _result, _report, plan = asserted(yaml.safe_dump(doc))
+                self.assertEqual(plan.settings.frontend_cert_pairs, expected)
 
 
 if __name__ == "__main__":
