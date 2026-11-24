@@ -619,6 +619,89 @@ class KongHardeningTest(unittest.TestCase):
         self.assertEqual(active["interval_seconds"], 3600)
         self.assertEqual(one_proxy(self, result.config, "/go")["labels"]["ferrum-migration/status"], "refused")
 
+    def test_nested_consumer_group_plugins_top_level_acls_and_huge_int_timeout(self):
+        # Nested consumer_group_plugins + top-level consumer_group_consumers quarantines member;
+        # top-level acls attaches deny-list group to consumer.
+        text = textwrap.dedent("""
+            _format_version: "3.0"
+            consumer_groups:
+              - id: grp-1
+                name: gold
+                consumer_group_plugins:
+                  - name: rate-limiting
+                    config: {minute: 10}
+            consumers:
+              - id: c-alice
+                username: alice
+                keyauth_credentials: [{key: "alice-synthetic-key-16-chars"}]
+              - id: c-bob
+                username: bob
+                keyauth_credentials: [{key: "bob-synthetic-key-16-chars"}]
+            consumer_group_consumers:
+              - consumer: {id: c-alice}
+                consumer_group: {id: grp-1}
+            acls:
+              - consumer: {id: c-bob}
+                group: blocked
+            plugins:
+              - name: key-auth
+                config: {}
+              - name: acl
+                config: {deny: [blocked]}
+            services:
+              - name: s
+                url: http://s.internal:8080
+                routes: [{name: r, paths: [/api/]}]
+        """)
+        res, _rep, _ = migrate("kong", text, include_secrets=True)
+        by_user = {c["username"]: c for c in res.config["consumers"]}
+        self.assertNotIn("credentials", by_user["alice"])
+        self.assertEqual(by_user["bob"]["acl_groups"], ["blocked"])
+
+        # Unresolved consumer_group_consumers member fails closed on authenticated routes.
+        unres = textwrap.dedent("""
+            _format_version: "3.0"
+            consumers:
+              - username: alice
+                keyauth_credentials: [{key: "alice-synthetic-key-16-chars"}]
+            consumer_group_consumers:
+              - consumer: {id: missing-consumer-uuid}
+                consumer_group: gold
+            plugins:
+              - name: key-auth
+                config: {}
+            services:
+              - name: s
+                url: http://s.internal:8080
+                routes: [{name: r, paths: [/api/]}]
+        """)
+        unres_res, _unres_rep, _ = migrate("kong", unres, include_secrets=True)
+        self.assertEqual(one_proxy(self, unres_res.config, "/api")["labels"]["ferrum-migration/status"], "refused")
+        self.assertNotIn("credentials", unres_res.config["consumers"][0])
+
+        # Huge JSON integer timeout (10**309) does not abort; >2048-byte http_path omits active check cleanly.
+        huge_doc = {
+            "_format_version": "3.0",
+            "upstreams": [
+                {"name": "up1", "targets": [{"target": "10.0.0.1:8080", "weight": 100}],
+                 "healthchecks": {"active": {"timeout": 10 ** 309, "http_path": "/health",
+                                             "healthy": {"interval": 5, "successes": 1}}}},
+                {"name": "up2", "targets": [{"target": "10.0.0.2:8080", "weight": 100}],
+                 "healthchecks": {"active": {"timeout": 1, "http_path": "/" + "a" * 2048,
+                                             "healthy": {"interval": 5, "successes": 1}}}},
+            ],
+            "services": [
+                {"name": "s1", "url": "http://up1:8080", "routes": [{"name": "r1", "paths": ["/a/"]}]},
+                {"name": "s2", "url": "http://up2:8080", "routes": [{"name": "r2", "paths": ["/b/"]}]},
+            ],
+        }
+        import json
+        huge_res, _huge_rep, _ = migrate("kong", json.dumps(huge_doc), fmt="json")
+        assert_structurally_valid(self, huge_res.config)
+        by_up = {u["name"]: u for u in huge_res.config["upstreams"]}
+        self.assertEqual(by_up["up1"]["health_checks"]["active"]["timeout_ms"], 86_400_000)
+        self.assertNotIn("health_checks", by_up["up2"])
+
 
 if __name__ == "__main__":
     unittest.main()

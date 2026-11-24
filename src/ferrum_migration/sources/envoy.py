@@ -421,7 +421,7 @@ class _Envoy:
             spec.refuse("only fully static redirects (scheme, host and path) are migrated")
             return
         location = f"{scheme}://{host}{path}"
-        if not header_value_ok(location, nonempty=True):
+        if not header_value_ok(location, nonempty=True, strict_ws=True):
             spec.refuse("redirect location is not a valid header value")
             return
         spec.termination = {"status_code": code, "headers": {"location": location}, "body": ""}
@@ -655,11 +655,19 @@ class _Envoy:
             return TlsSpec(), "http", []
         kind = _kind(socket)
         if kind != "tls":
-            type_url = mapping(socket.get("typed_config")).get("@type")
-            if isinstance(type_url, str) and type_url.strip():
-                is_raw_buffer = "raw_buffer" in type_url.lower()
+            typed_cfg = mapping(socket.get("typed_config"))
+            if "@type" in typed_cfg:
+                type_url = typed_cfg.get("@type")
+                msg_type = type_url.rsplit("/", 1)[-1] if isinstance(type_url, str) and "/" in type_url else ""
+                is_raw_buffer = msg_type in (
+                    "envoy.extensions.transport_sockets.raw_buffer.v3.RawBuffer",
+                    "envoy.api.v2.core.RawBuffer",
+                )
             else:
-                is_raw_buffer = "raw_buffer" in str(socket.get("name", "")).lower()
+                is_raw_buffer = str(socket.get("name", "")) in (
+                    "envoy.transport_sockets.raw_buffer",
+                    "raw_buffer",
+                )
             if is_raw_buffer:
                 return TlsSpec(), "http", []
             return TlsSpec(), "http", [f"upstream transport_socket {safe_label(kind, 48)} is not supported"]
@@ -700,8 +708,12 @@ class _Envoy:
                         continue
                     san_type = str(typed_matcher.get("san_type", "")).upper()
                     matcher = typed_matcher.get("matcher")
-                    if san_type not in ("DNS", "URI", "IP_ADDRESS"):
-                        problems.append(f"SAN matcher type {safe_label(san_type, 24)} is not supported")
+                    if san_type not in ("DNS", "IP_ADDRESS"):
+                        if san_type == "URI":
+                            problems.append("Envoy exact URI SAN matchers are case-sensitive, whereas Ferrum compares "
+                                            "SPIFFE trust domains case-insensitively")
+                        else:
+                            problems.append(f"SAN matcher type {safe_label(san_type, 24)} is not supported")
                         continue
                     if not isinstance(matcher, dict) or not isinstance(matcher.get("exact"), str) \
                             or any(k != "exact" and not (k == "ignore_case" and matcher[k] is False) for k in matcher):
@@ -724,8 +736,12 @@ class _Envoy:
                             problems.append("non-exact or option-bearing SAN matchers are not supported")
                             continue
                         san = matcher["exact"]
-                        if util.valid_backend_tls_san(san):
+                        san_kind = util.backend_tls_san_kind(san)
+                        if san_kind in ("DNS", "IP_ADDRESS"):
                             sans.append(san)
+                        elif san_kind == "URI":
+                            problems.append("Envoy exact URI SAN matchers are case-sensitive, whereas Ferrum compares "
+                                            "SPIFFE trust domains case-insensitively")
                         else:
                             problems.append("upstream TLS SAN entry is not representable in Ferrum")
             tls.san_allow_list = sans
@@ -747,13 +763,18 @@ class _Envoy:
         for check in seq(raw.get("health_checks")):
             check = mapping(check)
             http = mapping(check.get("http_health_check"))
-            if not isinstance(http.get("path"), str):
+            path = http.get("path")
+            if not isinstance(path, str):
                 continue
-            entry = {"http_path": http["path"],
-                     "interval_seconds": max(1, (util.proto_duration_ms(check.get("interval")) or 10_000) // 1000),
-                     "timeout_ms": util.proto_duration_ms(check.get("timeout")) or 5_000,
-                     "healthy_threshold": max(1, util.as_int(check.get("healthy_threshold")) or 1),
-                     "unhealthy_threshold": max(1, util.as_int(check.get("unhealthy_threshold")) or 1)}
+            if not path.startswith("/") or len(path.encode("utf-8")) > util.MAX_BACKEND_PATH_LENGTH \
+                    or any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in path):
+                self.report.warning("envoy-health", ref, "Active health check path is not representable; omitted.")
+                continue
+            entry = {"http_path": path,
+                     "interval_seconds": max(1, min((util.proto_duration_ms(check.get("interval")) or 10_000) // 1000, 3600)),
+                     "timeout_ms": max(1, min(util.proto_duration_ms(check.get("timeout")) or 5_000, util.MAX_TIMEOUT_MS)),
+                     "healthy_threshold": max(1, min(util.as_int(check.get("healthy_threshold")) or 1, 1000)),
+                     "unhealthy_threshold": max(1, min(util.as_int(check.get("unhealthy_threshold")) or 1, 1000))}
             self.report.warning("envoy-health", ref, "Active health checks mapped approximately.")
             return {"active": entry}
         return None

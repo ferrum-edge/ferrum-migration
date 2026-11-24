@@ -1308,7 +1308,7 @@ class _Traefik:
             return result
         health = self._health(mapping(lb.get("healthCheck")), ref)
         sticky = mapping(mapping(lb.get("sticky")).get("cookie"))
-        if len(targets) == 1 and not health and not sticky:
+        if len(targets) == 1 and not health and not sticky and not (scheme == "https" and (tls.sni or tls.san_allow_list)):
             result["backend"] = BackendRef(scheme=scheme, host=targets[0].host, port=targets[0].port, tls=tls)
             return result
         key = f"{name}|{scheme}|{tls.key()}"

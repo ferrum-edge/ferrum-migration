@@ -38,7 +38,7 @@ COSMETIC_PLUGINS = {
 }
 KNOWN_TOP_LEVEL = {"_format_version", "_transform", "_info", "_workspace", "_konnect", "services", "routes",
                    "upstreams", "consumers", "plugins", "certificates", "ca_certificates", "snis", "vaults",
-                   "consumer_groups", "consumer_group_consumers", "consumer_group_plugins"}
+                   "acls", "consumer_groups", "consumer_group_consumers", "consumer_group_plugins"}
 _REGEX_HINT = re.compile(r"[\\^$*+?()\[\]{}|]")
 _KEY_NAME = re.compile(r"^[A-Za-z0-9!#$%&'*+.^_`|~-]+$")
 # Ferrum authentication plugins this translator can emit (from key-auth, basic-auth and jwt).
@@ -90,6 +90,8 @@ class _Kong:
         self.consumer_group_members: dict[str, set[str]] = {}
         self.consumer_group_aliases: dict[str, set[str]] = {}
         self.unresolved_consumer_groups: list[str] = []
+        self.top_acls_by_consumer: dict[int, list[str]] = {}
+        self.unresolved_acls: list[str] = []
         self.jwt_algorithm = "HS256"
         self.format_version = "3.0"
         self.pretransformed = False
@@ -260,16 +262,45 @@ class _Kong:
 
     def _index_consumers(self) -> list[dict]:
         consumers = []
+        consumer_ref_to_indices: dict[str, list[int]] = {}
         for index, consumer in enumerate(seq(self.root.get("consumers"))):
             if not isinstance(consumer, dict):
                 raise InputError("every Kong consumer must be a mapping")
             consumers.append(consumer)
+            for ident in (consumer.get("username"), consumer.get("custom_id"), consumer.get("id")):
+                if isinstance(ident, str):
+                    consumer_ref_to_indices.setdefault(ident, []).append(index)
             for plugin in seq(consumer.get("plugins")):
                 if isinstance(plugin, dict):
-                    key = consumer.get("username") or consumer.get("custom_id") or str(index)
+                    key = consumer.get("username") or consumer.get("custom_id") or consumer.get("id") or str(index)
                     self.consumer_quarantine.setdefault(str(key), []).append(
                         f"plugin {safe_label(plugin.get('name'), 40)} is scoped to this consumer and has no Ferrum "
                         "equivalent")
+        # Top-level DB-less ACL records associate consumers with ACL groups; index them before emitting credentials
+        # so deny-list rules cannot be bypassed.
+        raw_acls = self.root.get("acls")
+        if raw_acls is not None and not isinstance(raw_acls, list):
+            self.unresolved_acls.append("top-level acls is not a list")
+            self.report.error("kong-acl-unresolved", "kong acls",
+                              "Top-level acls is not a list; ACL membership cannot be resolved safely (fail closed).")
+        for entry in seq(raw_acls):
+            if not isinstance(entry, dict):
+                self.unresolved_acls.append("top-level acls contains a malformed entry")
+                self.report.error("kong-acl-unresolved", "kong acls",
+                                  "Top-level acls contains a malformed entry; affected consumers and ACL-protected "
+                                  "routes are failed closed.")
+                continue
+            ckey = _ref_key(entry.get("consumer"))
+            group = entry.get("group")
+            indices = consumer_ref_to_indices.get(ckey, []) if ckey else []
+            if not ckey or not isinstance(group, str) or not indices:
+                self.unresolved_acls.append("top-level acls entry cannot be resolved to a consumer and group")
+                self.report.error("kong-acl-unresolved", "kong acls",
+                                  "A top-level ACL record could not be resolved to a declared consumer and group; "
+                                  "consumers are quarantined and ACL-protected routes are refused (fail closed).")
+                continue
+            for idx in indices:
+                self.top_acls_by_consumer.setdefault(idx, []).append(group)
         groups_with_plugins: set[str] = set()
         for group in seq(self.root.get("consumer_groups")):
             if not isinstance(group, dict):
@@ -279,17 +310,18 @@ class _Kong:
             group_ids = [ident for ident in (group.get("name"), group.get("id")) if isinstance(ident, str)]
             for gid in group_ids:
                 self.consumer_group_aliases.setdefault(gid, set()).update(group_ids)
-            if group.get("plugins"):
+            has_nested_plugins = bool(group.get("plugins") or group.get("consumer_group_plugins"))
+            if has_nested_plugins:
                 groups_with_plugins.update(group_ids)
                 if not group_ids:
                     self.unresolved_consumer_groups.append(
                         f"consumer group {name} carries plugin overrides without a resolvable group name/id")
             for member in seq(group.get("consumers")):
                 key = _ref_key(member)
-                if key:
+                if key and key in consumer_ref_to_indices:
                     for gid in group_ids:
                         self.consumer_group_members.setdefault(gid, set()).add(key)
-                    if group.get("plugins"):
+                    if has_nested_plugins:
                         self.consumer_quarantine.setdefault(key, []).append(
                             f"consumer group {name} carries plugin overrides")
                 elif member is not None:
@@ -321,7 +353,7 @@ class _Kong:
                 continue
             gid = _ref_key(entry.get("consumer_group"))
             ckey = _ref_key(entry.get("consumer"))
-            if not gid or not ckey:
+            if not gid or not ckey or ckey not in consumer_ref_to_indices:
                 self.unresolved_consumer_groups.append("consumer_group_consumers has an unresolvable membership entry")
                 continue
             aliases = self.consumer_group_aliases.get(gid, {gid})
@@ -390,11 +422,16 @@ class _Kong:
                 group = acl.get("group") if isinstance(acl, dict) else None
                 if isinstance(group, str):
                     spec.acl_groups.append(group)
+            for group in self.top_acls_by_consumer.get(index, []):
+                if group not in spec.acl_groups:
+                    spec.acl_groups.append(group)
             for marker in (username, custom_id, consumer.get("id")):
                 if isinstance(marker, str) and marker in self.consumer_quarantine:
                     spec.quarantined.extend(self.consumer_quarantine[marker])
             if self.unresolved_consumer_groups:
                 spec.quarantined.extend(self.unresolved_consumer_groups)
+            if self.unresolved_acls:
+                spec.quarantined.extend(self.unresolved_acls)
             for cred in seq(consumer.get("keyauth_credentials")):
                 value = cred.get("key") if isinstance(cred, dict) else None
                 if self.pretransformed:
@@ -702,32 +739,47 @@ class _Kong:
         if interval > 0:
             probe = {"http": "http", "https": "http", "tcp": "tcp", "grpc": "grpc", "grpcs": "grpc"}.get(
                 str(active.get("type") or "http"), "http")
-            raw_timeout = active.get("timeout", 1)
-            timeout_s = 1.0
-            if not isinstance(raw_timeout, bool) and isinstance(raw_timeout, (int, float, str)):
-                try:
-                    parsed_t = float(raw_timeout)
-                    if math.isfinite(parsed_t) and parsed_t > 0:
-                        timeout_s = min(parsed_t, util.MAX_TIMEOUT_MS / 1000.0)
-                except ValueError:
-                    pass
-            entry: dict[str, Any] = {
-                "http_path": active.get("http_path") if isinstance(active.get("http_path"), str) else "/",
-                "interval_seconds": max(1, min(interval, 3600)),
-                "timeout_ms": max(1, min(int(round(timeout_s * 1000)), util.MAX_TIMEOUT_MS)),
-                "healthy_threshold": max(1, min(util.as_int(healthy.get("successes")) or 1, 1000)),
-                "unhealthy_threshold": max(1, min(util.as_int(unhealthy.get("http_failures"))
-                                                  or util.as_int(unhealthy.get("tcp_failures")) or 1, 1000)),
-                "probe_type": probe,
-            }
-            if str(active.get("type")) in ("https", "grpcs"):
-                entry["use_tls"] = True
-            statuses = healthy.get("http_statuses")
-            if isinstance(statuses, list) and 0 < len(statuses) <= 500 \
-                    and all(isinstance(code, int) and not isinstance(code, bool) and 100 <= code <= 599
-                            for code in statuses):
-                entry["healthy_status_codes"] = statuses
-            result["active"] = entry
+            raw_http_path = active.get("http_path")
+            http_path = "/" if raw_http_path is None else raw_http_path
+            if not isinstance(http_path, str) or not http_path.startswith("/") \
+                    or len(http_path.encode("utf-8")) > util.MAX_BACKEND_PATH_LENGTH \
+                    or any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in http_path):
+                self.report.warning("kong-health-checks", ref,
+                                    "Active health check http_path is not representable in Ferrum (must start with "
+                                    f"'/' and be at most {util.MAX_BACKEND_PATH_LENGTH} bytes); active health check "
+                                    "omitted.")
+            else:
+                raw_timeout = active.get("timeout", 1)
+                max_timeout_s = util.MAX_TIMEOUT_MS / 1000.0
+                timeout_s = 1.0
+                if not isinstance(raw_timeout, bool):
+                    if isinstance(raw_timeout, int):
+                        if raw_timeout > 0:
+                            timeout_s = float(min(raw_timeout, int(max_timeout_s)))
+                    elif isinstance(raw_timeout, (float, str)):
+                        try:
+                            parsed_t = float(raw_timeout)
+                            if math.isfinite(parsed_t) and parsed_t > 0:
+                                timeout_s = min(parsed_t, max_timeout_s)
+                        except (ValueError, OverflowError):
+                            pass
+                entry: dict[str, Any] = {
+                    "http_path": http_path,
+                    "interval_seconds": max(1, min(interval, 3600)),
+                    "timeout_ms": max(1, min(int(round(timeout_s * 1000)), util.MAX_TIMEOUT_MS)),
+                    "healthy_threshold": max(1, min(util.as_int(healthy.get("successes")) or 1, 1000)),
+                    "unhealthy_threshold": max(1, min(util.as_int(unhealthy.get("http_failures"))
+                                                      or util.as_int(unhealthy.get("tcp_failures")) or 1, 1000)),
+                    "probe_type": probe,
+                }
+                if str(active.get("type")) in ("https", "grpcs"):
+                    entry["use_tls"] = True
+                statuses = healthy.get("http_statuses")
+                if isinstance(statuses, list) and 0 < len(statuses) <= 500 \
+                        and all(isinstance(code, int) and not isinstance(code, bool) and 100 <= code <= 599
+                                for code in statuses):
+                    entry["healthy_status_codes"] = statuses
+                result["active"] = entry
         passive = mapping(mapping(checks.get("passive")).get("unhealthy"))
         failures = max(util.as_int(passive.get("http_failures")) or 0, util.as_int(passive.get("tcp_failures")) or 0,
                        util.as_int(passive.get("timeouts")) or 0)
@@ -781,9 +833,11 @@ class _Kong:
             hosts, methods, paths = hosts or [], methods or [], paths or []
         plugins, termination, plugin_refusals = self._effective_plugins(index, service_key)
         auth_composition = None if termination is not None else self._auth_composition(plugins, ref)
-        effective_auth = (({p.name for p in plugins} | {p.name for p in self.plan.global_plugins}) & AUTH_PLUGINS)
-        if termination is None and effective_auth and self.unresolved_consumer_groups:
+        effective_names = {p.name for p in plugins} | {p.name for p in self.plan.global_plugins}
+        if termination is None and (effective_names & AUTH_PLUGINS) and self.unresolved_consumer_groups:
             plugin_refusals.append("consumer-group membership or policy could not be resolved safely")
+        if termination is None and "access_control" in effective_names and self.unresolved_acls:
+            plugin_refusals.append("top-level ACL membership could not be resolved safely")
         backend_info: dict[str, Any] = {"problems": []}
         if termination is None:
             if service_key is None:
@@ -1192,9 +1246,9 @@ def _kong_request_termination(self: _Kong, config: dict, ref: str) -> tuple:
     termination: dict[str, Any] = {"status_code": status}
     if isinstance(config.get("body"), str):
         ct = str(config.get("content_type") or "application/json")
-        if not ct.strip() or not header_value_ok(ct, nonempty=True):
+        if not ct.strip(" \t") or not header_value_ok(ct, nonempty=True):
             return ("refuse", "content_type is not a valid header value")
-        termination["content_type"] = ct
+        termination["content_type"] = ct.strip(" \t")
         termination["body"] = config["body"]
     elif status in (204, 205, 304):
         termination["body"] = ""
@@ -1207,7 +1261,7 @@ def _kong_request_termination(self: _Kong, config: dict, ref: str) -> tuple:
 def _kong_redirect(self: _Kong, config: dict, ref: str) -> tuple:
     location = config.get("location")
     if config.get("keep_incoming_path") or not isinstance(location, str) or "$" in location \
-            or not header_value_ok(location, nonempty=True):
+            or not header_value_ok(location, nonempty=True, strict_ws=True):
         return ("refuse", "only static redirects with valid Location header values are translated")
     raw_status = config.get("status_code")
     status = 301 if raw_status is None else util.as_int(raw_status)

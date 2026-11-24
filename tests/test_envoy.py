@@ -471,13 +471,31 @@ class EnvoyHardeningTest(unittest.TestCase):
             r2, _rep2, _ = migrate("envoy", yaml.safe_dump(doc2))
             self.assertEqual(one_proxy(self, r2.config, "/api")["labels"]["ferrum-migration/status"], "refused")
 
-        # Transport socket named raw_buffer with non-raw_buffer @type is refused.
-        doc3 = minimal_bootstrap({"path_separated_prefix": "/api"})
-        doc3["static_resources"]["clusters"][0]["transport_socket"] = {
-            "name": "envoy.transport_sockets.raw_buffer",
-            "typed_config": {"@type": "type.googleapis.com/envoy.extensions.transport_sockets.alts.v3.Alts"}}
-        r3, _rep3, _ = migrate("envoy", yaml.safe_dump(doc3))
-        self.assertEqual(one_proxy(self, r3.config, "/api")["labels"]["ferrum-migration/status"], "refused")
+        # Transport socket named raw_buffer or with /raw_buffer/ URL prefix wrapping another message type is refused.
+        for sock in (
+            {"name": "envoy.transport_sockets.raw_buffer",
+             "typed_config": {"@type": "type.googleapis.com/envoy.extensions.transport_sockets.alts.v3.Alts"}},
+            {"name": "envoy.transport_sockets.http_11_proxy",
+             "typed_config": {"@type": "example.invalid/raw_buffer/envoy.extensions.transport_sockets.http_11_proxy.v3.Http11ProxyUpstreamTransport"}},
+        ):
+            doc3 = minimal_bootstrap({"path_separated_prefix": "/api"})
+            doc3["static_resources"]["clusters"][0]["transport_socket"] = sock
+            r3, _rep3, _ = migrate("envoy", yaml.safe_dump(doc3))
+            self.assertEqual(one_proxy(self, r3.config, "/api")["labels"]["ferrum-migration/status"], "refused")
+
+        # Exact URI SAN matcher refused (case-sensitive in Envoy vs case-insensitive SPIFFE trust domain in Ferrum).
+        doc_uri = minimal_bootstrap({"path_separated_prefix": "/api"})
+        doc_uri["static_resources"]["clusters"][0]["transport_socket"] = {
+            "name": "envoy.transport_sockets.tls",
+            "typed_config": {
+                "@type": "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext",
+                "common_tls_context": {"validation_context": {
+                    "trusted_ca": {"filename": "/etc/ca.pem"},
+                    "match_typed_subject_alt_names": [
+                        {"san_type": "URI", "matcher": {"exact": "spiffe://trust.example/workload"}}
+                    ]}}}}
+        r_uri, _rep_uri, _ = migrate("envoy", yaml.safe_dump(doc_uri))
+        self.assertEqual(one_proxy(self, r_uri.config, "/api")["labels"]["ferrum-migration/status"], "refused")
 
         # Malformed require_client_certificate: "true" refuses TLS routes (never treated as absent).
         doc4 = minimal_bootstrap({"path_separated_prefix": "/api"})

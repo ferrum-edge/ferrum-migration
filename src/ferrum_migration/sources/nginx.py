@@ -202,7 +202,8 @@ class _Scope:
     timeouts: dict[str, int] = field(default_factory=dict)
     auth_basic: str | None = None
     auth_basic_file: str | None = None
-    ssl: dict[str, str] = field(default_factory=dict)
+    proxy_ssl: dict[str, str] = field(default_factory=dict)
+    grpc_ssl: dict[str, str] = field(default_factory=dict)
     problems: list[str] = field(default_factory=list)
 
 
@@ -221,7 +222,8 @@ class _Nginx:
 
     def apply(self, parent: _Scope, directives: list[Directive], ref: str) -> _Scope:
         child = _Scope(arrays=dict(parent.arrays), body_size=parent.body_size, timeouts=dict(parent.timeouts),
-                       auth_basic=parent.auth_basic, auth_basic_file=parent.auth_basic_file, ssl=dict(parent.ssl),
+                       auth_basic=parent.auth_basic, auth_basic_file=parent.auth_basic_file,
+                       proxy_ssl=dict(parent.proxy_ssl), grpc_ssl=dict(parent.grpc_ssl),
                        problems=list(parent.problems))
         level: dict[str, list[list[str]]] = {}
         for directive in directives:
@@ -257,8 +259,10 @@ class _Nginx:
                 child.auth_basic = args[0]
             elif name == "auth_basic_user_file" and args:
                 child.auth_basic_file = args[0]
-            elif name.startswith(("proxy_ssl_", "grpc_ssl_")) and name in STRUCTURAL and args:
-                child.ssl[name.split("_", 2)[2]] = args[0]
+            elif name.startswith("proxy_ssl_") and name in STRUCTURAL and args:
+                child.proxy_ssl[name.split("_", 2)[2]] = args[0]
+            elif name.startswith("grpc_ssl_") and name in STRUCTURAL and args:
+                child.grpc_ssl[name.split("_", 2)[2]] = args[0]
             elif name == "satisfy" and args and args[0] == "any":
                 child.problems.append("satisfy any (OR of access and auth) has no Ferrum equivalent")
             elif name in STRUCTURAL or name in SAFE_IGNORED or name in DEFINITIONS:
@@ -310,6 +314,7 @@ class _Nginx:
                                 "suggested in ferrum.conf; ip_restriction and rate limits use the socket peer until "
                                 "FERRUM_TRUSTED_PROXIES is set.")
         infos = [self._server_info(server, index) for index, server in enumerate(servers)]
+        self._merge_shared_tls_sockets(infos)
         self.infos = infos
         self._elect_ports(infos)
         for info in infos:
@@ -358,6 +363,26 @@ class _Nginx:
         label = names[0] if names and names[0] not in ("_", "") else "default"
         return {"directive": server, "listens": listens, "names": names, "index": index,
                 "ref": f"nginx server '{safe_label(label, 64)}' (line {server.line})", "label": label}
+
+    def _merge_shared_tls_sockets(self, infos: list[dict]) -> None:
+        """NGINX marks a shared (addr, port) listening socket as TLS if any server on that socket sets ``ssl``."""
+        tls_sockets = {
+            (listen["addr"], listen["port"])
+            for info in infos for listen in info["listens"]
+            if not listen.get("invalid") and listen["ssl"]
+        }
+        if not tls_sockets:
+            return
+        tls_wildcard_ports = {port for addr, port in tls_sockets if addr is None}
+        tls_any_ports = {port for _addr, port in tls_sockets}
+        for info in infos:
+            for listen in info["listens"]:
+                if listen.get("invalid") or listen["ssl"]:
+                    continue
+                if (listen["addr"], listen["port"]) in tls_sockets \
+                        or listen["port"] in tls_wildcard_ports \
+                        or (listen["addr"] is None and listen["port"] in tls_any_ports):
+                    listen["ssl"] = True
 
     def _elect_ports(self, infos: list[dict]) -> None:
         plain: dict[int, int] = {}
@@ -761,7 +786,7 @@ class _Nginx:
             route.refuse("return with variables cannot be reproduced statically")
             return
         if code in (301, 302, 303, 307, 308):
-            if not value or not header_value_ok(value, nonempty=True):
+            if not value or not header_value_ok(value, nonempty=True, strict_ws=True):
                 route.refuse("redirect target is missing or not a valid header value")
                 return
             route.termination = {"status_code": code, "headers": {"location": value}, "body": ""}
@@ -829,7 +854,7 @@ class _Nginx:
         self._auth_and_limits(route, scope, ref)
 
     def _tls(self, scope: _Scope, grpc: bool) -> tuple[TlsSpec, list[str]]:
-        ssl = scope.ssl
+        ssl = scope.grpc_ssl if grpc else scope.proxy_ssl
         tls = TlsSpec(verify=ssl.get("verify") == "on")
         problems: list[str] = []
         ca = ssl.get("trusted_certificate")

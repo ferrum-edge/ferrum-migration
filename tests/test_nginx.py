@@ -638,6 +638,45 @@ class NginxFrontendScopeTest(unittest.TestCase):
         self.assertEqual(self.status(dyn_res, "/api"), "refused")
         self.assertIn("route-refused", codes(dyn_rep, "error"))
 
+    def test_shared_tls_socket_handshake_rejection_and_separate_grpc_proxy_ssl(self):
+        # listen 443 default_server without explicit `ssl` shares the TLS socket with `listen 443 ssl;`.
+        shared_conf = """
+        server {
+            listen 443 default_server;
+            ssl_reject_handshake on;
+        }
+        server {
+            listen 443 ssl; server_name app.example.test;
+            ssl_certificate /etc/synthetic/server.crt; ssl_certificate_key /etc/synthetic/server.key;
+            location /api/ { proxy_pass http://app.internal:8080; }
+        }
+        """
+        res, rep, _ = nginx(shared_conf)
+        assert_structurally_valid(self, res.config)
+        self.assertEqual(live_routes(res.config), [])
+        self.assertIn("nginx-ssl-reject-handshake", codes(rep, "error"))
+
+        # proxy_ssl_name and grpc_ssl_name must not overwrite each other.
+        sep_conf = """
+        server {
+            listen 80; server_name app.example.test;
+            proxy_ssl_name secure.internal.test;
+            grpc_ssl_name grpc.internal.test;
+            location /http/ {
+                proxy_ssl_verify on;
+                proxy_pass https://10.0.0.5:8443;
+            }
+            location /grpc/ {
+                grpc_ssl_verify on;
+                grpc_pass grpcs://10.0.0.6:8443;
+            }
+        }
+        """
+        sep_res, _sep_rep, _ = nginx(sep_conf)
+        assert_structurally_valid(self, sep_res.config)
+        snis = {u["targets"][0]["host"]: u["backend_tls_sni"] for u in sep_res.config["upstreams"]}
+        self.assertEqual(snis, {"10.0.0.5": "secure.internal.test", "10.0.0.6": "grpc.internal.test"})
+
 
 if __name__ == "__main__":
     unittest.main()

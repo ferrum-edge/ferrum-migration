@@ -242,16 +242,17 @@ def backend_tls_san_kind(san: object) -> str | None:
         return None
     if any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7F for ch in san):
         return None
-    try:
-        ipaddress.ip_address(san)
-        return "IP_ADDRESS"
-    except ValueError:
-        pass
+    if "%" not in san:
+        try:
+            ipaddress.ip_address(san)
+            return "IP_ADDRESS"
+        except ValueError:
+            pass
     if san.lower().startswith("spiffe://"):
         rest = san[9:]
         slash = rest.find("/")
         return "URI" if (slash > 0 and slash + 1 < len(rest)) else None
-    if "://" in san or "*" in san or san.endswith("."):
+    if not san.isascii() or "://" in san or "*" in san or san.endswith("."):
         return None
     lower = san.lower()
     if normalize_host(san) != lower:

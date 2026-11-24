@@ -458,9 +458,9 @@ class MatchingTest(unittest.TestCase):
         for proxy in result.config["proxies"]:
             self.assertLessEqual(len(proxy.get("hosts", [])), util.MAX_HOSTS_PER_PROXY)
 
-    def test_string_prefix_divergence_guards_broader_catch_all_route(self):
-        # Sol P1 #2: a live string-prefix route (a.example.test /api with auth) next to a broader public catch-all /
-        # must guard /api on the catch-all so /apix cannot bypass auth.
+    def test_string_prefix_divergence_scoped_guard_and_global_termination(self):
+        # Opus P1 #2 + Sol P1 #2: a live string-prefix route (a.example.test /api with auth) next to a broader
+        # catch-all / gets a host-scoped regex 404 guard on a.example.test without breaking other hosts on /.
         from ferrum_migration.model import PluginSpec
         auth_api = RouteSpec(ref="api", name="api", hosts=["a.example.test"], kind="prefix", path="/api",
                              protocols=frozenset({"http"}), backend=BackendRef("http", "api.internal", 80),
@@ -471,33 +471,85 @@ class MatchingTest(unittest.TestCase):
         report = Report("test", "synthetic")
         result = emit(Plan(platform="test", routes=[auth_api, pub_root]), EmitOptions(), report)
         self.assertGreaterEqual(result.stats["prefix_guards"], 1)
-        self.assertIn("prefix-divergence", {c.code for c in report.caveats})
+        root_proxy = [p for p in result.config["proxies"] if p.get("listen_path") == "/"][0]
+        self.assertEqual(root_proxy["plugins"], [])
+        guard_proxies = [p for p in result.config["proxies"]
+                         if p["labels"].get("ferrum-migration/status") == "prefix-guard"]
+        self.assertEqual(len(guard_proxies), 1)
+        self.assertEqual(guard_proxies[0]["hosts"], ["a.example.test"])
+        self.assertEqual(guard_proxies[0]["listen_path"], "~/api.*")
+
+        # Sol P1 #2: when an unconditional global request_termination governs the plan, do NOT attach scoped
+        # divergence guards (a scoped request_termination would shadow the global termination in Ferrum).
+        g_api = RouteSpec(ref="api", name="api", hosts=[], kind="prefix", path="/api",
+                          protocols=frozenset({"http"}), backend=BackendRef("http", "api.internal", 80),
+                          plugins=[PluginSpec("key_auth", {"key_location": ["header:apikey"]}, "api")])
+        g_root = RouteSpec(ref="root", name="root", hosts=[], kind="prefix", path="/",
+                           protocols=frozenset({"http"}), backend=BackendRef("http", "pub.internal", 80))
+        g_term = PluginSpec("request_termination", {"status_code": 403, "message": "Closed"}, "global-403")
+        g_res = emit(Plan(platform="test", routes=[g_api, g_root], global_plugins=[g_term]),
+                     EmitOptions(), Report("test", "synthetic"))
+        g_root_proxy = [p for p in g_res.config["proxies"] if p.get("listen_path") == "/"][0]
+        self.assertEqual(g_root_proxy["plugins"], [])
+
+    def test_oversized_conflict_collapse_also_refuses_outranking_higher_tier_live_route(self):
+        # Sol P1 #1 + Opus P1 #1: when two conflicting routes at =/api form a >100-host ambiguous wildcard
+        # component and collapse to a catch-all 503 placeholder, an overlapping wildcard live route at / must
+        # also be failed closed so it cannot outrank the catch-all placeholder.
+        r_a = RouteSpec(ref="ra", name="ra",
+                        hosts=["*.example.test"] + [f"*.s{i}.example.test" for i in range(60)],
+                        kind="exact", path="/api", protocols=frozenset({"http"}),
+                        backend=BackendRef("http", "a.internal", 80))
+        r_b = RouteSpec(ref="rb", name="rb",
+                        hosts=[f"*.s{i}.example.test" for i in range(60, 120)],
+                        kind="exact", path="/api", protocols=frozenset({"http"}),
+                        backend=BackendRef("http", "b.internal", 80))
+        live = RouteSpec(ref="live", name="live", hosts=["*.s0.example.test"], kind="prefix", path="/",
+                         protocols=frozenset({"http"}), backend=BackendRef("http", "pub.internal", 80))
+        report = Report("test", "synthetic")
+        result = emit(Plan(platform="test", routes=[r_a, r_b, live]), EmitOptions(), report)
+        self.assertTrue(live.refusals)
+        self.assertIn("conflict-collapse", {c.code for c in report.caveats})
+        for proxy in result.config["proxies"]:
+            self.assertLessEqual(len(proxy.get("hosts", [])), util.MAX_HOSTS_PER_PROXY)
 
     def test_termination_validation_global_and_edge_cases(self):
         from ferrum_migration.model import PluginSpec
-        # 205 with non-empty body, reserved header, trailing whitespace, whitespace-only content_type all refused.
+        # 205 with non-empty body, reserved header, trailing whitespace, whitespace-only content_type,
+        # newline in header name, and >1 MiB body all refused.
         for label, term in (
             ("205-body", {"status_code": 205, "body": "nonempty"}),
             ("reserved-hdr", {"status_code": 200, "headers": {"Set-Cookie": "a=b"}, "body": ""}),
             ("ferrum-hdr", {"status_code": 200, "headers": {"X-Ferrum-Debug": "1"}, "body": ""}),
             ("dup-hdr", {"status_code": 200, "headers": {"X-A": "1", "x-a": "2"}, "body": ""}),
+            ("newline-hdr", {"status_code": 200, "headers": {"X-Demo\n": "1"}, "body": ""}),
             ("trailing-ws", {"status_code": 302, "headers": {"location": "https://a.test/ "}, "body": ""}),
             ("blank-ct", {"status_code": 200, "content_type": "   ", "body": "ok"}),
+            ("oversized-1mib", {"status_code": 200, "content_type": "text/plain", "body": "a" * (1024 * 1024)}),
         ):
             with self.subTest(case=label):
                 r = RouteSpec(ref=label, name=label, hosts=["a.example.test"], kind="prefix", path="/r",
                               protocols=frozenset({"http"}), termination=term)
                 emit(Plan(platform="test", routes=[r]), EmitOptions(), Report("test", "synthetic"))
                 self.assertTrue(r.refusals)
-        # Invalid global request_termination fails closed on all routes.
-        route = RouteSpec(ref="ok", name="ok", hosts=["a.example.test"], kind="prefix", path="/ok",
-                          protocols=frozenset({"http"}), backend=BackendRef("http", "a.internal", 80))
-        bad_global = PluginSpec("request_termination", {"status_code": 205, "body": "nope"}, "global-term")
-        report = Report("test", "synthetic")
-        result = emit(Plan(platform="test", routes=[route], global_plugins=[bad_global]), EmitOptions(), report)
-        self.assertTrue(route.refusals)
-        self.assertIn("global-plugin-invalid", {c.code for c in report.caveats})
-        self.assertFalse([p for p in result.config["plugin_configs"] if p["scope"] == "global"])
+        # Surrounding spaces on content_type are accepted (Ferrum trims OWS).
+        ws_ct = RouteSpec(ref="ws-ct", name="ws-ct", hosts=["a.example.test"], kind="prefix", path="/ok",
+                          protocols=frozenset({"http"}),
+                          termination={"status_code": 200, "content_type": " text/plain ", "body": "ok"})
+        emit(Plan(platform="test", routes=[ws_ct]), EmitOptions(), Report("test", "synthetic"))
+        self.assertFalse(ws_ct.refusals)
+        # Invalid global request_termination (including >1 MiB body) fails closed on all routes.
+        for bad_global in (
+            PluginSpec("request_termination", {"status_code": 205, "body": "nope"}, "global-term"),
+            PluginSpec("request_termination", {"status_code": 200, "body": "a" * (1024 * 1024)}, "global-big"),
+        ):
+            route = RouteSpec(ref="ok", name="ok", hosts=["a.example.test"], kind="prefix", path="/ok",
+                              protocols=frozenset({"http"}), backend=BackendRef("http", "a.internal", 80))
+            report = Report("test", "synthetic")
+            result = emit(Plan(platform="test", routes=[route], global_plugins=[bad_global]), EmitOptions(), report)
+            self.assertTrue(route.refusals)
+            self.assertIn("global-plugin-invalid", {c.code for c in report.caveats})
+            self.assertFalse([p for p in result.config["plugin_configs"] if p["scope"] == "global"])
 
     def test_san_limits_and_dns_syntax_and_lone_surrogate_rejected(self):
         from ferrum_migration.errors import InputError
@@ -507,6 +559,9 @@ class MatchingTest(unittest.TestCase):
         self.assertFalse(util.valid_backend_tls_san("api.example.com."))
         self.assertFalse(util.valid_backend_tls_san("-bad.example.com"))
         self.assertFalse(util.valid_backend_tls_san("a" * 64 + ".example.com"))
+        self.assertFalse(util.valid_backend_tls_san("fe80::1%eth0"))
+        self.assertFalse(util.valid_backend_tls_san("\u212a.internal"))  # Kelvin sign
+        self.assertFalse(util.valid_backend_tls_sni("\u212a.internal"))
         self.assertEqual(util.backend_tls_san_kind("spiffe://trust.domain/ns/default/sa/app"), "URI")
         self.assertEqual(util.backend_tls_san_kind("10.0.0.1"), "IP_ADDRESS")
         self.assertEqual(util.backend_tls_san_kind("api.example.com"), "DNS")
@@ -530,14 +585,23 @@ class MatchingTest(unittest.TestCase):
         c1 = ConsumerSpec(ref="c1", key="c1", username="shared-id", keyauth=["key-one-at-least-16-chars"])
         c2 = ConsumerSpec(ref="c2", key="c2", username="bob", custom_id="shared-id",
                           keyauth=["key-two-at-least-16-chars"])
+        # Consumer with >2 keys exceeds Ferrum's default per-type limit; keys withheld fail closed.
+        c_many = ConsumerSpec(ref="c-many", key="c-many", username="carol",
+                              keyauth=[f"synthetic-key-{i:04d}-long" for i in range(17)])
+        # Consumer with a 3000-character multibyte key (<=4096 chars even though >4096 UTF-8 bytes) succeeds.
+        c_mb = ConsumerSpec(ref="c-mb", key="c-mb", username="dave", keyauth=["é" * 3000])
         report = Report("test", "synthetic")
-        result = emit(Plan(platform="test", consumers=[c_acl, c1, c2]), EmitOptions(include_secrets=True), report)
-        emitted_names = [c["username"] for c in result.config["consumers"]]
-        self.assertEqual(emitted_names, ["alice"])
-        self.assertNotIn("credentials", result.config["consumers"][0])
+        result = emit(Plan(platform="test", consumers=[c_acl, c1, c2, c_many, c_mb]),
+                      EmitOptions(include_secrets=True), report)
+        by_name = {c["username"]: c for c in result.config["consumers"]}
+        self.assertEqual(sorted(by_name), ["alice", "carol", "dave"])
+        self.assertNotIn("credentials", by_name["alice"])
+        self.assertNotIn("credentials", by_name["carol"])
+        self.assertIn("credentials", by_name["dave"])
         self.assertIn("consumer-acl-groups", {c.code for c in report.caveats})
         self.assertIn("consumer-quarantined", {c.code for c in report.caveats})
         self.assertIn("consumer-identity-conflict", {c.code for c in report.caveats})
+        self.assertIn("keyauth-limit", {c.code for c in report.caveats})
 
     def test_conflict_merging_over_100_hosts_chunks_without_colliding_with_sibling(self):
         hosts_a = ["shared.example.test"] + [f"a{i}.example.test" for i in range(60)]

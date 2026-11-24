@@ -88,6 +88,9 @@ LABEL_STATUS = "ferrum-migration/status"
 MIN_KEYAUTH_KEY_LENGTH = 16
 MIN_JWT_SECRET_LENGTH = 32
 MAX_CREDENTIAL_VALUE_LENGTH = 4096
+MAX_CREDENTIALS_SIZE = 65_536
+MAX_CREDENTIALS_PER_TYPE = 2
+CREDENTIAL_REDACTION_PLACEHOLDER = "[REDACTED]"
 MAX_PLUGIN_CONFIG_BYTES = 1_048_576
 _HEADER_TOKEN_RE = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
 _RESERVED_TERM_HEADERS = frozenset({
@@ -161,10 +164,10 @@ def emit(plan: Plan, options: EmitOptions, report: Report) -> EmitResult:
     _poison_case_variants(plan, routes)
     _resolve_frontend_client_ca(plan, routes, report, mode)
     candidates = _build_candidates(routes)
-    candidates = _resolve_conflicts(candidates)
+    candidates = _resolve_conflicts(candidates, report)
     _add_scope_closures(plan, candidates, report)
     _add_trailing_slash_placeholders(candidates, report)
-    _add_divergence_guards(candidates, report)
+    _add_divergence_guards(plan, candidates, report)
     _assert_frontend_protocols(candidates, mode)
     builder = _Builder(plan, options, report)
     config = builder.build(candidates)
@@ -338,10 +341,10 @@ def _validate_route(route: RouteSpec, plan: Plan, options: EmitOptions, report: 
             route.refuse(f"plugin {plugin.name} config exceeds Ferrum's 1 MiB limit")
 
 
-def _term_header_value_ok(value: object) -> bool:
+def _term_header_value_ok(value: object, *, allow_outer_ws: bool = False) -> bool:
     if not isinstance(value, str) or len(value.encode("utf-8")) > 4096:
         return False
-    if value and (value[0] in (" ", "\t") or value[-1] in (" ", "\t")):
+    if not allow_outer_ws and value and (value[0] in (" ", "\t") or value[-1] in (" ", "\t")):
         return False
     return all(ch == "\t" or 0x20 <= ord(ch) <= 0x7E for ch in value)
 
@@ -355,7 +358,8 @@ def validate_termination_config(termination: object) -> str | None:
         return "termination status code is outside 200-599"
     content_type = termination.get("content_type")
     if content_type is not None:
-        if not isinstance(content_type, str) or not content_type.strip() or not _term_header_value_ok(content_type):
+        if not isinstance(content_type, str) or not content_type.strip(" \t") \
+                or not _term_header_value_ok(content_type, allow_outer_ws=True):
             return "termination content_type is not representable"
     body = termination.get("body")
     if body is not None and not isinstance(body, str):
@@ -371,7 +375,7 @@ def validate_termination_config(termination: object) -> str | None:
             return "termination headers are not representable"
         seen_names: set[str] = set()
         for key, value in headers.items():
-            if not isinstance(key, str) or not _HEADER_TOKEN_RE.match(key):
+            if not isinstance(key, str) or not _HEADER_TOKEN_RE.fullmatch(key):
                 return "a termination header name is invalid"
             lower = key.lower()
             if lower in _RESERVED_TERM_HEADERS or lower.startswith(("x-ferrum-", "grpc-")):
@@ -381,6 +385,12 @@ def validate_termination_config(termination: object) -> str | None:
             seen_names.add(lower)
             if not _term_header_value_ok(value):
                 return f"termination header {lower} has an unrepresentable value"
+    try:
+        encoded_size = len(json.dumps(termination, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
+    except (TypeError, ValueError):
+        return "termination response is not JSON-serializable"
+    if encoded_size > MAX_PLUGIN_CONFIG_BYTES:
+        return "termination plugin config exceeds Ferrum's 1 MiB limit"
     return None
 
 
@@ -763,7 +773,7 @@ def _chunk_hosts_no_prune(hosts: list[str], host_only: bool) -> list[list[str]] 
     return chunks
 
 
-def _resolve_conflicts(candidates: list[_Cand]) -> list[_Cand]:
+def _resolve_conflicts(candidates: list[_Cand], report: Report) -> list[_Cand]:
     groups: dict[tuple[int | None, str | None], list[_Cand]] = {}
     for cand in candidates:
         groups.setdefault((cand.listen_port, cand.listen_path), []).append(cand)
@@ -794,12 +804,33 @@ def _resolve_conflicts(candidates: list[_Cand]) -> list[_Cand]:
             if host_chunks is None:
                 if path is not None:
                     # A single ambiguous component exceeds 100 hosts: fail-close the whole (port, path) slot as one
-                    # catch-all 503 placeholder so Ferrum accepts it and no conflicting sibling remains live.
+                    # catch-all 503 placeholder, and also fail-close every overlapping live candidate that sits in a
+                    # higher host tier (exact/wildcard beats catch-all in Ferrum) so no live route can outrank the
+                    # replacement.
                     for member in members:
                         member.route.refuse("a merged host conflict on this path exceeds Ferrum's 100-host limit and "
                                             "cannot be split safely; the whole path slot was failed closed")
                         member.route.placeholder_emitted = True
                         replacement[id(member)] = []
+                    refused_outrank = 0
+                    for other in candidates:
+                        if other in members or other.placeholder:
+                            continue
+                        if not matching.ports_compatible(other.listen_port, port):
+                            continue
+                        if not other.hosts or not matching.hosts_overlap(other.hosts, hosts):
+                            continue
+                        if matching.route_overlaps(first.route, other.route):
+                            _fail_close(other, "overlaps a >100-host path conflict that collapsed to a catch-all "
+                                               "placeholder; its higher host tier would outrank the catch-all")
+                            refused_outrank += 1
+                    report.error("conflict-collapse", first.route.ref,
+                                 f"A merged host conflict on path {safe_label(path, 80)} exceeds Ferrum's 100-host "
+                                 "limit inside one ambiguous component and collapsed to a catch-all 503 placeholder "
+                                 f"(also failing closed {refused_outrank} overlapping higher-tier route(s)); catch-all "
+                                 "requests on that path for unrelated hosts will also answer 503.",
+                                 "Split the overlapping wildcards/hosts into separate Ferrum frontends or fewer than "
+                                 "100 hosts per proxy, then convert again.")
                     replacement[id(members[0])] = [
                         _Cand(members[0].route, True, [], path, port, termination=REFUSED_TERMINATION,
                               kind_label="refused")
@@ -1084,7 +1115,12 @@ def _regex_reaches_siblings(regex: str | None, prefix: str) -> bool:
     return prefix.startswith(literal) or (literal.startswith(prefix) and not literal.startswith(prefix + "/"))
 
 
-def _add_divergence_guards(candidates: list[_Cand], report: Report) -> None:
+def _add_divergence_guards(plan: Plan, candidates: list[_Cand], report: Report) -> None:
+    # A scoped request_termination guard replaces global request_termination on that proxy (plugin_cache.rs:5797).
+    # If an unconditional global termination already governs the plan, do not attach scoped guards that would
+    # shadow it on non-matching paths.
+    if any(p.name == "request_termination" and not p.config.get("trigger") for p in plan.global_plugins):
+        return
     by_path: dict[tuple[int | None, str | None], list[_Cand]] = {}
     regex_by_port: dict[int | None, list[_Cand]] = {}
     for cand in candidates:
@@ -1092,13 +1128,15 @@ def _add_divergence_guards(candidates: list[_Cand], report: Report) -> None:
         if cand.listen_path is not None and cand.listen_path.startswith("~"):
             regex_by_port.setdefault(cand.listen_port, []).append(cand)
     fingerprints: dict[int, str] = {}
+    scoped_guards_added: set[tuple[int | None, tuple[str, ...], str]] = set()
+    new_guard_cands: list[_Cand] = []
 
     def fp(item: _Cand) -> str:
         if id(item) not in fingerprints:
             fingerprints[id(item)] = _fingerprint(item)
         return fingerprints[id(item)]
 
-    for cand in candidates:
+    for cand in list(candidates):
         route = cand.route
         # A refused route's placeholder keeps its envelope too: the source sent its string-prefix siblings
         # (/apix for /api) to the refused route, so they must not fall through to a broader live route.
@@ -1210,20 +1248,55 @@ def _add_divergence_guards(candidates: list[_Cand], report: Report) -> None:
                              "Recreate the refused route in Ferrum, then remove the guard only for hosts where the "
                              "broader route should serve those paths.")
             else:
-                # The guard cannot be scoped strictly to this route's hosts, but leaving the broader route unguarded
-                # would let sibling paths such as /apix bypass this route's policy (for example authentication).
-                # Guard anyway (fail closed) and report the collateral 404s on the broader route's other hosts.
-                if route.path not in other.guards:
-                    other.guards.append(route.path or "/")
-                divergence_error = True
-                report.error("prefix-divergence", route.ref,
-                             f"The source matched any path starting with {route.path} (for example {route.path}x); "
-                             f"Ferrum matches by path segment, so on some hosts those paths would reach "
-                             f"{other_route.ref}, which has a different policy and serves more hosts or listeners. "
-                             f"A request_termination guard (trigger.path_prefix {route.path}) was added to it for all "
-                             "of its hosts so such paths answer 404 there (fail closed).",
-                             "Confirm such paths are not needed on the broader route's other hosts, or add explicit "
-                             "routes for them in the source and convert again.")
+                # If this route is strictly in a more specific host tier than `other` on every overlapping host,
+                # emit a host-scoped regex 404 guard in this route's own tier so siblings like /apix are blocked on
+                # these hosts without returning 404 for `other`'s unrelated hosts.
+                guard_pattern = re.escape(route.path or "/") + ".*"
+                guard_listen = "~" + guard_pattern
+                can_scope_regex = (
+                    bool(cand.hosts)
+                    and len(cand.hosts) <= util.MAX_HOSTS_PER_PROXY
+                    and other.listen_port == cand.listen_port
+                    and not regex_other
+                    and bool(pairs) and all(tb > ta for ta, tb in pairs)
+                    and util.regex_problem(guard_pattern) is None
+                    and not any(
+                        c.listen_port == cand.listen_port and c.listen_path == guard_listen
+                        and matching.hosts_overlap(c.hosts, cand.hosts)
+                        for c in candidates
+                    )
+                    and not any(
+                        not c.placeholder and matching.hosts_overlap(c.hosts, cand.hosts)
+                        for c in regex_by_port.get(cand.listen_port, [])
+                    )
+                )
+                if can_scope_regex:
+                    guarded = True
+                    guard_key = (cand.listen_port, tuple(cand.hosts), guard_listen)
+                    if guard_key not in scoped_guards_added:
+                        scoped_guards_added.add(guard_key)
+                        synthetic = RouteSpec(ref=route.ref, name=f"{route.name}-sibling-guard",
+                                              hosts=list(cand.hosts), kind="regex", path=guard_pattern)
+                        guard_cand = _Cand(synthetic, True, list(cand.hosts), guard_listen, cand.listen_port,
+                                           termination=NOT_FOUND_TERMINATION, kind_label="prefix-guard")
+                        new_guard_cands.append(guard_cand)
+                        report.info("prefix-divergence-guard", route.ref,
+                                    f"Added a host-scoped regex 404 guard ({guard_listen}) so sibling paths like "
+                                    f"{route.path}x cannot reach {other_route.ref} without affecting its other hosts.")
+                else:
+                    # Cannot scope strictly to this route's hosts: guard `other` anyway (fail closed) and report
+                    # the collateral 404s on the broader route's other hosts.
+                    if route.path not in other.guards:
+                        other.guards.append(route.path or "/")
+                    divergence_error = True
+                    report.error("prefix-divergence", route.ref,
+                                 f"The source matched any path starting with {route.path} (for example {route.path}x); "
+                                 f"Ferrum matches by path segment, so on some hosts those paths would reach "
+                                 f"{other_route.ref}, which has a different policy and serves more hosts or listeners. "
+                                 f"A request_termination guard (trigger.path_prefix {route.path}) was added to it for "
+                                 "all of its hosts so such paths answer 404 there (fail closed).",
+                                 "Confirm such paths are not needed on the broader route's other hosts, or add "
+                                 "explicit routes for them in the source and convert again.")
         if route.report_prefix_siblings and not refused and not divergence_error \
                 and not (equivalent and not intercepted and not guarded):
             report.error("prefix-string-siblings", route.ref,
@@ -1234,6 +1307,7 @@ def _add_divergence_guards(candidates: list[_Cand], report: Report) -> None:
                          f"response or another route's termination instead. The route was not widened.",
                          "If clients use such paths, add explicit routes for them in the source configuration and "
                          "convert again, or confirm they are unused.")
+    candidates.extend(new_guard_cands)
 
 
 # ------------------------------------------------------------------ building
@@ -1564,7 +1638,8 @@ class _Builder:
             if key_owners.get(key, 0) > 1:
                 self.report.error("keyauth-duplicate", consumer.ref,
                                   "An API key is shared with another consumer; it was not migrated (fail closed).")
-            elif stripped < MIN_KEYAUTH_KEY_LENGTH or len(key.encode("utf-8")) > MAX_CREDENTIAL_VALUE_LENGTH \
+            elif stripped < MIN_KEYAUTH_KEY_LENGTH or len(key) > MAX_CREDENTIAL_VALUE_LENGTH \
+                    or key == CREDENTIAL_REDACTION_PLACEHOLDER \
                     or any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in key):
                 self.report.error("keyauth-weak", consumer.ref,
                                   "An API key is shorter than Ferrum's 16-character minimum or not representable; "
@@ -1572,9 +1647,15 @@ class _Builder:
                                   "Issue a new random key of at least 16 characters.")
             elif key not in keys:
                 keys.append(key)
+        if len(keys) > MAX_CREDENTIALS_PER_TYPE:
+            self.report.error("keyauth-limit", consumer.ref,
+                              f"{len(keys)} API keys exceed Ferrum's default limit of {MAX_CREDENTIALS_PER_TYPE} "
+                              "credentials per type; none was migrated (fail closed).",
+                              "Reduce the consumer to at most 2 keys or raise FERRUM_MAX_CREDENTIALS_PER_TYPE and "
+                              "provision keys in Ferrum.")
+            keys = []
         if keys:
             credentials["keyauth"] = [{"key": key} for key in keys]
-            self.secrets_emitted += len(keys)
         secrets = []
         for secret in consumer.jwt:
             stripped = sum(1 for ch in secret if not ch.isspace())
@@ -1582,7 +1663,8 @@ class _Builder:
                 self.report.error("jwt-secret-duplicate", consumer.ref,
                                   "A JWT secret is shared with another consumer; Ferrum refuses shared secrets, so it "
                                   "was not migrated (fail closed).")
-            elif stripped < MIN_JWT_SECRET_LENGTH or len(secret.encode("utf-8")) > MAX_CREDENTIAL_VALUE_LENGTH \
+            elif stripped < MIN_JWT_SECRET_LENGTH or len(secret) > MAX_CREDENTIAL_VALUE_LENGTH \
+                    or secret == CREDENTIAL_REDACTION_PLACEHOLDER \
                     or any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in secret):
                 self.report.error("jwt-secret-weak", consumer.ref,
                                   "A JWT secret is shorter than Ferrum's 32-character minimum; it was not migrated "
@@ -1599,18 +1681,28 @@ class _Builder:
             secrets = []
         if secrets:
             credentials["jwt"] = [{"secret": secret} for secret in secrets]
-            self.secrets_emitted += len(secrets)
+        if credentials:
+            size = len(json.dumps(credentials, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
+            if size > MAX_CREDENTIALS_SIZE:
+                self.report.error("consumer-credentials-size", consumer.ref,
+                                  f"Consumer credentials JSON ({size} bytes) exceeds Ferrum's {MAX_CREDENTIALS_SIZE}-byte "
+                                  "limit; credentials withheld (fail closed).",
+                                  "Reduce credential count/length and provision credentials in Ferrum.")
+                return {}
+            self.secrets_emitted += len(keys) + len(secrets)
         return credentials
 
     def stats(self, routes: list[RouteSpec], candidates: list[_Cand]) -> dict[str, Any]:
         source_routes = [r for r in routes if not r.skip]
+        scoped_prefix_guards = sum(1 for c in candidates if c.kind_label == "prefix-guard")
         return {
             "source_routes": len(source_routes),
             "migrated_routes": sum(1 for c in candidates if not c.placeholder),
             "refused_routes": sum(1 for r in source_routes if r.refusals),
             "fail_closed_placeholders": sum(1 for c in candidates if c.placeholder and c.kind_label == "refused"),
-            "synthetic_404_routes": sum(1 for c in candidates if c.kind_label in ("scope-default", "exact-guard")),
-            "prefix_guards": self.guard_count,
+            "synthetic_404_routes": sum(1 for c in candidates
+                                        if c.kind_label in ("scope-default", "exact-guard", "prefix-guard")),
+            "prefix_guards": self.guard_count + scoped_prefix_guards,
             "skipped_source_routes": sum(1 for r in routes if r.skip),
             "proxies": len(candidates),
             "upstreams": len(self.upstream_id_by_key),

@@ -86,15 +86,15 @@ def fold(name: str) -> str:
 
 
 def header_name_ok(name: Any) -> bool:
-    return isinstance(name, str) and bool(_TOKEN_RE.match(name))
+    return isinstance(name, str) and bool(_TOKEN_RE.fullmatch(name))
 
 
-def header_value_ok(value: Any, nonempty: bool = False) -> bool:
+def header_value_ok(value: Any, nonempty: bool = False, strict_ws: bool = False) -> bool:
     if not isinstance(value, str):
         return False
     if nonempty and not value:
         return False
-    if value and (value[0] in (" ", "\t") or value[-1] in (" ", "\t")):
+    if strict_ws and value and (value[0] in (" ", "\t") or value[-1] in (" ", "\t")):
         return False
     return all(ch == "\t" or 0x20 <= ord(ch) <= 0x7E for ch in value)
 

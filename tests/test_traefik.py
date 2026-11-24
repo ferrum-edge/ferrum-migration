@@ -1122,6 +1122,23 @@ class TraefikHardeningTest(unittest.TestCase):
                 self.assertEqual(one_proxy(self, result.config, "/api")["labels"]["ferrum-migration/status"], "refused")
                 self.assertIn("route-refused", codes(report, "error"))
 
+    def test_single_server_https_with_server_name_promotes_to_upstream(self):
+        doc = {
+            "http": {
+                "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "svc"}},
+                "services": {
+                    "svc": {"loadBalancer": {"servers": [{"url": "https://10.0.0.1:8443"}],
+                                             "serversTransport": "t1"}},
+                },
+                "serversTransports": {"t1": {"serverName": "backend.internal.test"}},
+            }
+        }
+        result, _report, _ = asserted(yaml.safe_dump(doc))
+        assert_structurally_valid(self, result.config)
+        self.assertEqual(one_proxy(self, result.config, "/api")["labels"]["ferrum-migration/status"], "migrated")
+        self.assertEqual(len(result.config["upstreams"]), 1)
+        self.assertEqual(result.config["upstreams"][0]["backend_tls_sni"], "backend.internal.test")
+
 
 if __name__ == "__main__":
     unittest.main()

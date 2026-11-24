@@ -605,7 +605,7 @@ class _Istio:
             code = util.as_int(redirect.get("redirectCode")) or 301
             location = f"{scheme}://{authority}{uri}" if (scheme and authority and uri) else ""
             if not (scheme and authority and uri) or redirect.get("derivePort") or redirect.get("port") \
-                    or not 200 <= code <= 599 or not header_value_ok(location, nonempty=True):
+                    or not 200 <= code <= 599 or not header_value_ok(location, nonempty=True, strict_ws=True):
                 spec.refuse("only fully static redirects (scheme, authority and uri without custom port) are migrated")
             else:
                 spec.termination = {"status_code": code, "headers": {"location": location},
