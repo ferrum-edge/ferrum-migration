@@ -5,11 +5,21 @@ form; ``Host``/``Path``/``PathPrefix``/``Method`` are representable, anything
 else (headers, queries, client IPs, regex matchers, negation) refuses the router
 and poisons overlapping routes. Router priorities are compared against Ferrum's
 specificity order; shadowed routes are dropped and contradictory pairs refused.
+
+The file provider input is dynamic configuration only. Every router is attached to static entryPoints (named in
+``entryPoints``, or Traefik's default entryPoints), and those can add TLS, client certificate options, prepended
+middlewares, HTTP redirections, forwarded-header trust and bind restrictions that the input does not contain. A
+missing router ``tls`` block therefore does not prove plaintext, and a ``tls`` block does not prove that nothing
+else applied. Without the operator's explicit assertion (``--assert-traefik-entrypoints-add-no-controls``, given only
+after inspecting the static configuration; it is not verified here) every route that would forward traffic is
+refused. With it, the routers are translated from the dynamic input alone, and everything the input does state
+(router ``tls`` and TLS options, middlewares, explicit ``entryPoints`` lists) still applies.
 """
 
 from __future__ import annotations
 
 import re
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -29,6 +39,15 @@ DEFAULT_TLS_OPTIONS = "default"
 VERIFYING_CLIENT_AUTH = ("RequireAndVerifyClientCert", "VerifyClientCertIfGiven")
 # clientAuthType values that ask for client certificates without verifying them against a CA.
 UNVERIFIED_CLIENT_AUTH = ("RequestClientCert", "RequireAnyClientCert")
+#: The one CLI opt-in (Traefik only) through which the operator asserts that the static entryPoints used by the
+#: converted routers add no frontend controls missing from the dynamic input. The converter cannot check it.
+ENTRYPOINTS_ASSERTION_FLAG = "--assert-traefik-entrypoints-add-no-controls"
+#: Refusal reason for routes that would forward traffic without that assertion.
+ENTRYPOINTS_UNVERIFIED_REASON = (
+    "the static entryPoints this router is attached to are not part of the input and may add TLS, client "
+    "certificate options, middlewares, redirections, forwarded-header trust or bind restrictions, so how the source "
+    f"served it is unknown (see traefik-entrypoints-unverified; {ENTRYPOINTS_ASSERTION_FLAG} only after inspecting "
+    "the static configuration)")
 
 
 class RuleError(Exception):
@@ -223,6 +242,10 @@ class _Traefik:
         self.tls_option_of: dict[int, tuple[str, list[str]]] = {}
         self.client_auth_cache: dict[str, tuple[tuple[str, ...], str | None]] = {}
         self.builtin_default_tls_used = False
+        # Per route spec (by id): the sorted entryPoint names its router lists, or None when it lists none (Traefik
+        # then attaches it to its default entryPoints, which only the static configuration defines).
+        self.entrypoints_of: dict[int, tuple[str, ...] | None] = {}
+        self.entrypoints_asserted = ctx.traefik_entrypoints_asserted
 
     def run(self) -> Plan:
         for key in self.root:
@@ -234,15 +257,8 @@ class _Traefik:
                                     "Unknown top-level section ignored (static configuration is not read).")
         self._tls_section()
         check_route_budget(len(self.routers), self.ctx.limits)
-        entrypoints_seen = False
         for name, router in self.routers.items():
-            if isinstance(router, dict) and router.get("entryPoints"):
-                entrypoints_seen = True
             self._router(str(name), router)
-        if entrypoints_seen:
-            self.report.info("traefik-entrypoints", "traefik routers", "EntryPoints live in Traefik's static "
-                             "configuration, which is not read: routers with a tls block are treated as HTTPS-only, "
-                             "the rest as plaintext.")
         self._client_auth_scopes()
         if self.builtin_default_tls_used:
             self.report.info("traefik-tls-default-options", "traefik tls options",
@@ -252,8 +268,99 @@ class _Traefik:
                              "If another provider defines default TLS options with clientAuth, add them to the input "
                              "and convert again.")
         self._precedence()
+        self._entrypoints()
         check_route_budget(len(self.plan.routes), self.ctx.limits)
         return self.plan
+
+    # ------------------------------------------------------------ entryPoints
+
+    def _entrypoints(self) -> None:
+        """Account for the static entryPoints, which the dynamic input does not contain (fail closed).
+
+        Without the operator's assertion nothing proves how the source served a router: its entryPoints may add
+        TLS (a router without ``tls`` is then served over HTTPS), client certificate options, prepended middlewares,
+        redirections, forwarded-header trust or bind restrictions, and an explicit router ``tls`` does not rule any
+        of those out either. Every route that would forward traffic is refused (503 placeholder). Routes already
+        refused stay placeholders, and redirect routers are never emitted, so nothing forwards.
+
+        With the assertion the routers keep the translation of the dynamic input. Explicit restrictions in the
+        input still apply, including ``entryPoints`` lists: Ferrum serves every route of one protocol on one
+        listener, so routers of that protocol whose lists leave out the entryPoint the others share are refused
+        instead of being served where the source never served them.
+        """
+        present = [spec for spec in self.plan.routes if not spec.skip]
+        if not present:
+            return
+        if self.entrypoints_asserted and any(str(key).lower() == "entrypoints" for key in self.root):
+            # Static entryPoint definitions in the input are explicit source settings this translator does not read;
+            # the operator's assertion never overrides what the input itself states.
+            forwarding = [spec for spec in present if not spec.refusals]
+            for spec in forwarding:
+                spec.refuse("the input itself defines static entryPoints, which are not translated, and the operator "
+                            "assertion does not override settings stated in the input")
+            if forwarding:
+                self.report.error(
+                    "traefik-entrypoints-in-input", "traefik entryPoints",
+                    f"The input contains a static entryPoints section, which this converter does not translate. "
+                    f"{ENTRYPOINTS_ASSERTION_FLAG} cannot override settings the input states, so {len(forwarding)} "
+                    "route(s) that would forward traffic were refused (fail closed).",
+                    "Convert the dynamic configuration on its own. Assert only after checking that those entryPoints "
+                    "add no TLS, client certificate options, middlewares, redirections, forwarded-header trust or "
+                    "bind restrictions, or configure the equivalent controls in Ferrum by hand.")
+            return
+        if not self.entrypoints_asserted:
+            forwarding = [spec for spec in present if not spec.refusals]
+            for spec in forwarding:
+                spec.refuse(ENTRYPOINTS_UNVERIFIED_REASON)
+            if forwarding:
+                self.report.error(
+                    "traefik-entrypoints-unverified", "traefik entryPoints",
+                    "The input is Traefik dynamic configuration only. The static entryPoints its routers are "
+                    "attached to (named in entryPoints, or Traefik's default entryPoints) can add TLS, client "
+                    "certificate options, prepended middlewares, HTTP redirections, forwarded-header trust and bind "
+                    "restrictions that are not in the input, so neither a missing router tls block (plaintext) nor a "
+                    f"present one proves how the source served a route. {len(forwarding)} route(s) that would "
+                    "forward traffic were refused (fail closed); they answer 503.",
+                    "Inspect the static configuration (file, CLI flags or environment) of every entryPoint these "
+                    "routers use, including the default entryPoints of routers that name none: http.tls, "
+                    "http.middlewares, http.redirections, forwardedHeaders, proxyProtocol and address. Only if none of "
+                    f"them adds anything, convert again with {ENTRYPOINTS_ASSERTION_FLAG}; the tool cannot verify "
+                    "that statement. Otherwise configure the equivalent controls in Ferrum by hand, or keep the "
+                    "routes refused.")
+            return
+        self.report.warning(
+            "traefik-entrypoints-asserted", "traefik entryPoints",
+            f"Translated on the operator's assertion ({ENTRYPOINTS_ASSERTION_FLAG}) that the static entryPoints these "
+            "routers use (named, or Traefik's default entryPoints for routers that name none) add no TLS, client "
+            "certificate options, middlewares, redirections, forwarded-header trust or bind restrictions. The tool "
+            "did not and cannot verify this. Routers with a tls block are HTTPS-only, the rest plaintext-only, and "
+            "routers that name no entryPoints are taken to share the entryPoint the other routers of their protocol "
+            "use.",
+            "Re-check the static configuration if it changes; a wrong assertion can expose routes on a protocol or "
+            "without a control the source applied.")
+        for tls in (False, True):
+            kind = "HTTPS" if tls else "plaintext"
+            group = [spec for spec in present if spec.requires_tls is tls and id(spec) in self.entrypoints_of]
+            named = [self.entrypoints_of[id(spec)] for spec in group if self.entrypoints_of[id(spec)]]
+            if not named:
+                continue
+            counts = Counter(name for names in named for name in names)
+            main = sorted(counts.items(), key=lambda item: (-item[1], item[0]))[0][0]
+            outside = [spec for spec in group
+                       if self.entrypoints_of[id(spec)] and main not in self.entrypoints_of[id(spec)]]
+            for spec in outside:
+                spec.refuse(f"the router's entryPoints leave out {safe_label(main, 48)}, which the other {kind} "
+                            f"routers share; Ferrum serves every {kind} route on one listener, so this router would "
+                            "answer on an entryPoint the source never served it on")
+            if outside:
+                self.report.error(
+                    "traefik-entrypoint-scope", "traefik entryPoints",
+                    f"{len(outside)} {kind} route(s) name entryPoints that do not include "
+                    f"{safe_label(main, 48)}, the entryPoint the other {kind} routers share. Ferrum serves all "
+                    f"{kind} routes on one listener and cannot keep separate entryPoints apart, so they were refused "
+                    "(fail closed).",
+                    "Convert the routers of each entryPoint separately (a copy of the input with only those "
+                    "routers) for separately configured Ferrum instances.")
 
     def _tls_section(self) -> None:
         tls = mapping(self.root.get("tls"))
@@ -288,8 +395,18 @@ class _Traefik:
         priority = priority if priority and priority > 0 else len(rule)
         requires_tls = router.get("tls") is not None
         # A Traefik router matches TLS requests only with a tls block and plaintext requests only without one, so
-        # each router has exactly one frontend (entryPoint-level TLS lives in the static configuration, not read).
+        # each router has exactly one frontend. entryPoint-level TLS (and everything else an entryPoint adds) lives
+        # in the static configuration, which is not part of the input: without the operator's assertion these
+        # routes are refused in _entrypoints, with it the frontend below is taken as stated.
         frontends = frozenset({"https" if requires_tls else "http"})
+        listed = str_list(router.get("entryPoints"))
+        entrypoints_problem = None
+        if listed is None or any(not item.strip() for item in listed):
+            entrypoints_problem = ("router entryPoints has unexpected types or empty names, so the listeners that "
+                                   "served it are unknown")
+            entrypoints: tuple[str, ...] | None = None
+        else:
+            entrypoints = tuple(sorted(set(listed))) or None
         if requires_tls and mapping(router.get("tls")).get("certResolver"):
             self.report.warning("traefik-cert-resolver", ref, "ACME certResolver is not migrated; provide a "
                                 "certificate or configure Ferrum's ACME settings.")
@@ -304,6 +421,9 @@ class _Traefik:
             spec.path_ok = False
             spec.extra_conditions = True
             spec.refuse(f"rule cannot be parsed ({exc})")
+            if entrypoints_problem:
+                spec.refuse(entrypoints_problem)
+            self.entrypoints_of[id(spec)] = entrypoints
             self.plan.routes.append(spec)
             return
         # Traefik maps TLS options to SNI names from Host matchers only; HostHeader does not take part, so such
@@ -360,6 +480,9 @@ class _Traefik:
                 if client_auth_problem:
                     spec.refuse(client_auth_problem)
                 self.tls_option_of[id(spec)] = (tls_option, list(spec.hosts) if sni_mapped else [])
+            if entrypoints_problem:
+                spec.refuse(entrypoints_problem)
+            self.entrypoints_of[id(spec)] = entrypoints
             for condition in extra:
                 spec.refuse(f"rule uses {condition}, which Ferrum cannot express")
                 spec.extra_conditions = True

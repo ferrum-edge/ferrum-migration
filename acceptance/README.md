@@ -45,7 +45,14 @@ python3 acceptance/run.py --no-ferrum --converter-env PYTHONPATH=/path/to/ferrum
 The default converter profile (`profiles/converter.default.json`) mirrors the
 real CLI in `src/ferrum_migration/cli.py`:
 `{python} -m ferrum_migration convert {source} --from {platform} --out {outdir}`,
-plus `--include-secrets` for cases that opt in. DB-less (`kong-dbless`) and
+plus `--include-secrets` for cases that opt in, and the argv the profile's
+`assertion_argv` maps to each operator assertion a case names in
+`converter_assertions`. Every Traefik case names
+`traefik-entrypoints-add-no-controls` (`--assert-traefik-entrypoints-add-no-controls`):
+its source is served on the harness's own static configuration, one plaintext
+loopback entryPoint without TLS, middlewares, redirections or forwarded-header
+settings, and no router names entryPoints. Without the assertion the converter
+refuses every forwarding Traefik route. DB-less (`kong-dbless`) and
 decK (`kong-deck`) cases both map to `--from kong`. There is no decK-specific
 flag, because both share one schema; the report's `kong-input-flavor` caveat
 records which flavor was detected. The output names are fixed
@@ -143,4 +150,6 @@ keys fail). Positive probes: `{"forward": {"backend": "a|b", "path": "…"}}`.
 Deny probes: `{"deny": true, "status": [...]}`. Mark migration-policy probes
 that the source product would answer differently with `"ferrum_only": true`.
 Only add a claim when the request-target and backend are exactly determined by
-the source product's documented semantics.
+the source product's documented semantics. Name a converter assertion in
+`converter_assertions` only when the case's synthetic source is known to
+satisfy it; an assertion the converter profile does not map is an `ERROR`.

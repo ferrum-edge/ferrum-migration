@@ -3,7 +3,8 @@
 Nothing here hard-codes the CLI: the profile JSON (default:
 ``profiles/converter.default.json``, which mirrors ``ferrum-migrate convert``)
 supplies an argv template with ``{token}`` placeholders, the per-adapter
-platform names, the extra argv that opts into credential inclusion, explicit
+platform names, the extra argv that opts into credential inclusion, the argv
+for each named operator assertion a case may pass (``assertion_argv``), explicit
 output filenames (content discovery is the fallback), and the exit-code
 contract used to cross-check the report.
 """
@@ -29,6 +30,7 @@ _PROFILE_KEYS = {
     "timeout_seconds",
     "assumed",
     "exit_codes",
+    "assertion_argv",
 }
 _OUTPUT_KEYS = {"resources", "settings", "report", "mesh"}
 _EXIT_CODE_KEYS = {"ok", "review", "input_rejected"}
@@ -45,6 +47,8 @@ class ConverterProfile:
     assumed: bool
     source_path: str
     exit_codes: dict[str, list[int]] = field(default_factory=dict)
+    #: Operator assertion name -> extra argv (only appended for cases that name the assertion).
+    assertion_argv: dict[str, list[str]] = field(default_factory=dict)
 
     @classmethod
     def load(cls, path: Path, argv_override: "list[str] | None" = None) -> "ConverterProfile":
@@ -64,6 +68,11 @@ class ConverterProfile:
         if not isinstance(exit_codes, dict) or set(exit_codes) - _EXIT_CODE_KEYS or not all(
                 isinstance(v, list) and all(isinstance(c, int) for c in v) for v in exit_codes.values()):
             raise TemplateError("converter profile exit_codes may only map ok/review/input_rejected to integer lists")
+        assertion_argv = data.get("assertion_argv") or {}
+        if not isinstance(assertion_argv, dict) or not all(
+                isinstance(name, str) and isinstance(value, list) and value and all(isinstance(x, str) for x in value)
+                for name, value in assertion_argv.items()):
+            raise TemplateError("converter profile assertion_argv must map assertion names to non-empty argv lists")
         return cls(
             argv=list(argv),
             include_secrets_argv=list(data.get("include_secrets_argv") or []),
@@ -74,6 +83,7 @@ class ConverterProfile:
             assumed=bool(data.get("assumed", False)) and argv_override is None,
             source_path=str(path),
             exit_codes={key: list(value) for key, value in exit_codes.items()},
+            assertion_argv={key: list(value) for key, value in assertion_argv.items()},
         )
 
     def platform(self, adapter: str) -> str:
@@ -219,7 +229,13 @@ def run_converter(
     extra_env: dict[str, str],
     pass_env: "list[str] | tuple[str, ...]",
     sensitive: list[str],
+    assertions: "list[str] | tuple[str, ...]" = (),
 ) -> ConversionResult:
+    missing = [name for name in assertions if name not in profile.assertion_argv]
+    if missing:
+        raise TemplateError(
+            "case passes converter assertion(s) the converter profile has no assertion_argv for: " + ", ".join(missing)
+        )
     outdir.mkdir(parents=True, exist_ok=True)
     values = {
         "python": sys.executable,
@@ -238,6 +254,9 @@ def run_converter(
                 "case requires credential inclusion but the converter profile has no include_secrets_argv"
             )
         argv += extra
+    for name in assertions:
+        # Only cases whose synthetic source is known to satisfy the assertion name it (case.json).
+        argv += expand_optional_argv(profile.assertion_argv[name], values)
     cwd = workdir / "converter-cwd"
     cwd.mkdir(parents=True, exist_ok=True)
     env = minimal_env(workdir, pass_env)

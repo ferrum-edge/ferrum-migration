@@ -10,6 +10,7 @@ typo cannot silently weaken an assertion.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -24,8 +25,11 @@ CANARY_NAMES = {"CANARY_KEY", "CANARY_HASH"}
 _CASE_KEYS = {
     "id", "adapter", "title", "source", "include_secrets", "allow_rejection", "claims",
     "not_claimed", "not_established", "source_semantics", "backend_host_rewrite", "probes",
-    "report", "secret_free", "mesh_policy",
+    "report", "secret_free", "mesh_policy", "converter_assertions",
 }
+# Names of operator assertions a case may pass to the converter (the profile maps each to argv). A case names one
+# only when its synthetic source is known to satisfy it.
+_ASSERTION_NAME = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 _PROBE_KEYS = {"id", "method", "path", "host", "headers", "expect", "ferrum_only", "note"}
 _EXPECT_KEYS = {"forward", "deny", "status"}
 _FORWARD_KEYS = {"backend", "path"}
@@ -75,6 +79,9 @@ class Case:
     report_mentions_any: list[str]
     secret_free: list[str]
     mesh_policy: bool = False
+    #: Operator assertions passed to the converter (profile ``assertion_argv``), e.g.
+    #: ``traefik-entrypoints-add-no-controls``. Never implied: absent means the converter's default.
+    converter_assertions: list[str] = field(default_factory=list)
     extra: dict = field(default_factory=dict)
 
     @property
@@ -181,6 +188,9 @@ def load_case(directory: Path) -> Case:
     _require(isinstance(semantics, str) and semantics, f"{cid}: source_semantics is required")
     title = raw.get("title")
     _require(isinstance(title, str) and title, f"{cid}: title is required")
+    assertions = _str_list(raw.get("converter_assertions", []), f"{cid}: converter_assertions")
+    _require(all(_ASSERTION_NAME.match(name) for name in assertions) and len(assertions) == len(set(assertions)),
+             f"{cid}: converter_assertions must be unique lower-case names")
     return Case(
         id=cid, adapter=adapter, title=title, directory=directory, source=source,
         include_secrets=bool(raw.get("include_secrets", False)),
@@ -196,6 +206,7 @@ def load_case(directory: Path) -> Case:
         report_mentions_any=_str_list(report.get("mentions_any", []), f"{cid}: report.mentions_any"),
         secret_free=secret_free,
         mesh_policy=bool(raw.get("mesh_policy", False)),
+        converter_assertions=assertions,
     )
 
 

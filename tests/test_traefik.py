@@ -4,10 +4,20 @@ import unittest
 
 import yaml
 
-from helpers import assert_structurally_valid, codes, migrate, one_proxy, plugin, plugins_of, proxies, read_fixture, \
-    upstream_of
+from helpers import assert_structurally_valid, codes, live_routes, migrate, one_proxy, plugin, plugins_of, proxies, \
+    read_fixture, upstream_of
 
-from ferrum_migration.sources.traefik import RuleError, evaluate_term, rule_to_dnf
+from ferrum_migration.sources.traefik import ENTRYPOINTS_ASSERTION_FLAG, RuleError, evaluate_term, rule_to_dnf
+
+
+def asserted(text, **kwargs):
+    """Convert with the operator's entryPoint assertion (``--assert-traefik-entrypoints-add-no-controls``).
+
+    Used for the mapping tests below: their synthetic inputs stand for sources whose static entryPoints (named, or
+    the defaults) add no TLS, client options, middlewares, redirections, forwarded-header trust or bind restriction.
+    Default behavior without the assertion is covered by TraefikEntryPointsTest.
+    """
+    return migrate("traefik", text, traefik_entrypoints_asserted=True, **kwargs)
 
 
 class TraefikRuleTest(unittest.TestCase):
@@ -39,7 +49,7 @@ class TraefikRuleTest(unittest.TestCase):
 
 class TraefikFixtureTest(unittest.TestCase):
     def setUp(self):
-        self.result, self.report, _ = migrate("traefik", read_fixture("traefik", "dynamic.yaml"))
+        self.result, self.report, _ = asserted(read_fixture("traefik", "dynamic.yaml"))
         self.config = self.result.config
 
     def test_structure(self):
@@ -94,7 +104,7 @@ class TraefikFixtureTest(unittest.TestCase):
 
 class TraefikSemanticsTest(unittest.TestCase):
     def test_toml_v2_hosts_and_ip_allow_list(self):
-        result, report, _ = migrate("traefik", read_fixture("traefik", "dynamic.toml"), fmt="toml")
+        result, report, _ = asserted(read_fixture("traefik", "dynamic.toml"), fmt="toml")
         proxy = one_proxy(self, result.config, "/api")
         self.assertEqual(proxy["hosts"], ["a.example.com", "b.example.com"])
         self.assertFalse(proxy["strip_listen_path"])
@@ -118,22 +128,22 @@ class TraefikSemanticsTest(unittest.TestCase):
                         "middlewares": ["narrow", "broad"]}}
         middlewares = {"narrow": {"headers": {"allowedHosts": ["b.example.test"]}},
                        "broad": {"headers": {"allowedHosts": ["a.example.test", "b.example.test"]}}}
-        result, _report, _ = migrate("traefik", self._doc(router, middlewares))
+        result, _report, _ = asserted(self._doc(router, middlewares))
         self.assertEqual(one_proxy(self, result.config, "=/x", "a.example.test")["labels"]["ferrum-migration/status"],
                          "refused")
         # One list covering the router host is a no-op, unless hostsProxyHeaders also subjects other headers to it.
-        result, _report, _ = migrate("traefik", self._doc(router, {
+        result, _report, _ = asserted(self._doc(router, {
             "narrow": {"headers": {"allowedHosts": ["a.example.test"]}}, "broad": {"headers": {}}}))
         self.assertEqual(one_proxy(self, result.config, "=/x", "a.example.test")["labels"]["ferrum-migration/status"],
                          "migrated")
-        result, _report, _ = migrate("traefik", self._doc(router, {
+        result, _report, _ = asserted(self._doc(router, {
             "narrow": {"headers": {"allowedHosts": ["a.example.test"], "hostsProxyHeaders": ["X-Forwarded-Host"]}},
             "broad": {"headers": {}}}))
         self.assertEqual(one_proxy(self, result.config, "=/x", "a.example.test")["labels"]["ferrum-migration/status"],
                          "refused")
 
     def test_higher_priority_catch_all_shadows_specific_router(self):
-        result, report, _ = migrate("traefik", self._doc({
+        result, report, _ = asserted(self._doc({
             "catchall": {"rule": "PathPrefix(`/`)", "priority": 1000, "service": "s"},
             "api": {"rule": "PathPrefix(`/api`)", "service": "s"},
         }))
@@ -141,7 +151,7 @@ class TraefikSemanticsTest(unittest.TestCase):
         self.assertIn("route-shadowed", codes(report, "warning"))
 
     def test_equal_priority_overlap_is_refused(self):
-        result, _report, _ = migrate("traefik", self._doc({
+        result, _report, _ = asserted(self._doc({
             "a": {"rule": "PathPrefix(`/a`)", "priority": 10, "service": "s"},
             "b": {"rule": "PathPrefix(`/a/b`)", "priority": 10, "service": "s"},
         }))
@@ -149,14 +159,14 @@ class TraefikSemanticsTest(unittest.TestCase):
             self.assertEqual(proxy["labels"]["ferrum-migration/status"], "refused")
 
     def test_forward_auth_is_refused(self):
-        result, _report, _ = migrate("traefik", self._doc(
+        result, _report, _ = asserted(self._doc(
             {"r": {"rule": "PathPrefix(`/p`)", "service": "s", "middlewares": ["auth"]}},
             {"auth": {"forwardAuth": {"address": "http://auth.internal/check"}}}))
         self.assertEqual(one_proxy(self, result.config, "/p")["labels"]["ferrum-migration/status"], "refused")
 
     def test_basic_auth_users_never_echoed(self):
         fake_hash = "test:$apr1$fakefake$0123456789abcdefghijkl"
-        result, report, _ = migrate("traefik", self._doc(
+        result, report, _ = asserted(self._doc(
             {"r": {"rule": "PathPrefix(`/b`)", "service": "s", "middlewares": ["ba"]}},
             {"ba": {"basicAuth": {"users": [fake_hash], "removeHeader": True}}}))
         proxy = one_proxy(self, result.config, "/b")
@@ -165,19 +175,19 @@ class TraefikSemanticsTest(unittest.TestCase):
         self.assertNotIn("fakefake", json.dumps([c.to_dict() for c in report.caveats]))
 
     def test_ip_strategy_refused(self):
-        result, _report, _ = migrate("traefik", self._doc(
+        result, _report, _ = asserted(self._doc(
             {"r": {"rule": "PathPrefix(`/i`)", "service": "s", "middlewares": ["ip"]}},
             {"ip": {"ipAllowList": {"sourceRange": ["10.0.0.0/8"], "ipStrategy": {"depth": 1}}}}))
         self.assertEqual(one_proxy(self, result.config, "/i")["labels"]["ferrum-migration/status"], "refused")
 
     def test_conditional_strip_prefix_refused(self):
-        result, _report, _ = migrate("traefik", self._doc(
+        result, _report, _ = asserted(self._doc(
             {"r": {"rule": "PathPrefix(`/api`)", "service": "s", "middlewares": ["strip"]}},
             {"strip": {"stripPrefix": {"prefixes": ["/api/v1"]}}}))
         self.assertEqual(one_proxy(self, result.config, "/api")["labels"]["ferrum-migration/status"], "refused")
 
     def test_strip_prefix_shorter_than_route_uses_backend_path(self):
-        result, _report, _ = migrate("traefik", self._doc(
+        result, _report, _ = asserted(self._doc(
             {"r": {"rule": "PathPrefix(`/api/v1`)", "service": "s", "middlewares": ["strip"]}},
             {"strip": {"stripPrefix": {"prefixes": ["/api"]}}}))
         proxy = one_proxy(self, result.config, "/api/v1")
@@ -185,14 +195,14 @@ class TraefikSemanticsTest(unittest.TestCase):
         self.assertEqual(proxy["backend_path"], "/v1")
 
     def test_path_prefix_siblings_are_reported_not_widened(self):
-        result, report, _ = migrate("traefik", self._doc({"r": {"rule": "PathPrefix(`/api`)", "service": "s"}}))
+        result, report, _ = asserted(self._doc({"r": {"rule": "PathPrefix(`/api`)", "service": "s"}}))
         self.assertEqual([p.get("listen_path") for p in result.config["proxies"]], ["/api"])
         self.assertEqual(one_proxy(self, result.config, "/api")["labels"]["ferrum-migration/status"], "migrated")
         self.assertIn("prefix-string-siblings", codes(report, "error"))
 
     def test_exact_path_and_trailing_slash_prefix_have_no_sibling_report(self):
         # Path(`/status`) is exact; PathPrefix(`/api/`) siblings all continue at a '/' boundary.
-        _result, report, _ = migrate("traefik", self._doc({
+        _result, report, _ = asserted(self._doc({
             "status": {"rule": "Path(`/status`)", "service": "s"},
             "api": {"rule": "PathPrefix(`/api/`)", "service": "s"},
         }))
@@ -222,31 +232,31 @@ class TraefikServersTransportTest(unittest.TestCase):
     TIMEOUTS = {"forwardingTimeouts": {"dialTimeout": "2s", "responseHeaderTimeout": "7s"}}
 
     def test_weighted_children_keep_agreeing_forwarding_timeouts(self):
-        result, report, _ = migrate("traefik", self._doc(self._weighted("t", "t"), {"t": self.TIMEOUTS}))
+        result, report, _ = asserted(self._doc(self._weighted("t", "t"), {"t": self.TIMEOUTS}))
         proxy = one_proxy(self, result.config, "/w")
         self.assertEqual(proxy["labels"]["ferrum-migration/status"], "migrated")
         self.assertEqual((proxy["backend_connect_timeout_ms"], proxy["backend_read_timeout_ms"]), (2000, 7000))
         self.assertIn("timeout-approximate", codes(report, "warning"))
 
     def test_weighted_children_with_different_timeouts_are_refused(self):
-        result, report, _ = migrate("traefik", self._doc(self._weighted("t", None), {"t": self.TIMEOUTS}))
+        result, report, _ = asserted(self._doc(self._weighted("t", None), {"t": self.TIMEOUTS}))
         self.assertEqual(one_proxy(self, result.config, "/w")["labels"]["ferrum-migration/status"], "refused")
         self.assertIn("route-refused", codes(report, "error"))
 
     def test_weighted_child_with_undefined_transport_is_refused(self):
-        result, _report, _ = migrate("traefik", self._doc(self._weighted("missing", "missing"), {}))
+        result, _report, _ = asserted(self._doc(self._weighted("missing", "missing"), {}))
         self.assertEqual(one_proxy(self, result.config, "/w")["labels"]["ferrum-migration/status"], "refused")
 
     def test_identity_controls_are_refused_for_direct_and_weighted_backends(self):
         direct = {"d": {"loadBalancer": {"servers": [{"url": "https://d.internal:443"}], "serversTransport": "pin"}}}
-        result, _report, _ = migrate("traefik", self._doc(
+        result, _report, _ = asserted(self._doc(
             direct, {"pin": {"peerCertURI": "spiffe://example.test/backend"}}, router_service="d"))
         self.assertEqual(one_proxy(self, result.config, "/w")["labels"]["ferrum-migration/status"], "refused")
-        result, _report, _ = migrate("traefik", self._doc(
+        result, _report, _ = asserted(self._doc(
             self._weighted("id", "id"), {"id": {"spiffe": {"ids": ["spiffe://example.test/backend"]}}}))
         self.assertEqual(one_proxy(self, result.config, "/w")["labels"]["ferrum-migration/status"], "refused")
         # Several pinned roots cannot be expressed; Ferrum's default trust store would trust more CAs.
-        result, _report, _ = migrate("traefik", self._doc(
+        result, _report, _ = asserted(self._doc(
             direct, {"pin": {"rootCAs": ["/etc/test-only/ca-a.pem", "/etc/test-only/ca-b.pem"]}}, router_service="d"))
         self.assertEqual(one_proxy(self, result.config, "/w")["labels"]["ferrum-migration/status"], "refused")
 
@@ -269,20 +279,20 @@ class TraefikClientAuthTest(unittest.TestCase):
     def test_referenced_client_auth_is_preserved_as_frontend_client_ca(self):
         router = {"r": {"rule": "Host(`m.example.test`) && Path(`/m`)", "service": "s",
                         "tls": {"options": "mtls@file"}}}
-        result, report, plan = migrate("traefik", self._doc(router, {"mtls": {"clientAuth": {
+        result, report, plan = asserted(self._doc(router, {"mtls": {"clientAuth": {
             "caFiles": [self.CA], "clientAuthType": "RequireAndVerifyClientCert"}}}))
         self.assertEqual(self._status(result, "=/m", "m.example.test"), "migrated")
         self.assertEqual(plan.settings.client_ca_paths, [self.CA])
         self.assertNotIn("traefik-client-auth", codes(report))
         # Optional verification becomes mandatory (stricter), with a warning.
-        _result, report, plan = migrate("traefik", self._doc(router, {"mtls": {"clientAuth": {
+        _result, report, plan = asserted(self._doc(router, {"mtls": {"clientAuth": {
             "caFiles": [self.CA], "clientAuthType": "VerifyClientCertIfGiven"}}}))
         self.assertEqual(plan.settings.client_ca_paths, [self.CA])
         self.assertIn("traefik-mtls-optional", codes(report, "warning"))
 
     def test_default_option_client_auth_applies_to_routers_without_options(self):
         # caFiles without clientAuthType: Traefik requires and verifies client certificates.
-        result, _report, plan = migrate("traefik", self._doc(
+        result, _report, plan = asserted(self._doc(
             {"r": {"rule": "Host(`d.example.test`)", "service": "s", "tls": {}}},
             {"default": {"clientAuth": {"caFiles": [self.CA]}}}))
         self.assertEqual(self._status(result, None, "d.example.test"), "migrated")
@@ -300,7 +310,7 @@ class TraefikClientAuthTest(unittest.TestCase):
         }
         for label, (router_tls, options) in cases.items():
             with self.subTest(label):
-                result, report, plan = migrate("traefik", self._doc(
+                result, report, plan = asserted(self._doc(
                     {"r": {"rule": "Host(`u.example.test`) && Path(`/u`)", "service": "s", "tls": router_tls}},
                     options))
                 self.assertEqual(self._status(result, "=/u", "u.example.test"), "refused")
@@ -310,11 +320,11 @@ class TraefikClientAuthTest(unittest.TestCase):
     def test_sni_dependent_client_auth_is_refused(self):
         options = {"mtls": {"clientAuth": {"caFiles": [self.CA]}}}
         # No Host matcher: Traefik applies the options selected by SNI (the default ones for unclaimed names).
-        result, _report, _plan = migrate("traefik", self._doc(
+        result, _report, _plan = asserted(self._doc(
             {"r": {"rule": "Path(`/h`)", "service": "s", "tls": {"options": "mtls"}}}, options))
         self.assertEqual(self._status(result, "=/h"), "refused")
         # One host mapped to different TLS options: Traefik falls back to the default options for that host.
-        result, _report, _plan = migrate("traefik", self._doc({
+        result, _report, _plan = asserted(self._doc({
             "a": {"rule": "Host(`c.example.test`) && Path(`/a`)", "service": "s", "tls": {"options": "mtls"}},
             "b": {"rule": "Host(`c.example.test`) && Path(`/b`)", "service": "s", "tls": {}},
         }, options))
@@ -328,10 +338,142 @@ class TraefikClientAuthTest(unittest.TestCase):
                 router = {"rule": "Host(`p.example.test`) && Path(`/p`)", "service": "s"}
                 if router_tls is not None:
                     router["tls"] = router_tls
-                result, report, plan = migrate("traefik", self._doc({"r": router}, options))
+                result, report, plan = asserted(self._doc({"r": router}, options))
                 self.assertEqual(self._status(result, "=/p", "p.example.test"), "migrated")
                 self.assertEqual(plan.settings.client_ca_paths, [])
                 self.assertNotIn("traefik-client-auth", codes(report))
+
+
+class TraefikEntryPointsTest(unittest.TestCase):
+    """Static entryPoints are not in the dynamic input: no forwarding without the operator's explicit assertion."""
+
+    SERVICE = {"s": {"loadBalancer": {"servers": [{"url": "http://s.internal:80"}]}}}
+    ROUTERS = {
+        "plaintext, no entryPoints": {"rule": "Host(`p.example.test`) && Path(`/p`)", "service": "s"},
+        "plaintext, named entryPoint": {"rule": "Host(`p.example.test`) && Path(`/p`)", "service": "s",
+                                        "entryPoints": ["web"]},
+        "explicit tls": {"rule": "Host(`p.example.test`) && Path(`/p`)", "service": "s", "tls": {},
+                         "entryPoints": ["websecure"]},
+    }
+
+    def _doc(self, routers, middlewares=None):
+        http = {"routers": routers, "services": self.SERVICE}
+        if middlewares:
+            http["middlewares"] = middlewares
+        return yaml.safe_dump({"http": http})
+
+    @staticmethod
+    def _status(proxy):
+        return proxy["labels"]["ferrum-migration/status"]
+
+    def test_default_refuses_every_forwarding_router(self):
+        for label, router in self.ROUTERS.items():
+            with self.subTest(label):
+                result, report, plan = migrate("traefik", self._doc({"r": router}))
+                proxy = one_proxy(self, result.config, "=/p", "p.example.test")
+                self.assertEqual(self._status(proxy), "refused")
+                self.assertEqual([(p["plugin_name"], p["config"]["status_code"])
+                                  for p in plugins_of(result.config, proxy)], [("request_termination", 503)])
+                self.assertEqual(live_routes(result.config), [])
+                self.assertEqual(result.stats["migrated_routes"], 0)
+                self.assertIn("traefik-entrypoints-unverified", codes(report, "error"))
+                self.assertNotIn("traefik-entrypoints-asserted", codes(report))
+                self.assertTrue(any("static entryPoints" in reason for reason in plan.routes[0].refusals))
+
+    def test_default_refusal_names_the_remediation_without_calling_it_validation(self):
+        _result, report, _plan = migrate("traefik", self._doc({"r": self.ROUTERS["plaintext, no entryPoints"]}))
+        [caveat] = [c for c in report.caveats if c.code == "traefik-entrypoints-unverified"]
+        self.assertEqual(caveat.severity, "error")
+        self.assertIn(ENTRYPOINTS_ASSERTION_FLAG, caveat.action)
+        self.assertIn("Inspect the static configuration", caveat.action)
+        self.assertIn("cannot verify", caveat.action)
+        self.assertNotIn("p.example.test", caveat.message + caveat.action)
+
+    def test_default_refuses_the_real_fixtures(self):
+        for name, fmt in (("dynamic.yaml", "yaml"), ("dynamic.toml", "toml")):
+            with self.subTest(name):
+                result, report, _plan = migrate("traefik", read_fixture("traefik", name), fmt=fmt)
+                assert_structurally_valid(self, result.config)
+                self.assertEqual(live_routes(result.config), [])
+                self.assertEqual(result.config["upstreams"], [])
+                self.assertIn("traefik-entrypoints-unverified", codes(report, "error"))
+
+    def test_assertion_restores_the_dynamic_mapping(self):
+        for label, router in self.ROUTERS.items():
+            with self.subTest(label):
+                result, report, _plan = asserted(self._doc({"r": router}))
+                self.assertEqual(self._status(one_proxy(self, result.config, "=/p", "p.example.test")), "migrated")
+                self.assertNotIn("traefik-entrypoints-unverified", codes(report))
+                self.assertIn("traefik-entrypoints-asserted", codes(report, "warning"))
+                # The router's own tls block still decides the frontend: HTTPS-only output for the tls router.
+                self.assertEqual(result.tls_only, "tls" in router)
+
+    def test_assertion_is_reported_as_unverified(self):
+        _result, report, _plan = asserted(self._doc({"r": self.ROUTERS["plaintext, no entryPoints"]}))
+        [caveat] = [c for c in report.caveats if c.code == "traefik-entrypoints-asserted"]
+        self.assertIn(ENTRYPOINTS_ASSERTION_FLAG, caveat.message)
+        self.assertIn("cannot verify", caveat.message)
+
+    def test_assertion_never_overrides_restrictions_stated_in_the_input(self):
+        base = {"rule": "Host(`p.example.test`) && Path(`/p`)", "service": "s"}
+        cases = {
+            "TLS options from another provider": ({**base, "tls": {"options": "mtls@kubernetescrd"}}, None),
+            "untranslatable middleware": ({**base, "middlewares": ["auth"]},
+                                          {"auth": {"forwardAuth": {"address": "http://auth.internal/check"}}}),
+            "malformed entryPoints": ({**base, "entryPoints": [""]}, None),
+            "non-string entryPoints": ({**base, "entryPoints": [{"name": "web"}]}, None),
+        }
+        for label, (router, middlewares) in cases.items():
+            with self.subTest(label):
+                result, report, _plan = asserted(self._doc({"r": router}, middlewares))
+                self.assertEqual(self._status(one_proxy(self, result.config, "=/p", "p.example.test")), "refused")
+                self.assertEqual(live_routes(result.config), [])
+                self.assertIn("route-refused", codes(report, "error"))
+
+    def test_assertion_never_overrides_static_entrypoints_stated_in_the_input(self):
+        # A static entryPoints section in the input is not translated; the assertion cannot speak over it.
+        text = yaml.safe_dump({
+            "entryPoints": {"web": {"address": ":80", "http": {"redirections": {"entryPoint": {"to": "websecure"}}}}},
+            "http": {"routers": {"r": self.ROUTERS["plaintext, named entryPoint"]}, "services": self.SERVICE},
+        })
+        result, report, _plan = asserted(text)
+        self.assertEqual(self._status(one_proxy(self, result.config, "=/p", "p.example.test")), "refused")
+        self.assertEqual(live_routes(result.config), [])
+        self.assertIn("traefik-entrypoints-in-input", codes(report, "error"))
+        self.assertNotIn("traefik-entrypoints-asserted", codes(report))
+
+    def test_assertion_keeps_router_tls_as_https_only(self):
+        result, report, _plan = asserted(self._doc({
+            "plain": {"rule": "Host(`p.example.test`) && Path(`/plain`)", "service": "s", "entryPoints": ["web"]},
+            "secure": {"rule": "Host(`p.example.test`) && Path(`/secure`)", "service": "s", "tls": {},
+                       "entryPoints": ["websecure"]},
+        }))
+        self.assertEqual(self._status(one_proxy(self, result.config, "=/plain", "p.example.test")), "migrated")
+        # Never exposed on the plaintext listener; the separate HTTPS entryPoint is not an entryPoint-scope conflict.
+        self.assertEqual(self._status(one_proxy(self, result.config, "=/secure", "p.example.test")), "refused")
+        self.assertEqual(result.frontend_protocols, "http")
+        self.assertNotIn("traefik-entrypoint-scope", codes(report))
+
+    def test_assertion_keeps_explicit_entrypoint_lists(self):
+        def router(path, entrypoints=None):
+            spec = {"rule": f"Host(`e.example.test`) && Path(`{path}`)", "service": "s"}
+            if entrypoints is not None:
+                spec["entryPoints"] = entrypoints
+            return spec
+
+        result, report, plan = asserted(self._doc({
+            "a": router("/a", ["web"]),
+            "b": router("/b", ["web", "metrics"]),
+            "c": router("/c", ["admin"]),
+            "d": router("/d"),
+        }))
+        statuses = {path: self._status(one_proxy(self, result.config, f"={path}", "e.example.test"))
+                    for path in ("/a", "/b", "/c", "/d")}
+        # web is the entryPoint the plaintext routers share; admin-only router c was never served there.
+        self.assertEqual(statuses, {"/a": "migrated", "/b": "migrated", "/c": "refused", "/d": "migrated"})
+        self.assertIn("traefik-entrypoint-scope", codes(report, "error"))
+        refused = next(spec for spec in plan.routes if spec.name == "c")
+        self.assertTrue(any("leave out web" in reason for reason in refused.refusals))
 
 
 if __name__ == "__main__":

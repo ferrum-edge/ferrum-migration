@@ -309,10 +309,12 @@ def _run_case(case: Case, ctx: RunContext, canaries: SyntheticCanaries) -> dict:
         conv = run_converter(
             ctx.converter, case.adapter, case.id, source_path, outdir, workdir,
             case.include_secrets, ctx.converter_env, ctx.pass_env, sensitive,
+            assertions=case.converter_assertions,
         )
         out = conv.outputs
         result["converter"] = {
             "argv": conv.argv_display,
+            "operator_assertions": list(case.converter_assertions),
             "returncode": conv.returncode,
             "timed_out": conv.timed_out,
             "resources": out.resources.name if out.resources else None,

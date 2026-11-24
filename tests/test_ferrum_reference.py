@@ -67,8 +67,12 @@ def struct_fields(source: str, name: str) -> set[str]:
 
 
 def outputs():
+    # The synthetic Traefik fixtures stand for sources whose static entryPoints add no frontend controls, so they are
+    # converted with the operator's assertion (as with --assert-traefik-entrypoints-add-no-controls); the default
+    # refusal output is admitted separately (test_traefik_default_refusal_passes_ferrum_validate).
     for platform, parts, fmt in CASES:
-        result, _report, plan = migrate(platform, read_fixture(*parts), fmt=fmt, include_secrets=False)
+        result, _report, plan = migrate(platform, read_fixture(*parts), fmt=fmt, include_secrets=False,
+                                        traefik_entrypoints_asserted=platform == "traefik")
         yield platform, parts, result, plan
 
 
@@ -285,6 +289,23 @@ class FerrumBinaryValidateTest(unittest.TestCase):
             result, _report, _plan = migrate(platform, text, fmt=fmt, tls_only=tls_only)
             with self.subTest(case=index, platform=platform, tls_only=tls_only), \
                     tempfile.TemporaryDirectory() as directory:
+                completed = self.validate(binary, directory, result.config, result.basic_auth_used)
+                self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+                self.assertIn("Validation passed", completed.stdout)
+
+    def test_traefik_default_refusal_passes_ferrum_validate(self):
+        """Admission regression: without the entryPoint assertion the Traefik fixtures become placeholders only.
+
+        Benign synthetic fixtures, converted with the default (no operator assertion): every forwarding router is a
+        fail-closed 503 placeholder. Only the resources are validated; no traffic is sent.
+        """
+        binary = os.environ["FERRUM_EDGE_BIN"]
+        for parts, fmt in ((("traefik", "dynamic.yaml"), "yaml"), (("traefik", "dynamic.toml"), "toml")):
+            result, report, _plan = migrate("traefik", read_fixture(*parts), fmt=fmt)
+            with self.subTest(fixture="/".join(parts)), tempfile.TemporaryDirectory() as directory:
+                self.assertIn("traefik-entrypoints-unverified", {c.code for c in report.caveats})
+                self.assertFalse([p for p in result.config["proxies"]
+                                  if p["labels"].get("ferrum-migration/status") == "migrated"])
                 completed = self.validate(binary, directory, result.config, result.basic_auth_used)
                 self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
                 self.assertIn("Validation passed", completed.stdout)

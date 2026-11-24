@@ -124,6 +124,7 @@ def main(argv: "list[str] | None" = None) -> int:
                 flags.append("deny-only")
             if c.include_secrets:
                 flags.append("include-secrets")
+            flags.extend(f"asserts {name}" for name in c.converter_assertions)
             print(f"{c.id:40s} {c.adapter:12s} {', '.join(flags)}")
         return 0
     if not cases:

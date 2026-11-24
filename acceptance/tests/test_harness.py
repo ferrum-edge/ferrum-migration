@@ -30,7 +30,7 @@ import run as run_cli  # noqa: E402
 from harness import ferrum as ferrum_mod  # noqa: E402
 from harness import probe  # noqa: E402
 from harness.cases import ADAPTERS, load_cases  # noqa: E402
-from harness.converter import ConverterProfile, exit_code_verdict  # noqa: E402
+from harness.converter import ConverterProfile, exit_code_verdict, run_converter  # noqa: E402
 from harness.echo import PROBE_HEADER, EchoBackend, EchoRecorder  # noqa: E402
 from harness.ferrum import GatewayIdentity, ferrum_env, FerrumOptions  # noqa: E402
 from harness.loopback import LoopbackThreadingHTTPServer  # noqa: E402
@@ -101,6 +101,15 @@ class FixtureTests(unittest.TestCase):
             self.assertTrue(any(p.deny for p in case.probes), case_id)
         self.assertEqual(adapters, {"kong-dbless", "kong-deck", "nginx", "traefik", "envoy", "istio"})
 
+    def test_traefik_cases_pass_the_entrypoint_assertion_explicitly(self):
+        # The converter refuses forwarding Traefik routes unless the operator asserts the static entryPoints add no
+        # controls; each Traefik case states that it passes it (its source is served on the harness's plain
+        # loopback entryPoint), and no other adapter's case does.
+        for case in load_cases(ROOT / "fixtures"):
+            with self.subTest(case=case.id):
+                expected = ["traefik-entrypoints-add-no-controls"] if case.adapter == "traefik" else []
+                self.assertEqual(case.converter_assertions, expected)
+
     def test_canaries_are_unique_per_run(self):
         a, b = SyntheticCanaries(), SyntheticCanaries()
         self.assertNotEqual(a.key, b.key)
@@ -118,6 +127,16 @@ class ConverterContractTests(unittest.TestCase):
         self.assertEqual(self.profile.platform("kong-deck"), "kong")
         self.assertEqual(self.profile.platform("kong-dbless"), "kong")
         self.assertEqual(self.profile.outputs["report"], ["migration-report.json"])
+        self.assertEqual(self.profile.assertion_argv,
+                         {"traefik-entrypoints-add-no-controls": ["--assert-traefik-entrypoints-add-no-controls"]})
+
+    def test_unmapped_converter_assertion_is_a_template_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            with self.assertRaises(TemplateError):
+                run_converter(self.profile, "traefik", "x", work / "in.yaml", work / "out", work, False, {}, [], [],
+                              assertions=["not-a-known-assertion"])
+            self.assertFalse((work / "out").exists())
 
     def test_exit_code_must_agree_with_report(self):
         clean = {"caveats": [], "counts": {"error": 0}}

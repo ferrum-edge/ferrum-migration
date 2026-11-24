@@ -10,7 +10,7 @@ cannot reproduce is refused or reported.
 |---|---|
 | Kong Gateway | DB-less `kong.yml` or a decK dump (`deck gateway dump`), YAML or JSON. Both share one schema, so `--from kong` handles either; no extra flag is needed, and the report states which flavor was detected. The tool never talks to a Kong database or Admin API. |
 | NGINX OSS | One `nginx.conf`-syntax file with an `http {}` block (or bare `server {}` blocks). Includes are never followed. |
-| Traefik OSS | Dynamic configuration for the file provider (`http` section), YAML, TOML or JSON. |
+| Traefik OSS | Dynamic configuration for the file provider (`http` section), YAML, TOML or JSON. The static configuration (entryPoints) is not read, so forwarding routes are refused unless you pass `--assert-traefik-entrypoints-add-no-controls` (see Options). |
 | Envoy | v3 static bootstrap (`static_resources`) with HTTP connection managers and inline `route_config`. |
 | Istio | Networking CRDs (`Gateway`, `VirtualService`, `DestinationRule`, `ServiceEntry`) as multi-document YAML or a `kind: List`. This is an **ingress projection**: only Gateway-bound routes become Ferrum edge proxies. Mesh routing, sidecars and workload mTLS are reported, not migrated. |
 
@@ -46,7 +46,8 @@ ferrum-migrate platforms
 ferrum-migrate check   kong.yaml   --from kong                 # report only, writes nothing
 ferrum-migrate convert kong.yaml   --from kong    --out ./ferrum-out
 ferrum-migrate convert nginx.conf  --from nginx   --out ./ferrum-out --tls-only
-ferrum-migrate convert dynamic.yml --from traefik --out ./ferrum-out --run-mode database
+ferrum-migrate convert dynamic.yml --from traefik --out ./ferrum-out --run-mode database \
+    --assert-traefik-entrypoints-add-no-controls             # only after inspecting the static entryPoints
 ferrum-migrate convert envoy.yaml  --from envoy   --out ./ferrum-out
 ferrum-migrate convert istio.yaml  --from istio   --out ./ferrum-out
 
@@ -60,6 +61,7 @@ Options:
 |---|---|
 | `--run-mode file\|database\|cp\|dp` | Which Ferrum operating mode `ferrum.conf` targets (default `file`). For database/cp, validate in file mode, then import through Ferrum's documented Admin API. This tool does no network I/O. |
 | `--tls-only` | Disable Ferrum's plaintext listener so routes that were HTTPS-only in the source can be migrated. This is chosen automatically when every migrated route requires HTTPS. Routes the source served over plaintext only are then refused (`frontend-protocol-scope`), because Ferrum would serve them on its HTTPS listener. |
+| `--assert-traefik-entrypoints-add-no-controls` | Traefik only (refused with exit 2 for other sources). Your statement, made after you inspected Traefik's static configuration (file, CLI flags or environment), that every static entryPoint the converted routers use (those named in `entryPoints`, and the default entryPoints of routers that name none) adds no TLS (`http.tls`), client certificate options, middlewares (`http.middlewares`), redirections (`http.redirections`), forwarded-header or PROXY protocol trust (`forwardedHeaders`, `proxyProtocol`) or bind restriction (`address`), and that routers naming no entryPoints share the entryPoint the other routers of their protocol use. The tool cannot check any of this; it is not a validation. Without it, every Traefik route that would forward traffic is refused (`traefik-entrypoints-unverified`). With it, the report carries a `traefik-entrypoints-asserted` warning, and everything the input states still applies: router `tls` (HTTPS-only), TLS options `clientAuth`, middlewares, and explicit `entryPoints` lists (routers that leave out the entryPoint the other routers of their protocol share are refused, `traefik-entrypoint-scope`). An input that itself contains a static `entryPoints` section stays refused (`traefik-entrypoints-in-input`). |
 | `--include-secrets` | Explicit opt-in to write migratable plaintext credentials (Kong key-auth keys) into the resources file. Kong JWT secrets are never written (see Safety model). Output files are always mode `0600`; with this flag a `.gitignore` containing `*` is also written. |
 | `--strict` | Treat warnings as "review required" (exit 4). |
 | `--max-input-bytes N` | Input size cap (default 8 MiB). |
@@ -184,6 +186,14 @@ rather than opening routes or downgrading security:
   holds even when the source's HTTPS listener was not migrated (Envoy RDS, skipped listeners). A route
   without that information refuses the whole plan (`frontend-protocol-unknown`). The rendered `ferrum.conf`
   is checked against the decision before anything is written.
+* **Traefik static entryPoints are never assumed.** The file provider input is dynamic configuration only.
+  The entryPoints a router is attached to can add TLS, client certificate options, prepended middlewares,
+  redirections, forwarded-header trust and bind restrictions, so a router without a `tls` block is not proven
+  plaintext, and one with a `tls` block is not proven free of other entryPoint controls. By default every Traefik
+  route that would forward traffic is refused (503 placeholder, error `traefik-entrypoints-unverified`, with the
+  remediation). Only `--assert-traefik-entrypoints-add-no-controls`, given after you inspected the static
+  configuration, lets them forward; the tool records it as your unverified statement and still applies every
+  restriction the input states.
 * **Restricted listeners stay restricted.** NGINX `listen`, Envoy listener and Istio `Server.bind`
   addresses are reproduced only when every server shares one address (`FERRUM_PROXY_BIND_ADDRESS`).
   Otherwise the address-restricted servers (and Unix sockets) are skipped, never exposed on
