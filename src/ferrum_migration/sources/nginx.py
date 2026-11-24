@@ -19,7 +19,7 @@ from ..limits import Limits
 from ..model import BackendRef, HostScope, Plan, PluginSpec, RouteSpec, Target, TlsSpec, UpstreamSpec
 from ..redact import safe_label
 from .common import (SourceContext, check_route_budget, choose_main_port, is_sensitive_header, literal_value,
-                     request_header_rule, response_header_rule)
+                     refuse_frontend_scope_conflicts, request_header_rule, response_header_rule)
 
 PLATFORM = "nginx"
 
@@ -215,6 +215,8 @@ class _Nginx:
         self.zones: dict[str, dict] = {}
         self.body_sizes: list[tuple[RouteSpec, int]] = []
         self.catch_all_routes: dict[int, list[RouteSpec]] = {}
+        # One entry per server on the main listeners, checked together once every server is translated.
+        self.projections: list[dict] = []
 
     # --------------------------------------------------------- scope merge
 
@@ -314,6 +316,9 @@ class _Nginx:
         for info in infos:
             self._translate_server(info)
         self._refuse_conflicting_defaults()
+        # A plaintext-only server must not answer HTTPS requests for hosts a server on the TLS listener served.
+        # Runs before body-size ceilings are taken from the remaining live routes.
+        refuse_frontend_scope_conflicts(self.projections, self.report, "nginx-frontend-scope-conflict")
         check_route_budget(len(self.plan.routes), self.ctx.limits)
         self._finish_body_sizes()
         return self.plan
@@ -501,6 +506,7 @@ class _Nginx:
                 route.refuse(problem)
             self.plan.routes.append(route)
             self._note_catch_all(info, base, [route])
+            self._note_projection(info, base, [route], on_plain, on_tls)
             return
         locations = [d for d in server.block or [] if d.name == "location"]
         if not locations:
@@ -519,8 +525,20 @@ class _Nginx:
         _check_precedence(routes)
         self.plan.routes.extend(routes)
         self._note_catch_all(info, base, routes)
+        self._note_projection(info, base, routes, on_plain, on_tls)
         if base["hosts"]:
             self.plan.host_scopes.append(HostScope(ref, list(base["hosts"]), listen_port))
+
+    def _note_projection(self, info: dict, base: dict, routes: list[RouteSpec], on_plain: bool, on_tls: bool) -> None:
+        """Remember a server served on the main listeners for the frontend isolation check in run().
+
+        ``frontend`` is the pair of main listeners Ferrum serves it on (plaintext, TLS). Refused routes are included.
+        """
+        if base["listen_port"] is not None:
+            return
+        self.projections.append({"scope": info["index"], "ref": info["ref"], "routes": list(routes),
+                                 "frontend": (on_plain, on_tls),
+                                 "hosts": None if base["hosts"] is None else list(base["hosts"])})
 
     def _note_catch_all(self, info: dict, base: dict, routes: list[RouteSpec]) -> None:
         """Remember port-agnostic catch-all routes per server (checked for conflicting defaults in run())."""

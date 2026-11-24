@@ -212,8 +212,15 @@ def regex_problem(pattern: object) -> str | None:
 
 
 def regex_literal_prefix(pattern: str) -> str:
-    """Literal text every match must start with (pattern is anchored at the start)."""
+    """Literal text every match must start with (pattern is anchored at the start).
+
+    A top-level alternation (``/a|/B``) has no literal that every branch shares, and the first branch's literal
+    proves nothing about the others. The proof is then unknown: ``""`` is returned, so callers treat the pattern as
+    able to match any path (overlaps everything, covered by nothing narrower).
+    """
     text = pattern[1:] if pattern.startswith("^") else pattern
+    if has_top_level_alternation(text):
+        return ""
     out: list[str] = []
     index = 0
     while index < len(text):

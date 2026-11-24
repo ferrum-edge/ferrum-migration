@@ -269,6 +269,20 @@ class MatchingTest(unittest.TestCase):
             ref="i", name="i", kind="prefix", path="/admin/x", case_insensitive=True)))
         self.assertTrue(matching.route_covers(other("prefix", "/"), ci))
 
+    def test_top_level_alternation_has_no_literal_prefix_proof(self):
+        # The first branch's literal says nothing about the other branches: the proof is unknown ("").
+        for pattern in ("/other|/ADMIN/.*", "^/a|^/b", "/a/(x)|/b"):
+            self.assertEqual(util.regex_literal_prefix(pattern), "", pattern)
+        # Alternation inside a group or a character class keeps the literal every match starts with.
+        self.assertEqual(util.regex_literal_prefix("/api/(v1|v2)/x"), "/api/")
+        self.assertEqual(util.regex_literal_prefix("/a[|]b"), "/a")
+        ci = RouteSpec(ref="ci", name="ci", kind="prefix", path="/admin", case_insensitive=True)
+        alternation = RouteSpec(ref="alt", name="alt", kind="regex", path="/other|/ADMIN/.*")
+        self.assertTrue(matching.receives_case_variants(ci, alternation))
+        self.assertTrue(matching.route_overlaps(ci, alternation))
+        grouped = RouteSpec(ref="grp", name="grp", kind="regex", path="/other/(a|B)")
+        self.assertFalse(matching.receives_case_variants(ci, grouped))
+
     def test_url_userinfo_refused(self):
         with self.assertRaises(util.UrlProblem):
             util.split_url("http://user:pass@host:80/", {"http": 80})

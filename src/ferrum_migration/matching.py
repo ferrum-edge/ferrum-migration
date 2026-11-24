@@ -212,6 +212,10 @@ def receives_case_variants(source, other) -> bool:
     if not other.path_ok or other.kind == "hostonly" or not isinstance(other.path, str):
         return True
     if other.kind == "regex":
+        # A top-level alternation has no literal prefix shared by every branch: the first branch's literal says
+        # nothing about the others, so whether it intersects the variants is unknown (fail closed).
+        if util.has_top_level_alternation(other.path):
+            return True
         # Every regex match starts with its literal prefix; the rest of the pattern may match any case.
         q, q_exact = util.regex_literal_prefix(other.path), False
     elif other.kind in ("prefix", "exact"):

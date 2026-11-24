@@ -456,5 +456,66 @@ class NginxClientCaScopeTest(unittest.TestCase):
         self.assertEqual(plan.settings.client_ca_paths, [])
 
 
+class NginxFrontendScopeTest(unittest.TestCase):
+    # Synthetic paths only: no certificate material is read, written or needed.
+    CA = "/etc/synthetic/client-ca.pem"
+    DEFAULT = """
+        server {
+            listen 80 default_server;
+            listen 443 ssl default_server;
+            ssl_certificate /etc/synthetic/server.crt;
+            ssl_certificate_key /etc/synthetic/server.key;
+            return 444;
+        }
+    """
+    SECURE = """
+        server {
+            listen 443 ssl;
+            server_name app.example.test;
+            ssl_certificate /etc/synthetic/server.crt;
+            ssl_certificate_key /etc/synthetic/server.key;
+            ssl_client_certificate /etc/synthetic/client-ca.pem;
+            ssl_verify_client on;
+            location /secure/ { proxy_pass http://secure.internal:8080; }
+        }
+    """
+
+    def status(self, result, path, host=None):
+        return one_proxy(self, result.config, path, host)["labels"]["ferrum-migration/status"]
+
+    def test_plaintext_only_server_overlapping_https_server_is_refused(self):
+        # Ferrum serves port-agnostic routes on both listeners, so the plaintext-only server's routes would also
+        # answer HTTPS requests the source sent to the HTTPS server (with its client CA). Neither side is kept, the
+        # client CA is not configured from a partial plan, and --tls-only does not change that.
+        plain = """
+            server {
+                listen 80;
+                server_name app.example.test;
+                location /plain/ { proxy_pass http://plain.internal:8080; }
+            }
+        """
+        for tls_only in (False, True):
+            with self.subTest(tls_only=tls_only):
+                result, report, plan = nginx(self.DEFAULT + plain + self.SECURE, tls_only=tls_only)
+                assert_structurally_valid(self, result.config)
+                self.assertEqual(self.status(result, "/plain", "app.example.test"), "refused")
+                self.assertEqual(self.status(result, "/secure", "app.example.test"), "refused")
+                self.assertIn("nginx-frontend-scope-conflict", codes(report, "error"))
+                self.assertEqual(plan.settings.client_ca_paths, [])
+
+    def test_https_scopes_behind_a_redirect_keep_their_single_frontend(self):
+        # The plaintext server only redirects (not emitted) and the default server serves both listeners, so no
+        # plaintext-only scope remains: the HTTPS server and its one client CA are migrated as before.
+        redirect = """
+            server { listen 80; server_name app.example.test; return 301 https://$host$request_uri; }
+        """
+        result, report, plan = nginx(self.DEFAULT + redirect + self.SECURE, tls_only=True)
+        assert_structurally_valid(self, result.config)
+        self.assertEqual(self.status(result, "/secure", "app.example.test"), "migrated")
+        self.assertNotEqual(self.status(result, "/"), "refused")
+        self.assertNotIn("nginx-frontend-scope-conflict", codes(report))
+        self.assertEqual(plan.settings.client_ca_paths, [self.CA])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -162,6 +162,74 @@ class EnvoyClientCaTest(unittest.TestCase):
         self.assertEqual(plan.settings.client_ca_paths, [])
 
 
+def two_listener_bootstrap(plain_domains, tls_domains, client_ca=None):
+    """A main plaintext listener (/plain) and a main HTTPS listener (/secure). Synthetic file paths only."""
+    doc = minimal_bootstrap({"path_separated_prefix": "/plain"})
+    listeners = doc["static_resources"]["listeners"]
+    secure = copy.deepcopy(listeners[0])
+    secure["name"] = "tls"
+    secure["address"]["socket_address"]["port_value"] = 8443
+    listeners.append(secure)
+    for listener, domains, path in ((listeners[0], plain_domains, "/plain"), (secure, tls_domains, "/secure")):
+        vhost = listener["filter_chains"][0]["filters"][0]["typed_config"]["route_config"]["virtual_hosts"][0]
+        vhost["domains"] = list(domains)
+        vhost["routes"][0]["match"] = {"path_separated_prefix": path}
+    context = {"@type": "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext",
+               "common_tls_context": {"tls_certificates": [
+                   {"certificate_chain": {"filename": "/etc/synthetic/server.crt"},
+                    "private_key": {"filename": "/etc/synthetic/server.key"}}]}}
+    if client_ca:
+        context["require_client_certificate"] = True
+        context["common_tls_context"]["validation_context"] = {"trusted_ca": {"filename": client_ca}}
+    secure["filter_chains"][0]["transport_socket"] = {"name": "envoy.transport_sockets.tls", "typed_config": context}
+    return doc
+
+
+class EnvoyFrontendScopeTest(unittest.TestCase):
+    CA = "/etc/synthetic/client-ca.pem"
+
+    def status(self, result, path, host):
+        return one_proxy(self, result.config, path, host)["labels"]["ferrum-migration/status"]
+
+    def test_plaintext_and_https_listeners_with_overlapping_hosts_are_refused(self):
+        # Ferrum serves port-agnostic routes on both of its listeners, so the plaintext listener's routes would also
+        # answer HTTPS requests for hosts the HTTPS listener (with its client CA) served. Neither side is kept, the
+        # client CA is not configured from a partial plan, and --tls-only does not change that.
+        for plain_domains in (("app.example.test",), ("*",)):
+            for tls_only in (False, True):
+                with self.subTest(plain_domains=plain_domains, tls_only=tls_only):
+                    doc = two_listener_bootstrap(plain_domains, ("app.example.test",), client_ca=self.CA)
+                    result, report, plan = migrate("envoy", yaml.safe_dump(doc), tls_only=tls_only)
+                    assert_structurally_valid(self, result.config)
+                    plain_host = None if plain_domains == ("*",) else "app.example.test"
+                    self.assertEqual(self.status(result, "/plain", plain_host), "refused")
+                    self.assertEqual(self.status(result, "/secure", "app.example.test"), "refused")
+                    self.assertEqual([p for p in result.config["proxies"]
+                                      if p["labels"]["ferrum-migration/status"] == "migrated"], [])
+                    self.assertIn("envoy-frontend-scope-conflict", codes(report, "error"))
+                    self.assertEqual(plan.settings.client_ca_paths, [])
+
+    def test_disjoint_hosts_on_plaintext_and_https_listeners_are_kept(self):
+        doc = two_listener_bootstrap(("www.example.test",), ("app.example.test",), client_ca=self.CA)
+        result, report, plan = migrate("envoy", yaml.safe_dump(doc), tls_only=True)
+        assert_structurally_valid(self, result.config)
+        self.assertEqual(self.status(result, "/plain", "www.example.test"), "migrated")
+        self.assertEqual(self.status(result, "/secure", "app.example.test"), "migrated")
+        self.assertNotIn("envoy-frontend-scope-conflict", codes(report))
+        self.assertEqual(plan.settings.client_ca_paths, [self.CA])
+
+    def test_single_listener_plans_are_unchanged(self):
+        # Overlapping virtual hosts of one listener share one frontend; the emitter's checks apply as before.
+        _result, report, _plan = migrate("envoy", read_fixture("envoy", "envoy.yaml"))
+        self.assertNotIn("envoy-frontend-scope-conflict", codes(report))
+        doc = with_client_cert_listener(minimal_bootstrap({"path_separated_prefix": "/api"}),
+                                        {"trusted_ca": {"filename": self.CA}})
+        result, report, plan = migrate("envoy", yaml.safe_dump(doc))
+        self.assertEqual(one_proxy(self, result.config, "/api")["labels"]["ferrum-migration/status"], "migrated")
+        self.assertNotIn("envoy-frontend-scope-conflict", codes(report))
+        self.assertEqual(plan.settings.client_ca_paths, [self.CA])
+
+
 def bootstrap_with_routes(routes, domains=("app.example.test",)):
     doc = minimal_bootstrap({"prefix": "/"})
     vhost = doc["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"][
@@ -217,6 +285,18 @@ class EnvoyCaseSensitivityTest(unittest.TestCase):
         self.assertEqual(proxies(result.config, "=/API"), [])
         self.assertIn("route-shadowed", codes(report, "warning"))
         self.assertEqual(self.status(result, "/api"), "migrated")
+
+    def test_regex_alternation_has_no_literal_prefix_proof_for_case_variants(self):
+        # The first branch's literal (/other) says nothing about the later branch, which can match case variants of
+        # the case-insensitive /admin/ route. A regex without top-level alternation keeps its literal-prefix proof.
+        routes = [{"name": "admin", "match": {"prefix": "/admin/", "case_sensitive": False}, "route": {"cluster": "c"}},
+                  {"name": "alt", "match": {"safe_regex": {"regex": "/other|/ADMIN/.*"}}, "route": {"cluster": "c"}},
+                  {"name": "other", "match": {"safe_regex": {"regex": "/other/[0-9]+"}}, "route": {"cluster": "c"}}]
+        result, _report, _ = migrate("envoy", yaml.safe_dump(bootstrap_with_routes(routes)))
+        assert_structurally_valid(self, result.config)
+        self.assertEqual(self.status(result, "~/other|/ADMIN/.*"), "refused")
+        self.assertEqual(self.status(result, "~/other/[0-9]+"), "migrated")
+        self.assertEqual(self.status(result, "/admin"), "migrated")
 
 
 class EnvoyPrefixSemanticsTest(unittest.TestCase):

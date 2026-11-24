@@ -320,6 +320,67 @@ def retry_from_policy(retry_on: Any, attempts: Any) -> tuple[dict | None, list[s
     }, notes
 
 
+# ------------------------------------------------------ frontend isolation
+
+def frontend_conflict(first: tuple[bool, bool], second: tuple[bool, bool]) -> bool:
+    """Whether two source scopes' main listeners ``(plaintext, https)`` cannot share Ferrum's listeners.
+
+    Ferrum serves every port-agnostic route on its plaintext and its HTTPS listener. A scope the source served on
+    plaintext only would therefore also answer HTTPS requests that the source sent to a scope served on HTTPS
+    (with that scope's routes, client-certificate requirement or refusal). The emitter covers the opposite
+    direction (HTTPS-only routes are refused, or the plaintext listener is disabled) but nothing restores the
+    HTTPS scope for plaintext-only routes, so such a pair is a conflict. Scopes on the same main listeners keep
+    the emitter's per-route checks, as in a single-frontend plan.
+    """
+    if first == second:
+        return False
+    plain_only = (True, False)
+    return (first == plain_only and second[1]) or (second == plain_only and first[1])
+
+
+def refuse_frontend_scope_conflicts(projections: list[dict], report: Report, code: str) -> None:
+    """Refuse overlapping source scopes served through incompatible main listeners (fail closed).
+
+    The same frontend isolation invariant the Istio adapter enforces for Gateway bindings
+    (``istio-frontend-scope-conflict``). Each projection is one source scope on the main listeners (an Envoy
+    virtual host, an NGINX server): ``scope`` identifies its source listener/server, ``frontend`` is
+    ``(served on main plaintext, served on main HTTPS)``, ``hosts`` its host scope (``[]`` any host, ``None``
+    unknown) and ``routes`` every route it produced. It runs on the translator's whole plan, before the emitter
+    filters skipped or refused routes, decides TLS-only, or collects client CA bundles, so refused routes and
+    scopes whose trust cannot be reproduced still count. When the hosts of a plaintext-only scope overlap a scope
+    served on HTTPS, Ferrum cannot keep the two apart, and equivalence of the mixed plan is not provable: every
+    route of both scopes is refused and reported. Different trust scopes are never combined. Plans whose scopes
+    all use the same main listeners are unchanged.
+    """
+    conflicts: dict[int, list[str]] = {}
+    for i, first in enumerate(projections):
+        for j in range(i + 1, len(projections)):
+            second = projections[j]
+            if first["scope"] == second["scope"] or not frontend_conflict(first["frontend"], second["frontend"]):
+                continue
+            if not matching.hosts_overlap(first["hosts"], second["hosts"]):
+                continue
+            conflicts.setdefault(i, []).append(second["ref"])
+            conflicts.setdefault(j, []).append(first["ref"])
+    for index in sorted(conflicts):
+        projection = projections[index]
+        others = list(dict.fromkeys(conflicts[index]))
+        names = ", ".join(others)[:400]
+        reason = (f"a scope the source served through other main listeners ({names}) overlaps its hosts; Ferrum "
+                  "serves port-agnostic routes on both its plaintext and HTTPS listeners, so the plaintext-only and "
+                  "the HTTPS scope's routes, client-certificate requirement or refusal cannot be kept apart")
+        for route in projection["routes"]:
+            route.refuse(reason)
+        report.error(code, projection["ref"],
+                     f"This scope and {len(others)} other scope(s) serve overlapping hosts, one only over plaintext "
+                     "and the other over HTTPS. Ferrum serves these routes on all of its listeners, so HTTPS requests "
+                     "the source sent to one scope (with its client-certificate requirement or refusal) could reach "
+                     "the other scope's routes. Every route of this scope was refused (fail closed).",
+                     "Serve the plaintext and HTTPS scopes from separately configured Ferrum instances (convert a "
+                     "copy of the source with only one of them), or give the hosts one scope on both listeners, "
+                     "then convert again.")
+
+
 # ------------------------------------------------------ first-match order
 
 def apply_first_match_order(routes: list[RouteSpec], report: Report) -> None:

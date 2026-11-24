@@ -257,6 +257,38 @@ class FerrumBinaryValidateTest(unittest.TestCase):
                 self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
                 self.assertIn("Validation passed", completed.stdout)
 
+    def test_frontend_scope_outputs_pass_ferrum_validate(self):
+        """Admission regression: mixed main plaintext/HTTPS plans, refused or kept, load in Ferrum.
+
+        Synthetic NGINX and Envoy inputs where a plaintext-only scope overlaps an HTTPS scope (both refused as
+        fail-closed placeholders), plus an NGINX plan whose HTTPS scope sits behind a redirect (kept). Only the
+        resources are validated; no client CA or certificate file is needed and no traffic is sent.
+        """
+        from test_envoy import two_listener_bootstrap
+
+        binary = os.environ["FERRUM_EDGE_BIN"]
+        default = ("server { listen 80 default_server; listen 443 ssl default_server; "
+                   "ssl_certificate /etc/synthetic/server.crt; ssl_certificate_key /etc/synthetic/server.key; "
+                   "return 444; }\n")
+        secure = ("server { listen 443 ssl; server_name app.example.test; "
+                  "ssl_certificate /etc/synthetic/server.crt; ssl_certificate_key /etc/synthetic/server.key; "
+                  "ssl_client_certificate /etc/synthetic/client-ca.pem; ssl_verify_client on; "
+                  "location /secure/ { proxy_pass http://secure.internal:8080; } }\n")
+        plain = ("server { listen 80; server_name app.example.test; "
+                 "location /plain/ { proxy_pass http://plain.internal:8080; } }\n")
+        redirect = "server { listen 80; server_name app.example.test; return 301 https://$host$request_uri; }\n"
+        envoy = yaml.safe_dump(two_listener_bootstrap(("app.example.test",), ("app.example.test",),
+                                                      client_ca="/etc/synthetic/client-ca.pem"))
+        cases = (("nginx", default + plain + secure, "nginx", False), ("nginx", default + plain + secure, "nginx", True),
+                 ("nginx", default + redirect + secure, "nginx", True), ("envoy", envoy, "yaml", False))
+        for index, (platform, text, fmt, tls_only) in enumerate(cases):
+            result, _report, _plan = migrate(platform, text, fmt=fmt, tls_only=tls_only)
+            with self.subTest(case=index, platform=platform, tls_only=tls_only), \
+                    tempfile.TemporaryDirectory() as directory:
+                completed = self.validate(binary, directory, result.config, result.basic_auth_used)
+                self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+                self.assertIn("Validation passed", completed.stdout)
+
     def test_missing_operator_ca_is_rejected_not_ignored(self):
         """Evidence that the operator-CA reference is real: Ferrum refuses it while the file is absent."""
         binary = os.environ["FERRUM_EDGE_BIN"]
