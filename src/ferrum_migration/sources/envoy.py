@@ -185,7 +185,16 @@ class _Envoy:
             self.report.error("envoy-sds", ref, "SDS certificates are not migrated.")
         self.plan.settings.frontend_tls_expected = True
         validation = mapping(common.get("validation_context"))
-        required = _proto_bool(config.get("require_client_certificate")) is True
+        raw_required = config.get("require_client_certificate")
+        parsed_required = _proto_bool(raw_required)
+        if raw_required is not None and parsed_required is None:
+            self.report.error("envoy-client-ca", ref,
+                              "require_client_certificate has an invalid non-boolean value, so client certificate "
+                              "enforcement cannot be determined. Its routes were refused (fail closed).",
+                              "Set require_client_certificate to a boolean or BoolValue ({value: true/false}) and "
+                              "convert again.")
+            return [], "require_client_certificate has an invalid non-boolean value"
+        required = parsed_required is True
         has_sds_or_combined = bool(common.get("validation_context_sds_secret_config")
                                    or common.get("combined_validation_context"))
         has_validation = bool(validation) or has_sds_or_combined
@@ -338,7 +347,12 @@ class _Envoy:
             spec.path_ok = False
             spec.extra_conditions = True
             spec.refuse("route match type is not supported")
-        if _proto_bool(match.get("case_sensitive")) is False and spec.kind in ("prefix", "exact") and spec.path_ok:
+        raw_case = match.get("case_sensitive")
+        parsed_case = _proto_bool(raw_case)
+        if raw_case is not None and parsed_case is None:
+            spec.extra_conditions = True
+            spec.refuse("case_sensitive has an invalid non-boolean value")
+        elif parsed_case is False and spec.kind in ("prefix", "exact") and spec.path_ok:
             # Envoy ignores case_sensitive for safe_regex. Ferrum matches literal paths case-sensitively: the route
             # keeps its exact-case path and the emitter refuses every route that could receive the case variants
             # (fail closed), instead of letting them reach an overlapping route with another policy.
@@ -387,8 +401,10 @@ class _Envoy:
             spec.refuse("direct response bodies from files or bytes are not migrated")
             return
         text = body.get("inline_string", "")
-        spec.termination = {"status_code": status, "content_type": "text/plain", "body": str(text)} \
-            if status not in (204, 304) else {"status_code": status, "body": ""}
+        if status in (204, 205, 304):
+            spec.termination = {"status_code": status, "body": str(text)}
+        else:
+            spec.termination = {"status_code": status, "content_type": "text/plain", "body": str(text)}
 
     def _redirect(self, spec: RouteSpec, redirect: dict, tls: bool) -> None:
         if redirect.get("https_redirect") or redirect.get("scheme_redirect") == "https":
@@ -405,7 +421,7 @@ class _Envoy:
             spec.refuse("only fully static redirects (scheme, host and path) are migrated")
             return
         location = f"{scheme}://{host}{path}"
-        if not header_value_ok(location):
+        if not header_value_ok(location, nonempty=True):
             spec.refuse("redirect location is not a valid header value")
             return
         spec.termination = {"status_code": code, "headers": {"location": location}, "body": ""}
@@ -548,10 +564,19 @@ class _Envoy:
                 origins = []
                 break
         max_age = policy.get("max_age")
+        raw_creds = policy.get("allow_credentials")
+        creds: bool | None = None
+        if raw_creds is not None:
+            creds = _proto_bool(raw_creds)
+            if creds is None:
+                self.report.warning("envoy-cors", ref,
+                                    "CORS omitted (allow_credentials has an invalid non-boolean value); browsers block "
+                                    "cross-origin calls.")
+                return
         built, problem = cors_config(origins, split_csv(policy.get("allow_methods")) or None,
                                      split_csv(policy.get("allow_headers")) or None,
                                      split_csv(policy.get("expose_headers")) or None,
-                                     policy.get("allow_credentials"), util.as_int(max_age) if max_age else None)
+                                     creds, util.as_int(max_age) if max_age else None)
         if built:
             spec.plugins.append(PluginSpec("cors", built, ref))
         else:
@@ -630,9 +655,12 @@ class _Envoy:
             return TlsSpec(), "http", []
         kind = _kind(socket)
         if kind != "tls":
-            raw_text = (str(mapping(socket.get("typed_config")).get("@type", "")) + " "
-                        + str(socket.get("name", ""))).lower()
-            if "raw_buffer" in raw_text:
+            type_url = mapping(socket.get("typed_config")).get("@type")
+            if isinstance(type_url, str) and type_url.strip():
+                is_raw_buffer = "raw_buffer" in type_url.lower()
+            else:
+                is_raw_buffer = "raw_buffer" in str(socket.get("name", "")).lower()
+            if is_raw_buffer:
                 return TlsSpec(), "http", []
             return TlsSpec(), "http", [f"upstream transport_socket {safe_label(kind, 48)} is not supported"]
         config = mapping(socket.get("typed_config"))
@@ -656,31 +684,50 @@ class _Envoy:
                 tls.ca_path = str(ca["filename"])
             elif ca:
                 problems.append("inline or invalid trusted CA material is not migrated")
-            sans = []
-            for matcher in seq(validation.get("match_subject_alt_names")):
-                matcher = mapping(matcher)
-                if "exact" in matcher:
-                    san = str(matcher["exact"])
-                    if util.valid_backend_tls_san(san):
+            sans: list[str] = []
+            raw_typed = validation.get("match_typed_subject_alt_names")
+            raw_legacy = validation.get("match_subject_alt_names")
+            if raw_typed is not None and not isinstance(raw_typed, list):
+                problems.append("match_typed_subject_alt_names has unexpected shape")
+                typed_sans: list = []
+            else:
+                typed_sans = list(raw_typed or [])
+            if typed_sans:
+                # Envoy ignores deprecated match_subject_alt_names whenever match_typed_subject_alt_names is populated.
+                for typed_matcher in typed_sans:
+                    if not isinstance(typed_matcher, dict):
+                        problems.append("malformed typed SAN matcher")
+                        continue
+                    san_type = str(typed_matcher.get("san_type", "")).upper()
+                    matcher = typed_matcher.get("matcher")
+                    if san_type not in ("DNS", "URI", "IP_ADDRESS"):
+                        problems.append(f"SAN matcher type {safe_label(san_type, 24)} is not supported")
+                        continue
+                    if not isinstance(matcher, dict) or not isinstance(matcher.get("exact"), str) \
+                            or any(k != "exact" and not (k == "ignore_case" and matcher[k] is False) for k in matcher):
+                        problems.append("non-exact or option-bearing SAN matchers are not supported")
+                        continue
+                    san = matcher["exact"]
+                    if util.backend_tls_san_kind(san) == san_type:
                         sans.append(san)
                     else:
-                        problems.append("upstream TLS SAN entry is not representable in Ferrum")
-                elif matcher:
-                    problems.append("non-exact SAN matchers are not supported")
-            for typed_matcher in seq(validation.get("match_typed_subject_alt_names")):
-                typed_matcher = mapping(typed_matcher)
-                san_type = str(typed_matcher.get("san_type", "")).upper()
-                matcher = mapping(typed_matcher.get("matcher"))
-                if san_type not in ("DNS", "URI", "IP_ADDRESS"):
-                    problems.append(f"SAN matcher type {safe_label(san_type, 24)} is not supported")
-                elif "exact" in matcher:
-                    san = str(matcher["exact"])
-                    if util.valid_backend_tls_san(san):
-                        sans.append(san)
-                    else:
-                        problems.append("upstream TLS SAN entry is not representable in Ferrum")
-                elif matcher:
-                    problems.append("non-exact SAN matchers are not supported")
+                        problems.append("upstream TLS SAN entry does not match declared SAN type or is not "
+                                        "representable in Ferrum")
+            elif raw_legacy is not None:
+                if not isinstance(raw_legacy, list):
+                    problems.append("match_subject_alt_names has unexpected shape")
+                else:
+                    for matcher in raw_legacy:
+                        if not isinstance(matcher, dict) or not isinstance(matcher.get("exact"), str) \
+                                or any(k != "exact" and not (k == "ignore_case" and matcher[k] is False)
+                                       for k in matcher):
+                            problems.append("non-exact or option-bearing SAN matchers are not supported")
+                            continue
+                        san = matcher["exact"]
+                        if util.valid_backend_tls_san(san):
+                            sans.append(san)
+                        else:
+                            problems.append("upstream TLS SAN entry is not representable in Ferrum")
             tls.san_allow_list = sans
             if sans:
                 tls.verify = True

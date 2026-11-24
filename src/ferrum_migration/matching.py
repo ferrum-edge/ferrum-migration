@@ -62,23 +62,48 @@ def host_tier(hosts: list[str] | None) -> int:
     return 1 if any(host.startswith("*.") for host in hosts) else 0
 
 
-def overlapping_tier_pairs(a: list[str] | None, b: list[str] | None) -> set[tuple[int, int]]:
-    """All ``(tier_a, tier_b)`` pairs under which Ferrum can evaluate ``a`` and ``b`` for one hostname.
+def _witness_tier(hosts: list[str], witness: str) -> tuple[int, int] | None:
+    """How ``hosts`` matches ``witness`` in Ferrum's router: ``(tier, wildcard_len)`` or ``None``.
 
-    Ferrum indexes each host of a proxy individually into exact (0) or wildcard (1), and empty ``hosts``
-    into catch-all (2). A proxy with mixed exact and wildcard hosts (such as NGINX ``.example.com`` ->
-    ``["example.com", "*.example.com"]``) therefore sits in BOTH tiers 0 and 1. Returns an empty set when
-    either host list is unknown (``None``) or the two lists do not overlap.
+    Tier 0 = exact host, 1 = longest covering wildcard (pattern length descending in ``router_cache.rs``),
+    2 = catch-all (empty ``hosts``).
+    """
+    if not hosts:
+        return (2, 0)
+    if not witness.startswith("*.") and witness in hosts:
+        return (0, 0)
+    matched = [h for h in hosts if h.startswith("*.") and host_cover(h, witness)]
+    if matched:
+        return (1, max(len(h) for h in matched))
+    return None
+
+
+def _overlapping_witness_tiers(a: list[str] | None, b: list[str] | None) -> list[tuple[tuple[int, int], tuple[int, int]]]:
+    """Realizable ``((tier_a, wc_len_a), (tier_b, wc_len_b))`` pairs across all concrete overlapping hostnames.
+
+    Evaluated per witness in ``a ∪ b`` (rather than entry-pair Cartesian product) so impossible pairs such as
+    ``(0, 1)`` between identical mixed lists ``["api.example.com", "*.example.com"]`` are never fabricated.
     """
     if a is None or b is None:
-        return set()
+        return []
     if not a and not b:
-        return {(2, 2)}
-    if not a:
-        return {(2, single_host_tier(hb)) for hb in b}
-    if not b:
-        return {(single_host_tier(ha), 2) for ha in a}
-    return {(single_host_tier(ha), single_host_tier(hb)) for ha in a for hb in b if host_overlap(ha, hb)}
+        return [((2, 0), (2, 0))]
+    witnesses: list[str] = []
+    for entry in (a or []) + (b or []):
+        if entry not in witnesses:
+            witnesses.append(entry)
+    result: list[tuple[tuple[int, int], tuple[int, int]]] = []
+    for witness in witnesses:
+        ma = _witness_tier(a, witness)
+        mb = _witness_tier(b, witness)
+        if ma is not None and mb is not None:
+            result.append((ma, mb))
+    return result
+
+
+def overlapping_tier_pairs(a: list[str] | None, b: list[str] | None) -> set[tuple[int, int]]:
+    """All realizable ``(tier_a, tier_b)`` pairs under which Ferrum evaluates ``a`` and ``b`` for one hostname."""
+    return {(ma[0], mb[0]) for ma, mb in _overlapping_witness_tiers(a, b)}
 
 
 def path_space(kind: str, path: str | None) -> tuple[str, bool] | None:
@@ -304,22 +329,26 @@ def route_covers(outer, inner) -> bool:
 def ferrum_prefers(a, b) -> bool | None:
     """True if Ferrum picks ``a`` over ``b`` for every overlapping request; False if ``b``; None if unclear.
 
-    Because Ferrum indexes each host entry individually into exact (0) or wildcard (1), mixed host lists
-    (e.g. ``["example.com", "*.example.com"]``) participate in both tiers. Preference is definite only when
-    every overlapping ``(tier_a, tier_b)`` pair resolves to the same winner.
+    Mirrors ``router_cache.rs``: exact host (tier 0) > wildcard host (tier 1) > catch-all (tier 2). Within each
+    tier, exact path > prefix > regex > host-only; within the wildcard tier's same path class, Ferrum scans
+    wildcard patterns by length descending (e.g. ``*.sub.example.test`` before ``*.example.test``) before
+    comparing prefix lengths. Definite only when every realizable overlapping witness resolves to one winner.
     """
-    pairs = overlapping_tier_pairs(a.hosts, b.hosts)
+    pairs = _overlapping_witness_tiers(a.hosts, b.hosts)
     if not pairs:
         return None
-    rank_a, rank_b = path_rank(a.kind, a.path), path_rank(b.kind, b.path)
-    verdicts: set[bool | None] = set()
-    for tier_a, tier_b in pairs:
+    class_a, sub_a = path_rank(a.kind, a.path)
+    class_b, sub_b = path_rank(b.kind, b.path)
+    verdicts: set[bool] = set()
+    for (tier_a, wc_a), (tier_b, wc_b) in pairs:
         if tier_a != tier_b:
             verdicts.add(tier_a < tier_b)
-        elif rank_a != rank_b:
-            verdicts.add(rank_a < rank_b)
+        elif class_a != class_b:
+            verdicts.add(class_a < class_b)
+        elif tier_a == 1 and wc_a != wc_b:
+            verdicts.add(wc_a > wc_b)
+        elif sub_a != sub_b:
+            verdicts.add(sub_a < sub_b)
         else:
             return None
-    if len(verdicts) == 1:
-        return next(iter(verdicts))
-    return None
+    return next(iter(verdicts)) if len(verdicts) == 1 else None

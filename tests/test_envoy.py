@@ -399,8 +399,10 @@ class EnvoyHardeningTest(unittest.TestCase):
         self.assertEqual(live_routes(result.config), [])
         self.assertIn("envoy-domains", codes(report, "error"))
 
-    def test_weighted_cluster_header_remove_and_connect_timeout_mismatch_refused(self):
+    def test_weighted_cluster_overrides_and_connect_timeout_independently(self):
+        # Positive control: two weighted clusters with matching connect_timeout and no overrides migrate cleanly.
         doc = minimal_bootstrap({"path_separated_prefix": "/api"})
+        doc["static_resources"]["clusters"][0]["connect_timeout"] = "2s"
         doc["static_resources"]["clusters"].append({
             "name": "c2", "type": "STATIC", "connect_timeout": "2s",
             "load_assignment": {"endpoints": [{"lb_endpoints": [{"endpoint": {"address": {"socket_address": {
@@ -409,15 +411,100 @@ class EnvoyHardeningTest(unittest.TestCase):
         route = doc["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"][
             "route_config"]["virtual_hosts"][0]["routes"][0]
         route["route"] = {"weighted_clusters": {"clusters": [
-            {"name": "c", "weight": 50, "request_headers_to_remove": ["x-auth"]},
+            {"name": "c", "weight": 50},
             {"name": "c2", "weight": 50},
         ]}}
-        result, _report, _ = migrate("envoy", yaml.safe_dump(doc))
-        self.assertEqual(one_proxy(self, result.config, "/api")["labels"]["ferrum-migration/status"], "refused")
-        # Remove header override; differing connect_timeout (5s default vs 2s) still refuses.
+        ok_res, _ok_rep, _ = migrate("envoy", yaml.safe_dump(doc))
+        assert_structurally_valid(self, ok_res.config)
+        self.assertEqual(one_proxy(self, ok_res.config, "/api")["labels"]["ferrum-migration/status"], "migrated")
+
+        # Per-cluster request_headers_to_remove refuses even when connect_timeout matches.
+        route["route"]["weighted_clusters"]["clusters"][0]["request_headers_to_remove"] = ["x-auth"]
+        hdr_res, _hdr_rep, _ = migrate("envoy", yaml.safe_dump(doc))
+        self.assertEqual(one_proxy(self, hdr_res.config, "/api")["labels"]["ferrum-migration/status"], "refused")
+
+        # Removing the header override but making connect_timeout differ refuses independently.
         del route["route"]["weighted_clusters"]["clusters"][0]["request_headers_to_remove"]
-        result2, _report2, _ = migrate("envoy", yaml.safe_dump(doc))
-        self.assertEqual(one_proxy(self, result2.config, "/api")["labels"]["ferrum-migration/status"], "refused")
+        doc["static_resources"]["clusters"][0]["connect_timeout"] = "5s"
+        to_res, _to_rep, _ = migrate("envoy", yaml.safe_dump(doc))
+        self.assertEqual(one_proxy(self, to_res.config, "/api")["labels"]["ferrum-migration/status"], "refused")
+
+    def test_identical_mixed_domains_remain_migrated(self):
+        doc = minimal_bootstrap({"path": "/api"})
+        vhost = doc["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"][
+            "route_config"]["virtual_hosts"][0]
+        vhost["domains"] = ["api.example.com", "*.example.com"]
+        vhost["routes"].append({"match": {"prefix": "/"}, "route": {"cluster": "c"}})
+        result, _report, _ = migrate("envoy", yaml.safe_dump(doc))
+        assert_structurally_valid(self, result.config)
+        self.assertEqual(one_proxy(self, result.config, "=/api")["labels"]["ferrum-migration/status"], "migrated")
+        self.assertEqual(one_proxy(self, result.config, "/")["labels"]["ferrum-migration/status"], "migrated")
+
+    def test_envoy_san_precedence_type_match_malformed_bools_and_raw_buffer_type(self):
+        # Typed SANs override deprecated match_subject_alt_names (retired SAN must NOT be emitted).
+        doc = minimal_bootstrap({"path_separated_prefix": "/api"})
+        doc["static_resources"]["clusters"][0]["transport_socket"] = {
+            "name": "envoy.transport_sockets.tls",
+            "typed_config": {"@type": "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext",
+                             "common_tls_context": {"validation_context": {
+                                 "trusted_ca": {"filename": "/etc/ca.pem"},
+                                 "match_subject_alt_names": [{"exact": "retired.example.test"}],
+                                 "match_typed_subject_alt_names": [
+                                     {"san_type": "DNS", "matcher": {"exact": "active.example.test"}}
+                                 ]}}}}
+        res, _rep, _ = migrate("envoy", yaml.safe_dump(doc))
+        self.assertEqual(res.config["upstreams"][0]["backend_tls_san_allow_list"], ["active.example.test"])
+
+        # SAN type mismatch (DNS declared with IP literal) or ignore_case: true refused.
+        for bad_typed in (
+            [{"san_type": "DNS", "matcher": {"exact": "10.0.0.1"}}],
+            [{"san_type": "DNS", "matcher": {"exact": "active.example.test", "ignore_case": True}}],
+        ):
+            doc2 = minimal_bootstrap({"path_separated_prefix": "/api"})
+            doc2["static_resources"]["clusters"][0]["transport_socket"] = {
+                "name": "envoy.transport_sockets.tls",
+                "typed_config": {
+                    "@type": "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext",
+                    "common_tls_context": {"validation_context": {
+                        "trusted_ca": {"filename": "/etc/ca.pem"},
+                        "match_typed_subject_alt_names": bad_typed}}}}
+            r2, _rep2, _ = migrate("envoy", yaml.safe_dump(doc2))
+            self.assertEqual(one_proxy(self, r2.config, "/api")["labels"]["ferrum-migration/status"], "refused")
+
+        # Transport socket named raw_buffer with non-raw_buffer @type is refused.
+        doc3 = minimal_bootstrap({"path_separated_prefix": "/api"})
+        doc3["static_resources"]["clusters"][0]["transport_socket"] = {
+            "name": "envoy.transport_sockets.raw_buffer",
+            "typed_config": {"@type": "type.googleapis.com/envoy.extensions.transport_sockets.alts.v3.Alts"}}
+        r3, _rep3, _ = migrate("envoy", yaml.safe_dump(doc3))
+        self.assertEqual(one_proxy(self, r3.config, "/api")["labels"]["ferrum-migration/status"], "refused")
+
+        # Malformed require_client_certificate: "true" refuses TLS routes (never treated as absent).
+        doc4 = minimal_bootstrap({"path_separated_prefix": "/api"})
+        doc4["static_resources"]["listeners"][0]["filter_chains"][0]["transport_socket"] = {
+            "name": "envoy.transport_sockets.tls",
+            "typed_config": {
+                "@type": "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext",
+                "require_client_certificate": "true",
+                "common_tls_context": {"tls_certificates": [
+                    {"certificate_chain": {"filename": "/etc/s.crt"}, "private_key": {"filename": "/etc/s.key"}}
+                ]}}}
+        r4, rep4, _ = migrate("envoy", yaml.safe_dump(doc4))
+        self.assertEqual(one_proxy(self, r4.config, "/api")["labels"]["ferrum-migration/status"], "refused")
+        self.assertIn("envoy-client-ca", codes(rep4, "error"))
+
+        # CORS allow_credentials: {value: false} decodes to False (not truthy dict).
+        doc5 = minimal_bootstrap({"path_separated_prefix": "/api"})
+        hcm = doc5["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"]
+        hcm["http_filters"].insert(0, {"name": "envoy.filters.http.cors"})
+        hcm["route_config"]["virtual_hosts"][0]["cors"] = {
+            "allow_origin_string_match": [{"exact": "https://app.example.test"}],
+            "allow_credentials": {"value": False},
+        }
+        r5, _rep5, _ = migrate("envoy", yaml.safe_dump(doc5))
+        cors_plugins = [p for p in r5.config["plugin_configs"] if p["plugin_name"] == "cors"]
+        self.assertEqual(len(cors_plugins), 1)
+        self.assertFalse(cors_plugins[0]["config"].get("allow_credentials", False))
 
 
 if __name__ == "__main__":

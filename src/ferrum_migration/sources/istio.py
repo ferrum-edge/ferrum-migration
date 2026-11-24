@@ -592,10 +592,11 @@ class _Istio:
             body = mapping(response.get("body"))
             if status is None or not 200 <= status <= 599 or body.get("bytes"):
                 spec.refuse("directResponse is not representable")
+            elif status in (204, 205, 304):
+                spec.termination = {"status_code": status, "body": str(body.get("string", ""))}
             else:
                 spec.termination = {"status_code": status, "content_type": "text/plain",
-                                    "body": str(body.get("string", ""))} if status not in (204, 304) else \
-                    {"status_code": status, "body": ""}
+                                    "body": str(body.get("string", ""))}
             return
         if entry.get("redirect"):
             redirect = mapping(entry["redirect"])
@@ -604,7 +605,7 @@ class _Istio:
             code = util.as_int(redirect.get("redirectCode")) or 301
             location = f"{scheme}://{authority}{uri}" if (scheme and authority and uri) else ""
             if not (scheme and authority and uri) or redirect.get("derivePort") or redirect.get("port") \
-                    or not 200 <= code <= 599 or not header_value_ok(location):
+                    or not 200 <= code <= 599 or not header_value_ok(location, nonempty=True):
                 spec.refuse("only fully static redirects (scheme, authority and uri without custom port) are migrated")
             else:
                 spec.termination = {"status_code": code, "headers": {"location": location},
@@ -647,7 +648,11 @@ class _Istio:
             if entry.get(key):
                 self.report.warning("istio-dropped", ref, f"{label} is dropped.")
         self._cors(spec, mapping(entry.get("corsPolicy")))
-        self._headers(spec, mapping(entry.get("headers")))
+        raw_headers = entry.get("headers")
+        if raw_headers is not None and not isinstance(raw_headers, dict):
+            spec.refuse("route headers section is not a mapping")
+        elif isinstance(raw_headers, dict):
+            self._headers(spec, raw_headers)
 
     def _cors(self, spec: RouteSpec, policy: dict) -> None:
         if not policy:
@@ -672,33 +677,57 @@ class _Istio:
             self.report.warning("istio-cors", spec.ref, f"CORS omitted ({problem}); browsers block cross-origin calls.")
 
     def _headers(self, spec: RouteSpec, headers: dict) -> None:
-        request = mapping(headers.get("request"))
-        response = mapping(headers.get("response"))
+        raw_req = headers.get("request")
+        raw_resp = headers.get("response")
         request_rules: list[dict] = []
         response_rules: list[dict] = []
+        if raw_req is not None and not isinstance(raw_req, dict):
+            spec.refuse("request headers section is not a mapping")
+            request: dict = {}
+        else:
+            request = mapping(raw_req)
         if request.get("add"):
             spec.refuse("request header 'add' appends in Istio but only adds when absent in Ferrum")
-        for key, value in mapping(request.get("set")).items():
-            rule, problem = request_header_rule("update", key, literal_value(str(value)))
-            request_rules.append(rule) if rule else spec.refuse(problem or "invalid header")
+        raw_req_set = request.get("set")
+        if raw_req_set is not None and not isinstance(raw_req_set, dict):
+            spec.refuse("request header 'set' section is not a mapping")
+        else:
+            for key, value in mapping(raw_req_set).items():
+                rule, problem = request_header_rule("update", key, literal_value(str(value)))
+                request_rules.append(rule) if rule else spec.refuse(problem or "invalid header")
         remove_req = str_list(request.get("remove"))
         if request.get("remove") is not None and remove_req is None:
             spec.refuse("request header 'remove' list has unexpected types")
         for key in remove_req or []:
             rule, problem = request_header_rule("remove", key)
             request_rules.append(rule) if rule else spec.refuse(problem or "invalid header")
+        if raw_resp is not None and not isinstance(raw_resp, dict):
+            self.report.warning("istio-response-header", spec.ref,
+                                "Response headers section is not a mapping; omitted.")
+            response: dict = {}
+        else:
+            response = mapping(raw_resp)
         for op, section in (("update", "set"), ("add", "add")):
-            for key, value in mapping(response.get(section)).items():
+            raw_section = response.get(section)
+            if raw_section is not None and not isinstance(raw_section, dict):
+                self.report.warning("istio-response-header", spec.ref,
+                                    f"Response header '{section}' section is not a mapping; omitted.")
+                continue
+            for key, value in mapping(raw_section).items():
                 rule, problem = response_header_rule(op, key, literal_value(str(value)))
                 if rule:
                     response_rules.append(rule)
                 else:
                     self.report.warning("istio-response-header", spec.ref, f"Response header not migrated ({problem}).")
-        for key in str_list(response.get("remove")) or []:
+        remove_resp = str_list(response.get("remove"))
+        if response.get("remove") is not None and remove_resp is None:
+            self.report.warning("istio-response-header", spec.ref,
+                                "Response header 'remove' list has unexpected types; omitted.")
+        for key in remove_resp or []:
             rule, _ = response_header_rule("remove", key)
             if rule:
                 response_rules.append(rule)
-        if response.get("add"):
+        if isinstance(response.get("add"), dict) and response.get("add"):
             self.report.warning("istio-response-add", spec.ref, "Response header 'add' only adds when absent in Ferrum.")
         if request_rules:
             spec.plugins.append(PluginSpec("request_transformer", {"rules": request_rules}, spec.ref))
@@ -750,11 +779,11 @@ class _Istio:
         spec.backend = BackendRef(scheme=resolved[0][1]["backend"].scheme, upstream_key=key)
 
     def _backend(self, fqdn: str, port: int | None, gw_ns: str, ref: str) -> dict:
-        targets, port, problem = self._service_entry_targets(fqdn, port)
+        targets, port, se_sans, problem = self._service_entry_targets(fqdn, port)
         if problem:
             return {"problem": problem}
         rule = self._destination_rule(fqdn, gw_ns)
-        tls, scheme, algorithm, hash_on, problem = self._traffic_policy(rule, port, ref)
+        tls, scheme, algorithm, hash_on, problem = self._traffic_policy(rule, port, ref, se_sans)
         if problem:
             return {"problem": problem}
         if rule is None and not self.no_dr_warned:
@@ -768,36 +797,40 @@ class _Istio:
         return {"backend": BackendRef(scheme=scheme, upstream_key=key), "targets": targets,
                 "tls_key": scheme + tls.key()}
 
-    def _service_entry_targets(self, fqdn: str, port: int | None) -> tuple[list[Target], int | None, str | None]:
+    def _service_entry_targets(
+        self, fqdn: str, port: int | None
+    ) -> tuple[list[Target], int | None, list[str] | None, str | None]:
         for entry in self.service_entries:
             spec = mapping(entry.get("spec"))
             hosts = [h.lower() for h in (str_list(spec.get("hosts")) or [])]
             if not any(matching.host_cover(h, fqdn) for h in hosts):
                 continue
+            raw_se_sans = spec.get("subjectAltNames")
+            se_sans: list[str] | None = [] if raw_se_sans is None else str_list(raw_se_sans)
             ports = [mapping(p) for p in seq(spec.get("ports"))]
             if port is None and len(ports) == 1:
                 port = util.parse_port(ports[0].get("number"))
             if port is None:
-                return [], None, "destination port is required (ServiceEntry has several ports)"
+                return [], None, se_sans, "destination port is required (ServiceEntry has several ports)"
             port_entry = next((p for p in ports if util.parse_port(p.get("number")) == port), {})
             resolution = str(spec.get("resolution", "NONE")).upper()
             if resolution == "NONE":
-                return [], port, "ServiceEntry with resolution NONE (passthrough) is not migrated"
+                return [], port, se_sans, "ServiceEntry with resolution NONE (passthrough) is not migrated"
             endpoints = [mapping(e) for e in seq(spec.get("endpoints"))]
             if not endpoints:
-                return [Target(fqdn, util.parse_port(port_entry.get("targetPort")) or port, 1)], port, None
+                return [Target(fqdn, util.parse_port(port_entry.get("targetPort")) or port, 1)], port, se_sans, None
             targets = []
             for endpoint in endpoints:
                 address = endpoint.get("address")
                 if not isinstance(address, str) or address.startswith("unix://"):
-                    return [], port, "ServiceEntry endpoint address is not representable"
+                    return [], port, se_sans, "ServiceEntry endpoint address is not representable"
                 endpoint_port = util.parse_port(mapping(endpoint.get("ports")).get(str(port_entry.get("name", "")))) \
                     or util.parse_port(port_entry.get("targetPort")) or port
                 targets.append(Target(address, endpoint_port, util.as_int(endpoint.get("weight")) or 1))
-            return targets, port, None
+            return targets, port, se_sans, None
         if port is None:
-            return [], None, "destination port is required (no ServiceEntry describes the service ports)"
-        return [Target(fqdn, port, 1)], port, None
+            return [], None, [], "destination port is required (no ServiceEntry describes the service ports)"
+        return [Target(fqdn, port, 1)], port, [], None
 
     def _destination_rule(self, fqdn: str, gw_ns: str) -> dict | None:
         best = None
@@ -814,7 +847,7 @@ class _Istio:
                 best, best_rank = rule, rank
         return best
 
-    def _traffic_policy(self, rule: dict | None, port: int | None, ref: str):
+    def _traffic_policy(self, rule: dict | None, port: int | None, ref: str, se_sans: list[str] | None = None):
         tls = TlsSpec()
         if rule is None:
             return tls, "http", "round_robin", None, None
@@ -829,8 +862,9 @@ class _Istio:
         if mode in ("SIMPLE", "MUTUAL"):
             scheme = "https"
             tls.verify = not tls_policy.get("insecureSkipVerify")
-            if tls_policy.get("credentialName"):
-                return tls, scheme, "round_robin", None, "DestinationRule credentialName (Kubernetes Secret) is never read"
+            if tls_policy.get("credentialName") or tls_policy.get("caCertCredentialName"):
+                return tls, scheme, "round_robin", None, (
+                    "DestinationRule credentialName/caCertCredentialName (Kubernetes Secret) is never read")
             extra_tls = [k for k in ("caCrl", "verifyCertificateSpki", "verifyCertificateHash") if tls_policy.get(k)]
             if extra_tls:
                 return tls, scheme, "round_robin", None, (
@@ -839,9 +873,20 @@ class _Istio:
                 tls.ca_path = tls_policy["caCertificates"]
             if isinstance(tls_policy.get("sni"), str):
                 tls.sni = tls_policy["sni"]
-            sans = [str(s) for s in seq(tls_policy.get("subjectAltNames"))]
+            raw_dr_sans = tls_policy.get("subjectAltNames")
+            if raw_dr_sans is not None:
+                parsed_dr_sans = str_list(raw_dr_sans)
+                if parsed_dr_sans is None:
+                    return tls, scheme, "round_robin", None, "DestinationRule subjectAltNames has unexpected types"
+                sans = parsed_dr_sans
+            else:
+                sans = []
+            if not sans:
+                if se_sans is None:
+                    return tls, scheme, "round_robin", None, "ServiceEntry subjectAltNames has unexpected types"
+                sans = list(se_sans)
             if any(not util.valid_backend_tls_san(s) for s in sans):
-                return tls, scheme, "round_robin", None, "DestinationRule subjectAltNames entry is not representable"
+                return tls, scheme, "round_robin", None, "DestinationRule/ServiceEntry subjectAltNames entry is not representable"
             tls.san_allow_list = sans
             if mode == "MUTUAL":
                 cert, key = tls_policy.get("clientCertificate"), tls_policy.get("privateKey")

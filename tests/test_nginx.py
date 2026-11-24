@@ -587,6 +587,57 @@ class NginxFrontendScopeTest(unittest.TestCase):
                 self.assertEqual(self.status(result, "/api"), "refused")
                 self.assertIn("route-refused", codes(report, "error"))
 
+    def test_named_ssl_reject_handshake_without_locations_refuses_default_tls_server(self):
+        conf = """
+        server {
+            listen 443 ssl default_server;
+            ssl_certificate /etc/synthetic/server.crt; ssl_certificate_key /etc/synthetic/server.key;
+            location / { proxy_pass http://app.internal:8080; }
+        }
+        server {
+            listen 443 ssl; server_name blocked.example.test;
+            ssl_reject_handshake on;
+        }
+        """
+        result, report, _ = nginx(conf)
+        assert_structurally_valid(self, result.config)
+        self.assertEqual(live_routes(result.config), [])
+        self.assertEqual(self.status(result, "/"), "refused")
+        self.assertIn("nginx-ssl-reject-handshake", codes(report, "error"))
+
+    def test_proxy_ssl_name_preserved_or_refused_when_dynamic(self):
+        # Static proxy_ssl_name without proxy_ssl_server_name on is preserved on a 1-target upstream.
+        static_conf = """
+        server {
+            listen 80; server_name app.example.test;
+            location /api/ {
+                proxy_ssl_verify on;
+                proxy_ssl_name api.internal.test;
+                proxy_pass https://10.0.0.5:8443;
+            }
+        }
+        """
+        result, _report, _ = nginx(static_conf)
+        assert_structurally_valid(self, result.config)
+        self.assertEqual(self.status(result, "/api"), "migrated")
+        self.assertEqual(len(result.config["upstreams"]), 1)
+        self.assertEqual(result.config["upstreams"][0]["backend_tls_sni"], "api.internal.test")
+        # Dynamic proxy_ssl_name refuses the route (never silently replaced with dial target).
+        dyn_conf = """
+        server {
+            listen 80; server_name app.example.test;
+            location /api/ {
+                proxy_ssl_verify on;
+                proxy_ssl_name $host;
+                proxy_pass https://10.0.0.5:8443;
+            }
+        }
+        """
+        dyn_res, dyn_rep, _ = nginx(dyn_conf)
+        assert_structurally_valid(self, dyn_res.config)
+        self.assertEqual(self.status(dyn_res, "/api"), "refused")
+        self.assertIn("route-refused", codes(dyn_rep, "error"))
+
 
 if __name__ == "__main__":
     unittest.main()

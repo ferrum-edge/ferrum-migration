@@ -341,26 +341,42 @@ class FerrumBinaryValidateTest(unittest.TestCase):
                 self.assertIn("Validation passed", completed.stdout)
 
     def test_over_100_hosts_and_chunked_conflicts_pass_ferrum_validate(self):
-        """Admission regression: >100-host routes and >100-host conflict merges pass ferrum-edge validate."""
+        """Admission regression: source-generated >100-host closures and wildcard/host-only chunks pass ferrum-edge validate."""
         from ferrum_migration.ferrum import EmitOptions, emit
-        from ferrum_migration.model import BackendRef, Plan, RouteSpec
+        from ferrum_migration.model import BackendRef, HostScope, Plan, RouteSpec
         from ferrum_migration.report import Report
 
         binary = os.environ["FERRUM_EDGE_BIN"]
-        many = RouteSpec(ref="many", name="many", hosts=[f"m{i}.example.test" for i in range(105)],
-                         kind="prefix", path="/many", protocols=frozenset({"http"}),
-                         backend=BackendRef("http", "m.internal", 80))
-        r1 = RouteSpec(ref="r1", name="r1",
-                       hosts=["shared.example.test"] + [f"a{i}.example.test" for i in range(60)],
+        # Real NGINX source with 105 server_names + default server (exercises >100-host closure + chunked placeholders).
+        names = " ".join(f"h{i}.example.test" for i in range(105))
+        nginx_conf = (
+            f"server {{ listen 80; server_name {names}; location /api/ {{ proxy_pass http://a.internal:80; }} }}\n"
+            "server { listen 80 default_server; location / { proxy_pass http://b.internal:80; } }\n"
+        )
+        nginx_res, _nginx_rep, _ = migrate("nginx", nginx_conf, fmt="nginx")
+        with tempfile.TemporaryDirectory() as directory:
+            completed = self.validate(binary, directory, nginx_res.config, nginx_res.basic_auth_used)
+            self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+            self.assertIn("Validation passed", completed.stdout)
+
+        # Synthetic wildcard conflict merge + host-only conflict merge (>100 hosts) + HostScope.
+        w1 = RouteSpec(ref="w1", name="w1", hosts=["*.example.test"] + [f"a{i}.other.test" for i in range(60)],
                        kind="prefix", path="/api", protocols=frozenset({"http"}),
                        backend=BackendRef("http", "a.internal", 80))
-        r2 = RouteSpec(ref="r2", name="r2",
-                       hosts=["shared.example.test"] + [f"b{i}.example.test" for i in range(60)],
+        w2 = RouteSpec(ref="w2", name="w2", hosts=["*.sub.example.test"] + [f"b{i}.other.test" for i in range(60)],
                        kind="prefix", path="/api", protocols=frozenset({"http"}),
                        backend=BackendRef("http", "b.internal", 80))
+        ho1 = RouteSpec(ref="ho1", name="ho1", hosts=["*.ho.test"] + [f"c{i}.ho.test" for i in range(60)],
+                        kind="hostonly", path=None, protocols=frozenset({"http"}),
+                        backend=BackendRef("http", "c.internal", 80))
+        ho2 = RouteSpec(ref="ho2", name="ho2", hosts=["exact.ho.test"] + [f"d{i}.ho.test" for i in range(60)],
+                        kind="hostonly", path=None, protocols=frozenset({"http"}),
+                        backend=BackendRef("http", "d.internal", 80))
         sib = RouteSpec(ref="sib", name="sib", hosts=["other.example.test"], kind="prefix", path="/api",
-                        protocols=frozenset({"http"}), backend=BackendRef("http", "c.internal", 80))
-        result = emit(Plan(platform="test", routes=[many, r1, r2, sib]), EmitOptions(), Report("test", "synthetic"))
+                        protocols=frozenset({"http"}), backend=BackendRef("http", "e.internal", 80))
+        result = emit(Plan(platform="test", routes=[w1, w2, ho1, ho2, sib],
+                           host_scopes=[HostScope("w1-scope", w1.hosts, None)]),
+                      EmitOptions(), Report("test", "synthetic"))
         with tempfile.TemporaryDirectory() as directory:
             completed = self.validate(binary, directory, result.config, result.basic_auth_used)
             self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)

@@ -24,6 +24,8 @@ MAX_TARGET_WEIGHT = 65_535
 MAX_TIMEOUT_MS = 86_400_000
 MAX_RETRIES = 100
 MAX_REGEX_LENGTH = 1024
+MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES = 256
+MAX_BACKEND_TLS_SAN_BYTES = 2048
 
 _HOST_RE = re.compile(r"^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$")
 _WILDCARD_RE = re.compile(r"^\*\.[a-z0-9]([a-z0-9.-]*[a-z0-9])?$")
@@ -223,28 +225,51 @@ def ends_with_unescaped_dollar(pattern: str) -> bool:
     return slashes % 2 == 0
 
 
-def valid_backend_tls_san(san: object) -> bool:
-    """Whether ``san`` matches Ferrum's ``backend_tls_san_allow_list`` admission rules.
+def backend_tls_san_kind(san: object) -> str | None:
+    """Return ``"IP_ADDRESS"``, ``"URI"``, or ``"DNS"`` if ``san`` passes Ferrum's SAN allow-list rules, else None.
 
-    Ferrum accepts exact DNS names (no wildcards), IP addresses, and ``spiffe://<domain>/<path>`` URIs
-    without whitespace or control characters.
+    Mirrors Ferrum's ``validate_backend_tls_san_allow_list_entry`` and ``validate_host_entry``:
+    exact DNS names (no trailing dot, no wildcards, labels 1..63 ASCII bytes starting/ending alphanumeric),
+    IP addresses, or ``spiffe://<domain>/<path>`` URIs, at most 2048 UTF-8 bytes, without whitespace or controls.
     """
-    if not isinstance(san, str) or not san or len(san.encode("utf-8")) > 255:
-        return False
+    if not isinstance(san, str) or not san:
+        return None
+    try:
+        encoded = san.encode("utf-8")
+    except UnicodeEncodeError:
+        return None
+    if len(encoded) > MAX_BACKEND_TLS_SAN_BYTES:
+        return None
     if any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7F for ch in san):
-        return False
+        return None
     try:
         ipaddress.ip_address(san)
-        return True
+        return "IP_ADDRESS"
     except ValueError:
         pass
     if san.lower().startswith("spiffe://"):
         rest = san[9:]
         slash = rest.find("/")
-        return slash > 0 and slash + 1 < len(rest)
-    if "://" in san or "*" in san:
-        return False
-    return normalize_host(san) is not None and not san.startswith("*.")
+        return "URI" if (slash > 0 and slash + 1 < len(rest)) else None
+    if "://" in san or "*" in san or san.endswith("."):
+        return None
+    lower = san.lower()
+    if normalize_host(san) != lower:
+        return None
+    labels = lower.split(".")
+    if any(not label or len(label) > 63 or not (label[0].isalnum() and label[-1].isalnum()) for label in labels):
+        return None
+    return "DNS"
+
+
+def valid_backend_tls_san(san: object) -> bool:
+    """Whether ``san`` matches Ferrum's ``backend_tls_san_allow_list`` admission rules."""
+    return backend_tls_san_kind(san) is not None
+
+
+def valid_backend_tls_sni(sni: object) -> bool:
+    """Whether ``sni`` matches Ferrum's ``validate_backend_tls_sni`` (exact DNS hostname, not IP/wildcard)."""
+    return backend_tls_san_kind(sni) == "DNS"
 
 
 #: Escapes the narrow alternation grammar accepts: one ASCII punctuation character (a literal in Rust's regex

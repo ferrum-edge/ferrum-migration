@@ -374,17 +374,170 @@ class MatchingTest(unittest.TestCase):
         result2 = emit(Plan(platform="test", routes=[mixed_api, exact_rx]), EmitOptions(), report2)
         self.assertGreaterEqual(result2.stats["prefix_guards"], 1)
 
-    def test_over_100_hosts_route_refused_without_emitting_invalid_proxy(self):
+    def test_over_100_hosts_route_chunks_cleanly_and_unchunkable_poisons(self):
+        from ferrum_migration.model import HostScope
+
+        # Chunkable 105 exact hosts with a HostScope: refused placeholders and scope closures stay <= 100 hosts each,
+        # without poisoning an unrelated catch-all or a more-specific route.
         many = [f"h{i}.example.test" for i in range(105)]
         bad = RouteSpec(ref="many", name="many", hosts=many, kind="prefix", path="/api",
                         protocols=frozenset({"http"}), backend=BackendRef("http", "a.internal", 80))
-        overlap = RouteSpec(ref="one", name="one", hosts=["h0.example.test"], kind="prefix", path="/api/sub",
-                            protocols=frozenset({"http"}), backend=BackendRef("http", "b.internal", 80))
-        result = emit(Plan(platform="test", routes=[bad, overlap]), EmitOptions(), Report("test", "synthetic"))
+        sub = RouteSpec(ref="one", name="one", hosts=["h0.example.test"], kind="prefix", path="/api/sub",
+                        protocols=frozenset({"http"}), backend=BackendRef("http", "b.internal", 80))
+        catch_all = RouteSpec(ref="root", name="root", hosts=[], kind="prefix", path="/",
+                              protocols=frozenset({"http"}), backend=BackendRef("http", "c.internal", 80))
+        plan = Plan(platform="test", routes=[bad, sub, catch_all], host_scopes=[HostScope("many-scope", many, None)])
+        result = emit(plan, EmitOptions(), Report("test", "synthetic"))
         self.assertTrue(bad.refusals)
-        self.assertTrue(overlap.refusals)
+        self.assertFalse(sub.refusals)
+        self.assertFalse(catch_all.refusals)
         for proxy in result.config["proxies"]:
             self.assertLessEqual(len(proxy.get("hosts", [])), util.MAX_HOSTS_PER_PROXY)
+
+        # Unchunkable single ambiguous wildcard component (>100 mutually overlapping wildcards): poisons overlapping route
+        # instead of emitting an invalid >100-host proxy.
+        nested = ["*.example.test"] + [f"*.s{i}.example.test" for i in range(101)]
+        bad_nested = RouteSpec(ref="nested", name="nested", hosts=nested, kind="prefix", path="/api",
+                               protocols=frozenset({"http"}), backend=BackendRef("http", "a.internal", 80))
+        overlap = RouteSpec(ref="ov", name="ov", hosts=["a.s0.example.test"], kind="prefix", path="/api/sub",
+                            protocols=frozenset({"http"}), backend=BackendRef("http", "b.internal", 80))
+        result2 = emit(Plan(platform="test", routes=[bad_nested, overlap]), EmitOptions(), Report("test", "synthetic"))
+        self.assertTrue(bad_nested.refusals)
+        self.assertTrue(overlap.refusals)
+        for proxy in result2.config["proxies"]:
+            self.assertLessEqual(len(proxy.get("hosts", [])), util.MAX_HOSTS_PER_PROXY)
+
+    def test_identical_mixed_hosts_and_wildcard_suffix_precedence(self):
+        # Identical mixed exact + wildcard hosts: witness-based tiers must not produce impossible (0, 1)/(1, 0) pairs.
+        mixed = ["api.example.com", "*.example.com"]
+        self.assertEqual(matching.overlapping_tier_pairs(mixed, mixed), {(0, 0), (1, 1)})
+        exact_api = RouteSpec(ref="a", name="a", hosts=mixed, kind="exact", path="/api")
+        root = RouteSpec(ref="b", name="b", hosts=mixed, kind="prefix", path="/")
+        self.assertIs(matching.ferrum_prefers(exact_api, root), True)
+        # Within wildcard prefix class, longer wildcard suffix wins over longer path prefix (router_cache.rs:2146).
+        broad_long = RouteSpec(ref="bl", name="bl", hosts=["*.example.test"], kind="prefix", path="/api/private")
+        narrow_short = RouteSpec(ref="ns", name="ns", hosts=["*.sub.example.test"], kind="prefix", path="/api")
+        self.assertIs(matching.ferrum_prefers(broad_long, narrow_short), False)
+        self.assertIs(matching.ferrum_prefers(narrow_short, broad_long), True)
+
+    def test_wildcard_conflict_chunking_preserves_narrower_wildcard_without_pruning(self):
+        # Opus P1-3: merging conflicting wildcards (>100 total hosts) must NOT drop *.a.example.test, because a live
+        # route on *.a.example.test / would otherwise beat a *.example.test /api placeholder in Ferrum.
+        hosts_1 = ["*.example.test"] + [f"a{i}.other.test" for i in range(60)]
+        hosts_2 = ["*.a.example.test"] + [f"b{i}.other.test" for i in range(60)]
+        r1 = RouteSpec(ref="r1", name="r1", hosts=hosts_1, kind="prefix", path="/api",
+                       protocols=frozenset({"http"}), backend=BackendRef("http", "a.internal", 80))
+        r2 = RouteSpec(ref="r2", name="r2", hosts=hosts_2, kind="prefix", path="/api",
+                       protocols=frozenset({"http"}), backend=BackendRef("http", "b.internal", 80))
+        live = RouteSpec(ref="live", name="live", hosts=hosts_2, kind="prefix", path="/",
+                         protocols=frozenset({"http"}), backend=BackendRef("http", "c.internal", 80))
+        result = emit(Plan(platform="test", routes=[r1, r2, live]), EmitOptions(), Report("test", "synthetic"))
+        refused_api = [p for p in result.config["proxies"]
+                       if p.get("listen_path") == "/api" and p["labels"].get("ferrum-migration/status") == "refused"]
+        all_refused_hosts = [h for p in refused_api for h in p.get("hosts", [])]
+        self.assertIn("*.example.test", all_refused_hosts)
+        self.assertIn("*.a.example.test", all_refused_hosts)
+        # Both overlapping wildcards must stay in the same chunk so Ferrum does not reject them as ambiguous.
+        same_chunk = any("*.example.test" in p.get("hosts", []) and "*.a.example.test" in p.get("hosts", [])
+                         for p in refused_api)
+        self.assertTrue(same_chunk)
+        for proxy in result.config["proxies"]:
+            self.assertLessEqual(len(proxy.get("hosts", [])), util.MAX_HOSTS_PER_PROXY)
+
+    def test_host_only_conflict_chunking_preserves_exact_under_wildcard(self):
+        hosts_1 = ["*.example.test"] + [f"a{i}.other.test" for i in range(60)]
+        hosts_2 = ["api.example.test"] + [f"b{i}.other.test" for i in range(60)]
+        r1 = RouteSpec(ref="r1", name="r1", hosts=hosts_1, kind="hostonly", path=None,
+                       protocols=frozenset({"http"}), backend=BackendRef("http", "a.internal", 80))
+        r2 = RouteSpec(ref="r2", name="r2", hosts=hosts_2, kind="hostonly", path=None,
+                       protocols=frozenset({"http"}), backend=BackendRef("http", "b.internal", 80))
+        result = emit(Plan(platform="test", routes=[r1, r2]), EmitOptions(), Report("test", "synthetic"))
+        host_only_proxies = [p for p in result.config["proxies"] if "listen_path" not in p]
+        self.assertTrue(any("*.example.test" in p["hosts"] and "api.example.test" in p["hosts"]
+                            for p in host_only_proxies))
+        for proxy in result.config["proxies"]:
+            self.assertLessEqual(len(proxy.get("hosts", [])), util.MAX_HOSTS_PER_PROXY)
+
+    def test_string_prefix_divergence_guards_broader_catch_all_route(self):
+        # Sol P1 #2: a live string-prefix route (a.example.test /api with auth) next to a broader public catch-all /
+        # must guard /api on the catch-all so /apix cannot bypass auth.
+        from ferrum_migration.model import PluginSpec
+        auth_api = RouteSpec(ref="api", name="api", hosts=["a.example.test"], kind="prefix", path="/api",
+                             protocols=frozenset({"http"}), backend=BackendRef("http", "api.internal", 80),
+                             plugins=[PluginSpec("key_auth", {"key_location": ["header:apikey"]}, "api")],
+                             report_prefix_siblings=True)
+        pub_root = RouteSpec(ref="root", name="root", hosts=[], kind="prefix", path="/",
+                             protocols=frozenset({"http"}), backend=BackendRef("http", "pub.internal", 80))
+        report = Report("test", "synthetic")
+        result = emit(Plan(platform="test", routes=[auth_api, pub_root]), EmitOptions(), report)
+        self.assertGreaterEqual(result.stats["prefix_guards"], 1)
+        self.assertIn("prefix-divergence", {c.code for c in report.caveats})
+
+    def test_termination_validation_global_and_edge_cases(self):
+        from ferrum_migration.model import PluginSpec
+        # 205 with non-empty body, reserved header, trailing whitespace, whitespace-only content_type all refused.
+        for label, term in (
+            ("205-body", {"status_code": 205, "body": "nonempty"}),
+            ("reserved-hdr", {"status_code": 200, "headers": {"Set-Cookie": "a=b"}, "body": ""}),
+            ("ferrum-hdr", {"status_code": 200, "headers": {"X-Ferrum-Debug": "1"}, "body": ""}),
+            ("dup-hdr", {"status_code": 200, "headers": {"X-A": "1", "x-a": "2"}, "body": ""}),
+            ("trailing-ws", {"status_code": 302, "headers": {"location": "https://a.test/ "}, "body": ""}),
+            ("blank-ct", {"status_code": 200, "content_type": "   ", "body": "ok"}),
+        ):
+            with self.subTest(case=label):
+                r = RouteSpec(ref=label, name=label, hosts=["a.example.test"], kind="prefix", path="/r",
+                              protocols=frozenset({"http"}), termination=term)
+                emit(Plan(platform="test", routes=[r]), EmitOptions(), Report("test", "synthetic"))
+                self.assertTrue(r.refusals)
+        # Invalid global request_termination fails closed on all routes.
+        route = RouteSpec(ref="ok", name="ok", hosts=["a.example.test"], kind="prefix", path="/ok",
+                          protocols=frozenset({"http"}), backend=BackendRef("http", "a.internal", 80))
+        bad_global = PluginSpec("request_termination", {"status_code": 205, "body": "nope"}, "global-term")
+        report = Report("test", "synthetic")
+        result = emit(Plan(platform="test", routes=[route], global_plugins=[bad_global]), EmitOptions(), report)
+        self.assertTrue(route.refusals)
+        self.assertIn("global-plugin-invalid", {c.code for c in report.caveats})
+        self.assertFalse([p for p in result.config["plugin_configs"] if p["scope"] == "global"])
+
+    def test_san_limits_and_dns_syntax_and_lone_surrogate_rejected(self):
+        from ferrum_migration.errors import InputError
+        from ferrum_migration.model import Target, TlsSpec, UpstreamSpec
+        from ferrum_migration.safe_load import Limits, load_structured
+
+        self.assertFalse(util.valid_backend_tls_san("api.example.com."))
+        self.assertFalse(util.valid_backend_tls_san("-bad.example.com"))
+        self.assertFalse(util.valid_backend_tls_san("a" * 64 + ".example.com"))
+        self.assertEqual(util.backend_tls_san_kind("spiffe://trust.domain/ns/default/sa/app"), "URI")
+        self.assertEqual(util.backend_tls_san_kind("10.0.0.1"), "IP_ADDRESS")
+        self.assertEqual(util.backend_tls_san_kind("api.example.com"), "DNS")
+        # 257 distinct SANs refused.
+        up = UpstreamSpec(key="u", name="u", ref="u", targets=[Target("b.internal", 443, 1)],
+                          tls=TlsSpec(verify=True, san_allow_list=[f"s{i}.example.test" for i in range(257)]))
+        r = RouteSpec(ref="s", name="s", hosts=["b.example.test"], kind="prefix", path="/s",
+                      protocols=frozenset({"http"}), backend=BackendRef("https", upstream_key="u"))
+        emit(Plan(platform="test", routes=[r], upstreams={"u": up}), EmitOptions(), Report("test", "synthetic"))
+        self.assertTrue(r.refusals)
+        # Lone surrogate in JSON raises InputError instead of UnicodeEncodeError.
+        with self.assertRaises(InputError):
+            load_structured('{"key": "\\ud800"}', "json", Limits())
+
+    def test_acl_drop_quarantines_consumer_and_cross_field_identity_collision_omitted(self):
+        from ferrum_migration.model import ConsumerSpec
+        # Dropping a >255-byte ACL group must quarantine the consumer so it cannot bypass a deny-list.
+        c_acl = ConsumerSpec(ref="c-acl", key="c-acl", username="alice",
+                             acl_groups=["é" * 130, "ok"], keyauth=["secret-key-at-least-16-chars"])
+        # Cross-field identity collision: c2's custom_id equals c1's username.
+        c1 = ConsumerSpec(ref="c1", key="c1", username="shared-id", keyauth=["key-one-at-least-16-chars"])
+        c2 = ConsumerSpec(ref="c2", key="c2", username="bob", custom_id="shared-id",
+                          keyauth=["key-two-at-least-16-chars"])
+        report = Report("test", "synthetic")
+        result = emit(Plan(platform="test", consumers=[c_acl, c1, c2]), EmitOptions(include_secrets=True), report)
+        emitted_names = [c["username"] for c in result.config["consumers"]]
+        self.assertEqual(emitted_names, ["alice"])
+        self.assertNotIn("credentials", result.config["consumers"][0])
+        self.assertIn("consumer-acl-groups", {c.code for c in report.caveats})
+        self.assertIn("consumer-quarantined", {c.code for c in report.caveats})
+        self.assertIn("consumer-identity-conflict", {c.code for c in report.caveats})
 
     def test_conflict_merging_over_100_hosts_chunks_without_colliding_with_sibling(self):
         hosts_a = ["shared.example.test"] + [f"a{i}.example.test" for i in range(60)]

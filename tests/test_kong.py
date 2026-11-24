@@ -558,6 +558,67 @@ class KongHardeningTest(unittest.TestCase):
         self.assertNotIn("credentials", result.config["consumers"][0])
         self.assertIn("kong-consumer-group", codes(report, "error"))
 
+    def test_dbless_consumer_group_consumers_and_plugins_quarantine_members(self):
+        text = textwrap.dedent("""
+            _format_version: "3.0"
+            consumer_groups:
+              - id: grp-uuid-1
+                name: gold
+            consumers:
+              - id: cons-uuid-1
+                username: alice
+                keyauth_credentials: [{key: "alice-synthetic-key-16-chars"}]
+              - id: cons-uuid-2
+                username: bob
+                keyauth_credentials: [{key: "bob-synthetic-key-16-chars"}]
+            consumer_group_consumers:
+              - consumer: {id: cons-uuid-1}
+                consumer_group: {id: grp-uuid-1}
+            consumer_group_plugins:
+              - name: rate-limiting
+                consumer_group: gold
+                config: {minute: 50}
+            services:
+              - name: s
+                url: http://s.internal:8080
+                routes: [{name: r, paths: [/api/]}]
+        """)
+        result, report, _ = migrate("kong", text, include_secrets=True)
+        by_user = {c["username"]: c for c in result.config["consumers"]}
+        self.assertNotIn("credentials", by_user["alice"])
+        self.assertIn("credentials", by_user["bob"])
+        self.assertIn("kong-consumer-group", codes(report, "error"))
+
+    def test_health_check_huge_timeout_and_empty_redirect_location(self):
+        text = textwrap.dedent("""
+            _format_version: "3.0"
+            upstreams:
+              - name: up
+                targets: [{target: 10.0.0.1:8080, weight: 100}]
+                healthchecks:
+                  active:
+                    timeout: 1e308
+                    healthy: {interval: 99999, successes: 1}
+                    unhealthy: {interval: 10, http_failures: 2}
+            services:
+              - name: s
+                url: http://up:8080
+                routes:
+                  - name: ok
+                    paths: [/ok/]
+                  - name: bad-redir
+                    paths: [/go/]
+                    plugins:
+                      - name: redirect
+                        config: {location: "", status_code: 301}
+        """)
+        result, _report, _ = migrate("kong", text)
+        assert_structurally_valid(self, result.config)
+        active = result.config["upstreams"][0]["health_checks"]["active"]
+        self.assertEqual(active["timeout_ms"], 86_400_000)
+        self.assertEqual(active["interval_seconds"], 3600)
+        self.assertEqual(one_proxy(self, result.config, "/go")["labels"]["ferrum-migration/status"], "refused")
+
 
 if __name__ == "__main__":
     unittest.main()

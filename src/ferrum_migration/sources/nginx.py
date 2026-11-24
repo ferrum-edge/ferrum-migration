@@ -541,33 +541,37 @@ class _Nginx:
             self.catch_all_routes.setdefault(info["index"], []).extend(routes)
 
     def _apply_ssl_reject_handshake(self, infos: list[dict]) -> None:
-        """If the default server on the main TLS listener enables ssl_reject_handshake, refuse every HTTPS route."""
+        """If any server on the main TLS listener enables ssl_reject_handshake, refuse every HTTPS route."""
         port = self.plan.settings.main_https_port
         if port is None:
             return
-        default_index = self.default_server.get((port, True))
-        if default_index is None:
-            return
-        default_info = next((info for info in infos if info["index"] == default_index), None)
-        if default_info is None:
-            return
-        setting = self._tls_setting(default_info["directive"], "ssl_reject_handshake")
-        if setting is None or setting == "off":
+        rejecting = []
+        for info in infos:
+            on_main_tls = any(not l.get("invalid") and l["ssl"] and l["port"] == port for l in info["listens"])
+            if not on_main_tls:
+                continue
+            setting = self._tls_setting(info["directive"], "ssl_reject_handshake")
+            if setting is not None and setting != "off":
+                rejecting.append(info)
+        if not rejecting:
             return
         https_routes = [r for r in self.plan.routes
                         if not r.skip and (r.requires_tls or "https" in (r.protocols or ()))]
         if not https_routes:
             return
+        unrefused = [r for r in https_routes if not r.refusals]
         for route in https_routes:
-            route.refuse("the default TLS server enables ssl_reject_handshake (SNI admission control), which Ferrum's "
-                         "HTTPS listener cannot reproduce")
-        self.report.error("nginx-ssl-reject-handshake", default_info["ref"],
-                          "The default server on the main TLS listener enables ssl_reject_handshake, rejecting TLS "
-                          "handshakes for unknown SNIs before HTTP routing. Ferrum's HTTPS listener completes every "
-                          f"handshake with its frontend certificate, so all {len(https_routes)} HTTPS route(s) were "
-                          "refused (fail closed).",
-                          "Keep SNI handshake rejection on a front proxy, or remove ssl_reject_handshake only if "
-                          "accepting handshakes for unknown SNIs is acceptable, then convert again.")
+            route.refuse("a server on the main TLS listener enables ssl_reject_handshake (SNI admission control), "
+                         "which Ferrum's HTTPS listener cannot reproduce")
+        if unrefused:
+            refs = ", ".join(info["ref"] for info in rejecting[:3])
+            self.report.error("nginx-ssl-reject-handshake", refs,
+                              "A server on the main TLS listener enables ssl_reject_handshake, rejecting TLS "
+                              "handshakes for matched/unknown SNIs before HTTP routing. Ferrum's HTTPS listener "
+                              f"completes every handshake with its frontend certificate, so all {len(https_routes)} "
+                              "HTTPS route(s) were refused (fail closed).",
+                              "Keep SNI handshake rejection on a front proxy, or remove ssl_reject_handshake only if "
+                              "accepting handshakes for those SNIs is acceptable, then convert again.")
 
     def _refuse_conflicting_defaults(self) -> None:
         """Different default servers on the main plaintext and TLS listeners cannot share one catch-all tier.
@@ -757,12 +761,12 @@ class _Nginx:
             route.refuse("return with variables cannot be reproduced statically")
             return
         if code in (301, 302, 303, 307, 308):
-            if not value or not header_value_ok(value):
+            if not value or not header_value_ok(value, nonempty=True):
                 route.refuse("redirect target is missing or not a valid header value")
                 return
             route.termination = {"status_code": code, "headers": {"location": value}, "body": ""}
-        elif code in (204, 304):
-            route.termination = {"status_code": code, "body": ""}
+        elif code in (204, 205, 304):
+            route.termination = {"status_code": code, "body": value or ""}
         else:
             route.termination = {"status_code": code, "content_type": "text/plain", "body": value or ""}
 
@@ -792,7 +796,16 @@ class _Nginx:
             if parsed is None:
                 route.refuse("backend host/port is invalid")
                 return
-            route.backend = BackendRef(scheme=scheme, host=parsed[0], port=parsed[1], tls=tls)
+            if scheme == "https" and (tls.sni or tls.san_allow_list):
+                key = f"direct:{parsed[0]}:{parsed[1]}|{scheme}|{tls.key()}"
+                if key not in self.plan.upstreams:
+                    self.plan.upstreams[key] = UpstreamSpec(
+                        key=key, name=f"{parsed[0]}-{parsed[1]}", ref=ref,
+                        targets=[Target(parsed[0], parsed[1], 1)], tls=tls,
+                    )
+                route.backend = BackendRef(scheme=scheme, upstream_key=key)
+            else:
+                route.backend = BackendRef(scheme=scheme, host=parsed[0], port=parsed[1], tls=tls)
         if uri is not None:
             if route.kind == "regex":
                 route.refuse("proxy_pass with a URI inside a regex location is invalid in NGINX")
@@ -836,8 +849,13 @@ class _Nginx:
             else:
                 tls.client_cert_path = cert
                 tls.client_key_path = key
-        if ssl.get("server_name") == "on" and ssl.get("name") and "$" not in ssl["name"]:
-            tls.sni = ssl["name"]
+        ssl_name = ssl.get("name")
+        if ssl_name is not None:
+            if "$" in ssl_name or not ssl_name.strip():
+                problems.append("backend TLS verification name (proxy_ssl_name/grpc_ssl_name) uses a variable or is "
+                                "empty, which cannot be migrated")
+            else:
+                tls.sni = ssl_name.strip()
         return tls, problems
 
     def _upstream(self, name: str, tls: TlsSpec, scheme: str) -> str | None:

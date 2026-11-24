@@ -38,7 +38,7 @@ COSMETIC_PLUGINS = {
 }
 KNOWN_TOP_LEVEL = {"_format_version", "_transform", "_info", "_workspace", "_konnect", "services", "routes",
                    "upstreams", "consumers", "plugins", "certificates", "ca_certificates", "snis", "vaults",
-                   "consumer_groups"}
+                   "consumer_groups", "consumer_group_consumers", "consumer_group_plugins"}
 _REGEX_HINT = re.compile(r"[\\^$*+?()\[\]{}|]")
 _KEY_NAME = re.compile(r"^[A-Za-z0-9!#$%&'*+.^_`|~-]+$")
 # Ferrum authentication plugins this translator can emit (from key-auth, basic-auth and jwt).
@@ -88,6 +88,8 @@ class _Kong:
         self.plugins_by_owner: dict[tuple[str, str | None], list[_Plugin]] = {}
         self.consumer_quarantine: dict[str, list[str]] = {}
         self.consumer_group_members: dict[str, set[str]] = {}
+        self.consumer_group_aliases: dict[str, set[str]] = {}
+        self.unresolved_consumer_groups: list[str] = []
         self.jwt_algorithm = "HS256"
         self.format_version = "3.0"
         self.pretransformed = False
@@ -199,6 +201,13 @@ class _Kong:
             service_key = self.service_index.get(service_ref) if service_ref else None
             self._register_route(route, service_key)
 
+    def _group_members(self, gid: str) -> set[str]:
+        aliases = self.consumer_group_aliases.get(gid, {gid})
+        members: set[str] = set()
+        for alias in aliases:
+            members.update(self.consumer_group_members.get(alias, set()))
+        return members
+
     def _register_plugin(self, raw: dict, level: str, owner: str | None) -> None:
         consumer = _ref_key(raw.get("consumer"))
         group = _ref_key(raw.get("consumer_group")) if raw.get("consumer_group") else None
@@ -209,10 +218,13 @@ class _Kong:
                     f"plugin {pname} is scoped to this consumer and has no Ferrum equivalent")
             if raw.get("consumer_group"):
                 glabel = safe_label(group or "?", 40)
-                members = self.consumer_group_members.get(group, set()) if group else set()
-                for member in members:
-                    self.consumer_quarantine.setdefault(member, []).append(
-                        f"plugin {pname} is scoped to consumer group {glabel} and has no Ferrum equivalent")
+                if not group:
+                    self.unresolved_consumer_groups.append(
+                        f"plugin {pname} references a consumer group whose identity cannot be resolved")
+                else:
+                    for member in self._group_members(group):
+                        self.consumer_quarantine.setdefault(member, []).append(
+                            f"plugin {pname} is scoped to consumer group {glabel} and has no Ferrum equivalent")
                 self.report.error("kong-consumer-group", f"kong plugin {pname}",
                                   f"Plugin is scoped to consumer group {glabel}, which is not migrated; members "
                                   "are quarantined (credentials withheld).")
@@ -258,11 +270,20 @@ class _Kong:
                     self.consumer_quarantine.setdefault(str(key), []).append(
                         f"plugin {safe_label(plugin.get('name'), 40)} is scoped to this consumer and has no Ferrum "
                         "equivalent")
+        groups_with_plugins: set[str] = set()
         for group in seq(self.root.get("consumer_groups")):
             if not isinstance(group, dict):
+                self.unresolved_consumer_groups.append("consumer_groups contains a malformed entry")
                 continue
-            name = safe_label(group.get("name"))
+            name = safe_label(group.get("name") or group.get("id"))
             group_ids = [ident for ident in (group.get("name"), group.get("id")) if isinstance(ident, str)]
+            for gid in group_ids:
+                self.consumer_group_aliases.setdefault(gid, set()).update(group_ids)
+            if group.get("plugins"):
+                groups_with_plugins.update(group_ids)
+                if not group_ids:
+                    self.unresolved_consumer_groups.append(
+                        f"consumer group {name} carries plugin overrides without a resolvable group name/id")
             for member in seq(group.get("consumers")):
                 key = _ref_key(member)
                 if key:
@@ -271,18 +292,70 @@ class _Kong:
                     if group.get("plugins"):
                         self.consumer_quarantine.setdefault(key, []).append(
                             f"consumer group {name} carries plugin overrides")
+                elif member is not None:
+                    self.unresolved_consumer_groups.append(
+                        f"consumer group {name} has an unresolvable member reference")
             self.report.error("kong-consumer-group", f"kong consumer_group {name}",
                               "Consumer groups are not migrated; members with group plugin overrides are "
                               "quarantined (credentials withheld).")
         for consumer in consumers:
+            markers = [m for m in (consumer.get("username"), consumer.get("custom_id"), consumer.get("id"))
+                       if isinstance(m, str)]
             for group in seq(consumer.get("groups")):
-                key = consumer.get("username") or consumer.get("custom_id")
                 gid = _ref_key(group)
-                if key:
+                for marker in markers:
                     if gid:
-                        self.consumer_group_members.setdefault(gid, set()).add(str(key))
-                    self.consumer_quarantine.setdefault(str(key), []).append(
+                        for alias in self.consumer_group_aliases.get(gid, {gid}):
+                            self.consumer_group_members.setdefault(alias, set()).add(marker)
+                    self.consumer_quarantine.setdefault(marker, []).append(
                         f"member of consumer group {safe_label(gid)}")
+        raw_cgc = self.root.get("consumer_group_consumers")
+        if raw_cgc is not None and not isinstance(raw_cgc, list):
+            self.unresolved_consumer_groups.append("consumer_group_consumers has unexpected shape")
+            self.report.error("kong-consumer-group", "kong consumer_group_consumers",
+                              "consumer_group_consumers is not a list; consumer-group membership cannot be resolved "
+                              "(fail closed).")
+        for entry in seq(raw_cgc):
+            if not isinstance(entry, dict):
+                self.unresolved_consumer_groups.append("consumer_group_consumers contains a malformed entry")
+                continue
+            gid = _ref_key(entry.get("consumer_group"))
+            ckey = _ref_key(entry.get("consumer"))
+            if not gid or not ckey:
+                self.unresolved_consumer_groups.append("consumer_group_consumers has an unresolvable membership entry")
+                continue
+            aliases = self.consumer_group_aliases.get(gid, {gid})
+            for alias in aliases:
+                self.consumer_group_members.setdefault(alias, set()).add(ckey)
+            if aliases & groups_with_plugins:
+                self.consumer_quarantine.setdefault(ckey, []).append(
+                    f"consumer group {safe_label(gid, 40)} carries plugin overrides")
+        raw_cgp = self.root.get("consumer_group_plugins")
+        if raw_cgp is not None and not isinstance(raw_cgp, list):
+            self.unresolved_consumer_groups.append("consumer_group_plugins has unexpected shape")
+            self.report.error("kong-consumer-group", "kong consumer_group_plugins",
+                              "consumer_group_plugins is not a list; consumer-group policy cannot be resolved "
+                              "(fail closed).")
+        for entry in seq(raw_cgp):
+            if not isinstance(entry, dict):
+                self.unresolved_consumer_groups.append("consumer_group_plugins contains a malformed entry")
+                continue
+            pname = safe_label(entry.get("name"), 40)
+            gid = _ref_key(entry.get("consumer_group"))
+            if not gid:
+                self.unresolved_consumer_groups.append(
+                    f"consumer_group_plugin {pname} has no resolvable consumer_group reference")
+                self.report.error("kong-consumer-group", f"kong consumer_group_plugin {pname}",
+                                  "Consumer group plugin has no resolvable consumer_group; affected consumers and "
+                                  "authenticated routes are failed closed.")
+                continue
+            glabel = safe_label(gid, 40)
+            for member in self._group_members(gid):
+                self.consumer_quarantine.setdefault(member, []).append(
+                    f"consumer_group_plugin {pname} is scoped to consumer group {glabel} and has no Ferrum equivalent")
+            self.report.error("kong-consumer-group", f"kong consumer_group_plugin {pname}",
+                              f"Consumer group plugin is scoped to consumer group {glabel}, which is not migrated; "
+                              "members are quarantined (credentials withheld).")
         return consumers
 
     def _decide_jwt_algorithm(self, consumers: list[dict]) -> None:
@@ -320,6 +393,8 @@ class _Kong:
             for marker in (username, custom_id, consumer.get("id")):
                 if isinstance(marker, str) and marker in self.consumer_quarantine:
                     spec.quarantined.extend(self.consumer_quarantine[marker])
+            if self.unresolved_consumer_groups:
+                spec.quarantined.extend(self.unresolved_consumer_groups)
             for cred in seq(consumer.get("keyauth_credentials")):
                 value = cred.get("key") if isinstance(cred, dict) else None
                 if self.pretransformed:
@@ -633,22 +708,22 @@ class _Kong:
                 try:
                     parsed_t = float(raw_timeout)
                     if math.isfinite(parsed_t) and parsed_t > 0:
-                        timeout_s = parsed_t
+                        timeout_s = min(parsed_t, util.MAX_TIMEOUT_MS / 1000.0)
                 except ValueError:
                     pass
             entry: dict[str, Any] = {
                 "http_path": active.get("http_path") if isinstance(active.get("http_path"), str) else "/",
-                "interval_seconds": interval,
-                "timeout_ms": max(1, int(round(timeout_s * 1000))),
-                "healthy_threshold": max(1, util.as_int(healthy.get("successes")) or 1),
-                "unhealthy_threshold": max(1, util.as_int(unhealthy.get("http_failures"))
-                                           or util.as_int(unhealthy.get("tcp_failures")) or 1),
+                "interval_seconds": max(1, min(interval, 3600)),
+                "timeout_ms": max(1, min(int(round(timeout_s * 1000)), util.MAX_TIMEOUT_MS)),
+                "healthy_threshold": max(1, min(util.as_int(healthy.get("successes")) or 1, 1000)),
+                "unhealthy_threshold": max(1, min(util.as_int(unhealthy.get("http_failures"))
+                                                  or util.as_int(unhealthy.get("tcp_failures")) or 1, 1000)),
                 "probe_type": probe,
             }
             if str(active.get("type")) in ("https", "grpcs"):
                 entry["use_tls"] = True
             statuses = healthy.get("http_statuses")
-            if isinstance(statuses, list) and statuses \
+            if isinstance(statuses, list) and 0 < len(statuses) <= 500 \
                     and all(isinstance(code, int) and not isinstance(code, bool) and 100 <= code <= 599
                             for code in statuses):
                 entry["healthy_status_codes"] = statuses
@@ -659,7 +734,7 @@ class _Kong:
         if failures > 0:
             entry = {"unhealthy_threshold": min(failures, 1000)}
             statuses = passive.get("http_statuses")
-            if isinstance(statuses, list) and statuses \
+            if isinstance(statuses, list) and 0 < len(statuses) <= 500 \
                     and all(isinstance(code, int) and not isinstance(code, bool) and 100 <= code <= 599
                             for code in statuses):
                 entry["unhealthy_status_codes"] = statuses
@@ -706,6 +781,9 @@ class _Kong:
             hosts, methods, paths = hosts or [], methods or [], paths or []
         plugins, termination, plugin_refusals = self._effective_plugins(index, service_key)
         auth_composition = None if termination is not None else self._auth_composition(plugins, ref)
+        effective_auth = (({p.name for p in plugins} | {p.name for p in self.plan.global_plugins}) & AUTH_PLUGINS)
+        if termination is None and effective_auth and self.unresolved_consumer_groups:
+            plugin_refusals.append("consumer-group membership or policy could not be resolved safely")
         backend_info: dict[str, Any] = {"problems": []}
         if termination is None:
             if service_key is None:
@@ -1107,16 +1185,19 @@ def _kong_response_transformer(self: _Kong, config: dict, ref: str) -> tuple:
 def _kong_request_termination(self: _Kong, config: dict, ref: str) -> tuple:
     if config.get("trigger") or config.get("echo"):
         return ("refuse", "trigger/echo modes are not translated")
-    status = util.as_int(config.get("status_code", 503)) or 503
-    if not 200 <= status <= 599:
+    raw_status = config.get("status_code")
+    status = 503 if raw_status is None else util.as_int(raw_status)
+    if status is None or not 200 <= status <= 599:
         return ("refuse", "status code outside 200-599")
     termination: dict[str, Any] = {"status_code": status}
     if isinstance(config.get("body"), str):
         ct = str(config.get("content_type") or "application/json")
-        if not header_value_ok(ct):
+        if not ct.strip() or not header_value_ok(ct, nonempty=True):
             return ("refuse", "content_type is not a valid header value")
         termination["content_type"] = ct
         termination["body"] = config["body"]
+    elif status in (204, 205, 304):
+        termination["body"] = ""
     else:
         termination["content_type"] = "application/json"
         termination["message"] = str(config.get("message") or "Service unavailable")
@@ -1126,10 +1207,11 @@ def _kong_request_termination(self: _Kong, config: dict, ref: str) -> tuple:
 def _kong_redirect(self: _Kong, config: dict, ref: str) -> tuple:
     location = config.get("location")
     if config.get("keep_incoming_path") or not isinstance(location, str) or "$" in location \
-            or not header_value_ok(location):
+            or not header_value_ok(location, nonempty=True):
         return ("refuse", "only static redirects with valid Location header values are translated")
-    status = util.as_int(config.get("status_code", 301)) or 301
-    if not 200 <= status <= 599:
+    raw_status = config.get("status_code")
+    status = 301 if raw_status is None else util.as_int(raw_status)
+    if status is None or not 200 <= status <= 599:
         return ("refuse", "redirect status code outside 200-599")
     return ("termination", {"status_code": status, "headers": {"location": location}, "body": ""})
 

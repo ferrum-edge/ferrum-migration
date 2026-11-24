@@ -69,6 +69,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -88,6 +89,15 @@ MIN_KEYAUTH_KEY_LENGTH = 16
 MIN_JWT_SECRET_LENGTH = 32
 MAX_CREDENTIAL_VALUE_LENGTH = 4096
 MAX_PLUGIN_CONFIG_BYTES = 1_048_576
+_HEADER_TOKEN_RE = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
+_RESERVED_TERM_HEADERS = frozenset({
+    "connection", "keep-alive", "proxy-authenticate", "proxy-connection", "te", "trailer",
+    "transfer-encoding", "upgrade", "content-length", "content-type",
+    "authentication-info", "authorization", "proxy-authentication-info", "proxy-authorization",
+    "set-cookie", "set-cookie2", "www-authenticate",
+    "x-gateway-error", "x-gateway-upstream-status",
+})
+_NO_BODY_STATUSES = frozenset({204, 205, 304})
 
 
 @dataclass
@@ -126,6 +136,18 @@ class _Cand:
 def emit(plan: Plan, options: EmitOptions, report: Report) -> EmitResult:
     routes = plan.routes
     _refuse_extra_listeners(plan, routes, report)
+    valid_globals: list[PluginSpec] = []
+    for plugin in plan.global_plugins:
+        if plugin.name == "request_termination":
+            problem = validate_termination_config(plugin.config)
+            if problem:
+                plan.global_refusals.append(f"global request_termination: {problem}")
+                report.error("global-plugin-invalid", plugin.ref or "global",
+                             f"Global request_termination config is not representable ({problem}); every route is "
+                             "refused (fail closed).")
+                continue
+        valid_globals.append(plugin)
+    plan.global_plugins = valid_globals
     for reason in plan.global_refusals:
         for route in routes:
             if not route.skip:
@@ -251,8 +273,6 @@ def _validate_route(route: RouteSpec, plan: Plan, options: EmitOptions, report: 
         else:
             if len(normalized) > util.MAX_HOSTS_PER_PROXY:
                 route.refuse("more than 100 hosts on one route")
-                route.path_ok = False
-                route.extra_conditions = True
             route.hosts = normalized
     if route.kind == "hostonly" and not route.hosts:
         if route.hosts == []:
@@ -279,6 +299,10 @@ def _validate_route(route: RouteSpec, plan: Plan, options: EmitOptions, report: 
             route.extra_conditions = True
     elif route.kind == "hostonly":
         route.path = None
+    if route.hosts and len(route.hosts) > util.MAX_HOSTS_PER_PROXY \
+            and _chunk_hosts_no_prune(route.hosts, host_only=route.kind == "hostonly") is None:
+        route.path_ok = False
+        route.extra_conditions = True
     if route.methods is not None:
         methods: list[str] = []
         for method in route.methods:
@@ -314,33 +338,56 @@ def _validate_route(route: RouteSpec, plan: Plan, options: EmitOptions, report: 
             route.refuse(f"plugin {plugin.name} config exceeds Ferrum's 1 MiB limit")
 
 
-def _validate_termination(route: RouteSpec) -> None:
-    termination = route.termination
+def _term_header_value_ok(value: object) -> bool:
+    if not isinstance(value, str) or len(value.encode("utf-8")) > 4096:
+        return False
+    if value and (value[0] in (" ", "\t") or value[-1] in (" ", "\t")):
+        return False
+    return all(ch == "\t" or 0x20 <= ord(ch) <= 0x7E for ch in value)
+
+
+def validate_termination_config(termination: object) -> str | None:
+    """Validate a Ferrum ``request_termination`` config against ``src/plugins/request_termination.rs``."""
     if not isinstance(termination, dict):
-        route.refuse("termination response is not representable")
-        return
+        return "termination response is not representable"
     status = termination.get("status_code")
     if isinstance(status, bool) or not isinstance(status, int) or not 200 <= status <= 599:
-        route.refuse("termination status code is outside 200-599")
-        return
+        return "termination status code is outside 200-599"
     content_type = termination.get("content_type")
     if content_type is not None:
-        if not isinstance(content_type, str) or not content_type \
-                or len(content_type.encode("utf-8")) > 4096 \
-                or not all(ch == "\t" or 0x20 <= ord(ch) <= 0x7E for ch in content_type):
-            route.refuse("termination content_type is not representable")
-            return
+        if not isinstance(content_type, str) or not content_type.strip() or not _term_header_value_ok(content_type):
+            return "termination content_type is not representable"
+    body = termination.get("body")
+    if body is not None and not isinstance(body, str):
+        return "termination body is not a string"
+    message = termination.get("message")
+    if message is not None and not isinstance(message, str):
+        return "termination message is not a string"
+    if status in _NO_BODY_STATUSES and body:
+        return f"termination status {status} cannot carry a non-empty response body"
     headers = termination.get("headers")
     if headers is not None:
         if not isinstance(headers, dict) or len(headers) > 32:
-            route.refuse("termination headers are not representable")
-            return
+            return "termination headers are not representable"
+        seen_names: set[str] = set()
         for key, value in headers.items():
-            if not isinstance(key, str) or not key or not isinstance(value, str) \
-                    or len(value.encode("utf-8")) > 4096 \
-                    or not all(ch == "\t" or 0x20 <= ord(ch) <= 0x7E for ch in value):
-                route.refuse("a termination header is not representable")
-                return
+            if not isinstance(key, str) or not _HEADER_TOKEN_RE.match(key):
+                return "a termination header name is invalid"
+            lower = key.lower()
+            if lower in _RESERVED_TERM_HEADERS or lower.startswith(("x-ferrum-", "grpc-")):
+                return f"termination header {lower} is reserved by Ferrum"
+            if lower in seen_names:
+                return f"duplicate termination header {lower}"
+            seen_names.add(lower)
+            if not _term_header_value_ok(value):
+                return f"termination header {lower} has an unrepresentable value"
+    return None
+
+
+def _validate_termination(route: RouteSpec) -> None:
+    problem = validate_termination_config(route.termination)
+    if problem:
+        route.refuse(problem)
 
 
 def _validate_backend(route: RouteSpec, plan: Plan, options: EmitOptions, report: Report) -> None:
@@ -367,9 +414,18 @@ def _validate_backend(route: RouteSpec, plan: Plan, options: EmitOptions, report
             target.host = host
             target.weight = max(1, min(int(target.weight), util.MAX_TARGET_WEIGHT))
         if backend.scheme == "https":
-            if any(not util.valid_backend_tls_san(san) for san in upstream.tls.san_allow_list):
+            if upstream.tls.sni is not None and not util.valid_backend_tls_sni(upstream.tls.sni):
+                route.refuse("upstream backend TLS SNI is not a valid DNS hostname")
+                return
+            deduped_sans = list(dict.fromkeys(upstream.tls.san_allow_list))
+            if len(deduped_sans) > util.MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES:
+                route.refuse(f"upstream backend TLS SAN allow-list exceeds Ferrum's "
+                             f"{util.MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES}-entry limit")
+                return
+            if any(not util.valid_backend_tls_san(san) for san in deduped_sans):
                 route.refuse("upstream backend TLS SAN allow-list contains an entry Ferrum cannot represent")
                 return
+            upstream.tls.san_allow_list = deduped_sans
             _apply_tls_policy(upstream.tls, upstream.ref, options, report)
         return
     host = util.normalize_backend_host(backend.host)
@@ -378,11 +434,10 @@ def _validate_backend(route: RouteSpec, plan: Plan, options: EmitOptions, report
         return
     backend.host = host
     if backend.scheme == "https":
-        _apply_tls_policy(backend.tls, route.ref, options, report)
         if backend.tls.sni or backend.tls.san_allow_list:
-            report.warning("backend-sni-dropped", route.ref,
-                           "Backend TLS SNI/SAN overrides are only representable on upstreams; Ferrum will "
-                           "use the backend host name for SNI and certificate verification.")
+            route.refuse("backend TLS SNI/SAN overrides are only representable on upstreams")
+            return
+        _apply_tls_policy(backend.tls, route.ref, options, report)
 
 
 def _apply_tls_policy(tls: TlsSpec, ref: str, options: EmitOptions, report: Report) -> None:
@@ -632,48 +687,79 @@ def _build_candidates(routes: list[RouteSpec]) -> list[_Cand]:
         if route.skip:
             continue
         representable = route.hosts is not None and route.path_ok
+        listen_path = _listen_path(route)
         if route.refusals:
             if not representable:
                 continue
+            hosts = list(route.hosts or [])
+            if len(hosts) > util.MAX_HOSTS_PER_PROXY:
+                chunks = _chunk_hosts_no_prune(hosts, host_only=listen_path is None)
+                if chunks is None:
+                    continue
+                route.placeholder_emitted = True
+                for chunk in chunks:
+                    candidates.append(_Cand(route, True, chunk, listen_path, route.listen_port,
+                                            termination=REFUSED_TERMINATION, kind_label="refused"))
+                continue
             route.placeholder_emitted = True
-            candidates.append(_Cand(route, True, list(route.hosts or []), _listen_path(route), route.listen_port,
+            candidates.append(_Cand(route, True, hosts, listen_path, route.listen_port,
                                     termination=REFUSED_TERMINATION, kind_label="refused"))
         else:
-            candidates.append(_Cand(route, False, list(route.hosts or []), _listen_path(route), route.listen_port,
+            candidates.append(_Cand(route, False, list(route.hosts or []), listen_path, route.listen_port,
                                     termination=route.termination,
                                     kind_label="terminated" if route.termination else "migrated"))
     return candidates
 
 
-def _prune_covered_hosts(hosts: list[str]) -> list[str]:
-    """Drop hosts already covered by another host in ``hosts`` (exact or narrower wildcard under a broader wildcard)."""
-    pruned: list[str] = []
-    for host in hosts:
-        if any(other != host and matching.host_cover(other, host) for other in hosts):
-            continue
-        if host not in pruned:
-            pruned.append(host)
-    return pruned
-
-
-def _chunk_conflict_hosts(hosts: list[str], host_only: bool) -> list[list[str]]:
-    """Split a merged conflict host list into chunks of at most ``MAX_HOSTS_PER_PROXY`` non-conflicting entries.
-
-    For path-carrying proxies, Ferrum checks exact and wildcard host tiers separately, so exact hosts keep their
-    exact tier while wildcards are pruned of covered sub-wildcards; chunks are pairwise disjoint in Ferrum's
-    duplicate-path check. For host-only proxies, Ferrum rejects exact+wildcard overlap too, so covered hosts are
-    pruned across both tiers first, leaving pairwise-disjoint hosts.
-    """
-    if len(hosts) <= util.MAX_HOSTS_PER_PROXY:
-        return [hosts]
-    limit = util.MAX_HOSTS_PER_PROXY
+def _hosts_conflict_in_ferrum(a: str, b: str, host_only: bool) -> bool:
+    """Whether Ferrum rejects ``a`` and ``b`` on two separate proxies of the same slot."""
+    if a == b:
+        return True
     if host_only:
-        pruned = _prune_covered_hosts(hosts)
-        return [pruned[i:i + limit] for i in range(0, len(pruned), limit)]
-    exact = [h for h in hosts if not h.startswith("*.")]
-    wildcards = _prune_covered_hosts([h for h in hosts if h.startswith("*.")])
-    chunks = [exact[i:i + limit] for i in range(0, len(exact), limit)]
-    chunks.extend(wildcards[i:i + limit] for i in range(0, len(wildcards), limit))
+        return matching.host_overlap(a, b)
+    return a.startswith("*.") and b.startswith("*.") and matching.host_overlap(a, b)
+
+
+def _chunk_hosts_no_prune(hosts: list[str], host_only: bool) -> list[list[str]] | None:
+    """Pack ``hosts`` into chunks of at most ``MAX_HOSTS_PER_PROXY`` without pruning any host.
+
+    Hosts that Ferrum considers ambiguous across separate proxies (``hosts_overlap`` for host-only proxies,
+    same-tier ``ambiguous_path_host_overlap`` for path proxies) are grouped into one connected component so
+    they always stay together in a single proxy — preserving exact-tier and narrower-wildcard routing buckets.
+    Returns ``None`` if any single ambiguous component exceeds ``MAX_HOSTS_PER_PROXY``.
+    """
+    unique = list(dict.fromkeys(hosts))
+    limit = util.MAX_HOSTS_PER_PROXY
+    if len(unique) <= limit:
+        return [unique]
+    parent = list(range(len(unique)))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for i in range(len(unique)):
+        for j in range(i + 1, len(unique)):
+            if _hosts_conflict_in_ferrum(unique[i], unique[j], host_only):
+                parent[find(i)] = find(j)
+    comps: dict[int, list[str]] = {}
+    for idx, host in enumerate(unique):
+        comps.setdefault(find(idx), []).append(host)
+    ordered = sorted(comps.values(), key=len, reverse=True)
+    if any(len(comp) > limit for comp in ordered):
+        return None
+    chunks: list[list[str]] = []
+    for comp in ordered:
+        placed = False
+        for chunk in chunks:
+            if len(chunk) + len(comp) <= limit:
+                chunk.extend(comp)
+                placed = True
+                break
+        if not placed:
+            chunks.append(list(comp))
     return chunks
 
 
@@ -682,9 +768,10 @@ def _resolve_conflicts(candidates: list[_Cand]) -> list[_Cand]:
     for cand in candidates:
         groups.setdefault((cand.listen_port, cand.listen_path), []).append(cand)
     replacement: dict[int, list[_Cand]] = {}
-    for (port, path), members in groups.items():
+    for (port, path), members in list(groups.items()):
         if len(members) < 2:
             continue
+        collapsed_group = False
         for component in _components(members):
             if len(component) < 2:
                 continue
@@ -700,13 +787,59 @@ def _resolve_conflicts(candidates: list[_Cand]) -> list[_Cand]:
                         if host not in hosts:
                             hosts.append(host)
             first = component[0]
-            host_chunks = _chunk_conflict_hosts(hosts, host_only=path is None) if hosts else [[]]
-            replacement[id(first)] = [
-                _Cand(first.route, True, chunk, path, port, termination=REFUSED_TERMINATION, kind_label="refused")
-                for chunk in host_chunks
-            ]
+            if not hosts:
+                host_chunks: list[list[str]] | None = [[]]
+            else:
+                host_chunks = _chunk_hosts_no_prune(hosts, host_only=path is None)
+            if host_chunks is None:
+                if path is not None:
+                    # A single ambiguous component exceeds 100 hosts: fail-close the whole (port, path) slot as one
+                    # catch-all 503 placeholder so Ferrum accepts it and no conflicting sibling remains live.
+                    for member in members:
+                        member.route.refuse("a merged host conflict on this path exceeds Ferrum's 100-host limit and "
+                                            "cannot be split safely; the whole path slot was failed closed")
+                        member.route.placeholder_emitted = True
+                        replacement[id(member)] = []
+                    replacement[id(members[0])] = [
+                        _Cand(members[0].route, True, [], path, port, termination=REFUSED_TERMINATION,
+                              kind_label="refused")
+                    ]
+                    collapsed_group = True
+                    break
+                # Host-only proxy cannot have empty hosts; try chunked regex 503 placeholders if that slot is free,
+                # else omit and fail-close every overlapping live candidate so no traffic escapes.
+                regex_chunks = _chunk_hosts_no_prune(hosts, host_only=False)
+                regex_slot = groups.get((port, REGEX_CLOSURE_PATH), [])
+                regex_free = regex_chunks is not None and not any(
+                    matching.hosts_overlap(other.hosts, hosts) for other in regex_slot
+                )
+                if regex_free and regex_chunks is not None:
+                    added = [
+                        _Cand(first.route, True, chunk, REGEX_CLOSURE_PATH, port,
+                              termination=REFUSED_TERMINATION, kind_label="refused")
+                        for chunk in regex_chunks
+                    ]
+                    replacement[id(first)] = added
+                    groups.setdefault((port, REGEX_CLOSURE_PATH), []).extend(added)
+                else:
+                    for member in component:
+                        member.route.placeholder_emitted = False
+                    replacement[id(first)] = []
+                    for other in candidates:
+                        if other not in component and not other.placeholder \
+                                and matching.ports_compatible(other.listen_port, port) \
+                                and matching.hosts_overlap(other.hosts, hosts):
+                            _fail_close(other, "overlaps a host-only route conflict whose hosts exceed Ferrum's "
+                                               "100-host limit and cannot be represented safely")
+            else:
+                replacement[id(first)] = [
+                    _Cand(first.route, True, chunk, path, port, termination=REFUSED_TERMINATION, kind_label="refused")
+                    for chunk in host_chunks
+                ]
             for member in component[1:]:
                 replacement[id(member)] = []
+        if collapsed_group:
+            continue
     result: list[_Cand] = []
     for cand in candidates:
         if id(cand) in replacement:
@@ -808,14 +941,19 @@ def _add_regex_closure(scope, hosts: list[str], candidates: list[_Cand], report:
     match, and it is not a host-only route, so it does not collide with the overlapping host-only closure. If the
     regex order assumption were wrong it could only shadow other routes with a 404 (fail closed).
     """
+    chunks = _chunk_hosts_no_prune(hosts, host_only=False)
+    if chunks is None:
+        return False
     for cand in candidates:
         if cand.listen_port == scope.listen_port and cand.listen_path == REGEX_CLOSURE_PATH \
                 and matching.hosts_overlap(cand.hosts, hosts):
             return False
-    synthetic = RouteSpec(ref=scope.ref, name=f"{scope.ref}-default", hosts=hosts, kind="regex",
-                          path=REGEX_CLOSURE_PATH[1:])
-    candidates.append(_Cand(synthetic, True, hosts, REGEX_CLOSURE_PATH, scope.listen_port,
-                            termination=NOT_FOUND_TERMINATION, kind_label="scope-default"))
+    for index, chunk in enumerate(chunks):
+        suffix = f"-default-{index + 1}" if len(chunks) > 1 else "-default"
+        synthetic = RouteSpec(ref=scope.ref, name=f"{scope.ref}{suffix}", hosts=chunk, kind="regex",
+                              path=REGEX_CLOSURE_PATH[1:])
+        candidates.append(_Cand(synthetic, True, chunk, REGEX_CLOSURE_PATH, scope.listen_port,
+                                termination=NOT_FOUND_TERMINATION, kind_label="scope-default"))
     report.info("scope-closure-regex", scope.ref,
                 "A host-only 404 route for this scope would overlap another host-only route, so a regex route "
                 "matching every path (answering 404, tried after the scope's own routes) closes it instead.")
@@ -848,7 +986,7 @@ def _add_scope_closures(plan: Plan, candidates: list[_Cand], report: Report) -> 
         elif cand.listen_path == "/":
             root_hosts.setdefault(cand.listen_port, set()).update(cand.hosts)
     for scope in scopes:
-        hosts = [h for h in (util.normalize_host(x) for x in scope.hosts) if h]
+        hosts = list(dict.fromkeys(h for h in (util.normalize_host(x) for x in scope.hosts) if h))
         if not hosts:
             continue
         # A prefix route for "/" on exactly these host names already catches every unmatched path in their tier.
@@ -861,25 +999,27 @@ def _add_scope_closures(plan: Plan, candidates: list[_Cand], report: Report) -> 
         if overlapping and all(c.kind_label == "scope-default" for c in overlapping) and \
                 all(any(host in c.hosts for c in overlapping) for host in hosts):
             continue
-        if overlapping:
+        chunks = None if overlapping else _chunk_hosts_no_prune(hosts, host_only=True)
+        if overlapping or chunks is None:
             if _add_regex_closure(scope, hosts, candidates, report):
                 continue
             refused = _refuse_fallthrough_targets(scope, hosts, candidates)
             report.error("scope-closure-skipped", scope.ref,
-                         "Another host-only route overlaps this scope's hosts without closing exactly these host "
-                         "names, so no default 404 route could be added (overlapping host-only routes are not "
-                         "emitted), and no regex closure fits either. Unmatched paths for these hosts could reach "
-                         "other host scopes' routes in Ferrum (another wildcard pattern or the catch-all tier), "
-                         f"which the source never did, so the {refused} route(s) that could receive them were "
-                         "refused (fail closed).",
+                         "Another host-only route overlaps this scope's hosts (or its host list cannot be split within "
+                         "Ferrum's 100-host limit), so no default 404 route could be added, and no regex closure fits "
+                         "either. Unmatched paths for these hosts could reach other host scopes' routes in Ferrum "
+                         f"(another wildcard pattern or the catch-all tier), which the source never did, so the "
+                         f"{refused} route(s) that could receive them were refused (fail closed).",
                          "Add explicit routes in the source for paths these hosts must answer, or serve the "
                          "overlapping host scopes from separate Ferrum frontends, then convert again.")
             continue
-        synthetic = RouteSpec(ref=scope.ref, name=f"{scope.ref}-default", hosts=hosts, kind="hostonly", path=None)
-        closure = _Cand(synthetic, True, hosts, None, scope.listen_port,
-                        termination=NOT_FOUND_TERMINATION, kind_label="scope-default")
-        candidates.append(closure)
-        host_only.setdefault(scope.listen_port, []).append(closure)
+        for index, chunk in enumerate(chunks):
+            suffix = f"-default-{index + 1}" if len(chunks) > 1 else "-default"
+            synthetic = RouteSpec(ref=scope.ref, name=f"{scope.ref}{suffix}", hosts=chunk, kind="hostonly", path=None)
+            closure = _Cand(synthetic, True, chunk, None, scope.listen_port,
+                            termination=NOT_FOUND_TERMINATION, kind_label="scope-default")
+            candidates.append(closure)
+            host_only.setdefault(scope.listen_port, []).append(closure)
         report.info("scope-closure", scope.ref,
                     "Added a host-only route answering 404 for paths this scope does not route, because the "
                     "source never falls through to other hosts' routes but Ferrum does.")
@@ -1070,12 +1210,20 @@ def _add_divergence_guards(candidates: list[_Cand], report: Report) -> None:
                              "Recreate the refused route in Ferrum, then remove the guard only for hosts where the "
                              "broader route should serve those paths.")
             else:
+                # The guard cannot be scoped strictly to this route's hosts, but leaving the broader route unguarded
+                # would let sibling paths such as /apix bypass this route's policy (for example authentication).
+                # Guard anyway (fail closed) and report the collateral 404s on the broader route's other hosts.
+                if route.path not in other.guards:
+                    other.guards.append(route.path or "/")
                 divergence_error = True
                 report.error("prefix-divergence", route.ref,
                              f"The source matched any path starting with {route.path} (for example {route.path}x); "
-                             f"Ferrum matches by path segment, so on some hosts those paths reach "
-                             f"{other_route.ref}, which has a different policy, and no exact guard could be added.",
-                             "Confirm such paths are not reachable or add an explicit route for them.")
+                             f"Ferrum matches by path segment, so on some hosts those paths would reach "
+                             f"{other_route.ref}, which has a different policy and serves more hosts or listeners. "
+                             f"A request_termination guard (trigger.path_prefix {route.path}) was added to it for all "
+                             "of its hosts so such paths answer 404 there (fail closed).",
+                             "Confirm such paths are not needed on the broader route's other hosts, or add explicit "
+                             "routes for them in the source and convert again.")
         if route.report_prefix_siblings and not refused and not divergence_error \
                 and not (equivalent and not intercepted and not guarded):
             report.error("prefix-string-siblings", route.ref,
@@ -1332,7 +1480,10 @@ class _Builder:
                 for secret in set(consumer.jwt):
                     jwt_owners[secret] = jwt_owners.get(secret, 0) + 1
         withheld = 0
-        result: list[dict[str, Any]] = []
+        # Build validated candidates first so we can check whole-config identity uniqueness across id, username, and
+        # normalized custom_id in one shared namespace (matching Ferrum's validate_unique_consumer_identities).
+        staged: list[tuple[Any, dict[str, Any], set[str]]] = []
+        identity_owners: dict[str, int] = {}
         for consumer in consumers:
             if usernames[consumer.username] > 1:
                 consumer.quarantined.append("its username is not unique")
@@ -1351,8 +1502,9 @@ class _Builder:
                     or any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in custom_id)):
                 self.report.error("consumer-invalid", consumer.ref, "Consumer custom_id is not representable; skipped.")
                 continue
+            cid = self.consumer_ids.take(self.plan.platform, "consumer", consumer.key)
             entry: dict[str, Any] = {
-                "id": self.consumer_ids.take(self.plan.platform, "consumer", consumer.key),
+                "id": cid,
                 "username": username,
                 "labels": self.labels(consumer.ref),
             }
@@ -1363,11 +1515,25 @@ class _Builder:
                       and not any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in g)]
             if len(groups) != len(consumer.acl_groups) or len(groups) > 500:
                 self.report.error("consumer-acl-groups", consumer.ref,
-                                  "Some ACL group names were not representable and were dropped; ACL decisions "
-                                  "for this consumer fail closed for those groups.")
+                                  "Some ACL group names were not representable or exceeded 500 entries and were "
+                                  "dropped; the consumer is quarantined (credentials withheld) so dropping a group "
+                                  "cannot bypass a deny-list rule (fail closed).")
+                consumer.quarantined.append("some ACL group names were dropped or truncated")
                 groups = groups[:500]
             if groups:
                 entry["acl_groups"] = groups
+            own_identities = {cid, username} | ({custom_id} if custom_id else set())
+            for ident in own_identities:
+                identity_owners[ident] = identity_owners.get(ident, 0) + 1
+            staged.append((consumer, entry, own_identities))
+        result: list[dict[str, Any]] = []
+        for consumer, entry, own_identities in staged:
+            if any(identity_owners[ident] > 1 for ident in own_identities):
+                self.report.error("consumer-identity-conflict", consumer.ref,
+                                  "Consumer id, username or custom_id collides with another consumer's identity in "
+                                  "Ferrum's shared identity namespace; omitted (fail closed).",
+                                  "Give every consumer a unique id, username and custom_id across all consumers.")
+                continue
             secret_count = len(consumer.keyauth) + len(consumer.jwt) + consumer.withheld_secrets
             if consumer.quarantined:
                 if secret_count:

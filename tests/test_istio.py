@@ -851,6 +851,105 @@ class IstioCaseAndNamesTest(unittest.TestCase):
         result, _report, _ = migrate("istio", dr_bad)
         self.assertEqual(one_proxy(self, result.config, "=/ok")["labels"]["ferrum-migration/status"], "refused")
 
+    def test_ca_cert_credential_name_service_entry_sans_and_malformed_headers(self):
+        # caCertCredentialName refuses SIMPLE DestinationRule instead of falling back to system roots.
+        ca_cred = textwrap.dedent("""
+            apiVersion: networking.istio.io/v1
+            kind: Gateway
+            metadata: {name: gw, namespace: default}
+            spec:
+              servers:
+                - port: {number: 80, name: http, protocol: HTTP}
+                  hosts: [api.example.test]
+            ---
+            apiVersion: networking.istio.io/v1
+            kind: VirtualService
+            metadata: {name: vs, namespace: default}
+            spec:
+              hosts: [api.example.test]
+              gateways: [gw]
+              http:
+                - match: [{uri: {exact: /ok}}]
+                  route: [{destination: {host: ext.example.internal, port: {number: 443}}}]
+            ---
+            apiVersion: networking.istio.io/v1
+            kind: DestinationRule
+            metadata: {name: dr, namespace: default}
+            spec:
+              host: ext.example.internal
+              trafficPolicy:
+                tls: {mode: SIMPLE, caCertCredentialName: private-ca-secret}
+        """)
+        r1, _rep1, _ = migrate("istio", ca_cred)
+        self.assertEqual(one_proxy(self, r1.config, "=/ok")["labels"]["ferrum-migration/status"], "refused")
+
+        # ServiceEntry.subjectAltNames is inherited when DestinationRule SIMPLE does not override subjectAltNames.
+        se_san = textwrap.dedent("""
+            apiVersion: networking.istio.io/v1
+            kind: Gateway
+            metadata: {name: gw, namespace: default}
+            spec:
+              servers:
+                - port: {number: 80, name: http, protocol: HTTP}
+                  hosts: [api.example.test]
+            ---
+            apiVersion: networking.istio.io/v1
+            kind: ServiceEntry
+            metadata: {name: se, namespace: default}
+            spec:
+              hosts: [ext.example.internal]
+              ports: [{number: 443, name: https, protocol: HTTPS}]
+              resolution: DNS
+              subjectAltNames: ["spiffe://cluster.local/ns/default/sa/ext"]
+            ---
+            apiVersion: networking.istio.io/v1
+            kind: VirtualService
+            metadata: {name: vs, namespace: default}
+            spec:
+              hosts: [api.example.test]
+              gateways: [gw]
+              http:
+                - match: [{uri: {exact: /ok}}]
+                  route: [{destination: {host: ext.example.internal, port: {number: 443}}}]
+            ---
+            apiVersion: networking.istio.io/v1
+            kind: DestinationRule
+            metadata: {name: dr, namespace: default}
+            spec:
+              host: ext.example.internal
+              trafficPolicy:
+                tls: {mode: SIMPLE}
+        """)
+        r2, _rep2, _ = migrate("istio", se_san)
+        self.assertEqual(one_proxy(self, r2.config, "=/ok")["labels"]["ferrum-migration/status"], "migrated")
+        self.assertEqual(r2.config["upstreams"][0]["backend_tls_san_allow_list"],
+                         ["spiffe://cluster.local/ns/default/sa/ext"])
+
+        # Malformed headers.request or headers.request.set refuses the route.
+        for bad_hdr in ("headers: {request: not-a-map}", "headers: {request: {set: [a, b]}}"):
+            hdr_doc = textwrap.dedent(f"""
+                apiVersion: networking.istio.io/v1
+                kind: Gateway
+                metadata: {{name: gw, namespace: default}}
+                spec:
+                  servers:
+                    - port: {{number: 80, name: http, protocol: HTTP}}
+                      hosts: [api.example.test]
+                ---
+                apiVersion: networking.istio.io/v1
+                kind: VirtualService
+                metadata: {{name: vs, namespace: default}}
+                spec:
+                  hosts: [api.example.test]
+                  gateways: [gw]
+                  http:
+                    - match: [{{uri: {{exact: /ok}}}}]
+                      {bad_hdr}
+                      route: [{{destination: {{host: svc.default.svc.cluster.local, port: {{number: 8080}}}}}}]
+            """)
+            r3, _rep3, _ = migrate("istio", hdr_doc)
+            self.assertEqual(one_proxy(self, r3.config, "=/ok")["labels"]["ferrum-migration/status"], "refused")
+
 
 if __name__ == "__main__":
     unittest.main()

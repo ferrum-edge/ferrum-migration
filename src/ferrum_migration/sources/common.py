@@ -89,8 +89,14 @@ def header_name_ok(name: Any) -> bool:
     return isinstance(name, str) and bool(_TOKEN_RE.match(name))
 
 
-def header_value_ok(value: Any) -> bool:
-    return isinstance(value, str) and all(ch == "\t" or 0x20 <= ord(ch) <= 0x7E for ch in value)
+def header_value_ok(value: Any, nonempty: bool = False) -> bool:
+    if not isinstance(value, str):
+        return False
+    if nonempty and not value:
+        return False
+    if value and (value[0] in (" ", "\t") or value[-1] in (" ", "\t")):
+        return False
+    return all(ch == "\t" or 0x20 <= ord(ch) <= 0x7E for ch in value)
 
 
 def is_gateway_owned_request_header(name: str) -> bool:

@@ -175,6 +175,15 @@ def load_toml(text: str) -> Any:
         raise InputError("TOML nesting is too deep") from None
 
 
+def _check_string(text: str, limit: int, what: str) -> None:
+    try:
+        encoded = text.encode("utf-8")
+    except UnicodeEncodeError:
+        raise InputError(f"{what} contains lone Unicode surrogates") from None
+    if len(encoded) > limit:
+        raise InputError(f"{what} exceeds the string-size limit")
+
+
 def check_tree(obj: Any, limits: Limits) -> Any:
     """Enforce visit/depth/string budgets and normalize date/time values to strings."""
     visits = 0
@@ -195,8 +204,8 @@ def check_tree(obj: Any, limits: Limits) -> Any:
             raise InputError(f"input nesting exceeds depth {limits.max_depth}")
         if isinstance(node, dict):
             for key in list(node.keys()):
-                if isinstance(key, str) and len(key) > limits.max_string_bytes:
-                    raise InputError("a mapping key exceeds the string-size limit")
+                if isinstance(key, str):
+                    _check_string(key, limits.max_string_bytes, "a mapping key")
                 value = normalize(node[key])
                 if value is not node[key]:
                     node[key] = value
@@ -208,8 +217,7 @@ def check_tree(obj: Any, limits: Limits) -> Any:
                     node[index] = normalized
                 stack.append((normalized, depth + 1))
         elif isinstance(node, str):
-            if len(node) > limits.max_string_bytes:
-                raise InputError("a string value exceeds the string-size limit")
+            _check_string(node, limits.max_string_bytes, "a string value")
     return root
 
 
