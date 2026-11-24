@@ -121,6 +121,9 @@ No case claims Istio mesh behavior, database-mode import (`/batch` additive or
   converted basic-auth routes carry no credentials, so it grants no access.
 * Converter-emitted `ferrum.conf` is used for `validate`; for `run` it is
   dropped (with a note) if it names listener keys the harness does not pin.
+* The harness's own HTTP listeners (echo backends, the self-test fake gateway)
+  accept only numeric IPv4 loopback addresses and skip the stdlib's reverse-DNS
+  `socket.getfqdn` lookup at bind time (`harness/loopback.py`).
 * Every child runs in its own process group with bounded waits:
   SIGTERM → grace → SIGKILL, also from `atexit` and on SIGTERM/SIGHUP.
 

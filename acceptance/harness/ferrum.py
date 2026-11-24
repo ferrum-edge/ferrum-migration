@@ -240,8 +240,14 @@ def start_gateway(
 
 
 def _wait_ready(proc: ManagedProcess, admin_port: int, identity: GatewayIdentity, timeout: float) -> "int | None":
+    """Poll authenticated /health, then prove ownership via JWT /proxies.
+
+    Observations carry only statuses, counts and exception class names, never
+    response bodies or credential values.
+    """
     deadline = time.monotonic() + timeout
     observation = "no response yet"
+    attempts = 0
     while time.monotonic() < deadline:
         if not proc.alive():
             stdout, stderr = proc.read_output()
@@ -252,18 +258,25 @@ def _wait_ready(proc: ManagedProcess, admin_port: int, identity: GatewayIdentity
                 any(marker in lowered for marker in _ADDR_IN_USE_MARKERS),
                 tail(combined),
             )
-        status, payload = probe.get_json(admin_port, "/health", identity.metrics_token)
-        if status is not None and isinstance(payload, dict):
-            if "cached_config" not in payload:
-                observation = "health answered without detail tier (not this instance's credential)"
-            elif status == 200 and payload.get("ready") is True:
-                jwt = mint_hs256_jwt(identity.jwt_secret, identity.jwt_issuer)
-                p_status, p_payload = probe.get_json(admin_port, "/proxies", jwt)
-                if p_status == 200 and proc.alive():
-                    return _count_proxies(p_payload)
-                observation = f"/proxies ownership probe returned {p_status}"
-            else:
-                observation = f"health status {status}, not ready"
+        attempts += 1
+        status, payload, transport_error = probe.get_json_detailed(admin_port, "/health", identity.metrics_token)
+        if status is None:
+            observation = (
+                f"no HTTP response from the admin listener after {attempts} health probe(s); "
+                f"last transport error {transport_error or 'unknown'}"
+            )
+        elif not isinstance(payload, dict):
+            observation = f"health status {status} without a JSON object body"
+        elif "cached_config" not in payload:
+            observation = "health answered without detail tier (not this instance's credential)"
+        elif status == 200 and payload.get("ready") is True:
+            jwt = mint_hs256_jwt(identity.jwt_secret, identity.jwt_issuer)
+            p_status, p_payload = probe.get_json(admin_port, "/proxies", jwt)
+            if p_status == 200 and proc.alive():
+                return _count_proxies(p_payload)
+            observation = f"/proxies ownership probe returned {p_status}"
+        else:
+            observation = f"health status {status}, not ready"
         time.sleep(0.25)
     stdout, stderr = proc.read_output()
     raise FerrumStartupError(

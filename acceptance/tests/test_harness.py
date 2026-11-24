@@ -16,19 +16,23 @@ import sys
 import tempfile
 import time
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from unittest import mock
 
 TESTS = Path(__file__).resolve().parent
 ROOT = TESTS.parent
 sys.path.insert(0, str(ROOT))
 
 import run as run_cli  # noqa: E402
+from harness import ferrum as ferrum_mod  # noqa: E402
 from harness import probe  # noqa: E402
 from harness.cases import ADAPTERS, load_cases  # noqa: E402
 from harness.converter import ConverterProfile, exit_code_verdict  # noqa: E402
 from harness.echo import PROBE_HEADER, EchoBackend, EchoRecorder  # noqa: E402
 from harness.ferrum import GatewayIdentity, ferrum_env, FerrumOptions  # noqa: E402
-from harness.procs import ManagedProcess, minimal_env  # noqa: E402
+from harness.loopback import LoopbackThreadingHTTPServer  # noqa: E402
+from harness.procs import ManagedProcess, PortHold, minimal_env  # noqa: E402
 from harness.runner import outcome_kind  # noqa: E402
 from harness.util import (  # noqa: E402
     SyntheticCanaries,
@@ -166,6 +170,107 @@ class EchoTests(unittest.TestCase):
             self.assertEqual(records[0]["host"], "h.example.test")
         finally:
             backend.stop()
+
+
+# Runs fake_ferrum.py as __main__ in a child whose socket.getfqdn raises, so any
+# reverse-DNS lookup during fake gateway startup crashes the child before readiness.
+_NO_FQDN_CHILD = (
+    "import runpy, socket, sys\n"
+    "def _no_fqdn(*_args, **_kwargs):\n"
+    "    raise AssertionError('socket.getfqdn called during fake gateway startup')\n"
+    "socket.getfqdn = _no_fqdn\n"
+    "sys.argv = sys.argv[1:]\n"
+    "runpy.run_path(sys.argv[0], run_name='__main__')\n"
+)
+
+
+class LoopbackStartupTests(unittest.TestCase):
+    """Listener startup must not reverse-resolve its numeric loopback address (socket.getfqdn)."""
+
+    @staticmethod
+    def _forbid_getfqdn():
+        return mock.patch("socket.getfqdn", side_effect=AssertionError("socket.getfqdn called"))
+
+    def test_control_patch_target_is_what_stdlib_http_server_calls(self):
+        # Proves the patch used below would catch a regression on this CPython.
+        with mock.patch("socket.getfqdn", return_value="control.invalid") as fqdn:
+            server = ThreadingHTTPServer(("127.0.0.1", 0), BaseHTTPRequestHandler)
+            server.server_close()
+        if not fqdn.called:
+            self.skipTest("this CPython's HTTPServer.server_bind no longer calls socket.getfqdn")
+        self.assertEqual(server.server_name, "control.invalid")
+
+    def test_echo_backend_startup_never_calls_getfqdn(self):
+        recorder = EchoRecorder()
+        with self._forbid_getfqdn() as fqdn:
+            backend = EchoBackend("a", recorder).start()
+            try:
+                self.assertEqual(backend.server.server_address[0], "127.0.0.1")
+                self.assertEqual(backend.server.server_name, "127.0.0.1")
+                self.assertGreater(backend.port, 0)
+                resp = probe.send(backend.port, "GET", "/n", "h.example.test", {PROBE_HEADER: "p-nofqdn"}, 5)
+                self.assertEqual(resp["status"], 200)
+                self.assertEqual(len(recorder.for_probe("p-nofqdn")), 1)
+            finally:
+                backend.stop()
+        fqdn.assert_not_called()
+
+    def test_loopback_server_refuses_names_and_non_loopback_hosts(self):
+        with self._forbid_getfqdn() as fqdn:
+            for host in ("localhost", "0.0.0.0", "192.0.2.1", "::1", "127.1", "", None):
+                with self.subTest(host=host), self.assertRaises(ValueError):
+                    LoopbackThreadingHTTPServer((host, 0), BaseHTTPRequestHandler)
+        fqdn.assert_not_called()
+
+    def test_fake_gateway_child_becomes_ready_without_getfqdn(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            spec = work / "spec.json"
+            spec.write_text(json.dumps({"proxies": []}), encoding="utf-8")
+            opts = FerrumOptions(
+                argv_prefix=[sys.executable, "-c", _NO_FQDN_CHILD, str(TESTS / "fake_ferrum.py")],
+                startup_timeout=20.0,
+            )
+            try:
+                gateway = ferrum_mod.start_gateway(opts, spec, None, work)
+            except ferrum_mod.FerrumStartupError as exc:
+                self.fail(f"fake gateway did not become ready without getfqdn: {exc}\n{exc.output_tail}")
+            try:
+                self.assertEqual(gateway.proxies_loaded, 0)
+                self.assertTrue(gateway.proc.alive())
+            finally:
+                gateway.stop()
+            self.assertFalse(gateway.proc.alive())
+            self.assertIn("fake gateway listeners bound", gateway.output_tail())
+
+
+class ReadinessDiagnosticsTests(unittest.TestCase):
+    def test_timeout_names_transport_error_without_credentials(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            hold = PortHold()
+            port = hold.port
+            hold.release()  # nothing listens on this port
+            identity = GatewayIdentity()
+            proc = ManagedProcess(
+                "sleeper",
+                [sys.executable, "-c", "import time; time.sleep(120)"],
+                work,
+                minimal_env(work),
+                work / "o.log",
+                work / "e.log",
+            )
+            try:
+                with self.assertRaises(ferrum_mod.FerrumStartupError) as caught:
+                    ferrum_mod._wait_ready(proc, port, identity, timeout=1.0)
+            finally:
+                proc.stop(grace_seconds=2)
+            message = str(caught.exception)
+            self.assertIn("no HTTP response from the admin listener", message)
+            self.assertRegex(message, r"last transport error \w+")
+            self.assertNotIn("last transport error unknown", message)
+            for value in identity.sensitive():
+                self.assertNotIn(value, message)
 
 
 class ProcessTests(unittest.TestCase):

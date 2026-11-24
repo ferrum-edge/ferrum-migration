@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import json
 import threading
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
+
+from .loopback import LoopbackThreadingHTTPServer
 
 PROBE_HEADER = "X-Acceptance-Probe"
 _MAX_BODY = 1_048_576
@@ -82,11 +84,12 @@ class EchoBackend:
 
     The listener is bound in the constructor and held for the backend's whole
     lifetime, so there is no bind-drop-rebind race with the configs that name it.
+    The server never reverse-resolves its address (see ``harness.loopback``).
     """
 
     def __init__(self, tag: str, recorder: EchoRecorder) -> None:
         self.tag = tag
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), _make_handler(tag, recorder))
+        self.server = LoopbackThreadingHTTPServer(("127.0.0.1", 0), _make_handler(tag, recorder))
         self.server.daemon_threads = True
         self.port: int = self.server.server_address[1]
         self._thread = threading.Thread(

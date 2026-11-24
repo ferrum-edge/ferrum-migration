@@ -45,6 +45,18 @@ def send(
 
 def get_json(port: int, path: str, bearer: "str | None", timeout: float = 3.0) -> tuple["int | None", object]:
     """GET a JSON document from a loopback admin listener."""
+    status, payload, _error = get_json_detailed(port, path, bearer, timeout)
+    return status, payload
+
+
+def get_json_detailed(
+    port: int, path: str, bearer: "str | None", timeout: float = 3.0
+) -> tuple["int | None", object, "str | None"]:
+    """Like ``get_json`` but also returns the transport error *class name* (never its text).
+
+    ``ConnectionRefusedError`` means nothing is listening yet; ``TimeoutError``
+    means something accepted (or the stack stalled) but never answered.
+    """
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
     try:
         headers = {"Accept": "application/json", "Connection": "close"}
@@ -57,8 +69,8 @@ def get_json(port: int, path: str, bearer: "str | None", timeout: float = 3.0) -
             payload: object = json.loads(raw.decode("utf-8"))
         except (ValueError, UnicodeDecodeError):
             payload = None
-        return response.status, payload
-    except (OSError, http.client.HTTPException):
-        return None, None
+        return response.status, payload, None
+    except (OSError, http.client.HTTPException) as exc:
+        return None, None, type(exc).__name__
     finally:
         conn.close()

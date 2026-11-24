@@ -4,6 +4,10 @@
 It is NOT Ferrum and proves nothing about Ferrum; it only lets the harness's
 own plumbing (argv handling, readiness/ownership probes, routing assertions,
 cleanup) be exercised without the real binary. JSON specs only. Loopback only.
+
+Listeners use the harness's numeric-loopback server, which skips the stdlib's
+reverse-DNS ``socket.getfqdn`` call at bind time; startup phases are written
+to stderr (elapsed time only, no ports or secrets) for readiness diagnostics.
 """
 
 import base64
@@ -15,7 +19,19 @@ import os
 import signal
 import sys
 import threading
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import time
+from http.server import BaseHTTPRequestHandler
+
+_STARTED = time.monotonic()
+# The child runs with a minimal environment (no PYTHONPATH), so locate the
+# harness package in acceptance/ (this file's grandparent directory) explicitly.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from harness.loopback import LoopbackThreadingHTTPServer  # noqa: E402
+
+
+def _phase(name):
+    print(json.dumps({"level": "INFO", "message": f"fake gateway {name}",
+                      "elapsed_s": round(time.monotonic() - _STARTED, 3)}), file=sys.stderr, flush=True)
 
 
 def _arg(argv, short, long_):
@@ -133,8 +149,11 @@ def run(argv):
         def log_message(self, *args):
             return
 
-    admin = ThreadingHTTPServer((admin_bind, int(os.environ["FERRUM_ADMIN_HTTP_PORT"])), Admin)
-    proxy = ThreadingHTTPServer((bind, int(os.environ["FERRUM_PROXY_HTTP_PORT"])), Proxy)
+    _phase("binding admin listener")
+    admin = LoopbackThreadingHTTPServer((admin_bind, int(os.environ["FERRUM_ADMIN_HTTP_PORT"])), Admin)
+    _phase("binding proxy listener")
+    proxy = LoopbackThreadingHTTPServer((bind, int(os.environ["FERRUM_PROXY_HTTP_PORT"])), Proxy)
+    _phase("listeners bound")
     stop = threading.Event()
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
     for server in (admin, proxy):
