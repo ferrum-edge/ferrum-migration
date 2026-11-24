@@ -118,5 +118,62 @@ class EnvoySemanticsTest(unittest.TestCase):
         self.assertIn("envoy-xds", codes(report, "error"))
 
 
+def minimal_bootstrap(match):
+    return {"static_resources": {
+        "listeners": [{"name": "l", "address": {"socket_address": {"address": "0.0.0.0", "port_value": 8080}},
+                       "filter_chains": [{"filters": [{
+                           "name": "envoy.filters.network.http_connection_manager",
+                           "typed_config": {"route_config": {"virtual_hosts": [
+                               {"name": "v", "domains": ["*"],
+                                "routes": [{"name": "r", "match": match, "route": {"cluster": "c"}}]}]},
+                               "http_filters": [{"name": "envoy.filters.http.router"}]}}]}]}],
+        "clusters": [{"name": "c", "type": "STRICT_DNS", "load_assignment": {"endpoints": [{"lb_endpoints": [
+            {"endpoint": {"address": {"socket_address": {"address": "c.internal", "port_value": 80}}}}]}]}}]}}
+
+
+def with_client_cert_listener(doc, validation_context):
+    """Make the minimal bootstrap's listener require client certificates (synthetic file paths only)."""
+    chain = doc["static_resources"]["listeners"][0]["filter_chains"][0]
+    chain["transport_socket"] = {"name": "envoy.transport_sockets.tls", "typed_config": {
+        "@type": "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext",
+        "require_client_certificate": True,
+        "common_tls_context": {
+            "tls_certificates": [{"certificate_chain": {"filename": "/etc/synthetic/server.crt"},
+                                  "private_key": {"filename": "/etc/synthetic/server.key"}}],
+            "validation_context": validation_context}}}
+    return doc
+
+
+class EnvoyClientCaTest(unittest.TestCase):
+    def test_file_client_ca_is_configured(self):
+        doc = with_client_cert_listener(minimal_bootstrap({"path_separated_prefix": "/api"}),
+                                        {"trusted_ca": {"filename": "/etc/synthetic/client-ca.pem"}})
+        result, _report, plan = migrate("envoy", yaml.safe_dump(doc))
+        self.assertEqual(one_proxy(self, result.config, "/api")["labels"]["ferrum-migration/status"], "migrated")
+        self.assertEqual(plan.settings.client_ca_paths, ["/etc/synthetic/client-ca.pem"])
+
+    def test_client_certificate_constraints_beyond_ca_refuse_listener_routes(self):
+        doc = with_client_cert_listener(minimal_bootstrap({"path_separated_prefix": "/api"}), {
+            "trusted_ca": {"filename": "/etc/synthetic/client-ca.pem"},
+            "match_typed_subject_alt_names": [{"san_type": "DNS", "matcher": {"exact": "client.example.test"}}]})
+        result, report, plan = migrate("envoy", yaml.safe_dump(doc))
+        self.assertEqual(one_proxy(self, result.config, "/api")["labels"]["ferrum-migration/status"], "refused")
+        self.assertIn("envoy-client-ca", codes(report, "error"))
+        self.assertEqual(plan.settings.client_ca_paths, [])
+
+
+class EnvoyPrefixSemanticsTest(unittest.TestCase):
+    def test_string_prefix_siblings_are_reported_not_widened(self):
+        # match.prefix /api also matches /apix in Envoy; Ferrum's segment prefix does not.
+        result, report, _ = migrate("envoy", yaml.safe_dump(minimal_bootstrap({"prefix": "/api"})))
+        self.assertEqual([p.get("listen_path") for p in result.config["proxies"]], ["/api"])
+        self.assertIn("prefix-string-siblings", codes(report, "error"))
+
+    def test_path_separated_prefix_is_segment_based(self):
+        result, report, _ = migrate("envoy", yaml.safe_dump(minimal_bootstrap({"path_separated_prefix": "/api"})))
+        self.assertEqual(one_proxy(self, result.config, "/api")["labels"]["ferrum-migration/status"], "migrated")
+        self.assertNotIn("prefix-string-siblings", codes(report))
+
+
 if __name__ == "__main__":
     unittest.main()

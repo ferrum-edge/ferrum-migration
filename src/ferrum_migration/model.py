@@ -76,6 +76,12 @@ class RouteSpec:
     review error when a string-prefix route's sibling paths (``/apix`` for
     ``/api``) would not reach an equivalent route in Ferrum, instead of letting
     them silently become 404s.
+
+    ``client_cas`` lists the frontend client CA bundle file paths whose verified
+    client certificates the source required for this route's TLS traffic (empty:
+    no client certificate required). Sources never configure the listener-wide
+    bundle themselves: the emitter sets ``SettingsHints.client_ca_paths`` only
+    when one bundle provably preserves every route's original trust scope.
     """
 
     ref: str
@@ -100,6 +106,7 @@ class RouteSpec:
     termination: dict | None = None
     refusals: list[str] = field(default_factory=list)
     extra_conditions: bool = False
+    client_cas: list[str] = field(default_factory=list)
     skip: bool = False
     skip_reason: str = ""
     # Maintained by the emitter.
@@ -142,7 +149,10 @@ class SettingsHints:
     main_https_port: int | None = None
     bind_address: str | None = None
     frontend_cert_pairs: list[tuple[str, str]] = field(default_factory=list)
+    #: Set by the emitter only: at most one bundle, and only when it preserves every route's trust scope.
     client_ca_paths: list[str] = field(default_factory=list)
+    #: Set by the emitter when per-scope client CA trust could not be established on one shared listener.
+    client_ca_scope_conflict: bool = False
     trusted_proxies: list[str] = field(default_factory=list)
     real_ip_header: str | None = None
     proxy_protocol: bool = False

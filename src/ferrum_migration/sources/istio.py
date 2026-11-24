@@ -138,7 +138,8 @@ class _Istio:
         if mode in ("MUTUAL", "OPTIONAL_MUTUAL"):
             ca = tls.get("caCertificates")
             if isinstance(ca, str):
-                self.plan.settings.client_ca_paths.append(ca)
+                # Recorded per server; the emitter decides whether one listener-wide bundle preserves every scope.
+                server["client_ca"] = ca
             else:
                 return "mutual TLS without a caCertificates file path"
             if mode == "OPTIONAL_MUTUAL":
@@ -248,7 +249,10 @@ class _Istio:
                 key = (None, True)
             else:
                 key = (None if server["port"] == settings.main_http_port else server["port"], False)
-            group = groups.setdefault(key, {"hosts": [], "any": False, "port": server["port"]})
+            group = groups.setdefault(key, {"hosts": [], "any": False, "port": server["port"], "client_cas": []})
+            client_ca = server.get("client_ca")
+            if client_ca and client_ca not in group["client_cas"]:
+                group["client_cas"].append(client_ca)
             if hosts == []:
                 group["any"] = True
             for host in hosts:
@@ -270,6 +274,7 @@ class _Istio:
                 routes.extend(self._http_route(mapping(entry), index, namespace, name, ref, hosts, listen_port,
                                                requires_tls, gw_ns, gateway_ref, group["port"]))
             for route in routes:
+                route.client_cas = list(group["client_cas"])
                 for reason in refusals:
                     route.refuse(reason)
             apply_first_match_order(routes, self.report)
@@ -296,6 +301,8 @@ class _Istio:
             if "exact" in uri:
                 kind, path = "exact", uri["exact"]
             elif "prefix" in uri:
+                # A VirtualService uri.prefix is a plain string prefix (/api also matches /apix); flagged for the
+                # emitter's sibling report below. exact and regex matches are not prefixes.
                 kind, path = "prefix", uri["prefix"] or "/"
             elif "regex" in uri:
                 kind, path = "regex", uri["regex"]
@@ -326,6 +333,7 @@ class _Istio:
                              hosts=list(hosts), kind=kind, path=path, listen_port=listen_port,
                              requires_tls=requires_tls)
             spec.methods = None if block["all"] else list(block["methods"])
+            spec.report_prefix_siblings = kind == "prefix"
             for condition in extra:
                 spec.extra_conditions = True
                 spec.refuse(f"matches on {condition}, which Ferrum cannot express")

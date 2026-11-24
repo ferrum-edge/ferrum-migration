@@ -24,7 +24,7 @@ jobs:
         os: [ubuntu-24.04]
         python: ["3.11", "3.12", "3.13"]
         include:
-          - os: macos-14
+          - os: macos-15
             python: "3.12"
     steps:
       - name: Checkout

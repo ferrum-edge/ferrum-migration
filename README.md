@@ -2,7 +2,9 @@
 
 Offline, best-effort, **fail-closed** migration of existing gateway, reverse-proxy and
 service-mesh configuration into [Ferrum Edge](https://github.com/ferrum-edge/ferrum-edge)
-declarative config, so you can try Ferrum without rebuilding your setup by hand.
+declarative config, so you can try Ferrum without rewriting every route by hand. The output is
+a starting point for review, not a guaranteed equivalent of the source: whatever the tool
+cannot reproduce is refused or reported.
 
 | Source | Input accepted |
 |---|---|
@@ -91,17 +93,22 @@ rather than opening routes or downgrading security:
 * **Precedence is checked, not assumed.** The tool checks first-match order (Envoy, Istio), router
   priorities (Traefik) and regex-versus-prefix precedence (NGINX, Kong) against Ferrum's specificity
   order. Unreachable routes are dropped and contradictory pairs are refused.
-* **Prefix semantics are guarded.** The sources match prefixes as plain strings, so `/api` also
-  matches `/apix`, while Ferrum matches by path segment. Where a broader route has a different
+* **Prefix semantics are guarded.** The source prefix matchers listed below match plain strings,
+  so `/api` also matches `/apix`, while Ferrum matches by path segment. Where a broader route has a different
   policy, a `request_termination` guard (`trigger.path_prefix`) is added so `/apix` cannot
   reach it. Trailing-slash prefixes get an exact 404 route for the bare path. Routes are never
-  widened to cover `/apix`. For NGINX, when `/apix` would not reach an equivalent route in Ferrum,
-  the report carries a `prefix-string-siblings` error (exit 4) instead of a silent 404.
+  widened to cover `/apix`. When `/apix` would not reach an equivalent route in Ferrum, the report
+  carries a `prefix-string-siblings` error (exit 4) instead of a silent 404. This applies to NGINX
+  prefix locations, Kong `paths`, Traefik `PathPrefix`, Envoy `prefix` and Istio `uri.prefix`.
+  It does not apply to Envoy `path_separated_prefix` (already segment-based), exact or regex
+  matches, or prefixes ending in `/`.
 * **No cross-host fallthrough.** An NGINX server, Envoy virtual host or Istio host never falls
   through to another host's routes. Ferrum can, so a host-only 404 route closes each such scope.
-* **Credentials are handled narrowly.** Plaintext API keys and HMAC JWT secrets are written only
-  with `--include-secrets`, and only where Ferrum's semantics match: key length minimums,
+* **Credentials are handled narrowly.** The only credentials that can be carried over are Kong
+  key-auth keys and Kong HMAC (HS256/384/512) JWT secrets. They are written only with
+  `--include-secrets`, and only where Ferrum's semantics match: key length minimums,
   no shared keys or secrets, and a JWT identity claim that resolves to the same consumer.
+  No other source's credentials, and no other credential type, are portable.
   Password hashes (Kong basic-auth, htpasswd, Traefik `basicAuth`) cannot be converted.
   The matching auth plugin is emitted with no credentials, so nobody can authenticate until
   you create new Ferrum credentials. Consumers with consumer-scoped plugins or consumer groups
@@ -113,8 +120,19 @@ rather than opening routes or downgrading security:
   certificates by default, and Traefik/Istio can skip verification. Ferrum output always verifies
   (`backend_tls_verify_server_cert: true`), and there is no opt-out. Requests to backends with
   private CAs fail closed until you provide the CA. CA paths named by the source must exist on the
-  Ferrum host, because Ferrum checks them when it loads the config.
-* **Auth is never silently skipped.** An Envoy route or virtual host whose
+  Ferrum host, because Ferrum checks them when it loads the config. A Kong service whose
+  `ca_certificates` restrict backend trust is refused rather than falling back to Ferrum's default
+  trust store.
+* **Client-certificate trust is never merged.** Ferrum file mode has one frontend client CA bundle
+  per listener. It is configured only when every migrated mTLS scope used the same CA file. Different
+  CA bundles from separate servers/listeners are never concatenated: the affected routes are refused
+  with a `frontend-client-ca-scope` error, and you configure a separate Ferrum frontend per trust boundary.
+  Client-certificate requirements are never dropped as metadata. Traefik `tls.options` `clientAuth`
+  (named or `default`) becomes the route's client CA. If it cannot be known or reproduced (another
+  provider, undefined, several or inline CA files, unverified certificate types, or SNI-dependent
+  selection), the route is refused.
+* **Auth is not silently skipped.** Auth plugins, middlewares, directives and HTTP filters the
+  tool cannot translate refuse their routes (see above). In addition, an Envoy route or virtual host whose
   `typed_per_filter_config` could enable or change an HTTP filter is refused. An Istio
   `AuthorizationPolicy`/`RequestAuthentication` whose workload selector matches the Gateway
   refuses that Gateway's routes, whatever namespace it lives in (the gateway pods' namespace is not
@@ -129,10 +147,14 @@ rather than opening routes or downgrading security:
 
 See [docs/design.md](docs/design.md) for details and [SECURITY.md](SECURITY.md) for reporting issues.
 
-## Limitations (read before production use)
+## Limitations (read before serving any traffic)
 
-* This is a starting point for trying Ferrum. **Review every error in the report** before
-  serving real traffic.
+* This is a starting point for trying Ferrum, not a production-readiness check. **Review every
+  error in the report** before serving real traffic.
+* Behavior has been checked only with original synthetic fixtures: unit tests, `ferrum-edge
+  validate` admission, and loopback runtime acceptance against Ferrum Edge v0.9.21. It has not
+  been validated against real deployments, so equivalence with your source configuration is not
+  established.
 * Only HTTP(S) reverse proxying is migrated. TCP/UDP/TLS-passthrough, mail, static file serving,
   dynamic xDS, Kubernetes service discovery and Istio subsets (which need pod labels) are reported, not translated.
 * Ferrum file mode serves one default frontend certificate. With several source certificates

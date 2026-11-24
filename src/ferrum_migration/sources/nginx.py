@@ -289,6 +289,7 @@ class _Nginx:
             if any(d.name == "location" for d in top):
                 raise InputError("location blocks must be inside a server block")
             http = top
+        self.http_directives = http
         self.http_scope = self.apply(_Scope(), [d for d in http if d.name not in ("server",)], "nginx http")
         servers = []
         for directive in http:
@@ -439,15 +440,10 @@ class _Nginx:
                 key = next((d.args[0] for d in server.block or [] if d.name == "ssl_certificate_key" and d.args), None)
                 if key and "$" not in cert and "$" not in key:
                     settings.frontend_cert_pairs.append((cert, key))
-            elif directive.name == "ssl_client_certificate" and directive.args:
-                verify = next((d.args[0] for d in server.block or [] if d.name == "ssl_verify_client" and d.args), "off")
-                if verify != "off":
-                    settings.client_ca_paths.append(directive.args[0])
-                    if verify != "on":
-                        self.report.warning("nginx-mtls-optional", ref, "Optional client certificates become "
-                                            "mandatory under Ferrum's frontend client CA (stricter).")
+        client_cas, client_ca_problem = self._client_trust(server, ref, on_tls)
         base = {"hosts": None if host_problem else hosts, "listen_port": listen_port, "requires_tls": requires_tls,
-                "server_label": info["label"], "server_ref": ref, "extra": bool(host_problem)}
+                "server_label": info["label"], "server_ref": ref, "extra": bool(host_problem),
+                "client_cas": client_cas, "client_ca_problem": client_ca_problem}
         server_return = next((d for d in server.block or [] if d.name == "return"), None)
         server_if = [d for d in server.block or [] if d.name == "if"]
         for condition in server_if:
@@ -497,7 +493,48 @@ class _Nginx:
         if base["extra"]:
             route.extra_conditions = True
             route.refuse("server_name is not representable")
+        route.client_cas = list(base["client_cas"])
+        if base["client_ca_problem"]:
+            route.refuse(base["client_ca_problem"])
         return route
+
+    def _tls_setting(self, server: Directive, name: str) -> str | None:
+        """First value of an ``ssl_*`` directive in the server block, else inherited from ``http``."""
+        for block in (server.block or [], self.http_directives):
+            value = next((d.args[0] for d in block if d.name == name and d.args), None)
+            if value is not None:
+                return value
+        return None
+
+    def _client_trust(self, server: Directive, ref: str, on_tls: bool) -> tuple[list[str], str | None]:
+        """Client CA bundle this server required on Ferrum's TLS listener, or a refusal reason.
+
+        The emitter decides whether one listener-wide bundle preserves every server's trust
+        scope; this only records each server's own scope and never merges bundles.
+        """
+        verify = self._tls_setting(server, "ssl_verify_client") or "off"
+        if verify == "off" or not on_tls:
+            return [], None
+        ca = self._tls_setting(server, "ssl_client_certificate")
+        if ca is None and verify == "optional_no_ca":
+            return [], None  # the certificate was never verified against a CA: no trust boundary to keep
+        if ca is None or "$" in ca or ca.startswith("data:"):
+            self.report.error("nginx-client-ca", ref,
+                              "ssl_verify_client requires client certificates, but no single ssl_client_certificate "
+                              "file path defines the trusted client CAs, so the original trust set cannot be "
+                              "reproduced. The server's routes were refused (fail closed).",
+                              "Write this server's client CA bundle to a file, configure it in a Ferrum frontend "
+                              "dedicated to this trust boundary (FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH), and "
+                              "validate it before serving traffic.")
+            return [], "client certificate trust (ssl_verify_client) has no single client CA file to reproduce"
+        if verify != "on":
+            self.report.warning("nginx-mtls-optional", ref, "Optional client certificates become "
+                                "mandatory under Ferrum's frontend client CA (stricter).")
+        if self._tls_setting(server, "ssl_trusted_certificate"):
+            self.report.warning("nginx-mtls-trusted-certificate", ref,
+                                "ssl_trusted_certificate also trusted client certificate issuers in NGINX; Ferrum "
+                                "trusts only the ssl_client_certificate bundle (stricter).")
+        return [ca], None
 
     # ------------------------------------------------------------ locations
 

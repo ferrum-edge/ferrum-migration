@@ -23,6 +23,12 @@ from .common import (SourceContext, check_route_budget, cors_config, literal_val
 
 PLATFORM = "traefik"
 REPRESENTABLE_MATCHERS = {"Host", "HostHeader", "Path", "PathPrefix", "Method"}
+# Traefik TLS options name applied to TLS routers that do not reference one.
+DEFAULT_TLS_OPTIONS = "default"
+# clientAuthType values that verify client certificates against caFiles (Traefik: required, or only if given).
+VERIFYING_CLIENT_AUTH = ("RequireAndVerifyClientCert", "VerifyClientCertIfGiven")
+# clientAuthType values that ask for client certificates without verifying them against a CA.
+UNVERIFIED_CLIENT_AUTH = ("RequestClientCert", "RequireAnyClientCert")
 
 
 class RuleError(Exception):
@@ -212,6 +218,11 @@ class _Traefik:
         self.middlewares = mapping(http.get("middlewares"))
         self.transports = mapping(http.get("serversTransports"))
         self.priority: dict[int, tuple[int, str]] = {}
+        # Per HTTPS route spec (by id): effective TLS options name and the host names Traefik maps those options to
+        # for SNI selection (empty when selection depends on the SNI). Plus the per-name client auth verdicts.
+        self.tls_option_of: dict[int, tuple[str, list[str]]] = {}
+        self.client_auth_cache: dict[str, tuple[tuple[str, ...], str | None]] = {}
+        self.builtin_default_tls_used = False
 
     def run(self) -> Plan:
         for key in self.root:
@@ -232,6 +243,14 @@ class _Traefik:
             self.report.info("traefik-entrypoints", "traefik routers", "EntryPoints live in Traefik's static "
                              "configuration, which is not read: routers with a tls block are treated as HTTPS-only, "
                              "the rest as plaintext.")
+        self._client_auth_scopes()
+        if self.builtin_default_tls_used:
+            self.report.info("traefik-tls-default-options", "traefik tls options",
+                             "The input defines no 'default' TLS options, so HTTPS routers that use the default were "
+                             "translated with Traefik's built-in default (no client certificates). A default TLS "
+                             "option defined by another provider is not part of the input.",
+                             "If another provider defines default TLS options with clientAuth, add them to the input "
+                             "and convert again.")
         self._precedence()
         check_route_budget(len(self.plan.routes), self.ctx.limits)
         return self.plan
@@ -251,8 +270,11 @@ class _Traefik:
                 and "BEGIN" not in default["certFile"] + default["keyFile"]:
             self.plan.settings.frontend_cert_pairs.append((default["certFile"], default["keyFile"]))
         if tls.get("options"):
-            self.report.info("traefik-tls-options", "traefik tls", "TLS options (versions, ciphers, client auth) are "
-                             "not migrated; set FERRUM_TLS_* settings manually.")
+            # clientAuth is not part of this note: it is resolved per HTTPS router (see _client_auth) and either
+            # carried over as the route's frontend client CA or refuses the route.
+            self.report.info("traefik-tls-options", "traefik tls", "TLS options other than clientAuth (versions, "
+                             "ciphers, curves, sniStrict, ALPN) are not migrated; set FERRUM_TLS_* settings manually. "
+                             "clientAuth is applied per HTTPS router or refuses it.")
 
     # ---------------------------------------------------------------- routers
 
@@ -268,6 +290,7 @@ class _Traefik:
         if requires_tls and mapping(router.get("tls")).get("certResolver"):
             self.report.warning("traefik-cert-resolver", ref, "ACME certResolver is not migrated; provide a "
                                 "certificate or configure Ferrum's ACME settings.")
+        tls_option, tls_option_problem = self._router_tls_option(router) if requires_tls else (None, None)
         try:
             if len(rule) > 4096:
                 raise RuleError("rule too long")
@@ -279,6 +302,9 @@ class _Traefik:
             spec.refuse(f"rule cannot be parsed ({exc})")
             self.plan.routes.append(spec)
             return
+        # Traefik maps TLS options to SNI names from Host matchers only; HostHeader does not take part, so such
+        # routers get the options selected by each connection's SNI.
+        sni_mapped = not any(kind == "ident" and value == "HostHeader" for kind, value in tokenize_rule(rule))
         service_name = router.get("service")
         backend_info = self._service_ref(service_name, ref)
         middleware_names = str_list(router.get("middlewares"))
@@ -316,8 +342,19 @@ class _Traefik:
                 spec.kind, spec.path = ("hostonly", None) if spec.hosts else ("prefix", "/")
             else:
                 spec.kind, spec.path = kind, path
+                # PathPrefix is a plain string prefix (/api also matches /apix); Path is exact. Ferrum matches
+                # prefixes by segment, so the emitter reports siblings it cannot route equivalently.
+                spec.report_prefix_siblings = kind == "prefix"
             spec.methods = list(methods) if methods else None
             spec.requires_tls = requires_tls
+            if tls_option_problem:
+                spec.refuse(tls_option_problem)
+            elif tls_option is not None:
+                client_cas, client_auth_problem = self._client_auth(tls_option)
+                spec.client_cas = list(client_cas)
+                if client_auth_problem:
+                    spec.refuse(client_auth_problem)
+                self.tls_option_of[id(spec)] = (tls_option, list(spec.hosts) if sni_mapped else [])
             for condition in extra:
                 spec.refuse(f"rule uses {condition}, which Ferrum cannot express")
                 spec.extra_conditions = True
@@ -361,6 +398,123 @@ class _Traefik:
                 spec.backend_path = remainder if remainder not in ("", "/") else None
         if acc.add_prefix:
             spec.backend_path = acc.add_prefix.rstrip("/") + (spec.backend_path or "")
+
+    # ------------------------------------------------------ TLS client auth
+
+    def _router_tls_option(self, router: dict) -> tuple[str | None, str | None]:
+        """Name of the TLS options an HTTPS router uses, or a refusal reason when they cannot be known."""
+        raw = mapping(router.get("tls")).get("options")
+        if raw is None or raw == "":
+            return DEFAULT_TLS_OPTIONS, None
+        if not isinstance(raw, str):
+            return None, ("router tls.options is not a TLS options name, so its client certificate requirements are "
+                          "unknown")
+        base, _, provider = raw.partition("@")
+        if provider not in ("", "file"):
+            return None, (f"TLS options from provider {safe_label(provider, 32)} are not in the input, so the router's "
+                          "client certificate requirements (clientAuth) are unknown")
+        return base, None
+
+    def _client_auth(self, name: str) -> tuple[tuple[str, ...], str | None]:
+        """Client CA bundle a TLS options entry requires (empty: none), or a refusal reason.
+
+        clientAuth is never dropped: a requirement that cannot be reproduced exactly (or more strictly) as one
+        frontend client CA bundle file refuses every route that uses it. The emitter decides whether one
+        listener-wide bundle preserves all routes' trust scopes.
+        """
+        if name not in self.client_auth_cache:
+            verdict = self._classify_client_auth(name)
+            self.client_auth_cache[name] = verdict
+            if verdict[1]:
+                self.report.error("traefik-client-auth", f"traefik tls options '{safe_label(name)}'",
+                                  f"Client certificate requirements cannot be reproduced ({verdict[1]}). Every HTTPS "
+                                  "router using these TLS options was refused (fail closed); clientAuth is never "
+                                  "dropped.",
+                                  "Use clientAuthType RequireAndVerifyClientCert with exactly one caFiles file path, "
+                                  "or configure a dedicated Ferrum frontend with "
+                                  "FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH manually and validate it.")
+        return self.client_auth_cache[name]
+
+    def _classify_client_auth(self, name: str) -> tuple[tuple[str, ...], str | None]:
+        tls_root = self.root.get("tls")
+        options = mapping(tls_root).get("options")
+        if (tls_root is not None and not isinstance(tls_root, dict)) or \
+                (options is not None and not isinstance(options, dict)):
+            return (), "the tls.options section is malformed"
+        options = options or {}
+        if name not in options:
+            if name == DEFAULT_TLS_OPTIONS:
+                self.builtin_default_tls_used = True  # Traefik's built-in default requests no client certificates
+                return (), None
+            return (), f"TLS options {safe_label(name, 48)} are undefined"
+        option = options[name] if options[name] is not None else {}
+        if not isinstance(option, dict):
+            return (), "the TLS options entry is malformed"
+        client_auth = option.get("clientAuth")
+        if client_auth is None:
+            return (), None
+        if not isinstance(client_auth, dict):
+            return (), "clientAuth is malformed"
+        cas = str_list(client_auth.get("caFiles"))
+        if cas is None:
+            return (), "clientAuth caFiles has unexpected types"
+        auth_type = client_auth.get("clientAuthType")
+        if auth_type is None or auth_type == "":
+            # Traefik requires and verifies client certificates whenever caFiles are set without a clientAuthType.
+            auth_type = "RequireAndVerifyClientCert" if cas else "NoClientCert"
+        if auth_type == "NoClientCert":
+            return (), None
+        if auth_type in UNVERIFIED_CLIENT_AUTH:
+            return (), (f"clientAuthType {auth_type} asks for client certificates without verifying them against a "
+                        "CA, which Ferrum's frontend client CA cannot express")
+        if auth_type not in VERIFYING_CLIENT_AUTH:
+            return (), "clientAuthType is not a known Traefik value"
+        if len(cas) != 1 or not cas[0].strip() or "BEGIN" in cas[0]:
+            # Inline material is never copied, and several bundles are never concatenated by this tool.
+            return (), "clientAuth needs exactly one caFiles file path; missing, inline or several CA bundles"
+        if auth_type == "VerifyClientCertIfGiven":
+            self.report.warning("traefik-mtls-optional", f"traefik tls options '{safe_label(name)}'",
+                                "Optional client certificates (VerifyClientCertIfGiven) become mandatory under "
+                                "Ferrum's frontend client CA (stricter).")
+        return (cas[0],), None
+
+    def _client_auth_scopes(self) -> None:
+        """Refuse HTTPS routes whose client certificate requirement depends on the connection's SNI.
+
+        Traefik selects TLS options during the handshake by SNI host name, not per router. A router without a
+        Host matcher gets whatever options the SNI selects (the default options for names no router claims), and
+        a host name that routers map to different TLS options falls back to the default options. When the
+        candidate options disagree on clientAuth, the requirement cannot be reproduced, so the route is refused.
+        """
+        specs = [spec for spec in self.plan.routes if id(spec) in self.tls_option_of and not spec.skip]
+        options_by_host: dict[str, set[str]] = {}
+        for spec in specs:
+            name, sni_hosts = self.tls_option_of[id(spec)]
+            for host in sni_hosts:
+                options_by_host.setdefault(host, set()).add(name)
+        for spec in specs:
+            name, sni_hosts = self.tls_option_of[id(spec)]
+            candidates = {name}
+            if not sni_hosts:
+                candidates.add(DEFAULT_TLS_OPTIONS)
+                reason = ("the router has no Host matcher, so Traefik applied the TLS options selected by each "
+                          "connection's SNI (the default options for unclaimed names)")
+            else:
+                conflicting = [host for host in sni_hosts if len(options_by_host.get(host, ())) > 1]
+                if not conflicting:
+                    continue
+                for host in conflicting:
+                    candidates |= options_by_host[host]
+                candidates.add(DEFAULT_TLS_OPTIONS)
+                reason = ("routers for the same host reference different TLS options, so Traefik fell back to the "
+                          "default TLS options for that host")
+            verdicts = set()
+            for name in sorted(candidates):
+                cas, problem = self._client_auth(name)
+                verdicts.add((cas, problem is not None))
+            if len(verdicts) > 1:
+                spec.refuse(f"{reason}, and those TLS options differ in client certificate requirements "
+                            "(clientAuth), so the requirement for this route cannot be reproduced")
 
     # ------------------------------------------------------------ middleware
 
@@ -581,27 +735,48 @@ class _Traefik:
             return self._service(str(main).partition("@")[0], depth + 1) if main else {"problems": ["mirroring without service"]}
         return {"problems": ["service type (failover or nested weighted) is not supported"]}
 
-    def _transport(self, name: Any, ref: str) -> tuple[TlsSpec, dict]:
+    def _transport(self, name: Any, ref: str) -> tuple[TlsSpec, dict, list[str]]:
+        """Backend TLS, forwarding timeouts and refusal reasons for one ``serversTransport`` reference.
+
+        Used for direct load balancers and for every weighted child alike. A transport that cannot be
+        found, or whose identity controls cannot be reproduced, is a refusal reason, never a silent default.
+        """
         tls = TlsSpec(verify=True)
         timeouts: dict = {}
+        problems: list[str] = []
         if not name:
-            return tls, timeouts
-        transport = mapping(self.transports.get(str(name).partition("@")[0]))
+            return tls, timeouts, problems
+        base, _, provider = str(name).partition("@")
+        if provider not in ("", "file"):
+            return tls, timeouts, [f"serversTransport from provider {safe_label(provider, 32)} is not in the input"]
+        transport = mapping(self.transports.get(base))
         if not transport:
-            return tls, {"problem": "serversTransport is undefined"}
+            return tls, timeouts, ["serversTransport is undefined"]
         if transport.get("insecureSkipVerify"):
             tls.verify = False
-        cas = str_list(transport.get("rootCAs")) or []
-        if len(cas) == 1 and "BEGIN" not in cas[0]:
+        cas = str_list(transport.get("rootCAs"))
+        if cas is None:
+            problems.append("serversTransport rootCAs has unexpected types")
+        elif len(cas) == 1 and "BEGIN" not in cas[0]:
             tls.ca_path = cas[0]
         elif cas:
-            self.report.warning("traefik-root-cas", ref, "Several or inline root CAs are not migrated; provide one CA "
-                                "bundle path.")
+            # Traefik trusts only the listed roots; falling back to Ferrum's default trust store would trust more.
+            problems.append("serversTransport rootCAs are inline or several; provide one CA bundle file path")
         certs = seq(transport.get("certificates"))
-        if certs and isinstance(certs[0], dict):
-            cert, key = certs[0].get("certFile"), certs[0].get("keyFile")
-            if isinstance(cert, str) and isinstance(key, str) and "BEGIN" not in cert + key:
+        if certs:
+            first = mapping(certs[0])
+            cert, key = first.get("certFile"), first.get("keyFile")
+            if len(certs) == 1 and isinstance(cert, str) and isinstance(key, str) and "BEGIN" not in cert + key:
                 tls.client_cert_path, tls.client_key_path = cert, key
+            else:
+                # Inline material is never copied, and Ferrum presents exactly one client certificate from file
+                # paths; dropping the identity silently would change who the backend sees.
+                problems.append("serversTransport client certificates are inline, malformed or several; the backend "
+                                "client identity cannot be migrated")
+        for key_name, label in (("spiffe", "spiffe workload identity"),
+                                ("peerCertURI", "peerCertURI backend certificate pinning")):
+            if transport.get(key_name):
+                problems.append(f"serversTransport {label} has no Ferrum equivalent")
         if isinstance(transport.get("serverName"), str):
             tls.sni = transport["serverName"]
         forwarding = mapping(transport.get("forwardingTimeouts"))
@@ -611,7 +786,7 @@ class _Traefik:
             timeouts["connect"] = dial
         if header:
             timeouts["read"] = header
-        return tls, timeouts
+        return tls, timeouts, problems
 
     def _servers(self, lb: dict, ref: str) -> tuple[str | None, list[Target], list[str]]:
         problems: list[str] = []
@@ -643,10 +818,9 @@ class _Traefik:
     def _load_balancer(self, name: str, lb: dict, ref: str) -> dict:
         scheme, targets, problems = self._servers(lb, ref)
         result: dict[str, Any] = {"problems": problems, "preserve_host": lb.get("passHostHeader", True) is not False}
-        tls, timeouts = self._transport(lb.get("serversTransport"), ref)
-        if timeouts.get("problem"):
-            result["problems"].append(timeouts["problem"])
-        result.update({k: v for k, v in timeouts.items() if k != "problem"})
+        tls, timeouts, transport_problems = self._transport(lb.get("serversTransport"), ref)
+        result["problems"].extend(transport_problems)  # same list object as `problems`
+        result.update(timeouts)
         if problems or scheme is None:
             return result
         health = self._health(mapping(lb.get("healthCheck")), ref)
@@ -698,28 +872,47 @@ class _Traefik:
         schemes = set()
         preserve = set()
         tls_keys = set()
+        timeout_keys: set[tuple] = set()
         tls_value = TlsSpec()
         problems: list[str] = []
+        dropped_lb_options = any(weighted.get(key) is not None for key in ("healthCheck", "sticky"))
         for child in seq(weighted.get("services")):
             if not isinstance(child, dict) or not isinstance(child.get("name"), str):
                 problems.append("weighted child without a name")
                 continue
-            child_raw = mapping(self.services.get(child["name"].partition("@")[0]))
+            base, _, provider = child["name"].partition("@")
+            if provider not in ("", "file"):
+                problems.append(f"weighted child from provider {safe_label(provider, 32)} is not in the input")
+                continue
+            child_raw = mapping(self.services.get(base))
             lb = mapping(child_raw.get("loadBalancer"))
             if not lb:
                 problems.append("weighted children must be load balancers")
                 continue
             scheme, targets, child_problems = self._servers(lb, ref)
             problems.extend(child_problems)
-            tls_value, _timeouts = self._transport(lb.get("serversTransport"), ref)
+            # Each child's serversTransport is resolved exactly like a direct load balancer's: an undefined
+            # transport or unmigratable identity control refuses the route instead of falling back to defaults.
+            tls_value, timeouts, transport_problems = self._transport(lb.get("serversTransport"), ref)
+            problems.extend(transport_problems)
             schemes.add(scheme)
             preserve.add(lb.get("passHostHeader", True) is not False)
             tls_keys.add(tls_value.key())
+            timeout_keys.add((timeouts.get("connect"), timeouts.get("read")))
+            dropped_lb_options = dropped_lb_options or any(lb.get(key) is not None for key in ("healthCheck", "sticky"))
             parts.append((util.as_int(child.get("weight")) or 0, targets))
         if len(schemes) > 1 or len(preserve) > 1 or len(tls_keys) > 1:
             problems.append("weighted children differ in scheme, passHostHeader or transport")
+        if len(timeout_keys) > 1:
+            problems.append("weighted children differ in serversTransport forwardingTimeouts (dialTimeout/"
+                            "responseHeaderTimeout), and Ferrum applies one timeout per route")
         if problems:
             return {"problems": problems}
+        if dropped_lb_options:
+            self.report.warning("traefik-weighted-lb-options", ref, "healthCheck/sticky settings of a weighted service "
+                                "or its child load balancers are not migrated: the merged upstream uses weighted "
+                                "round robin without health checks or session stickiness.",
+                                "Configure Ferrum upstream health_checks or hash_on manually if needed.")
         merged = merge_weighted_targets(parts)
         if merged is None:
             return {"problems": ["weighted service sends no traffic anywhere"]}
@@ -729,8 +922,9 @@ class _Traefik:
         key = f"weighted:{name}"
         self.plan.upstreams[key] = UpstreamSpec(key=key, name=name, ref=ref, targets=targets, tls=tls_value,
                                                 algorithm="weighted_round_robin")
+        connect, read = next(iter(timeout_keys))
         return {"problems": [], "backend": BackendRef(scheme=next(iter(schemes)), upstream_key=key),
-                "preserve_host": next(iter(preserve))}
+                "preserve_host": next(iter(preserve)), "connect": connect, "read": read}
 
     # ------------------------------------------------------------- priorities
 

@@ -16,9 +16,11 @@ Fail-closed rules applied here (see ``docs/design.md``):
    Where ``/api`` and a broader route differ in policy, a ``request_termination``
    guard with ``trigger.path_prefix`` is added to the broader route so
    ``/apix`` cannot reach it; a trailing-slash prefix gets an exact 404 route
-   for its bare path. Routes are never widened to cover ``/apix``. For sources
-   that opt in (NGINX), sibling paths that no equivalent route catches are
-   reported as a ``prefix-string-siblings`` error instead of becoming silent 404s.
+   for its bare path. Routes are never widened to cover ``/apix``. For routes
+   whose source matched literal string prefixes (NGINX prefix locations, Kong
+   ``paths``, Traefik ``PathPrefix``, Envoy ``prefix``, Istio ``uri.prefix``),
+   sibling paths that no equivalent route catches are reported as a
+   ``prefix-string-siblings`` error instead of becoming silent 404s.
 5. Source scopes that do not fall through between hosts (NGINX servers, Envoy
    virtual hosts, Istio hosts) get a host-only 404 route so unmatched paths do
    not reach another host tier.
@@ -27,6 +29,12 @@ Fail-closed rules applied here (see ``docs/design.md``):
 7. Backend TLS verification is never disabled. There is no opt-out: a source
    that did not verify gets verification turned on (warning), and every emitted
    ``backend_tls_verify_server_cert`` is literally ``true``.
+8. Ferrum file mode has one frontend client CA bundle for its whole HTTPS
+   listener. It is configured only when every migrated route that required
+   client certificates named the same single bundle. Several bundles from
+   separate source servers/listeners are never merged (that would let clients
+   trusted by one scope reach another): the affected routes are refused and a
+   ``frontend-client-ca-scope`` error asks for separately configured frontends.
 """
 
 from __future__ import annotations
@@ -91,6 +99,7 @@ def emit(plan: Plan, options: EmitOptions, report: Report) -> EmitResult:
         _validate_route(route, plan, options, report)
     tls_only = _decide_tls(routes, options, report)
     _poison(routes)
+    _resolve_frontend_client_ca(plan, routes, report)
     candidates = _build_candidates(routes)
     candidates = _resolve_conflicts(candidates)
     _add_scope_closures(plan, candidates, report)
@@ -270,6 +279,54 @@ def _decide_tls(routes: list[RouteSpec], options: EmitOptions, report: Report) -
             route.refuse("the source serves this route over HTTPS only, but other routes are plaintext and "
                          "Ferrum would expose it on the plaintext listener too (re-run with --tls-only)")
     return tls_only
+
+
+def _resolve_frontend_client_ca(plan: Plan, routes: list[RouteSpec], report: Report) -> None:
+    """Configure the listener-wide client CA bundle only when it preserves every route's trust scope.
+
+    Ferrum file mode verifies client certificates with one bundle
+    (``FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH``) for its whole HTTPS listener. One bundle
+    named by every route that required client certificates is equivalent for those routes
+    (routes that required none become stricter: warning). Several bundles cannot be scoped
+    per host/listener, and merging them would widen who is trusted, so none is configured and
+    every route that required one is refused (fail closed).
+    """
+    settings = plan.settings
+    settings.client_ca_paths = []
+    settings.client_ca_scope_conflict = False
+    live = [route for route in routes if not route.skip and not route.refusals]
+    required = sorted({ca for route in live for ca in route.client_cas})
+    if not required:
+        return
+    if len(required) == 1:
+        settings.client_ca_paths = required
+        open_routes = [route for route in live if not route.client_cas]
+        if open_routes:
+            report.warning("frontend-client-ca-shared", "frontend client CA",
+                           f"Ferrum applies one frontend client CA bundle to its whole HTTPS listener. "
+                           f"{len(open_routes)} migrated route(s) that did not require client certificates in the "
+                           "source will require a certificate from that CA over HTTPS in Ferrum (stricter).",
+                           "If those routes must stay reachable without client certificates, serve them from a "
+                           "separately configured Ferrum frontend without FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH, "
+                           "and validate it separately.")
+        return
+    settings.client_ca_scope_conflict = True
+    affected = [route for route in live if route.client_cas]
+    for route in affected:
+        route.refuse("the source required client certificates whose trusted CA bundle differs from other source "
+                     "servers/listeners that Ferrum serves on one shared HTTPS listener; one listener-wide client CA "
+                     "bundle cannot preserve this route's original trust scope")
+    report.error("frontend-client-ca-scope", "frontend client CA",
+                 f"The source required client certificates from {len(required)} different CA bundles on separate "
+                 "servers/listeners. Ferrum file mode verifies client certificates with one bundle "
+                 "(FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH) for its whole HTTPS listener, so the original "
+                 "per-host/listener trust scopes cannot be established. Concatenating the bundles would let clients "
+                 "trusted by one scope reach the others. No client CA bundle was configured, and the "
+                 f"{len(affected)} affected route(s) were refused (fail closed).",
+                 "Do not merge the CA files. Run a separately configured Ferrum frontend for each client CA trust "
+                 "boundary, each with its own FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH and only that boundary's routes "
+                 "(for example, convert a copy of the source that contains only those servers/listeners), then review "
+                 "and validate each frontend with `ferrum-edge validate` before serving traffic.")
 
 
 def _poison(routes: list[RouteSpec]) -> None:
@@ -538,10 +595,10 @@ def _add_divergence_guards(candidates: list[_Cand], report: Report) -> None:
                          f"The source matched every path that starts with {route.path}, including paths such as "
                          f"{route.path}x or {route.path}.json that do not continue at a '/' boundary. Ferrum prefix "
                          f"routes match only {route.path} and {route.path}/..., and in this output those sibling "
-                         f"paths do not reach the same backend and policy: they get a 404, a fail-closed response "
-                         f"or another route's termination instead of being forwarded. The route was not widened.",
-                         "If clients use such paths, add explicit locations for them and convert again, or "
-                         "confirm they are unused.")
+                         f"paths do not reach the same backend, response and policy: they get a 404, a fail-closed "
+                         f"response or another route's termination instead. The route was not widened.",
+                         "If clients use such paths, add explicit routes for them in the source configuration and "
+                         "convert again, or confirm they are unused.")
 
 
 # ------------------------------------------------------------------ building

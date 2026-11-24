@@ -262,6 +262,64 @@ class KongFailClosedTest(unittest.TestCase):
         self.assertIn("backend-tls-verify-enabled", codes(report, "warning"))
         self.assertNotIn("backend-tls-unverified", codes(report))
 
+    def test_restricted_ca_certificates_refuse_routes_instead_of_default_trust_store(self):
+        # Synthetic CA reference only (no certificate material): the restricted trust set cannot be emitted,
+        # so the route must fail closed rather than verify against Ferrum's broader default trust store.
+        text = textwrap.dedent("""
+            _format_version: "3.0"
+            services:
+              - name: pinned
+                url: https://pinned.internal:8443
+                tls_verify: true
+                ca_certificates: ["00000000-0000-4000-8000-000000000001"]
+                routes: [{name: pinned-route, paths: [/pinned/]}]
+              - name: public
+                url: https://public.internal:8443
+                tls_verify: true
+                routes: [{name: public-route, paths: [/public/]}]
+            ca_certificates:
+              - id: "00000000-0000-4000-8000-000000000001"
+        """)
+        result, report, _ = migrate("kong", text)
+        pinned = one_proxy(self, result.config, "/pinned")
+        self.assertEqual(pinned["labels"]["ferrum-migration/status"], "refused")
+        self.assertNotIn("backend_tls_server_ca_cert_path", pinned)
+        self.assertEqual([p["config"]["status_code"] for p in plugins_of(result.config, pinned)], [503])
+        self.assertIn("kong-ca-certificates", codes(report, "error"))
+        public = one_proxy(self, result.config, "/public")
+        self.assertEqual(public["labels"]["ferrum-migration/status"], "migrated")
+        self.assertIs(public["backend_tls_verify_server_cert"], True)
+
+
+class KongPrefixSemanticsTest(unittest.TestCase):
+    def test_string_prefix_path_siblings_are_reported_not_widened(self):
+        # Kong's traditional routers match paths as plain string prefixes: /api also forwarded /apix.
+        text = textwrap.dedent("""
+            _format_version: "3.0"
+            services:
+              - name: s
+                url: http://s.internal:8080
+                routes: [{name: r, paths: [/api]}]
+        """)
+        result, report, _ = migrate("kong", text)
+        self.assertEqual([p.get("listen_path") for p in result.config["proxies"]], ["/api"])
+        self.assertIn("prefix-string-siblings", codes(report, "error"))
+
+    def test_equivalent_unstripped_fallback_needs_no_sibling_report(self):
+        # /apix falls back to the / route with the same service and policy, so Ferrum forwards it identically.
+        text = textwrap.dedent("""
+            _format_version: "3.0"
+            services:
+              - name: s
+                url: http://s.internal:8080
+                routes:
+                  - {name: root, paths: [/], strip_path: false}
+                  - {name: api, paths: [/api], strip_path: false}
+        """)
+        _result, report, _ = migrate("kong", text)
+        self.assertNotIn("prefix-string-siblings", codes(report))
+        self.assertFalse(report.has_errors, [c.to_dict() for c in report.caveats if c.severity == "error"])
+
 
 if __name__ == "__main__":
     unittest.main()

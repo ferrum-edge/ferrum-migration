@@ -98,12 +98,18 @@ def render(run_mode: str, platform: str, settings: SettingsHints, tls_only: bool
                 out.lines.append("# FERRUM_FRONTEND_TLS_CERT_PATH=/etc/ferrum/tls/fullchain.pem")
                 out.lines.append("# FERRUM_FRONTEND_TLS_KEY_PATH=/etc/ferrum/tls/privkey.pem")
         cas = sorted(set(settings.client_ca_paths))
-        if len(cas) == 1:
+        if len(cas) == 1 and not settings.client_ca_scope_conflict:
             out.put("FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH", cas[0],
-                    "The source required client certificates (mTLS) signed by this CA.")
-        elif len(cas) > 1:
-            out.comment("REQUIRED: the source used several client CA bundles; concatenate them into one file:")
-            out.lines.append("# FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH=/etc/ferrum/tls/client-ca.pem")
+                    "Every migrated route that required client certificates (mTLS) used this one CA bundle; Ferrum "
+                    "applies it to the whole HTTPS listener.")
+        elif cas or settings.client_ca_scope_conflict:
+            # Never suggest merging bundles: that would let clients trusted by one source scope reach another.
+            out.comment("REVIEW REQUIRED (frontend-client-ca-scope): the source required client certificates from")
+            out.comment("several CA bundles on separate servers/listeners. One shared Ferrum listener cannot keep")
+            out.comment("those trust scopes apart, so no client CA bundle is configured here and the affected routes")
+            out.comment("were refused. Do NOT concatenate the bundles. Use a separately configured Ferrum frontend")
+            out.comment("per trust boundary, each with its own FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH, and review")
+            out.comment("and validate each one. See migration-report.md.")
         if settings.max_request_body_bytes:
             out.put("FERRUM_MAX_REQUEST_BODY_SIZE_BYTES", settings.max_request_body_bytes,
                     "Largest request body any source route accepted; smaller per-route limits use request_size_limiting.")

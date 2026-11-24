@@ -131,13 +131,16 @@ class _Envoy:
             self.report.error("envoy-filter-chain-match", ref, "filter_chain_match (SNI/ALPN selection) is not "
                               "migrated; listener skipped.")
             return
-        if info["tls"]:
-            self._downstream_tls(mapping(mapping(chain.get("transport_socket")).get("typed_config")), ref)
         listen_port = None
+        client_cas: list[str] = []
+        client_ca_problem = None
         if info["tls"]:
             if info["port"] != settings.main_https_port:
                 self.report.error("envoy-tls-port", ref, "TLS on a non-main port cannot be scoped reliably; skipped.")
                 return
+            # Only a listener that is actually migrated may contribute its client CA trust scope.
+            client_cas, client_ca_problem = self._downstream_tls(
+                mapping(mapping(chain.get("transport_socket")).get("typed_config")), ref)
         elif info["port"] != settings.main_http_port:
             listen_port = info["port"]
         filters = [f for f in seq(chain.get("filters")) if isinstance(f, dict)]
@@ -147,9 +150,15 @@ class _Envoy:
                               "migrated (TCP proxying and other network filters are not).")
             return
         config = mapping(hcms[0].get("typed_config"))
+        start = len(self.plan.routes)
         self._hcm(config, ref, listen_port, info["tls"])
+        for route in self.plan.routes[start:]:
+            route.client_cas = list(client_cas)
+            if client_ca_problem:
+                route.refuse(client_ca_problem)
 
-    def _downstream_tls(self, config: dict, ref: str) -> None:
+    def _downstream_tls(self, config: dict, ref: str) -> tuple[list[str], str | None]:
+        """Record frontend cert paths; return this listener's client CA scope or a refusal reason."""
         common = mapping(config.get("common_tls_context"))
         certs = seq(common.get("tls_certificates"))
         if certs:
@@ -164,13 +173,22 @@ class _Envoy:
             self.report.error("envoy-sds", ref, "SDS certificates are not migrated.")
         self.plan.settings.frontend_tls_expected = True
         validation = mapping(common.get("validation_context"))
-        if config.get("require_client_certificate"):
-            ca = mapping(validation.get("trusted_ca"))
-            if isinstance(ca.get("filename"), str):
-                self.plan.settings.client_ca_paths.append(ca["filename"])
-            else:
-                self.report.error("envoy-client-ca", ref, "Client-certificate CA is inline or missing; set "
-                                  "FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH manually.")
+        if not config.get("require_client_certificate"):
+            return [], None
+        ca = mapping(validation.get("trusted_ca"))
+        # Only a bare file-path trusted_ca is reproducible: SAN/hash/SPKI pins, CRLs or custom validators
+        # narrow who is trusted, and Ferrum's listener-wide bundle would accept every client of that CA.
+        constraints = [key for key in validation if key != "trusted_ca"]
+        if isinstance(ca.get("filename"), str) and not constraints:
+            return [ca["filename"]], None
+        self.report.error("envoy-client-ca", ref,
+                          "The listener required client certificates, but its trust (inline, SDS or missing CA, or "
+                          "extra validation constraints such as SAN, hash or SPKI pinning) cannot be reproduced by "
+                          "Ferrum's frontend client CA bundle. Its routes were refused (fail closed).",
+                          "Configure a Ferrum frontend dedicated to this trust boundary with a client CA file "
+                          "(FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH), review the dropped constraints, and validate "
+                          "it before serving traffic.")
+        return [], "the listener's client certificate trust cannot be reproduced by Ferrum's frontend client CA bundle"
 
     # -------------------------------------------------------------------- HCM
 
@@ -277,6 +295,9 @@ class _Envoy:
         match = mapping(raw.get("match"))
         if "prefix" in match:
             spec.kind, spec.path = "prefix", match.get("prefix") or "/"
+            # `prefix` is a plain string prefix (/api also matches /apix); `path_separated_prefix` below is
+            # segment-based like Ferrum and needs no sibling report.
+            spec.report_prefix_siblings = True
         elif "path" in match:
             spec.kind, spec.path = "exact", match.get("path")
         elif "safe_regex" in match:

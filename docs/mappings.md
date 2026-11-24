@@ -34,7 +34,8 @@ constructors in `src/plugins/*.rs` (closed key sets), `src/consumer_index.rs`,
 | service host naming an upstream | `upstream_id` | one Ferrum upstream per (upstream, TLS posture) |
 | `connect/read/write_timeout`, `retries` | `backend_*_timeout_ms`, `retry` (connect failures) | timeouts approximate: Kong read/write timeouts are idle bounds between two successive operations |
 | `tls_verify` absent/false | verification **on** (warning) | no opt-out; insecure backend TLS is never emitted |
-| route `paths` (one proxy per path), `hosts`, `methods`, `strip_path`, `preserve_host` | `listen_path`, `hosts`, `allowed_methods`, `strip_listen_path`, `preserve_host_header` | `~regex` paths become anchored Ferrum regexes; regex + `strip_path` refused |
+| https service with `ca_certificates` | **refused** (placeholder, error `kong-ca-certificates`) | the restricted backend trust set is never copied, and Ferrum's default trust store would trust more issuers; provision the CA file manually and set `backend_tls_server_ca_cert_path` |
+| route `paths` (one proxy per path), `hosts`, `methods`, `strip_path`, `preserve_host` | `listen_path`, `hosts`, `allowed_methods`, `strip_listen_path`, `preserve_host_header` | `~regex` paths become anchored Ferrum regexes; regex + `strip_path` refused. Literal paths are string prefixes in Kong's traditional and traditional_compatible routers, so `/api` also matched `/apix`. The path is never widened; when such siblings do not reach an equivalent route in Ferrum (always the case with `strip_path: true`), the route gets a `prefix-string-siblings` error |
 | route `headers`, `snis`, `expression`, `sources/destinations` | refused + overlap poisoning | |
 | `protocols: [https]` only | emitted only in TLS-only mode | |
 | upstream targets/weights, algorithm, `hash_on` ip/header/cookie, healthchecks | targets, `weighted_round_robin`/`least_connections`/`least_latency`/`consistent_hashing`, `hash_on`, `health_checks` (approximate) | weight 0 targets dropped; default target port 8000 |
@@ -96,20 +97,22 @@ proxies:
 | `auth_basic` | `basic_auth` without credentials (fail closed) | htpasswd never read |
 | `limit_req` + `limit_req_zone` (`$binary_remote_addr`, `$server_name`) | `rate_limiting` (shared per zone) | burst/delay differ (warning) |
 | `client_max_body_size` (default 1m) | `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` = largest; smaller → `request_size_limiting` | |
-| `ssl_certificate(_key)`, `ssl_client_certificate` + `ssl_verify_client` | frontend TLS paths, client CA | |
+| `ssl_certificate(_key)`, `ssl_client_certificate` + `ssl_verify_client` (server or inherited from `http`) | frontend TLS paths, client CA | one listener-wide client CA only when every mTLS server on the main TLS port uses the same file; different files → affected routes refused (`frontend-client-ca-scope`), never concatenated; `ssl_verify_client` without a client CA file → refused (`nginx-client-ca`) |
 | `include` (except `mime.types`, Debian `proxy_params`), `if`, `rewrite`, `auth_request`, `satisfy any`, unknown directives | containing location/server refused | |
 
 ## Traefik OSS (file provider)
 
 | Traefik | Ferrum | Notes |
 |---|---|---|
-| `rule` with `Host`, `HostHeader`, `Path`, `PathPrefix`, `Method` (`&&`, `||`, parentheses; v2 multi-arg) | one proxy per DNF alternative group | `Header*`, `Query*`, `ClientIP`, `*Regexp`, negation → refused + poisoning |
+| `rule` with `Host`, `HostHeader`, `Path`, `PathPrefix`, `Method` (`&&`, `||`, parentheses; v2 multi-arg) | one proxy per DNF alternative group | `Header*`, `Query*`, `ClientIP`, `*Regexp`, negation → refused + poisoning. `PathPrefix` is a string prefix (`/api` also matched `/apix`): never widened, `prefix-string-siblings` error when such siblings do not reach an equivalent route. `Path` and prefixes ending in `/` are not affected |
 | `priority` / rule length | checked against Ferrum specificity | shadowed → dropped; contradictory/equal → refused |
 | router `tls` | HTTPS-only route | certResolver not migrated |
+| `tls.options` `clientAuth` (router `tls.options`, or `default` when none is named) | frontend client CA | one `caFiles` file path with `RequireAndVerifyClientCert` (or no `clientAuthType`) → route's client CA; the listener-wide bundle follows the shared `frontend-client-ca-scope` rule. `VerifyClientCertIfGiven` becomes mandatory (warning, stricter). **Refused** (`traefik-client-auth`, placeholder) when the requirement cannot be known or reproduced: options undefined, from another provider or malformed; inline or several `caFiles`; `RequestClientCert`/`RequireAnyClientCert`; unknown types. Also refused when Traefik's per-SNI selection makes it connection-dependent and the candidate options differ in `clientAuth`: routers without a `Host` matcher (`HostHeader` does not count), or one host mapped to different options (Traefik falls back to `default`). With no `default` in the input, Traefik's built-in default (no client certificates) is assumed (info `traefik-tls-default-options`). Other TLS options (versions, ciphers, `sniStrict`, ALPN) are not migrated (info) |
 | `redirectScheme: https` router | TLS-only profile | |
 | `loadBalancer` servers/weights, `passHostHeader` (default true), `healthCheck`, `sticky.cookie`, `serversTransport` | upstream/direct backend, `preserve_host_header`, `health_checks`, cookie consistent hashing, backend TLS/timeouts | server URLs with paths refused |
 | `serversTransport.forwardingTimeouts` `dialTimeout`, `responseHeaderTimeout` | `backend_connect_timeout_ms`, `backend_read_timeout_ms` | approximate: `responseHeaderTimeout` only waits for headers after the request is written |
-| `weighted` services | merged weighted upstream | children must agree on scheme/transport |
+| `serversTransport` that is undefined or from another provider; inline or several `rootCAs`; inline, malformed or several client `certificates`; `spiffe`; `peerCertURI` | **refused** (placeholder) | applies to direct load balancers and weighted children alike. Ferrum presents one client certificate from file paths and has no SPIFFE or URI-SAN pinning equivalent here; configure backend identity in Ferrum by hand |
+| `weighted` services | merged weighted upstream | children must agree on scheme, `passHostHeader`, backend TLS and forwarding timeouts; their shared `dialTimeout`/`responseHeaderTimeout` are carried over, and differing timeouts are refused. `healthCheck`/`sticky` on the weighted service or its children are not migrated (warning `traefik-weighted-lb-options`) |
 | `mirroring` | main service only (warning) | `failover` refused |
 | `stripPrefix` / `addPrefix` | `strip_listen_path` + `backend_path` | partial/conditional strip refused |
 | `headers` custom request/response, STS/frame/nosniff/XSS/CSP/referrer/permissions, `accessControl*` | `request_transformer`, `response_transformer`, `cors` | `sslRedirect` etc. refused |
@@ -125,9 +128,10 @@ proxies:
 | Envoy | Ferrum | Notes |
 |---|---|---|
 | listener port, downstream TLS | main ports, TLS-only, frontend cert paths | inline/SDS material never copied |
+| `require_client_certificate` with a file `trusted_ca` | frontend client CA | inline/SDS/missing CA or extra validation constraints (SAN/hash/SPKI pins, CRLs) → listener's routes refused (`envoy-client-ca`) |
 | HCM with inline `route_config` | routes | RDS/scoped routes/xDS not read |
 | virtual host `domains` | `hosts` (+ host-only 404 closure) | prefix wildcards refused |
-| route `prefix` / `path` / `safe_regex` / `path_separated_prefix` | prefix / exact / regex / prefix (segment, no guard) | header/query/grpc/runtime matchers refused + poisoning |
+| route `prefix` / `path` / `safe_regex` / `path_separated_prefix` | prefix / exact / regex / prefix (segment, no guard) | header/query/grpc/runtime matchers refused + poisoning. `prefix` is a string prefix (`/api` also matched `/apix`): never widened, `prefix-string-siblings` error when such siblings do not reach an equivalent route |
 | ordered routes | first-match analysis | |
 | `cluster`, `weighted_clusters` | upstream / merged weighted upstream | EDS/original_dst refused; priority>0 endpoints dropped |
 | `prefix_rewrite`, `auto_host_rewrite`, default host pass-through | strip + `backend_path`, `preserve_host_header` | regex rewrites refused |
@@ -148,9 +152,9 @@ not exercise it.
 
 | Istio | Ferrum | Notes |
 |---|---|---|
-| `Gateway` servers (HTTP, HTTPS SIMPLE/MUTUAL with file paths) | ports, TLS-only, frontend cert/client CA | PASSTHROUGH/ISTIO_MUTUAL/credentialName not migrated |
+| `Gateway` servers (HTTP, HTTPS SIMPLE/MUTUAL with file paths) | ports, TLS-only, frontend cert/client CA | PASSTHROUGH/ISTIO_MUTUAL/credentialName not migrated; MUTUAL servers with different `caCertificates` → affected routes refused (`frontend-client-ca-scope`), never concatenated |
 | `VirtualService` bound to a Gateway; `gateways: [mesh]` | edge routes; mesh routes reported only | not translated |
-| `http[].match` uri exact/prefix/regex, method exact | exact/prefix/regex, `allowed_methods` | headers/query/authority/... refused + poisoning |
+| `http[].match` uri exact/prefix/regex, method exact | exact/prefix/regex, `allowed_methods` | headers/query/authority/... refused + poisoning. A VirtualService `uri.prefix` is a string prefix (`/api` also matched `/apix`): never widened, `prefix-string-siblings` error when such siblings do not reach an equivalent route |
 | ordered `http[]` | first-match analysis | |
 | destinations, weights, ports | upstream / merged weighted upstream | subsets refused (need pod labels) |
 | `ServiceEntry` static endpoints | upstream targets | resolution NONE refused |
@@ -176,5 +180,10 @@ written as comments. Secrets appear only as comments asking for `*_FILE` environ
 * Whether `request_termination`'s `trigger.path_prefix` is a plain string prefix. The guard
   logic assumes it is, as its name and validator suggest.
 * `FERRUM_TRUSTED_PROXIES` list syntax (only suggested, commented).
+* Istio VirtualServices that Istio itself generates from Kubernetes Ingress or Gateway API
+  resources (marked with an internal route-semantics annotation) are understood to use
+  path-separated prefixes. This was inferred from Istio's implementation, not its API docs. The
+  tool treats every `uri.prefix` as a string prefix, so such input gets extra guards and possibly
+  an unnecessary `prefix-string-siblings` error. That errs on the stricter side.
 * Behavior of the placeholder backend host `ferrum-migration-refused.invalid` during DNS/pool
   warm-up. Placeholders never dial, because termination runs first, but warm-up may log.

@@ -470,9 +470,19 @@ class _Kong:
             return result
         tls = TlsSpec(verify=service.get("tls_verify") is True)
         if scheme == "https" and service.get("ca_certificates"):
-            self.report.warning("kong-ca-certificates", ref,
-                                "Service CA certificates are not copied; Ferrum verifies against its default trust "
-                                "store unless backend_tls_server_ca_cert_path is set.")
+            # The service names a restricted backend trust set. Its PEM material is never copied, so the only
+            # emittable alternative would be Ferrum's default system trust store, which trusts more issuers.
+            # Refuse instead of silently widening backend trust.
+            result["problems"].append("service ca_certificates restrict backend TLS trust to specific CAs that are "
+                                      "not copied; Ferrum would fall back to its default trust store")
+            self.report.error("kong-ca-certificates", ref,
+                              "The service restricts backend TLS trust to its ca_certificates. CA certificate "
+                              "material is never copied, and falling back to Ferrum's default system trust store "
+                              "would trust more issuers than the source, so routes using this service were refused "
+                              "(fail closed).",
+                              "Provision those CA certificates manually as a PEM file on the Ferrum host, set "
+                              "backend_tls_server_ca_cert_path on the recreated proxy or upstream, and validate before "
+                              "serving traffic.")
         if service.get("client_certificate"):
             self.report.error("kong-client-certificate", ref,
                               "The service presented a client certificate (mTLS); key material is never migrated, "
@@ -645,6 +655,10 @@ class _Kong:
                 spec.extra_conditions = True
             else:
                 spec.kind, spec.path = "prefix", path
+                # Kong's traditional and traditional_compatible routers match literal paths as plain string
+                # prefixes (/api also matches /apix); `expression` routes are refused above. Ferrum matches by
+                # path segment, so the emitter reports siblings it cannot route equivalently.
+                spec.report_prefix_siblings = True
             for condition in extra:
                 spec.refuse(f"matches on {condition}, which Ferrum cannot express")
                 spec.extra_conditions = True

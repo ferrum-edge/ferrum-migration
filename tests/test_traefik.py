@@ -99,7 +99,9 @@ class TraefikSemanticsTest(unittest.TestCase):
         self.assertFalse(proxy["strip_listen_path"])
         self.assertEqual(plugin(self, result.config, proxy, "ip_restriction")["config"],
                          {"allow": ["192.0.2.0/24", "2001:db8::/32"]})
-        self.assertFalse(report.has_errors)
+        # The only review item is the string-prefix sibling report: Traefik's PathPrefix(`/api`) also forwarded
+        # /apix, which this output answers with 404.
+        self.assertEqual({c.code for c in report.caveats if c.severity == "error"}, {"prefix-string-siblings"})
 
     def _doc(self, routers, middlewares=None):
         return yaml.safe_dump({"http": {
@@ -159,6 +161,155 @@ class TraefikSemanticsTest(unittest.TestCase):
         proxy = one_proxy(self, result.config, "/api/v1")
         self.assertTrue(proxy["strip_listen_path"])
         self.assertEqual(proxy["backend_path"], "/v1")
+
+    def test_path_prefix_siblings_are_reported_not_widened(self):
+        result, report, _ = migrate("traefik", self._doc({"r": {"rule": "PathPrefix(`/api`)", "service": "s"}}))
+        self.assertEqual([p.get("listen_path") for p in result.config["proxies"]], ["/api"])
+        self.assertEqual(one_proxy(self, result.config, "/api")["labels"]["ferrum-migration/status"], "migrated")
+        self.assertIn("prefix-string-siblings", codes(report, "error"))
+
+    def test_exact_path_and_trailing_slash_prefix_have_no_sibling_report(self):
+        # Path(`/status`) is exact; PathPrefix(`/api/`) siblings all continue at a '/' boundary.
+        _result, report, _ = migrate("traefik", self._doc({
+            "status": {"rule": "Path(`/status`)", "service": "s"},
+            "api": {"rule": "PathPrefix(`/api/`)", "service": "s"},
+        }))
+        self.assertNotIn("prefix-string-siblings", codes(report))
+
+
+class TraefikServersTransportTest(unittest.TestCase):
+    def _doc(self, services, transports, router_service="split"):
+        return yaml.safe_dump({"http": {
+            "routers": {"r": {"rule": "PathPrefix(`/w`)", "service": router_service}},
+            "services": services,
+            "serversTransports": transports,
+        }})
+
+    def _weighted(self, transport_a, transport_b):
+        services = {
+            "split": {"weighted": {"services": [{"name": "a", "weight": 3}, {"name": "b", "weight": 1}]}},
+            "a": {"loadBalancer": {"servers": [{"url": "http://a.internal:80"}]}},
+            "b": {"loadBalancer": {"servers": [{"url": "http://b.internal:80"}]}},
+        }
+        if transport_a:
+            services["a"]["loadBalancer"]["serversTransport"] = transport_a
+        if transport_b:
+            services["b"]["loadBalancer"]["serversTransport"] = transport_b
+        return services
+
+    TIMEOUTS = {"forwardingTimeouts": {"dialTimeout": "2s", "responseHeaderTimeout": "7s"}}
+
+    def test_weighted_children_keep_agreeing_forwarding_timeouts(self):
+        result, report, _ = migrate("traefik", self._doc(self._weighted("t", "t"), {"t": self.TIMEOUTS}))
+        proxy = one_proxy(self, result.config, "/w")
+        self.assertEqual(proxy["labels"]["ferrum-migration/status"], "migrated")
+        self.assertEqual((proxy["backend_connect_timeout_ms"], proxy["backend_read_timeout_ms"]), (2000, 7000))
+        self.assertIn("timeout-approximate", codes(report, "warning"))
+
+    def test_weighted_children_with_different_timeouts_are_refused(self):
+        result, report, _ = migrate("traefik", self._doc(self._weighted("t", None), {"t": self.TIMEOUTS}))
+        self.assertEqual(one_proxy(self, result.config, "/w")["labels"]["ferrum-migration/status"], "refused")
+        self.assertIn("route-refused", codes(report, "error"))
+
+    def test_weighted_child_with_undefined_transport_is_refused(self):
+        result, _report, _ = migrate("traefik", self._doc(self._weighted("missing", "missing"), {}))
+        self.assertEqual(one_proxy(self, result.config, "/w")["labels"]["ferrum-migration/status"], "refused")
+
+    def test_identity_controls_are_refused_for_direct_and_weighted_backends(self):
+        direct = {"d": {"loadBalancer": {"servers": [{"url": "https://d.internal:443"}], "serversTransport": "pin"}}}
+        result, _report, _ = migrate("traefik", self._doc(
+            direct, {"pin": {"peerCertURI": "spiffe://example.test/backend"}}, router_service="d"))
+        self.assertEqual(one_proxy(self, result.config, "/w")["labels"]["ferrum-migration/status"], "refused")
+        result, _report, _ = migrate("traefik", self._doc(
+            self._weighted("id", "id"), {"id": {"spiffe": {"ids": ["spiffe://example.test/backend"]}}}))
+        self.assertEqual(one_proxy(self, result.config, "/w")["labels"]["ferrum-migration/status"], "refused")
+        # Several pinned roots cannot be expressed; Ferrum's default trust store would trust more CAs.
+        result, _report, _ = migrate("traefik", self._doc(
+            direct, {"pin": {"rootCAs": ["/etc/test-only/ca-a.pem", "/etc/test-only/ca-b.pem"]}}, router_service="d"))
+        self.assertEqual(one_proxy(self, result.config, "/w")["labels"]["ferrum-migration/status"], "refused")
+
+
+class TraefikClientAuthTest(unittest.TestCase):
+    """tls.options clientAuth becomes the frontend client CA or refuses the route; it is never dropped."""
+
+    CA = "/etc/test-only/client-ca.pem"  # synthetic path; never read by the tool
+
+    def _doc(self, routers, options=None):
+        doc = {"http": {"routers": routers,
+                        "services": {"s": {"loadBalancer": {"servers": [{"url": "http://s.internal:80"}]}}}}}
+        if options is not None:
+            doc["tls"] = {"options": options}
+        return yaml.safe_dump(doc)
+
+    def _status(self, result, path, host=None):
+        return one_proxy(self, result.config, path, host)["labels"]["ferrum-migration/status"]
+
+    def test_referenced_client_auth_is_preserved_as_frontend_client_ca(self):
+        router = {"r": {"rule": "Host(`m.example.test`) && Path(`/m`)", "service": "s",
+                        "tls": {"options": "mtls@file"}}}
+        result, report, plan = migrate("traefik", self._doc(router, {"mtls": {"clientAuth": {
+            "caFiles": [self.CA], "clientAuthType": "RequireAndVerifyClientCert"}}}))
+        self.assertEqual(self._status(result, "=/m", "m.example.test"), "migrated")
+        self.assertEqual(plan.settings.client_ca_paths, [self.CA])
+        self.assertNotIn("traefik-client-auth", codes(report))
+        # Optional verification becomes mandatory (stricter), with a warning.
+        _result, report, plan = migrate("traefik", self._doc(router, {"mtls": {"clientAuth": {
+            "caFiles": [self.CA], "clientAuthType": "VerifyClientCertIfGiven"}}}))
+        self.assertEqual(plan.settings.client_ca_paths, [self.CA])
+        self.assertIn("traefik-mtls-optional", codes(report, "warning"))
+
+    def test_default_option_client_auth_applies_to_routers_without_options(self):
+        # caFiles without clientAuthType: Traefik requires and verifies client certificates.
+        result, _report, plan = migrate("traefik", self._doc(
+            {"r": {"rule": "Host(`d.example.test`)", "service": "s", "tls": {}}},
+            {"default": {"clientAuth": {"caFiles": [self.CA]}}}))
+        self.assertEqual(self._status(result, None, "d.example.test"), "migrated")
+        self.assertEqual(plan.settings.client_ca_paths, [self.CA])
+
+    def test_unknown_or_unreproducible_client_auth_refuses_the_route(self):
+        cases = {
+            "other provider": ({"options": "mtls@kubernetescrd"}, {}),
+            "undefined": ({"options": "missing"}, {}),
+            "several CA files": ({"options": "m"}, {"m": {"clientAuth": {
+                "caFiles": [self.CA, "/etc/test-only/other-ca.pem"]}}}),
+            "unverified certificates": ({"options": "m"}, {"m": {"clientAuth": {
+                "clientAuthType": "RequireAnyClientCert"}}}),
+            "malformed default": ({}, {"default": {"clientAuth": "yes"}}),
+        }
+        for label, (router_tls, options) in cases.items():
+            with self.subTest(label):
+                result, report, plan = migrate("traefik", self._doc(
+                    {"r": {"rule": "Host(`u.example.test`) && Path(`/u`)", "service": "s", "tls": router_tls}},
+                    options))
+                self.assertEqual(self._status(result, "=/u", "u.example.test"), "refused")
+                self.assertEqual(plan.settings.client_ca_paths, [])
+                self.assertIn("route-refused", codes(report, "error"))
+
+    def test_sni_dependent_client_auth_is_refused(self):
+        options = {"mtls": {"clientAuth": {"caFiles": [self.CA]}}}
+        # No Host matcher: Traefik applies the options selected by SNI (the default ones for unclaimed names).
+        result, _report, _plan = migrate("traefik", self._doc(
+            {"r": {"rule": "Path(`/h`)", "service": "s", "tls": {"options": "mtls"}}}, options))
+        self.assertEqual(self._status(result, "=/h"), "refused")
+        # One host mapped to different TLS options: Traefik falls back to the default options for that host.
+        result, _report, _plan = migrate("traefik", self._doc({
+            "a": {"rule": "Host(`c.example.test`) && Path(`/a`)", "service": "s", "tls": {"options": "mtls"}},
+            "b": {"rule": "Host(`c.example.test`) && Path(`/b`)", "service": "s", "tls": {}},
+        }, options))
+        for path in ("=/a", "=/b"):
+            self.assertEqual(self._status(result, path, "c.example.test"), "refused")
+
+    def test_plaintext_and_tls_routers_without_client_auth_are_unaffected(self):
+        options = {"default": {"minVersion": "VersionTLS12"}, "mtls": {"clientAuth": {"caFiles": [self.CA]}}}
+        for router_tls in (None, {}):
+            with self.subTest(tls=router_tls):
+                router = {"rule": "Host(`p.example.test`) && Path(`/p`)", "service": "s"}
+                if router_tls is not None:
+                    router["tls"] = router_tls
+                result, report, plan = migrate("traefik", self._doc({"r": router}, options))
+                self.assertEqual(self._status(result, "=/p", "p.example.test"), "migrated")
+                self.assertEqual(plan.settings.client_ca_paths, [])
+                self.assertNotIn("traefik-client-auth", codes(report))
 
 
 if __name__ == "__main__":

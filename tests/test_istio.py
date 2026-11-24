@@ -165,6 +165,86 @@ class IstioSecurityTest(unittest.TestCase):
         self.assertEqual(one_proxy(self, result.config, "/", "app.example.com")["labels"]["ferrum-migration/status"],
                          "refused")
 
+    def test_mutual_servers_with_different_client_cas_are_refused_not_concatenated(self):
+        # Synthetic paths only; no certificate material.
+        text = textwrap.dedent("""
+            apiVersion: networking.istio.io/v1
+            kind: Gateway
+            metadata: {name: gw, namespace: default}
+            spec:
+              servers:
+                - port: {number: 443, name: https-a, protocol: HTTPS}
+                  hosts: ["a.example.test"]
+                  tls:
+                    mode: MUTUAL
+                    serverCertificate: /etc/synthetic/server.crt
+                    privateKey: /etc/synthetic/server.key
+                    caCertificates: /etc/synthetic/client-ca-a.pem
+                - port: {number: 443, name: https-b, protocol: HTTPS}
+                  hosts: ["b.example.test"]
+                  tls:
+                    mode: MUTUAL
+                    serverCertificate: /etc/synthetic/server.crt
+                    privateKey: /etc/synthetic/server.key
+                    caCertificates: /etc/synthetic/client-ca-b.pem
+            ---
+            apiVersion: networking.istio.io/v1
+            kind: VirtualService
+            metadata: {name: a, namespace: default}
+            spec:
+              hosts: [a.example.test]
+              gateways: [gw]
+              http:
+                - route: [{destination: {host: web-a, port: {number: 80}}}]
+            ---
+            apiVersion: networking.istio.io/v1
+            kind: VirtualService
+            metadata: {name: b, namespace: default}
+            spec:
+              hosts: [b.example.test]
+              gateways: [gw]
+              http:
+                - route: [{destination: {host: web-b, port: {number: 80}}}]
+        """)
+        result, report, plan = migrate("istio", text)
+        for host in ("a.example.test", "b.example.test"):
+            self.assertEqual(one_proxy(self, result.config, "/", host)["labels"]["ferrum-migration/status"],
+                             "refused", host)
+        self.assertIn("frontend-client-ca-scope", codes(report, "error"))
+        self.assertEqual(plan.settings.client_ca_paths, [])
+
+    def test_uri_prefix_siblings_reported_but_not_exact_matches(self):
+        # uri.prefix /api also matches /apix through an Istio gateway; uri.exact has no siblings.
+        text = textwrap.dedent("""
+            apiVersion: networking.istio.io/v1
+            kind: Gateway
+            metadata: {name: gw, namespace: default}
+            spec:
+              servers:
+                - port: {number: 80, name: http, protocol: HTTP}
+                  hosts: ["app.example.com"]
+            ---
+            apiVersion: networking.istio.io/v1
+            kind: VirtualService
+            metadata: {name: app, namespace: default}
+            spec:
+              hosts: [app.example.com]
+              gateways: [gw]
+              http:
+                - name: api
+                  match: [{uri: {prefix: /api}}]
+                  route: [{destination: {host: api, port: {number: 80}}}]
+                - name: status
+                  match: [{uri: {exact: /status}}]
+                  route: [{destination: {host: status, port: {number: 80}}}]
+        """)
+        result, report, _ = migrate("istio", text)
+        self.assertEqual(one_proxy(self, result.config, "/api", "app.example.com")["labels"]["ferrum-migration/status"],
+                         "migrated")
+        sources = [c.ref for c in report.caveats if c.code == "prefix-string-siblings"]
+        self.assertEqual(len(sources), 1)
+        self.assertIn("'api'", sources[0])
+
     def test_non_mapping_document_rejected(self):
         with self.assertRaises(InputError):
             migrate("istio", "- just\n- a list\n")

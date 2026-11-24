@@ -10,6 +10,7 @@ from helpers import assert_structurally_valid, codes, migrate, one_proxy, plugin
     upstream_of
 
 from ferrum_migration.cli import main as cli_main
+from ferrum_migration.envprofile import render
 from ferrum_migration.errors import InputError
 from ferrum_migration.limits import Limits
 from ferrum_migration.sources.nginx import parse
@@ -227,6 +228,84 @@ class NginxSemanticsTest(unittest.TestCase):
         text = "a {" * 40 + "}" * 40
         with self.assertRaises(InputError):
             parse(text, Limits())
+
+
+class NginxClientCaScopeTest(unittest.TestCase):
+    # Synthetic paths only: no certificate material is read, written or needed.
+    SERVERS = """
+        server {
+            listen 443 ssl;
+            server_name a.example.test;
+            ssl_certificate /etc/synthetic/server.crt;
+            ssl_certificate_key /etc/synthetic/server.key;
+            ssl_client_certificate CA_A;
+            ssl_verify_client on;
+            location /a/ { proxy_pass http://a.internal:8080; }
+        }
+        server {
+            listen 443 ssl;
+            server_name b.example.test;
+            ssl_certificate /etc/synthetic/server.crt;
+            ssl_certificate_key /etc/synthetic/server.key;
+            ssl_client_certificate CA_B;
+            ssl_verify_client on;
+            location /b/ { proxy_pass http://b.internal:8080; }
+        }
+        server {
+            listen 443 ssl;
+            server_name open.example.test;
+            ssl_certificate /etc/synthetic/server.crt;
+            ssl_certificate_key /etc/synthetic/server.key;
+            location /open/ { proxy_pass http://open.internal:8080; }
+        }
+    """
+
+    def status(self, result, path):
+        return one_proxy(self, result.config, path)["labels"]["ferrum-migration/status"]
+
+    def profile(self, result, plan):
+        return render("file", "nginx", plan.settings, result.tls_only, result.basic_auth_used, "resources.yaml")
+
+    def test_different_client_cas_are_refused_not_concatenated(self):
+        result, report, plan = nginx(self.SERVERS.replace("CA_A", "/etc/synthetic/client-ca-a.pem")
+                                     .replace("CA_B", "/etc/synthetic/client-ca-b.pem"))
+        self.assertEqual(self.status(result, "/a"), "refused")
+        self.assertEqual(self.status(result, "/b"), "refused")
+        self.assertEqual(self.status(result, "/open"), "migrated")
+        self.assertIn("frontend-client-ca-scope", codes(report, "error"))
+        self.assertEqual(plan.settings.client_ca_paths, [])
+        conf = self.profile(result, plan)
+        self.assertNotIn("FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH=", conf)
+        self.assertNotIn("concatenate them into one file", conf)
+        self.assertNotIn("client-ca-a.pem", conf)
+        self.assertIn("REVIEW REQUIRED (frontend-client-ca-scope)", conf)
+
+    def test_one_shared_client_ca_is_configured(self):
+        ca = "/etc/synthetic/client-ca.pem"
+        result, report, plan = nginx(self.SERVERS.replace("CA_A", ca).replace("CA_B", ca))
+        for path in ("/a", "/b", "/open"):
+            self.assertEqual(self.status(result, path), "migrated", path)
+        self.assertEqual(plan.settings.client_ca_paths, [ca])
+        self.assertNotIn("frontend-client-ca-scope", codes(report))
+        self.assertIn("frontend-client-ca-shared", codes(report, "warning"))
+        self.assertIn(f"FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH={ca}", self.profile(result, plan).splitlines())
+
+    def test_inherited_verify_without_client_ca_file_is_refused(self):
+        result, report, plan = nginx("""
+            http {
+                ssl_verify_client on;
+                server {
+                    listen 443 ssl;
+                    server_name m.example.test;
+                    ssl_certificate /etc/synthetic/server.crt;
+                    ssl_certificate_key /etc/synthetic/server.key;
+                    location /m/ { proxy_pass http://m.internal:8080; }
+                }
+            }
+        """)
+        self.assertEqual(self.status(result, "/m"), "refused")
+        self.assertIn("nginx-client-ca", codes(report, "error"))
+        self.assertEqual(plan.settings.client_ca_paths, [])
 
 
 if __name__ == "__main__":
