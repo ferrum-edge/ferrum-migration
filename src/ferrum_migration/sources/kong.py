@@ -279,9 +279,11 @@ class _Kong:
     def _register_plugin(self, raw: dict, level: str, owner: str | None) -> None:
         raw_consumer = raw.get("consumer")
         raw_group = raw.get("consumer_group")
-        if raw_consumer or raw_group:
+        has_consumer = "consumer" in raw and raw_consumer is not None
+        has_group = "consumer_group" in raw and raw_group is not None
+        if has_consumer or has_group:
             pname = safe_label(raw.get("name"), 40)
-            if raw_consumer:
+            if has_consumer:
                 cidx = self._resolve_consumer_ref(raw_consumer)
                 if cidx is not None:
                     self.consumer_quarantine_by_idx.setdefault(cidx, []).append(
@@ -296,7 +298,7 @@ class _Kong:
                     self.report.error("kong-consumer-quarantined", f"kong plugin {pname}",
                                       "Consumer-scoped plugin references an ambiguous or undeclared consumer; "
                                       "matched consumers are quarantined and authenticated routes fail closed.")
-            if raw_group:
+            if has_group:
                 gidx = self._resolve_group_ref(raw_group)
                 glabel = safe_label(_ref_key(raw_group) or "?", 40)
                 if gidx is None:
@@ -320,7 +322,7 @@ class _Kong:
                 raise InputError("every Kong plugin must be a mapping")
             route_ref = _ref_key(raw.get("route"))
             service_ref = _ref_key(raw.get("service"))
-            if raw.get("consumer") or raw.get("consumer_group"):
+            if raw.get("consumer") is not None or raw.get("consumer_group") is not None:
                 self._register_plugin(raw, "consumer", None)
             elif route_ref is not None:
                 if route_ref not in self.route_index:

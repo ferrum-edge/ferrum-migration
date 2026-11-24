@@ -712,12 +712,15 @@ class NginxFrontendScopeTest(unittest.TestCase):
             location /v6/ { proxy_pass http://v6.internal:8080; }
         }
         """
-        v_res, _v_rep, v_plan = nginx(v4v6_conf)
+        v_res, v_rep, v_plan = nginx(v4v6_conf)
         assert_structurally_valid(self, v_res.config)
         v6_routes = [r for r in v_plan.routes if r.path == "/v6"]
         self.assertEqual(len(v6_routes), 1)
         self.assertFalse(v6_routes[0].requires_tls)
         self.assertEqual(v6_routes[0].protocols, frozenset({"http"}))
+        # Because both HTTP and HTTPS elected port 443, the profile disables HTTPS so Ferrum never gets overlapping binds.
+        self.assertEqual(v_res.frontend_protocols, "http")
+        self.assertIn("frontend-port-conflict", codes(v_rep, "error"))
 
 
 if __name__ == "__main__":

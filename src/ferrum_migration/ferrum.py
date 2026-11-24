@@ -549,6 +549,16 @@ def _decide_frontend(plan: Plan, routes: list[RouteSpec], options: EmitOptions, 
         remaining = [route for route in active if not route.refusals]
         if not remaining or all("https" in _effective_protocols(route) for route in remaining):
             mode = "both"  # nothing live, or every live route was served on both main listeners
+            http_port = plan.settings.main_http_port or 8000
+            https_port = plan.settings.main_https_port or 8443
+            if (plan.settings.main_https_port or _source_https_activity(plan, present)) and http_port == https_port:
+                mode = "http"
+                report.error("frontend-port-conflict", "frontend listeners",
+                             f"The source binds both plaintext HTTP and HTTPS on port {http_port}. Ferrum cannot "
+                             "open both listeners on the same port and bind address, so the profile disables the "
+                             "HTTPS listener (FERRUM_PROXY_HTTPS_PORT=0).",
+                             "Serve the plaintext and HTTPS listeners on distinct ports or from separate Ferrum "
+                             "instances, then convert again.")
         else:
             mode = "http"
             plaintext_only = sum(1 for route in remaining if "https" not in _effective_protocols(route))
