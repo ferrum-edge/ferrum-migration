@@ -945,9 +945,11 @@ class NginxFrontendScopeTest(unittest.TestCase):
         """)
         self.assertNotIn("health_checks", mixed_hc_res.config["upstreams"][0])
         self.assertIn("nginx-passive-health", codes(mixed_hc_rep, "warning"))
-        # Refused named HTTP '/' alongside a live catch-all HTTPS '/' in TLS-only mode omits the off-protocol
-        # placeholder so Ferrum does not see an invalid catch-all + named '/' slot collision and HTTPS stays live.
+        # Refused named HTTP server alongside a separate empty HTTP default and live catch-all HTTPS '/' in TLS-only
+        # mode omits both the colliding '/' placeholder, the shadowing '/extra' placeholder, and the HTTP-only scope
+        # closure so Ferrum validates cleanly and HTTPS forwards plain.example.test to the live HTTPS default.
         http_named_https_default = """
+        server { listen 80 default_server; }
         server {
             listen 80;
             server_name plain.example.test;
@@ -964,10 +966,12 @@ class NginxFrontendScopeTest(unittest.TestCase):
         hn_res, hn_rep, _ = nginx(http_named_https_default, tls_only=True)
         assert_structurally_valid(self, hn_res.config)
         self.assertIn("frontend-protocol-scope", codes(hn_rep, "error"))
-        root_proxies = proxies(hn_res.config, "/")
-        self.assertEqual(len(root_proxies), 1)
-        self.assertNotIn("hosts", root_proxies[0])
-        self.assertEqual(root_proxies[0]["labels"]["ferrum-migration/status"], "migrated")
+        self.assertNotIn("nginx-default-server-conflict", codes(hn_rep))
+        self.assertEqual(len(hn_res.config["proxies"]), 1)
+        root_proxy = hn_res.config["proxies"][0]
+        self.assertEqual(root_proxy.get("listen_path"), "/")
+        self.assertNotIn("hosts", root_proxy)
+        self.assertEqual(root_proxy["labels"]["ferrum-migration/status"], "migrated")
 
 
 if __name__ == "__main__":

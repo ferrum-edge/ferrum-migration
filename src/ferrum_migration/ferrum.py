@@ -160,11 +160,16 @@ def emit(plan: Plan, options: EmitOptions, report: Report) -> EmitResult:
     # Decided before any candidate exists; every later step only adds refusals, so the decision stays valid.
     mode = _decide_frontend(plan, routes, options, report)
     tls_only = mode == "https"
+    opened = FRONTEND_MODES[mode]
+    plan.host_scopes = [
+        scope for scope in plan.host_scopes
+        if scope.protocols is None or bool(opened & scope.protocols)
+    ]
     _poison(routes)
     _poison_case_variants(plan, routes)
     _resolve_frontend_client_ca(plan, routes, report, mode)
     candidates = _build_candidates(routes)
-    candidates = _drop_off_protocol_slot_conflicts(candidates, mode)
+    candidates = _drop_off_protocol_slot_conflicts(plan, candidates, mode)
     candidates = _resolve_conflicts(candidates, report)
     has_deferred_redirects = any(route.https_redirect_fold is not None for route in routes)
     pre_closure_state = (
@@ -243,7 +248,7 @@ def _finalize_https_redirects(plan: Plan, routes: list[RouteSpec], candidates: l
     _poison(routes)
     _poison_case_variants(plan, routes)
     rebuilt = _build_candidates(routes)
-    rebuilt = _drop_off_protocol_slot_conflicts(rebuilt, mode)
+    rebuilt = _drop_off_protocol_slot_conflicts(plan, rebuilt, mode)
     rebuilt = _resolve_conflicts(rebuilt, report)
     _add_scope_closures(plan, rebuilt, report)
     _add_trailing_slash_placeholders(rebuilt, report)
@@ -829,23 +834,64 @@ def _build_candidates(routes: list[RouteSpec]) -> list[_Cand]:
     return candidates
 
 
-def _drop_off_protocol_slot_conflicts(candidates: list[_Cand], mode: str) -> list[_Cand]:
-    """Omit refused off-protocol placeholders that would collide with a live route on the selected frontend.
+def _drop_off_protocol_slot_conflicts(plan: Plan, candidates: list[_Cand], mode: str) -> list[_Cand]:
+    """Omit refused off-protocol placeholders that collide with or shadow live routes on the selected frontend.
 
     When the profile disables a listener (for example ``mode == "https"`` with plaintext disabled), a refused
-    route that was served exclusively on the disabled listener never existed on the selected frontend. Keeping
-    its placeholder when it shares a ``(listen_port, listen_path)`` slot with a live route (such as a refused
-    named HTTP ``/`` vs a live HTTPS catch-all ``/``) would either conflict in Ferrum's validator or collapse
-    the live route into a 503. Omitting only such colliding off-protocol placeholders preserves the live
-    frontend route while keeping the route's refusal diagnostics in the report.
+    route served exclusively on the disabled listener never existed on the selected frontend. Keeping its
+    placeholder when it collides in the same ``(listen_port, listen_path)`` slot with a live route would either
+    conflict in Ferrum's validator or collapse the live route into a 503; keeping a named off-protocol
+    placeholder whose hosts have no scope on the selected frontend would shadow a live catch-all default route
+    that answered those hosts in the source. Omitting such off-protocol placeholders preserves the live frontend
+    routes while keeping the route's refusal diagnostics in the report.
     """
     opened = FRONTEND_MODES[mode]
     live_by_path: dict[str | None, _PortHostIndex] = {}
+    live_catchall_by_port: dict[int | None, list[_Cand]] = {}
+    has_root_catchall: set[int | None] = set()
+    on_protocol_scope_idx = _PortHostIndex()
     for cand in candidates:
         if not cand.placeholder:
             live_by_path.setdefault(cand.listen_path, _PortHostIndex()).add(cand)
+            if not cand.hosts:
+                live_catchall_by_port.setdefault(cand.listen_port, []).append(cand)
+                if cand.listen_path in ("/", None):
+                    has_root_catchall.add(cand.listen_port)
+            else:
+                on_protocol_scope_idx.add(cand)
     if not live_by_path:
         return candidates
+    if live_catchall_by_port:
+        for scope in plan.host_scopes:
+            sh = _scope_hosts(scope)
+            if sh:
+                dummy = RouteSpec(ref=scope.ref, name=scope.ref, hosts=sh, kind="hostonly", path=None,
+                                  listen_port=scope.listen_port)
+                on_protocol_scope_idx.add(_Cand(dummy, True, sh, None, scope.listen_port))
+
+    catchall_overlap_cache: dict[tuple[int | None, str, str | None, str, bool, bool], bool] = {}
+
+    def _shadows_live_catchall(cand: _Cand) -> bool:
+        if not live_catchall_by_port:
+            return False
+        port = cand.listen_port
+        ports = list(live_catchall_by_port) if port is None else [p for p in (port, None) if p in live_catchall_by_port]
+        if not ports:
+            return False
+        if any(p in has_root_catchall for p in ports):
+            return True
+        r = cand.route
+        cache_key = (port, r.kind, r.path, r.prefix_semantics, r.trailing_slash, r.case_insensitive)
+        cached = catchall_overlap_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        probe = RouteSpec(ref="", name="", hosts=[], kind=r.kind, path=r.path,
+                          prefix_semantics=r.prefix_semantics, trailing_slash=r.trailing_slash,
+                          case_insensitive=r.case_insensitive, listen_port=port)
+        hit = any(matching.route_overlaps(ca.route, probe) for p in ports for ca in live_catchall_by_port[p])
+        catchall_overlap_cache[cache_key] = hit
+        return hit
+
     kept: list[_Cand] = []
     dropped_routes: list[RouteSpec] = []
     for cand in candidates:
@@ -853,7 +899,17 @@ def _drop_off_protocol_slot_conflicts(candidates: list[_Cand], mode: str) -> lis
             protos = _effective_protocols(cand.route)
             if protos is not None and not (opened & protos):
                 idx = live_by_path.get(cand.listen_path)
-                if idx is not None and idx.query(cand.listen_port, cand.hosts, path_slot=cand.listen_path is not None):
+                same_slot = idx is not None and idx.has_conflict(
+                    cand.listen_port, cand.hosts, path_slot=cand.listen_path is not None
+                )
+                shadows_catchall = (
+                    not same_slot
+                    and bool(cand.hosts)
+                    and bool(live_catchall_by_port)
+                    and not on_protocol_scope_idx.has_conflict(cand.listen_port, cand.hosts, path_slot=True)
+                    and _shadows_live_catchall(cand)
+                )
+                if same_slot or shadows_catchall:
                     dropped_routes.append(cand.route)
                     continue
         kept.append(cand)
@@ -958,6 +1014,50 @@ def _resolve_conflicts(candidates: list[_Cand], report: Report) -> list[_Cand]:
     for cand in candidates:
         groups.setdefault((cand.listen_port, cand.listen_path), []).append(cand)
     replacement: dict[int, list[_Cand]] = {}
+    named_live_idx: _PortHostIndex | None = None
+
+    def _fail_close_outranking(named_hosts: list[str], slot_members: list[_Cand],
+                               port: int | None, reason: str) -> int:
+        nonlocal named_live_idx
+        if named_live_idx is None:
+            named_live_idx = _PortHostIndex()
+            for item in candidates:
+                if not item.placeholder and item.hosts:
+                    named_live_idx.add(item)
+        if not named_live_idx.all_by_port:
+            return 0
+        ports = (
+            list(named_live_idx.all_by_port)
+            if port is None
+            else [p for p in (port, None) if p in named_live_idx.all_by_port]
+        )
+        if not ports:
+            return 0
+        excluded_ids = {id(m) for m in slot_members}
+        probes: list[RouteSpec] = []
+        seen_sigs: set[tuple[str, str | None, str, bool, bool]] = set()
+        for m in slot_members:
+            r = m.route
+            sig = (r.kind, r.path, r.prefix_semantics, r.trailing_slash, r.case_insensitive)
+            if sig in seen_sigs:
+                continue
+            seen_sigs.add(sig)
+            probes.append(RouteSpec(ref="", name="", hosts=list(named_hosts), kind=r.kind, path=r.path,
+                                    prefix_semantics=r.prefix_semantics, trailing_slash=r.trailing_slash,
+                                    case_insensitive=r.case_insensitive, listen_port=port))
+        refused_outrank = 0
+        seen_other: set[int] = set()
+        for p in ports:
+            for other in named_live_idx.query(p, named_hosts, path_slot=False):
+                oid = id(other)
+                if oid in seen_other or oid in excluded_ids or oid in replacement or other.placeholder:
+                    continue
+                seen_other.add(oid)
+                if any(matching.route_overlaps(probe, other.route) for probe in probes):
+                    _fail_close(other, reason)
+                    refused_outrank += 1
+        return refused_outrank
+
     for (port, path), members in list(groups.items()):
         if len(members) < 2:
             continue
@@ -996,18 +1096,11 @@ def _resolve_conflicts(candidates: list[_Cand], report: Report) -> list[_Cand]:
                     collapse_hosts = [] if any(not m.hosts for m in members) else list(
                         dict.fromkeys(h for m in members for h in m.hosts)
                     )
-                    refused_outrank = 0
-                    for other in candidates:
-                        if other in members or other.placeholder:
-                            continue
-                        if not matching.ports_compatible(other.listen_port, port):
-                            continue
-                        if not other.hosts or (collapse_hosts and not matching.hosts_overlap(other.hosts, collapse_hosts)):
-                            continue
-                        if any(matching.route_overlaps(m.route, other.route) for m in members):
-                            _fail_close(other, "overlaps a >100-host path conflict that collapsed to a catch-all "
-                                               "placeholder; its higher host tier would outrank the catch-all")
-                            refused_outrank += 1
+                    refused_outrank = _fail_close_outranking(
+                        collapse_hosts, members, port,
+                        "overlaps a >100-host path conflict that collapsed to a catch-all placeholder; "
+                        "its higher host tier would outrank the catch-all",
+                    )
                     report.error("conflict-collapse", first.route.ref,
                                  f"A merged host conflict on path {safe_label(path, 80)} exceeds Ferrum's 100-host "
                                  "limit inside one ambiguous component and collapsed to a catch-all 503 placeholder "
@@ -1047,6 +1140,27 @@ def _resolve_conflicts(candidates: list[_Cand], report: Report) -> list[_Cand]:
                             _fail_close(other, "overlaps a host-only route conflict whose hosts exceed Ferrum's "
                                                "100-host limit and cannot be represented safely")
             else:
+                if not hosts and path is not None:
+                    named_members = [m for m in component if m.hosts]
+                    if named_members:
+                        # Merging a named route with a catch-all into one catch-all 503 demotes those named hosts
+                        # behind Ferrum's exact/wildcard tiers; fail-close any overlapping higher-tier live route
+                        # so requests for those hosts cannot bypass the refused route.
+                        named_hosts = list(dict.fromkeys(h for m in named_members for h in m.hosts))
+                        refused_outrank = _fail_close_outranking(
+                            named_hosts, named_members, port,
+                            "overlaps a named route whose slot conflict with a catch-all collapsed to a catch-all "
+                            "placeholder; its higher host tier would outrank the catch-all",
+                        )
+                        if refused_outrank:
+                            report.error(
+                                "conflict-collapse", first.route.ref,
+                                f"A catch-all/named host conflict on path {safe_label(path, 80)} collapsed to a "
+                                f"catch-all 503 placeholder and failed closed {refused_outrank} overlapping "
+                                "higher-tier route(s) whose host tier would otherwise bypass the placeholder.",
+                                "Avoid sharing the same listen_path between catch-all and named host routes, then "
+                                "convert again.",
+                            )
                 replacement[id(first)] = [
                     _Cand(first.route, True, chunk, path, port, termination=REFUSED_TERMINATION, kind_label="refused")
                     for chunk in host_chunks
@@ -1269,6 +1383,42 @@ class _PortHostIndex:
                     ex_suf.setdefault(h[dot:], []).append(cand)
                     dot = h.find(".", dot + 1)
 
+    def has_conflict(self, port: int | None, scope_hosts: list[str], *, path_slot: bool = False) -> bool:
+        """O(|scope_hosts| * labels) existence check without scanning candidate buckets."""
+        if not scope_hosts:
+            return bool(self.all_by_port.get(port))
+        if self.catchall.get(port):
+            return True
+        ex_map = self.exact.get(port)
+        wi_map = self.wild.get(port)
+        ex_suf = self.exact_by_suffix.get(port)
+        wi_par = self.wild_by_parent.get(port)
+        for h in scope_hosts:
+            if h.startswith("*."):
+                suffix = h[1:]
+                if wi_map and suffix in wi_map:
+                    return True
+                if not path_slot and ex_suf and suffix in ex_suf:
+                    return True
+                if wi_par and suffix in wi_par:
+                    return True
+                if wi_map:
+                    dot = suffix.find(".", 1)
+                    while dot != -1:
+                        if suffix[dot:] in wi_map:
+                            return True
+                        dot = suffix.find(".", dot + 1)
+            else:
+                if ex_map and h in ex_map:
+                    return True
+                if not path_slot and wi_map:
+                    dot = h.find(".")
+                    while dot != -1:
+                        if h[dot:] in wi_map:
+                            return True
+                        dot = h.find(".", dot + 1)
+        return False
+
     def query(self, port: int | None, scope_hosts: list[str], *, path_slot: bool = False) -> list[_Cand]:
         if not scope_hosts:
             # Empty hosts (catch-all) conflicts with every proxy on the same slot in Ferrum v0.9.21.
@@ -1323,7 +1473,7 @@ def _add_regex_closure(scope, hosts: list[str], candidates: list[_Cand], regex_i
     chunks = _chunk_hosts_no_prune(hosts, host_only=False)
     if chunks is None:
         return False
-    if regex_idx.query(scope.listen_port, hosts, path_slot=True):
+    if regex_idx.has_conflict(scope.listen_port, hosts, path_slot=True):
         return False
     for index, chunk in enumerate(chunks):
         suffix = f"-default-{index + 1}" if len(chunks) > 1 else "-default"

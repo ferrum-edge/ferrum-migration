@@ -542,7 +542,9 @@ class _Envoy:
         apply_first_match_order(routes, self.report)
         self.plan.routes.extend(routes)
         if hosts:
-            self.plan.host_scopes.append(HostScope(ref, list(hosts), listen_port))
+            self.plan.host_scopes.append(
+                HostScope(ref, list(hosts), listen_port, protocols=frozenset({"https" if tls else "http"}))
+            )
 
     def _resolve_https_redirects(self) -> None:
         """Fold plaintext HTTP-to-HTTPS redirect virtual hosts away only when live HTTPS exists and no other plain routes do."""
@@ -583,7 +585,9 @@ class _Envoy:
             apply_first_match_order(routes, self.report)
             self.plan.routes.extend(routes)
             if hosts:
-                self.plan.host_scopes.append(HostScope(ref, list(hosts), listen_port))
+                self.plan.host_scopes.append(
+                    HostScope(ref, list(hosts), listen_port, protocols=frozenset({"http"}))
+                )
 
     # ------------------------------------------------------------------ routes
 

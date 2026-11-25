@@ -255,6 +255,8 @@ class MatchingTest(unittest.TestCase):
         self.assertIsNotNone(util.regex_problem(r"^/api/(?x:[a b])$"))
         self.assertIsNotNone(util.regex_problem(r"^/(?:[ab]{0,1000}){0,1000}$"))
         self.assertIsNotNone(util.regex_problem(r"^/items/\w{1000}$"))
+        self.assertIsNotNone(util.regex_problem(r"^/[\b]$"))
+        self.assertIsNotNone(util.regex_problem("^/" + "(a" * 60 + ")" * 60 + "$"))
         self.assertIsNone(util.regex_problem(r"^/api/a}b$"))
         self.assertIsNone(util.regex_problem(r"^/api[\\0]$"))
         self.assertIsNone(util.regex_problem(r"(?x)^/api$ # (?xx:[ab])"))
@@ -747,6 +749,29 @@ class MatchingTest(unittest.TestCase):
         assert_structurally_valid(self, result.config)
         nested_errs = [c for c in report.caveats if c.code == "nested-wildcard-scope"]
         self.assertEqual(len(nested_errs), 2)
+
+    def test_catchall_named_slot_conflict_fails_close_outranking_named_route(self):
+        # Catch-all =/admin conflicts with named app.example.test =/admin (403) and collapses to a catch-all 503.
+        # Because Ferrum checks the exact host tier first, app.example.test's '/' route must also fail closed so
+        # /admin on app.example.test cannot bypass the 403 to the backend. Disjoint /public stays live.
+        ca_admin = RouteSpec(ref="ca-admin", name="ca-admin", hosts=[], kind="exact", path="/admin",
+                             protocols=frozenset({"http"}), backend=BackendRef("http", "ca.internal", 80))
+        named_deny = RouteSpec(ref="named-deny", name="named-deny", hosts=["app.example.test"], kind="exact",
+                               path="/admin", protocols=frozenset({"http"}),
+                               termination={"status_code": 403, "body": "denied"})
+        named_root = RouteSpec(ref="named-root", name="named-root", hosts=["app.example.test"], kind="prefix",
+                               path="/", protocols=frozenset({"http"}),
+                               backend=BackendRef("http", "app.internal", 80))
+        named_pub = RouteSpec(ref="named-pub", name="named-pub", hosts=["app.example.test"], kind="prefix",
+                              path="/public", protocols=frozenset({"http"}),
+                              backend=BackendRef("http", "pub.internal", 80))
+        result, report = run([ca_admin, named_deny, named_root, named_pub])
+        assert_structurally_valid(self, result.config)
+        self.assertIn("conflict-collapse", codes(report, "error"))
+        root_p = next(p for p in result.config["proxies"] if p.get("listen_path") == "/")
+        self.assertEqual(root_p["labels"]["ferrum-migration/status"], "refused")
+        pub_p = next(p for p in result.config["proxies"] if p.get("listen_path") == "/public")
+        self.assertEqual(pub_p["labels"]["ferrum-migration/status"], "migrated")
 
 
 if __name__ == "__main__":

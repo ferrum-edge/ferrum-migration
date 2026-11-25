@@ -598,7 +598,9 @@ class _Nginx:
             self.plan.routes.append(route)
             self._note_catch_all(info, base, [route])
             if base["hosts"]:
-                self.plan.host_scopes.append(HostScope(ref, list(base["hosts"]), listen_port))
+                self.plan.host_scopes.append(
+                    HostScope(ref, list(base["hosts"]), listen_port, protocols=base["protocols"])
+                )
             return
         locations = [d for d in server.block or [] if d.name == "location"]
         if not locations:
@@ -622,7 +624,9 @@ class _Nginx:
         self.plan.routes.extend(routes)
         self._note_catch_all(info, base, routes)
         if base["hosts"]:
-            self.plan.host_scopes.append(HostScope(ref, list(base["hosts"]), listen_port))
+            self.plan.host_scopes.append(
+                HostScope(ref, list(base["hosts"]), listen_port, protocols=base["protocols"])
+            )
 
     def _note_catch_all(self, info: dict, base: dict, routes: list[RouteSpec]) -> None:
         """Remember port-agnostic catch-all routes per server (checked for conflicting defaults in run())."""
@@ -675,7 +679,9 @@ class _Nginx:
             self.plan.routes.extend(routes)
             self._note_catch_all(info, base, routes)
             if base["hosts"]:
-                self.plan.host_scopes.append(HostScope(ref, list(base["hosts"]), base["listen_port"]))
+                self.plan.host_scopes.append(
+                    HostScope(ref, list(base["hosts"]), base["listen_port"], protocols=base["protocols"])
+                )
 
     def _apply_ssl_reject_handshake(self, infos: list[dict]) -> None:
         """If any server on the main TLS listener enables ssl_reject_handshake, refuse every HTTPS route."""

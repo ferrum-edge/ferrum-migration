@@ -357,7 +357,9 @@ class _Istio:
                              bool(group["refusals"] or refusals)),
             })
             if hosts:
-                self.plan.host_scopes.append(HostScope(f"{ref} via {safe_label(gateway_ref)}", list(hosts), listen_port))
+                self.plan.host_scopes.append(
+                    HostScope(f"{ref} via {safe_label(gateway_ref)}", list(hosts), listen_port, protocols=frontends)
+                )
 
     def _resolve_https_redirects(self) -> None:
         """Fold main-port Gateway ``httpsRedirect`` servers away only when live HTTPS exists and no other main plain routes do.
@@ -423,7 +425,9 @@ class _Istio:
             route.refuse("Gateway httpsRedirect server on a non-main HTTP port is not migrated")
             self.plan.routes.append(route)
             if hosts:
-                self.plan.host_scopes.append(HostScope(server["ref"], list(hosts), server["port"]))
+                self.plan.host_scopes.append(
+                    HostScope(server["ref"], list(hosts), server["port"], protocols=frozenset())
+                )
         if not main_redirects:
             return
         has_live_https = any(not r.skip and not r.refusals and "https" in (r.protocols or ())
@@ -473,7 +477,9 @@ class _Istio:
                          "without a live HTTPS server")
             self.plan.routes.append(route)
             if hosts:
-                self.plan.host_scopes.append(HostScope(server["ref"], list(hosts), None))
+                self.plan.host_scopes.append(
+                    HostScope(server["ref"], list(hosts), None, protocols=frozenset({"http"}))
+                )
                 for host in hosts:
                     if host.startswith("*."):
                         wild_redir.setdefault(host[1:], server["ref"])

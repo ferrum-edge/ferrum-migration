@@ -628,6 +628,7 @@ class FerrumBinaryValidateTest(unittest.TestCase):
     def test_named_http_root_and_catchall_https_root_passes_ferrum_validate(self):
         binary = os.environ["FERRUM_EDGE_BIN"]
         conf = """
+        server { listen 80 default_server; }
         server {
             listen 80;
             server_name plain.example.test;
@@ -642,6 +643,8 @@ class FerrumBinaryValidateTest(unittest.TestCase):
         }
         """
         result, _report, _plan = migrate("nginx", conf, fmt="nginx", tls_only=True)
+        self.assertEqual(len(result.config["proxies"]), 1)
+        self.assertEqual(result.config["proxies"][0]["labels"]["ferrum-migration/status"], "migrated")
         with tempfile.TemporaryDirectory() as directory:
             completed = self.validate(binary, directory, result.config, result.basic_auth_used)
             self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)

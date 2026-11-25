@@ -162,6 +162,7 @@ class HostScope:
     ref: str
     hosts: list[str]
     listen_port: int | None = None
+    protocols: frozenset[str] | None = None
 
 
 @dataclass
