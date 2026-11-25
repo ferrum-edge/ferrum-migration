@@ -1071,30 +1071,82 @@ class EnvoyHardeningTest(unittest.TestCase):
             "labels"]["ferrum-migration/status"], "refused")
 
 
-        # A route that disables an untranslatable vhost fault (FilterConfig{disabled: true}) migrates cleanly.
-        dis_fault = minimal_bootstrap({"path_separated_prefix": "/api"})
-        dfhcm = dis_fault["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"]
-        dfhcm["http_filters"] = [
+        # A route that disables an untranslatable vhost fault (raw or wrapped in FilterConfig.config) or
+        # an untranslatable HCM fault via FilterConfig{disabled: true} migrates cleanly; grpc_web ordered
+        # before fault with explicit grpc_status refuses; origin regex matching literal '*' normalizes to
+        # ['*'] when uncredentialed and refuses when credentialed.
+        for label, hcm_fault_cfg, vhost_fault_cfg in (
+            ("raw-vhost-fault",
+             {"@type": "type.googleapis.com/envoy.extensions.filters.http.fault.v3.HTTPFault"},
+             {"@type": "type.googleapis.com/envoy.extensions.filters.http.fault.v3.HTTPFault",
+              "abort": {"http_status": 503, "percentage": {"numerator": 100, "denominator": "HUNDRED"}},
+              "headers": [{"name": "x-chaos", "exact_match": "1"}]}),
+            ("wrapped-vhost-fault",
+             {"@type": "type.googleapis.com/envoy.extensions.filters.http.fault.v3.HTTPFault"},
+             {"@type": "type.googleapis.com/envoy.config.route.v3.FilterConfig",
+              "config": {
+                  "@type": "type.googleapis.com/envoy.extensions.filters.http.fault.v3.HTTPFault",
+                  "abort": {"http_status": 503, "percentage": {"numerator": 100, "denominator": "HUNDRED"}},
+                  "headers": [{"name": "x-chaos", "exact_match": "1"}],
+              }}),
+            ("untranslatable-hcm-fault",
+             {"@type": "type.googleapis.com/envoy.extensions.filters.http.fault.v3.HTTPFault",
+              "abort": {"http_status": 503, "percentage": {"numerator": 100, "denominator": "HUNDRED"}},
+              "headers": [{"name": "x-chaos", "exact_match": "1"}]},
+             None),
+        ):
+            with self.subTest(fault_disable=label):
+                dis_fault = minimal_bootstrap({"path_separated_prefix": "/api"})
+                dfhcm = dis_fault["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"]
+                dfhcm["http_filters"] = [
+                    {"name": "envoy.filters.http.fault", "typed_config": hcm_fault_cfg},
+                    {"name": "envoy.filters.http.router"},
+                ]
+                if vhost_fault_cfg is not None:
+                    dfhcm["route_config"]["virtual_hosts"][0]["typed_per_filter_config"] = {
+                        "envoy.filters.http.fault": vhost_fault_cfg,
+                    }
+                dfhcm["route_config"]["virtual_hosts"][0]["routes"][0]["typed_per_filter_config"] = {
+                    "envoy.filters.http.fault": {
+                        "@type": "type.googleapis.com/envoy.config.route.v3.FilterConfig",
+                        "disabled": True,
+                    }
+                }
+                df_res = migrate("envoy", yaml.safe_dump(dis_fault))[0]
+                self.assertEqual(one_proxy(self, df_res.config, "/api")["labels"]["ferrum-migration/status"], "migrated")
+                self.assertEqual(df_res.config["plugin_configs"], [])
+
+        gw_fault = minimal_bootstrap({"path_separated_prefix": "/api"})
+        gfhcm = gw_fault["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"]
+        gfhcm["http_filters"] = [
+            {"name": "envoy.filters.http.grpc_web",
+             "typed_config": {"@type": "type.googleapis.com/envoy.extensions.filters.http.grpc_web.v3.GrpcWeb"}},
             {"name": "envoy.filters.http.fault",
-             "typed_config": {"@type": "type.googleapis.com/envoy.extensions.filters.http.fault.v3.HTTPFault"}},
+             "typed_config": {
+                 "@type": "type.googleapis.com/envoy.extensions.filters.http.fault.v3.HTTPFault",
+                 "abort": {"grpc_status": 7, "percentage": {"numerator": 100, "denominator": "HUNDRED"}},
+             }},
             {"name": "envoy.filters.http.router"},
         ]
-        dfhcm["route_config"]["virtual_hosts"][0]["typed_per_filter_config"] = {
-            "envoy.filters.http.fault": {
-                "@type": "type.googleapis.com/envoy.extensions.filters.http.fault.v3.HTTPFault",
-                "abort": {"http_status": 503, "percentage": {"numerator": 100, "denominator": "HUNDRED"}},
-                "headers": [{"name": "x-chaos", "exact_match": "1"}],
+        self.assertEqual(one_proxy(self, migrate("envoy", yaml.safe_dump(gw_fault))[0].config, "/api")[
+            "labels"]["ferrum-migration/status"], "refused")
+
+        star_rx = minimal_bootstrap({"path_separated_prefix": "/api"})
+        srhcm = star_rx["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"]
+        srhcm["http_filters"] = [{"name": "envoy.filters.http.cors"}, {"name": "envoy.filters.http.router"}]
+        srhcm["route_config"]["typed_per_filter_config"] = {
+            "envoy.filters.http.cors": {
+                "@type": "type.googleapis.com/envoy.extensions.filters.http.cors.v3.CorsPolicy",
+                "allow_origin_string_match": [{"safe_regex": {"regex": r"\*"}}],
+                "allow_credentials": {"value": False},
             }
         }
-        dfhcm["route_config"]["virtual_hosts"][0]["routes"][0]["typed_per_filter_config"] = {
-            "envoy.filters.http.fault": {
-                "@type": "type.googleapis.com/envoy.config.route.v3.FilterConfig",
-                "disabled": True,
-            }
-        }
-        df_res = migrate("envoy", yaml.safe_dump(dis_fault))[0]
-        self.assertEqual(one_proxy(self, df_res.config, "/api")["labels"]["ferrum-migration/status"], "migrated")
-        self.assertEqual(df_res.config["plugin_configs"], [])
+        sr_res = migrate("envoy", yaml.safe_dump(star_rx))[0]
+        self.assertEqual(plugin(self, sr_res.config, one_proxy(self, sr_res.config, "/api"), "cors")["config"][
+            "allowed_origins"], ["*"])
+        srhcm["route_config"]["typed_per_filter_config"]["envoy.filters.http.cors"]["allow_credentials"] = {"value": True}
+        self.assertEqual(one_proxy(self, migrate("envoy", yaml.safe_dump(star_rx))[0].config, "/api")[
+            "labels"]["ferrum-migration/status"], "refused")
 
 
 if __name__ == "__main__":

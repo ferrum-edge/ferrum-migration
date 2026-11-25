@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import ipaddress
+import math
 import re
 from urllib.parse import urlsplit
 
@@ -414,35 +415,119 @@ def has_top_level_alternation(pattern: str) -> bool:
 _GO_DURATION = re.compile(r"^(?:\d+(?:\.\d+)?(?:ns|us|µs|ms|s|m|h))+$")
 _GO_PART = re.compile(r"(\d+(?:\.\d+)?)(ns|us|µs|ms|s|m|h)")
 _GO_UNIT_MS = {"ns": 1e-6, "us": 1e-3, "µs": 1e-3, "ms": 1.0, "s": 1000.0, "m": 60_000.0, "h": 3_600_000.0}
+_MAX_DURATION_MS = (1 << 63) - 1
+
+
+def classify_go_duration(value: object) -> str:
+    """Classify a Go/Traefik/Istio duration without rounding sub-ms values to 0 or overflowing.
+
+    Returns ``"zero"`` (unset, empty, or valid zero duration such as ``"0m"`` / ``"0.0s"``),
+    ``"nonzero"`` (valid positive duration, including sub-ms like ``"100us"``), or ``"invalid"``.
+    """
+    if value is None:
+        return "zero"
+    if isinstance(value, bool):
+        return "invalid"
+    if isinstance(value, int):
+        if value < 0 or value > _MAX_DURATION_MS // 1000:
+            return "invalid"
+        return "zero" if value == 0 else "nonzero"
+    if isinstance(value, float):
+        if not math.isfinite(value) or value < 0.0 or value > _MAX_DURATION_MS / 1000.0:
+            return "invalid"
+        return "zero" if value == 0.0 else "nonzero"
+    if not isinstance(value, str):
+        return "invalid"
+    text = value.strip()
+    if not text:
+        return "zero"
+    num_body = text.replace(".", "", 1)
+    if num_body.isascii() and num_body.isdigit():
+        try:
+            secs = float(text)
+        except ValueError:
+            return "invalid"
+        if not math.isfinite(secs) or secs < 0.0 or secs > _MAX_DURATION_MS / 1000.0:
+            return "invalid"
+        return "zero" if secs == 0.0 else "nonzero"
+    if not _GO_DURATION.match(text):
+        return "invalid"
+    total = 0.0
+    any_nonzero = False
+    for number, unit in _GO_PART.findall(text):
+        if any(ch != "0" and ch != "." for ch in number):
+            any_nonzero = True
+        try:
+            part = float(number) * _GO_UNIT_MS[unit]
+        except (ValueError, OverflowError):
+            return "invalid"
+        if not math.isfinite(part) or part < 0.0:
+            return "invalid"
+        total += part
+        if not math.isfinite(total) or total > _MAX_DURATION_MS:
+            return "invalid"
+    return "nonzero" if any_nonzero else "zero"
 
 
 def parse_go_duration_ms(value: object) -> int | None:
     """Go/Traefik/Istio style durations (``1m30s``, ``500ms``, ``1.5s``); bare numbers are seconds."""
     if isinstance(value, bool):
         return None
-    if isinstance(value, (int, float)):
-        return int(round(float(value) * 1000)) if value >= 0 else None
+    if isinstance(value, int):
+        if 0 <= value <= _MAX_DURATION_MS // 1000:
+            return value * 1000
+        return None
+    if isinstance(value, float):
+        if math.isfinite(value) and 0.0 <= value <= _MAX_DURATION_MS / 1000.0:
+            return int(round(value * 1000.0))
+        return None
     if not isinstance(value, str):
         return None
     text = value.strip()
-    if text.replace(".", "", 1).isdigit():
-        return int(round(float(text) * 1000))
+    num_body = text.replace(".", "", 1)
+    if num_body and num_body.isascii() and num_body.isdigit():
+        try:
+            secs = float(text)
+        except ValueError:
+            return None
+        if not math.isfinite(secs) or secs < 0.0 or secs > _MAX_DURATION_MS / 1000.0:
+            return None
+        return int(round(secs * 1000.0))
     if not _GO_DURATION.match(text):
         return None
-    total = sum(float(number) * _GO_UNIT_MS[unit] for number, unit in _GO_PART.findall(text))
+    total = 0.0
+    for number, unit in _GO_PART.findall(text):
+        try:
+            part = float(number) * _GO_UNIT_MS[unit]
+        except (ValueError, OverflowError):
+            return None
+        if not math.isfinite(part) or part < 0.0:
+            return None
+        total += part
+        if not math.isfinite(total) or total > _MAX_DURATION_MS:
+            return None
     return int(round(total))
 
 
 def proto_duration_ms(value: object) -> int | None:
     """protobuf JSON Duration (``"15s"``, ``"0.25s"``) or ``{seconds, nanos}``."""
     if isinstance(value, dict):
-        seconds = as_int(value.get("seconds", 0)) or 0
-        nanos = as_int(value.get("nanos", 0)) or 0
+        seconds = as_int(value.get("seconds", 0))
+        nanos = as_int(value.get("nanos", 0))
+        if seconds is None or nanos is None or not (0 <= seconds <= _MAX_DURATION_MS // 1000) \
+                or not (0 <= nanos < 1_000_000_000):
+            return None
         return seconds * 1000 + nanos // 1_000_000
     if isinstance(value, str):
         match = re.fullmatch(r"(\d+(?:\.\d+)?)s", value.strip())
         if match:
-            return int(round(float(match.group(1)) * 1000))
+            try:
+                secs = float(match.group(1))
+            except ValueError:
+                return None
+            if not math.isfinite(secs) or secs < 0.0 or secs > _MAX_DURATION_MS / 1000.0:
+                return None
+            return int(round(secs * 1000.0))
         return parse_go_duration_ms(value)
     return None
 

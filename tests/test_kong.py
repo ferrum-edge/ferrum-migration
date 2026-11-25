@@ -881,6 +881,35 @@ class KongExtendedPluginsAndConsumersTest(unittest.TestCase):
                              for p in sc_res.config["plugin_configs"]))
         self.assertIn("kong-correlation-id", codes(sc_rep, "warning"))
 
+        # Protocol-scoped global correlation-id (https only): skipped on http-only route, omitted with warning
+        # on dual http+https route, and attached on https-only route.
+        proto_cid = textwrap.dedent("""
+            _format_version: "3.0"
+            plugins:
+              - name: correlation-id
+                protocols: [https]
+                config: {header_name: X-Tls-ID, echo_downstream: false, generator: uuid}
+            services:
+              - name: s
+                url: http://s.internal:8080
+                routes:
+                  - name: plain
+                    protocols: [http]
+                    paths: [/plain/]
+                  - name: both
+                    protocols: [http, https]
+                    paths: [/both/]
+                  - name: tls
+                    protocols: [https]
+                    paths: [/tls/]
+        """)
+        pc_res, pc_rep, _ = migrate("kong", proto_cid)
+        self.assertEqual(plugins_of(pc_res.config, one_proxy(self, pc_res.config, "/plain")), [])
+        self.assertEqual(plugins_of(pc_res.config, one_proxy(self, pc_res.config, "/both")), [])
+        self.assertEqual(plugin(self, pc_res.config, one_proxy(self, pc_res.config, "/tls"), "correlation_id")[
+            "config"]["header_name"], "x-tls-id")
+        self.assertIn("kong-correlation-id", codes(pc_rep, "warning"))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -520,6 +520,28 @@ def _cors_regex_problem(pattern: str) -> str | None:
     return None
 
 
+def cors_origin_matches_star(origin: Any) -> bool:
+    """Whether an Envoy/Istio CORS origin matcher matches the literal ``"*"`` (treated as allow-all by Envoy)."""
+    if origin == "*":
+        return True
+    if isinstance(origin, dict) and len(origin) == 1:
+        kind, value = next(iter(origin.items()))
+        if not isinstance(value, str):
+            return False
+        if kind == "exact":
+            return value == "*"
+        if kind == "prefix":
+            return value in ("", "*")
+        if kind == "regex":
+            if len(value.encode("utf-8")) > 512 or _cors_regex_problem(value) is not None:
+                return False
+            try:
+                return bool(re.fullmatch(value, "*"))
+            except (re.error, OverflowError):
+                return False
+    return False
+
+
 def cors_config(origins: Any, methods: Any = None, headers: Any = None, exposed: Any = None,
                 credentials: Any = None, max_age: Any = None, preflight_continue: Any = None,
                 private_network: Any = None, unmatched_preflights: str | None = None) -> tuple[dict | None, str | None]:

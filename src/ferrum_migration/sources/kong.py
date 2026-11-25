@@ -101,7 +101,7 @@ class _Kong:
         self.jwt_algorithm = "HS256"
         self.format_version = "3.0"
         self.pretransformed = False
-        self.global_correlation_id_plugin: PluginSpec | None = None
+        self.global_correlation_id: tuple[_Plugin, PluginSpec] | None = None
 
     # ------------------------------------------------------------ indexing
 
@@ -643,11 +643,11 @@ class _Kong:
             outcome = self._translate_plugin(plugin, ref)
             if outcome[0] == "plugin":
                 if plugin.name == "correlation-id":
-                    # Resolve correlation-id per route rather than emitting a global Ferrum plugin so an
-                    # omitted scoped override (e.g. a Ferrum-reserved header_name) never activates the global
-                    # correlation_id policy on that route.
-                    if self.global_correlation_id_plugin is None:
-                        self.global_correlation_id_plugin = outcome[1]
+                    # Resolve correlation-id per route (including protocol eligibility) rather than emitting a
+                    # global Ferrum plugin so an omitted scoped override or protocol-scoped global plugin never
+                    # activates on a route where Kong did not run it.
+                    if self.global_correlation_id is None:
+                        self.global_correlation_id = (plugin, outcome[1])
                 else:
                     self.plan.global_plugins.append(outcome[1])
             elif outcome[0] == "termination":
@@ -680,20 +680,42 @@ class _Kong:
             return ("refuse", f"plugin {safe_label(name, 40)} has no safe Ferrum equivalent")
         return handler(self, config, ref)
 
-    def _effective_plugins(self, route_index: int, service_key: str | None) -> tuple[list[PluginSpec], dict | None, list[str]]:
+    def _effective_plugins(self, route_index: int, service_key: str | None,
+                           route_frontends: frozenset[str]) -> tuple[list[PluginSpec], dict | None, list[str]]:
         by_name: dict[str, tuple[_Plugin, str]] = {}
         if service_key is not None:
             for plugin in self.plugins_by_owner.get(("service", service_key), []):
-                if plugin.raw.get("enabled") is not False:
-                    by_name.setdefault(plugin.name, (plugin, "service"))
+                if plugin.raw.get("enabled") is False:
+                    continue
+                if plugin.name == "correlation-id":
+                    pf = _plugin_frontends(plugin.raw)
+                    if pf is not None and pf.isdisjoint(route_frontends):
+                        continue
+                by_name.setdefault(plugin.name, (plugin, "service"))
         for plugin in self.plugins_by_owner.get(("route", str(route_index)), []):
-            if plugin.raw.get("enabled") is not False:
-                by_name[plugin.name] = (plugin, "route")
+            if plugin.raw.get("enabled") is False:
+                continue
+            if plugin.name == "correlation-id":
+                pf = _plugin_frontends(plugin.raw)
+                if pf is not None and pf.isdisjoint(route_frontends):
+                    continue
+            by_name[plugin.name] = (plugin, "route")
         plugins: list[PluginSpec] = []
         refusals: list[str] = []
         termination = None
+        cid_suppressed = False
         for name, (plugin, level) in by_name.items():
             ref = f"kong {level} plugin {safe_label(name, 40)}"
+            if name == "correlation-id":
+                p_frontends = _plugin_frontends(plugin.raw)
+                if p_frontends is not None and p_frontends.isdisjoint(route_frontends):
+                    continue
+                cid_suppressed = True
+                if p_frontends is None or not (route_frontends <= p_frontends):
+                    self.report.warning("kong-correlation-id", ref,
+                                        "correlation-id omitted: plugin protocols do not cover every protocol of this "
+                                        "route (Ferrum cannot restrict correlation_id to a subset of listeners).")
+                    continue
             outcome = self._translate_plugin(plugin, ref)
             if outcome[0] == "plugin":
                 spec = outcome[1]
@@ -704,10 +726,19 @@ class _Kong:
                 termination = outcome[1]
             elif outcome[0] == "refuse":
                 refusals.append(f"{level} plugin {safe_label(name, 40)}: {outcome[1]}")
-        if "correlation-id" not in by_name and self.global_correlation_id_plugin is not None:
-            gspec = self.global_correlation_id_plugin
-            plugins.append(PluginSpec(gspec.name, dict(gspec.config), gspec.ref,
-                                      shared_key="global-correlation-id"))
+        if not cid_suppressed and self.global_correlation_id is not None and route_frontends:
+            gplugin, gspec = self.global_correlation_id
+            g_frontends = _plugin_frontends(gplugin.raw)
+            if g_frontends is not None and g_frontends.isdisjoint(route_frontends):
+                pass
+            elif g_frontends is None or not (route_frontends <= g_frontends):
+                self.report.warning("kong-correlation-id", gspec.ref,
+                                    "global correlation-id omitted on route: plugin protocols do not cover every "
+                                    "protocol of this route (Ferrum cannot restrict correlation_id to a subset of "
+                                    "listeners).")
+            else:
+                plugins.append(PluginSpec(gspec.name, dict(gspec.config), gspec.ref,
+                                          shared_key="global-correlation-id"))
         return plugins, termination, refusals
 
     def _auth_composition(self, plugins: list[PluginSpec], ref: str) -> str | None:
@@ -948,7 +979,7 @@ class _Kong:
         if hosts is None or methods is None or paths is None:
             extra.append("hosts/methods/paths with unexpected types")
             hosts, methods, paths = hosts or [], methods or [], paths or []
-        plugins, termination, plugin_refusals = self._effective_plugins(index, service_key)
+        plugins, termination, plugin_refusals = self._effective_plugins(index, service_key, frontends)
         auth_composition = None if termination is not None else self._auth_composition(plugins, ref)
         effective_names = {p.name for p in plugins} | {p.name for p in self.plan.global_plugins}
         if termination is None and (effective_names & AUTH_PLUGINS) and self.unresolved_consumer_groups:
@@ -1385,6 +1416,17 @@ def _kong_redirect(self: _Kong, config: dict, ref: str) -> tuple:
     if status is None or not 200 <= status <= 599:
         return ("refuse", "redirect status code outside 200-599")
     return ("termination", {"status_code": status, "headers": {"location": location}, "body": ""})
+
+
+def _plugin_frontends(raw_plugin: dict) -> frozenset[str] | None:
+    """HTTP/HTTPS frontend protocols a Kong plugin applies to (None if ``protocols`` is malformed)."""
+    raw_protos = raw_plugin.get("protocols")
+    if raw_protos is None:
+        return frozenset({"http", "https"})
+    protos = str_list(raw_protos)
+    if protos is None or not protos:
+        return None
+    return frozenset(("https" if p in TLS_PROTOCOLS else "http") for p in protos if p in HTTP_PROTOCOLS)
 
 
 def _kong_correlation_id(self: _Kong, config: dict, ref: str) -> tuple:

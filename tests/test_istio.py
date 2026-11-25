@@ -1183,6 +1183,33 @@ class IstioCaseAndNamesTest(unittest.TestCase):
                 self.assertEqual(one_proxy(self, ep_res.config, "=/api", "api.example.test")["labels"][
                     "ferrum-migration/status"], "refused")
 
+        # Uncredentialed allowHeaders: ["*"] expands to ["*", "authorization"]; regex matching literal "*"
+        # normalizes to ["*"] (uncredentialed) and refuses (credentialed); overflowing maxAge refuses cleanly.
+        uncred_star = cred_cors_base.replace(
+            "        allowCredentials: true\n        unmatchedPreflights: IGNORE",
+            "        allowHeaders: ['*']\n        allowCredentials: false",
+        ).replace(
+            "exact: https://app.example.test",
+            r"regex: '\*'",
+        )
+        self.assertIn("allowHeaders: ['*']", uncred_star)
+        self.assertIn(r"regex: '\*'", uncred_star)
+        us_res = migrate("istio", uncred_star)[0]
+        us_proxy = one_proxy(self, us_res.config, "=/api", "api.example.test")
+        self.assertEqual(plugin(self, us_res.config, us_proxy, "cors")["config"], {
+            "allowed_origins": ["*"],
+            "allowed_headers": ["*", "authorization"],
+            "allow_credentials": False,
+            "unmatched_preflights": "forward",
+        })
+        cred_star_rx = cred_cors_base.replace("exact: https://app.example.test", r"regex: '\*'")
+        self.assertNotEqual(cred_star_rx, cred_cors_base)
+        self.assertEqual(one_proxy(self, migrate("istio", cred_star_rx)[0].config, "=/api", "api.example.test")[
+            "labels"]["ferrum-migration/status"], "refused")
+        huge_age_doc = cred_cors_base + f"        maxAge: {'1' + '0' * 310}s\n"
+        self.assertEqual(one_proxy(self, migrate("istio", huge_age_doc)[0].config, "=/api", "api.example.test")[
+            "labels"]["ferrum-migration/status"], "refused")
+
         # Oversized unquoted 310-digit integer percentages in fault/mirror drop cleanly without OverflowError.
         huge_pct = "1" + "0" * 310
         huge_doc = text.replace("percentage: {value: 15}", f"percentage: {{value: {huge_pct}}}").replace(

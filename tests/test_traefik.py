@@ -1373,6 +1373,19 @@ class TraefikHardeningTest(unittest.TestCase):
                     "serversTransports": {"subms": {"forwardingTimeouts": {"responseHeaderTimeout": "100us"}}},
                 }
             }),
+            ("overflow-timeout-mirror", {
+                "http": {
+                    "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "m"}},
+                    "services": {
+                        "m": {"mirroring": {"service": "main", "mirrorBody": False,
+                                            "mirrors": [{"name": "shadow", "percent": 20}]}},
+                        "main": {"loadBalancer": {"servers": [{"url": "http://main.internal:8080"}]}},
+                        "shadow": {"loadBalancer": {"passHostHeader": False, "serversTransport": "big",
+                                                    "servers": [{"url": "http://shadow.internal:9090"}]}},
+                    },
+                    "serversTransports": {"big": {"forwardingTimeouts": {"responseHeaderTimeout": "1" + "0" * 310 + "s"}}},
+                }
+            }),
             ("huge-percent-mirror", {
                 "http": {
                     "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "m"}},
@@ -1392,9 +1405,26 @@ class TraefikHardeningTest(unittest.TestCase):
                 self.assertEqual(mr_p["labels"]["ferrum-migration/status"], "migrated")
                 self.assertNotIn("request_mirror", [p["plugin_name"] for p in plugins_of(mr_res.config, mr_p)])
                 self.assertIn("traefik-mirroring", codes(mr_rep, "warning"))
-                if label == "subms-timeout-mirror":
+                if label in ("subms-timeout-mirror", "overflow-timeout-mirror"):
                     msgs = [c.message for c in mr_rep.caveats if c.code == "traefik-mirroring"]
                     self.assertTrue(any("forwardingTimeouts" in m for m in msgs), msgs)
+        # Equivalent zero duration (0m) on shadow serversTransport does NOT drop an eligible mirror.
+        zero_tm_doc = yaml.safe_dump({
+            "http": {
+                "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "m"}},
+                "services": {
+                    "m": {"mirroring": {"service": "main", "mirrorBody": False,
+                                        "mirrors": [{"name": "shadow", "percent": 20}]}},
+                    "main": {"loadBalancer": {"servers": [{"url": "http://main.internal:8080"}]}},
+                    "shadow": {"loadBalancer": {"passHostHeader": False, "serversTransport": "zero",
+                                                "servers": [{"url": "http://shadow.internal:9090"}]}},
+                },
+                "serversTransports": {"zero": {"forwardingTimeouts": {"responseHeaderTimeout": "0m"}}},
+            }
+        })
+        zt_res = asserted(zero_tm_doc)[0]
+        self.assertEqual(plugin(self, zt_res.config, one_proxy(self, zt_res.config, "/api", "a.example.test"),
+                                "request_mirror")["config"]["mirror_host"], "shadow.internal")
         # Buffering > 10 MiB warns about SSE rejection and raising FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES.
         big_buf = yaml.safe_dump({
             "http": {

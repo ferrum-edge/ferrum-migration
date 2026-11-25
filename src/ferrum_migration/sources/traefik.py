@@ -1392,17 +1392,18 @@ class _Traefik:
                 continue
             scheme, targets, problems = self._servers(lb, ref)
             transport_name = lb.get("serversTransport")
-            tls, timeouts, transport_problems = self._transport(transport_name, ref)
-            raw_ft: dict = {}
             if transport_name:
                 tbase, _, tprov = str(transport_name).partition("@")
                 if tprov in ("", "file"):
                     raw_ft = mapping(mapping(self.transports.get(tbase)).get("forwardingTimeouts"))
-            has_raw_phase_timeout = any(
-                raw_ft.get(k) is not None and str(raw_ft.get(k)).strip() not in ("", "0", "0s", "0ms", "0us", "0ns")
-                for k in ("dialTimeout", "responseHeaderTimeout")
-            )
-            if timeouts or has_raw_phase_timeout:
+                    if any(util.classify_go_duration(raw_ft.get(k)) != "zero"
+                           for k in ("dialTimeout", "responseHeaderTimeout")):
+                        self.report.warning("traefik-mirroring", ref,
+                                            "Mirror target configures serversTransport.forwardingTimeouts, which "
+                                            "Ferrum static request_mirror cannot reproduce per phase; mirror dropped.")
+                        continue
+            tls, timeouts, transport_problems = self._transport(transport_name, ref)
+            if timeouts:
                 self.report.warning("traefik-mirroring", ref,
                                     "Mirror target configures serversTransport.forwardingTimeouts, which Ferrum "
                                     "static request_mirror cannot reproduce per phase; mirror dropped.")

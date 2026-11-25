@@ -23,8 +23,9 @@ from ..model import BackendRef, HostScope, Plan, PluginSpec, RouteSpec, Target, 
 from ..redact import safe_label
 from ..safe_load import load_structured
 from .common import (SourceContext, apply_first_match_order, check_route_budget, choose_main_port, cors_config,
-                     fault_injection_config, header_value_ok, literal_value, mapping, merge_weighted_targets,
-                     parse_percentage, request_header_rule, response_header_rule, retry_from_policy, seq, str_list)
+                     cors_origin_matches_star, fault_injection_config, header_value_ok, literal_value, mapping,
+                     merge_weighted_targets, parse_percentage, request_header_rule, response_header_rule,
+                     retry_from_policy, seq, str_list)
 
 PLATFORM = "istio"
 ROOT_NAMESPACE = "istio-system"
@@ -737,15 +738,26 @@ class _Istio:
         if matcher_problem:
             spec.refuse(f"active CORS policy cannot be safely migrated ({matcher_problem})")
             return
-        if creds is True and any(o == "*" or o == {"exact": "*"} for o in origins):
-            spec.refuse("CORS policy combines allowCredentials=true with wildcard '*' origin, which Ferrum "
-                        "downgrades by disabling credentials")
-            return
+        # Istio/Envoy treats any origin matcher matching literal "*" (exact, prefix, or regex) as allow-all.
+        if any(cors_origin_matches_star(o) for o in origins):
+            if creds is True:
+                spec.refuse("CORS policy combines allowCredentials=true with a wildcard '*' origin matcher, "
+                            "which Ferrum downgrades by disabling credentials")
+                return
+            origins = ["*"]
         if creds is True and any("*" in (str_list(policy.get(k)) or [])
                                  for k in ("allowMethods", "allowHeaders", "exposeHeaders")):
             spec.refuse("CORS policy combines allowCredentials=true with wildcard '*' in "
                         "allowMethods/allowHeaders/exposeHeaders, which Ferrum returns literally; specify explicit lists")
             return
+        raw_headers = policy.get("allowHeaders")
+        parsed_headers = str_list(raw_headers) if raw_headers is not None else None
+        if creds is not True and parsed_headers == ["*"]:
+            # Istio forwards allowHeaders: ["*"] to Envoy as "*", which reflects requested headers including
+            # Authorization; Fetch excludes Authorization from literal "*", so emit ["*", "authorization"].
+            effective_headers: Any = ["*", "authorization"]
+        else:
+            effective_headers = raw_headers
         raw_max_age = policy.get("maxAge")
         max_age = util.parse_go_duration_ms(raw_max_age) if raw_max_age is not None else None
         if raw_max_age is not None and max_age is None:
@@ -753,7 +765,7 @@ class _Istio:
             return
         # Pass unmatched_preflights explicitly so Ferrum preserves omitted allowMethods/allowHeaders/maxAge
         # rather than supplying permissive defaults that could broaden credentialed CORS.
-        built, problem = cors_config(origins, policy.get("allowMethods"), policy.get("allowHeaders"),
+        built, problem = cors_config(origins, policy.get("allowMethods"), effective_headers,
                                      policy.get("exposeHeaders"), creds,
                                      max_age // 1000 if max_age is not None else None,
                                      unmatched_preflights=unmatched_mode)

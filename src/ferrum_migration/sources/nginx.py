@@ -1103,11 +1103,14 @@ class _Nginx:
                 if comp_cfg is not None:
                     route.plugins.append(PluginSpec("compression", comp_cfg, ref))
                     self.report.warning("nginx-gzip", ref,
-                                        "Ferrum compression skips chunked/unknown-length responses lacking "
-                                        "Content-Length when min_content_length > 0 (whereas NGINX compresses "
-                                        "eligible chunked responses), and returns HTTP 406 when Accept-Encoding "
-                                        "excludes identity and the response cannot be encoded (e.g. 'br, identity;q=0' "
-                                        "or unknown-length responses under 'gzip, identity;q=0').")
+                                        "Ferrum compression returns HTTP 406 when Accept-Encoding excludes identity "
+                                        "and no acceptable coding can be produced (e.g. 'br, identity;q=0', or a "
+                                        "response below min_content_length / non-whitelisted MIME type / no-transform "
+                                        "under 'gzip, identity;q=0'), whereas NGINX forwards the unencoded response. "
+                                        "Under Ferrum's default 10 MiB response ceiling, eligible chunked/unknown-length "
+                                        "responses are still compressed; if FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES is set "
+                                        "to 0 or above 32 MiB, Ferrum skips unknown-length responses lacking "
+                                        "Content-Length (serving identity, or 406 when identity is excluded).")
                 else:
                     self.report.warning("nginx-gzip", ref, f"gzip omitted ({comp_problem}).")
         size = scope.body_size if scope.body_size is not None else 1024 * 1024

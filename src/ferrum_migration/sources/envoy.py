@@ -20,8 +20,8 @@ from ..model import BackendRef, HostScope, Plan, PluginSpec, RouteSpec, Target, 
 from ..redact import safe_label
 from ..safe_load import load_structured
 from .common import (SourceContext, apply_first_match_order, check_route_budget, choose_main_port, compression_config,
-                     cors_config, fault_injection_config, header_value_ok, literal_value, mapping,
-                     merge_weighted_targets, request_header_rule, response_header_rule, retry_from_policy, seq,
+                     cors_config, cors_origin_matches_star, fault_injection_config, header_value_ok, literal_value,
+                     mapping, merge_weighted_targets, request_header_rule, response_header_rule, retry_from_policy, seq,
                      split_csv, str_list)
 
 PLATFORM = "envoy"
@@ -359,6 +359,7 @@ class _Envoy:
         cors_filter_count = 0
         fault_index: int | None = None
         cors_index: int | None = None
+        grpc_web_index: int | None = None
         for idx, http_filter in enumerate(seq(config.get("http_filters"))):
             raw_filter = mapping(http_filter)
             if raw_filter.get("config_discovery") is not None:
@@ -395,6 +396,8 @@ class _Envoy:
                 if set(typed) - {"@type"}:
                     filter_refusal = "HTTP filter grpc_web has unsupported configuration fields"
                 else:
+                    if grpc_web_index is None:
+                        grpc_web_index = idx
                     hcm_plugins.append(PluginSpec("grpc_web", {}, ref))
             elif kind == "compressor":
                 comp_status, comp_val = _parse_envoy_compressor(typed)
@@ -440,7 +443,8 @@ class _Envoy:
                   "hcm_fault": hcm_fault,
                   "hcm_fault_error": hcm_fault_error,
                   "fault_index": fault_index,
-                  "cors_index": cors_index}
+                  "cors_index": cors_index,
+                  "grpc_web_index": grpc_web_index}
         for index, vhost in enumerate(seq(route_config.get("virtual_hosts"))):
             if isinstance(vhost, dict):
                 self._vhost(vhost, index, ref, listen_port, tls, cors_enabled, filter_refusal, buffer_limit, shared)
@@ -595,15 +599,16 @@ class _Envoy:
                 if filter_kind == "fault":
                     if override.get("disabled") is True and (not override_msg or is_filter_config):
                         winning_fault = ("disabled", None)
-                        continue
-                    if not is_filter_config and (
-                        not override_msg or override_msg in (
-                            "envoy.extensions.filters.http.fault.v3.httpfault",
-                            "envoy.config.filter.http.fault.v2.httpfault",
-                        )
+                    elif is_filter_config:
+                        winning_fault = ("wrapped", (label, override))
+                    elif not override_msg or override_msg in (
+                        "envoy.extensions.filters.http.fault.v3.httpfault",
+                        "envoy.config.filter.http.fault.v2.httpfault",
                     ):
                         winning_fault = ("override", (label, override))
-                        continue
+                    else:
+                        winning_fault = ("unsupported", (label, key_str))
+                    continue
                 others.append(key_str)
             if others:
                 names = ", ".join(safe_label(key, 80) for key in others[:3])
@@ -614,6 +619,25 @@ class _Envoy:
             effective_fault = winning_fault[1]
         elif winning_fault[0] == "hcm_error":
             spec.refuse(winning_fault[1])
+        elif winning_fault[0] == "wrapped":
+            fault_label, wrapper = winning_fault[1]
+            inner = wrapper.get("config")
+            inner_type = str(mapping(inner).get("@type", "")).strip().lower()
+            inner_msg = inner_type.rsplit("/", 1)[-1] if inner_type else ""
+            if set(wrapper) <= {"@type", "config", "disabled", "is_optional"} and isinstance(inner, dict) \
+                    and (not inner_msg or inner_msg in (
+                        "envoy.extensions.filters.http.fault.v3.httpfault",
+                        "envoy.config.filter.http.fault.v2.httpfault",
+                    )):
+                fault_status, fault_val = _parse_envoy_fault(inner, has_runtime=self.has_runtime)
+                if fault_status == "plugin":
+                    effective_fault = PluginSpec("fault_injection", fault_val, ref)
+                elif fault_status == "omit":
+                    effective_fault = None
+                else:
+                    spec.refuse(f"{fault_label} typed_per_filter_config for fault cannot be migrated ({fault_val})")
+            else:
+                spec.refuse(f"{fault_label} typed_per_filter_config FilterConfig wrapper for fault is not supported")
         elif winning_fault[0] == "override":
             fault_label, fault_override = winning_fault[1]
             fault_status, fault_val = _parse_envoy_fault(fault_override, has_runtime=self.has_runtime)
@@ -623,6 +647,10 @@ class _Envoy:
                 effective_fault = None
             else:
                 spec.refuse(f"{fault_label} typed_per_filter_config for fault cannot be migrated ({fault_val})")
+        elif winning_fault[0] == "unsupported":
+            fault_label, fault_key = winning_fault[1]
+            spec.refuse(f"{fault_label} typed_per_filter_config for HTTP filter(s) {safe_label(fault_key, 80)} "
+                        "can enable or change a filter for this route, which is not migrated")
         if raw.get("direct_response") is not None:
             self._direct_response(spec, mapping(raw.get("direct_response")))
             if effective_fault is not None:
@@ -641,6 +669,13 @@ class _Envoy:
             return spec
         self._action(spec, action, vhost, ref)
         if effective_fault is not None:
+            gw_idx = shared.get("grpc_web_index")
+            f_idx = shared.get("fault_index")
+            if gw_idx is not None and f_idx is not None and gw_idx < f_idx \
+                    and effective_fault.config.get("abort", {}).get("grpc_status") is not None:
+                spec.refuse("grpc_web precedes fault with explicit grpc_status in Envoy http_filters, whereas "
+                            "Ferrum fault_injection emits grpc_status only for client-native gRPC (gRPC-Web falls "
+                            "back to HTTP 503 / gRPC UNAVAILABLE)")
             spec.plugins.append(PluginSpec(effective_fault.name, effective_fault.config, effective_fault.ref))
         self._headers(spec, raw, vhost, shared, ref)
         cors_active = self._cors(spec, raw, vhost, shared, cors_enabled, hcm_filter_kinds, ref)
@@ -951,10 +986,13 @@ class _Envoy:
         parsed_methods = split_csv(merged_methods) or None
         parsed_headers = split_csv(merged_headers) or None
         parsed_expose = split_csv(merged_expose) or None
-        if creds is True and any(o == "*" or o == {"exact": "*"} for o in origins):
-            spec.refuse("CORS policy combines allow_credentials=true with wildcard '*' origin, which Ferrum "
-                        "downgrades by disabling credentials")
-            return False
+        # Envoy treats any origin matcher matching literal "*" (exact, prefix, or safe_regex) as allow-all.
+        if any(cors_origin_matches_star(o) for o in origins):
+            if creds is True:
+                spec.refuse("CORS policy combines allow_credentials=true with a wildcard '*' origin matcher, "
+                            "which Ferrum downgrades by disabling credentials")
+                return False
+            origins = ["*"]
         if creds is True and any("*" in (lst or []) for lst in (parsed_methods, parsed_headers, parsed_expose)):
             spec.refuse("CORS policy combines allow_credentials=true with wildcard '*' in "
                         "allow_methods/allow_headers/expose_headers, which Ferrum returns literally; specify "
