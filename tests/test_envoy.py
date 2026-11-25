@@ -822,6 +822,59 @@ class EnvoyHardeningTest(unittest.TestCase):
         self.assertEqual(sc_res.config["plugin_configs"], [])
         self.assertIn("envoy-cors-inactive", codes(sc_rep, "info"))
         self.assertIn("envoy-compressor", codes(sc_rep, "warning"))
+        # 7) Envoy cors_filter.cc precedence regressions:
+        #    (A) vhost FilterConfig{disabled: true} disables CORS even when a stale legacy route.cors exists.
+        #    (B) route_config typed CorsPolicy overrides stale legacy route.cors.
+        #    (C) route typed CorsPolicy inherits narrower allow_methods from vhost typed CorsPolicy.
+        dis_cors = minimal_bootstrap({"path_separated_prefix": "/api"})
+        dhcm = dis_cors["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"]
+        dhcm["http_filters"].insert(0, {"name": "envoy.filters.http.cors"})
+        dhcm["route_config"]["virtual_hosts"][0]["typed_per_filter_config"] = {
+            "envoy.filters.http.cors": {
+                "@type": "type.googleapis.com/envoy.config.route.v3.FilterConfig",
+                "disabled": True,
+            }
+        }
+        dhcm["route_config"]["virtual_hosts"][0]["routes"][0]["route"]["cors"] = {
+            "allow_origin_string_match": [{"exact": "https://partner.example.net"}],
+            "allow_credentials": {"value": True},
+        }
+        dis_res, dis_rep, _ = migrate("envoy", yaml.safe_dump(dis_cors))
+        self.assertEqual(dis_res.config["plugin_configs"], [])
+        self.assertIn("envoy-cors-inactive", codes(dis_rep, "info"))
+
+        typed_over_legacy = minimal_bootstrap({"path_separated_prefix": "/api"})
+        thcm = typed_over_legacy["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"]
+        thcm["http_filters"].insert(0, {"name": "envoy.filters.http.cors"})
+        thcm["route_config"]["typed_per_filter_config"] = {
+            "envoy.filters.http.cors": {
+                "@type": "type.googleapis.com/envoy.extensions.filters.http.cors.v3.CorsPolicy",
+                "allow_origin_string_match": [{"exact": "https://app.example.com"}],
+                "allow_methods": "GET",
+            }
+        }
+        thcm["route_config"]["virtual_hosts"][0]["routes"][0]["route"]["cors"] = {
+            "allow_origin_string_match": [{"exact": "https://partner.example.net"}],
+            "allow_credentials": {"value": True},
+        }
+        tol_res, _tol_rep, _ = migrate("envoy", yaml.safe_dump(typed_over_legacy))
+        tol_cors = plugin(self, tol_res.config, one_proxy(self, tol_res.config, "/api"), "cors")["config"]
+        self.assertEqual(tol_cors["allowed_origins"], [{"exact": "https://app.example.com"}])
+        self.assertEqual(tol_cors["allowed_methods"], ["GET"])
+        self.assertFalse(tol_cors.get("allow_credentials", False))
+
+        typed_inherit = copy.deepcopy(typed_over_legacy)
+        ihcm = typed_inherit["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"]
+        ihcm["route_config"]["virtual_hosts"][0]["routes"][0]["typed_per_filter_config"] = {
+            "envoy.filters.http.cors": {
+                "@type": "type.googleapis.com/envoy.extensions.filters.http.cors.v3.CorsPolicy",
+                "allow_origin_string_match": [{"exact": "https://route.example.com"}],
+            }
+        }
+        ti_res, _ti_rep, _ = migrate("envoy", yaml.safe_dump(typed_inherit))
+        ti_cors = plugin(self, ti_res.config, one_proxy(self, ti_res.config, "/api"), "cors")["config"]
+        self.assertEqual(ti_cors["allowed_origins"], [{"exact": "https://route.example.com"}])
+        self.assertEqual(ti_cors["allowed_methods"], ["GET"])
 
 
 if __name__ == "__main__":

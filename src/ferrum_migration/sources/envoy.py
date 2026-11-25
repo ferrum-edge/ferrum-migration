@@ -730,20 +730,19 @@ class _Envoy:
 
     def _cors(self, spec: RouteSpec, raw: dict, vhost: dict, shared: dict, enabled: bool,
               hcm_filter_kinds: dict[str, str], ref: str) -> None:
-        # Resolve effective CORS policy in Envoy's precedence order:
-        # route typed_per_filter_config -> route.cors (RouteAction) -> vhost typed_per_filter_config ->
-        # vhost.cors -> route_config typed_per_filter_config. A FilterConfig{disabled: true} at a more specific
-        # level disables any inherited CORS policy.
-        policy: dict | None = None
-        route_action = mapping(raw.get("route"))
-        levels: list[tuple[dict, Any]] = [
-            (mapping(raw.get("typed_per_filter_config")),
-             route_action.get("cors") if route_action.get("cors") is not None else raw.get("cors")),
-            (mapping(vhost.get("typed_per_filter_config")), vhost.get("cors")),
-            (mapping(shared.get("typed_per_filter_config")), None),
-        ]
-        for per_filter, legacy_cors in levels:
-            found_typed = False
+        # Match Envoy cors_filter.cc initializeCorsPolicies precedence:
+        # 1) Walk route -> vhost -> route_config typed_per_filter_config for cors-kind entries. If the most
+        #    specific cors entry is FilterConfig{disabled: true}, the filter is disabled (legacy route.cors/vhost.cors
+        #    cannot re-enable it).
+        # 2) Collect all non-FilterConfig typed CorsPolicy entries (most specific first).
+        # 3) Read legacy route.cors / vhost.cors ONLY when no typed CorsPolicy exists at any level.
+        # 4) Enablement (enabled / filter_enabled / shadow_enabled) comes from policies[0]; other fields inherit
+        #    from the first policy in policies that sets each field.
+        typed_policies: list[dict] = []
+        saw_cors_override = False
+        for per_filter in (mapping(raw.get("typed_per_filter_config")),
+                           mapping(vhost.get("typed_per_filter_config")),
+                           mapping(shared.get("typed_per_filter_config"))):
             for k, v in per_filter.items():
                 if hcm_filter_kinds.get(str(k)) != "cors":
                     continue
@@ -751,27 +750,30 @@ class _Envoy:
                 otype = str(override.get("@type", "")).strip().lower()
                 omsg = otype.rsplit("/", 1)[-1] if otype else ""
                 is_fc = omsg in ("envoy.config.route.v3.filterconfig", "envoy.api.v2.route.filterconfig")
-                if override.get("disabled") is True and (not omsg or is_fc):
-                    self.report.info("envoy-cors-inactive", ref,
-                                     "CORS filter disabled via typed_per_filter_config; omitted.")
-                    return
+                if not saw_cors_override:
+                    saw_cors_override = True
+                    if override.get("disabled") is True and (not omsg or is_fc):
+                        self.report.info("envoy-cors-inactive", ref,
+                                         "CORS filter disabled via typed_per_filter_config; omitted.")
+                        return
                 if not is_fc:
-                    policy = override
-                    found_typed = True
-                    break
-            if found_typed:
+                    typed_policies.append(override)
                 break
-            if isinstance(legacy_cors, dict):
-                policy = legacy_cors
-                break
-        if policy is None:
+        route_action = mapping(raw.get("route"))
+        if typed_policies:
+            policies = typed_policies
+        else:
+            legacy_route = route_action.get("cors") if route_action.get("cors") is not None else raw.get("cors")
+            policies = [p for p in (legacy_route, vhost.get("cors")) if isinstance(p, dict)]
+        if not policies:
             return
-        if not enabled:
+        if not enabled and not typed_policies:
             self.report.info("envoy-cors-inactive", ref, "CORS policy present without the cors HTTP filter; ignored "
                              "(it had no effect in Envoy).")
             return
-        # Check Envoy enablement/shadow controls so 0% / shadow-only CORS policies never become active in Ferrum.
-        raw_legacy_enabled = policy.get("enabled")
+        # Check Envoy enablement/shadow controls on the most specific policy so 0% / shadow-only CORS never activates.
+        top_policy = policies[0]
+        raw_legacy_enabled = top_policy.get("enabled")
         if raw_legacy_enabled is not None:
             legacy_bool = _proto_bool(raw_legacy_enabled)
             if legacy_bool is False:
@@ -780,7 +782,7 @@ class _Envoy:
             if legacy_bool is None:
                 spec.refuse("CORS policy has an invalid enabled value")
                 return
-        raw_fe = policy.get("filter_enabled")
+        raw_fe = top_policy.get("filter_enabled")
         if raw_fe is not None:
             if not isinstance(raw_fe, dict) or raw_fe.get("runtime_key"):
                 spec.refuse("CORS policy uses dynamic or malformed filter_enabled that cannot be preserved statically")
@@ -794,11 +796,23 @@ class _Envoy:
                 self.report.info("envoy-cors-inactive", ref,
                                  "CORS policy has filter_enabled 0% (inactive or shadow-only); omitted.")
                 return
-        elif policy.get("shadow_enabled") is not None:
+        elif top_policy.get("shadow_enabled") is not None:
             spec.refuse("CORS policy sets shadow_enabled without an explicit filter_enabled; review manually")
             return
+        # Merge CORS fields most-specific-first matching Envoy's cors_filter.cc field fallback across policy layers.
+        merged_origins = next((p["allow_origin_string_match"] for p in policies
+                               if seq(p.get("allow_origin_string_match"))), None)
+        merged_methods = next((p["allow_methods"] for p in policies
+                               if isinstance(p.get("allow_methods"), str) and p["allow_methods"]), None)
+        merged_headers = next((p["allow_headers"] for p in policies
+                               if isinstance(p.get("allow_headers"), str) and p["allow_headers"]), None)
+        merged_expose = next((p["expose_headers"] for p in policies
+                              if isinstance(p.get("expose_headers"), str) and p["expose_headers"]), None)
+        merged_max_age = next((p["max_age"] for p in policies
+                               if p.get("max_age") is not None and p.get("max_age") != ""), None)
+        raw_creds = next((p["allow_credentials"] for p in policies if p.get("allow_credentials") is not None), None)
         origins = []
-        for matcher in seq(policy.get("allow_origin_string_match")):
+        for matcher in seq(merged_origins):
             matcher = mapping(matcher)
             if "exact" in matcher:
                 origins.append({"exact": matcher["exact"]})
@@ -809,8 +823,6 @@ class _Envoy:
             else:
                 origins = []
                 break
-        max_age = policy.get("max_age")
-        raw_creds = policy.get("allow_credentials")
         creds: bool | None = None
         if raw_creds is not None:
             creds = _proto_bool(raw_creds)
@@ -819,10 +831,10 @@ class _Envoy:
                                     "CORS omitted (allow_credentials has an invalid non-boolean value); browsers block "
                                     "cross-origin calls.")
                 return
-        built, problem = cors_config(origins, split_csv(policy.get("allow_methods")) or None,
-                                     split_csv(policy.get("allow_headers")) or None,
-                                     split_csv(policy.get("expose_headers")) or None,
-                                     creds, util.as_int(max_age) if max_age else None)
+        built, problem = cors_config(origins, split_csv(merged_methods) or None,
+                                     split_csv(merged_headers) or None,
+                                     split_csv(merged_expose) or None,
+                                     creds, util.as_int(merged_max_age) if merged_max_age else None)
         if built:
             spec.plugins.append(PluginSpec("cors", built, ref))
         else:
