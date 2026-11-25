@@ -244,7 +244,7 @@ _CORS_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
 _CORS_UNICODE_SHORTHANDS = frozenset("wWdDsS")
 _CORS_MAX_REPEAT = 64
 _CORS_MAX_TOTAL_REPEATS = 128
-_CORS_MAX_UNICODE_SHORTHANDS = 4
+_CORS_MAX_UNICODE_SHORTHANDS = 1
 _CORS_MAX_COMPILED_COST = 512
 
 
@@ -319,13 +319,14 @@ def _cors_regex_problem(pattern: str) -> str | None:
                 if unicode_shorthands > _CORS_MAX_UNICODE_SHORTHANDS:
                     return "an allowed origin regex exceeds safe Rust regex size bounds"
                 group_unicode_stack[-1] = True
+                shorthand_cost = 400 if nxt in ("w", "W") else 256
                 if class_depth > 0:
                     class_has_unicode = True
-                    class_atom_count += 1
+                    class_atom_count += shorthand_cost
                     class_state = 0
                 else:
-                    group_cost_stack[-1] += 128
-                    last_atom_cost = 128
+                    group_cost_stack[-1] += shorthand_cost
+                    last_atom_cost = shorthand_cost
                     last_atom_mult = 1
                     last_atom_unicode = True
                     has_atom = True
@@ -351,7 +352,9 @@ def _cors_regex_problem(pattern: str) -> str | None:
                 continue
             if ch == "]" and class_state == 0:
                 class_depth = 0
-                atom_cost = 128 if class_has_unicode else (64 if class_negated else max(4, class_atom_count))
+                atom_cost = max(256, class_atom_count) if class_has_unicode else (
+                    64 if class_negated else max(4, class_atom_count)
+                )
                 group_cost_stack[-1] += atom_cost
                 if sum(group_cost_stack) > _CORS_MAX_COMPILED_COST:
                     return "an allowed origin regex exceeds safe Ferrum compiled-size limits"

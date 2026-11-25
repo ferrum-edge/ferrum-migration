@@ -1296,13 +1296,13 @@ def _resolve_conflicts(candidates: list[_Cand], report: Report) -> list[_Cand]:
                 eset.add(h)
 
     def _build_outrank_indices() -> dict[str, Any]:
-        # Host-first indexing: lookup finds only _HostPathBuckets whose hosts overlap `named_hosts`, then
-        # queries only the matching path buckets inside each overlapping host (never enumerating unrelated hosts).
+        # Host-first + suffix-subtree indexing: exact hosts look up exact + parent wildcard buckets;
+        # wildcard hosts look up their own bucket + a single pre-aggregated subtree _HostPathBucket +
+        # parent wildcards, so wildcard collapses never enumerate N child hosts on disjoint paths.
         ports_present: set[int | None] = set()
         exact_buckets: dict[int | None, dict[str, _HostPathBucket]] = {}
         wild_buckets: dict[int | None, dict[str, _HostPathBucket]] = {}
-        exact_by_suffix: dict[int | None, dict[str, set[str]]] = {}
-        wild_by_parent: dict[int | None, dict[str, set[str]]] = {}
+        subtree_buckets: dict[int | None, dict[str, _HostPathBucket]] = {}
         for item in candidates:
             if item.placeholder or not item.hosts:
                 continue
@@ -1310,8 +1310,8 @@ def _resolve_conflicts(candidates: list[_Cand], report: Report) -> list[_Cand]:
             ports_present.add(port)
             ex_map = exact_buckets.setdefault(port, {})
             wi_map = wild_buckets.setdefault(port, {})
-            ex_suf = exact_by_suffix.setdefault(port, {})
-            wi_par = wild_by_parent.setdefault(port, {})
+            sub_map = subtree_buckets.setdefault(port, {})
+            seen_sub_suffixes: set[str] = set()
             for h in item.hosts:
                 if h.startswith("*."):
                     suffix = h[1:]
@@ -1319,27 +1319,40 @@ def _resolve_conflicts(candidates: list[_Cand], report: Report) -> list[_Cand]:
                     if bucket is None:
                         bucket = _HostPathBucket()
                         wi_map[suffix] = bucket
-                        dot = suffix.find(".", 1)
-                        while dot != -1:
-                            wi_par.setdefault(suffix[dot:], set()).add(suffix)
-                            dot = suffix.find(".", dot + 1)
                     bucket.add(item)
+                    dot = suffix.find(".", 1)
+                    while dot != -1:
+                        parent_suf = suffix[dot:]
+                        if parent_suf not in seen_sub_suffixes:
+                            seen_sub_suffixes.add(parent_suf)
+                            sb = sub_map.get(parent_suf)
+                            if sb is None:
+                                sb = _HostPathBucket()
+                                sub_map[parent_suf] = sb
+                            sb.add(item)
+                        dot = suffix.find(".", dot + 1)
                 else:
                     bucket = ex_map.get(h)
                     if bucket is None:
                         bucket = _HostPathBucket()
                         ex_map[h] = bucket
-                        dot = h.find(".")
-                        while dot != -1:
-                            ex_suf.setdefault(h[dot:], set()).add(h)
-                            dot = h.find(".", dot + 1)
                     bucket.add(item)
+                    dot = h.find(".")
+                    while dot != -1:
+                        parent_suf = h[dot:]
+                        if parent_suf not in seen_sub_suffixes:
+                            seen_sub_suffixes.add(parent_suf)
+                            sb = sub_map.get(parent_suf)
+                            if sb is None:
+                                sb = _HostPathBucket()
+                                sub_map[parent_suf] = sb
+                            sb.add(item)
+                        dot = h.find(".", dot + 1)
         return {
             "ports": ports_present,
             "exact": exact_buckets,
             "wild": wild_buckets,
-            "exact_by_suffix": exact_by_suffix,
-            "wild_by_parent": wild_by_parent,
+            "subtree": subtree_buckets,
         }
 
     def _matching_host_buckets(port: int | None, hosts: list[str]) -> list[_HostPathBucket]:
@@ -1348,8 +1361,7 @@ def _resolve_conflicts(candidates: list[_Cand], report: Report) -> list[_Cand]:
         wi_map: dict[str, _HostPathBucket] = outrank_indices["wild"].get(port, {})
         if not hosts:
             return list(ex_map.values()) + list(wi_map.values())
-        ex_suf: dict[str, set[str]] = outrank_indices["exact_by_suffix"].get(port, {})
-        wi_par: dict[str, set[str]] = outrank_indices["wild_by_parent"].get(port, {})
+        sub_map: dict[str, _HostPathBucket] = outrank_indices["subtree"].get(port, {})
         found: list[_HostPathBucket] = []
         seen_ids: set[int] = set()
 
@@ -1362,10 +1374,7 @@ def _resolve_conflicts(candidates: list[_Cand], report: Report) -> list[_Cand]:
             if h.startswith("*."):
                 suffix = h[1:]
                 _add_bucket(wi_map.get(suffix))
-                for ex_h in ex_suf.get(suffix, ()):
-                    _add_bucket(ex_map.get(ex_h))
-                for child_suf in wi_par.get(suffix, ()):
-                    _add_bucket(wi_map.get(child_suf))
+                _add_bucket(sub_map.get(suffix))
                 dot = suffix.find(".", 1)
                 while dot != -1:
                     _add_bucket(wi_map.get(suffix[dot:]))

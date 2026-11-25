@@ -213,6 +213,8 @@ _POSIX_CLASS_RE = re.compile(
 _UNICODE_CLASS_ESCAPES = frozenset("wWdDsSpP")
 _RUST_CLASS_LETTER_ESCAPES = frozenset("aftnrvxuUpPdDsSwW")
 _RUST_OUTER_LETTER_ESCAPES = _RUST_CLASS_LETTER_ESCAPES | frozenset("AzbB")
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+_HEX_ESCAPE_WIDTH = {"x": 2, "u": 4, "U": 8}
 MAX_REGEX_EXPANDED_COST = 10_000
 MAX_REGEX_GROUP_DEPTH = 48
 
@@ -266,6 +268,13 @@ def _rust_regex_syntax_problem(pattern: str) -> tuple[str | None, str]:
                 allowed = _RUST_CLASS_LETTER_ESCAPES if in_class else _RUST_OUTER_LETTER_ESCAPES
                 if nxt not in allowed:
                     return "regex uses escapes unsupported by the Rust regex engine", ""
+            step = 2
+            if nxt in _HEX_ESCAPE_WIDTH:
+                width = _HEX_ESCAPE_WIDTH[nxt]
+                if i + 2 + width <= n and all(c in _HEX_DIGITS for c in pattern[i + 2:i + 2 + width]):
+                    step = 2 + width
+                else:
+                    return "regex uses hex/unicode escape syntax not portable between Python and Rust regex", ""
             esc_cost = (100 if u_on else 4) if nxt in _UNICODE_CLASS_ESCAPES else 1
             if in_class:
                 class_cost += esc_cost
@@ -281,8 +290,8 @@ def _rust_regex_syntax_problem(pattern: str) -> tuple[str | None, str]:
                 err = _charge(esc_cost)
                 if err:
                     return err, ""
-            py_parts.append(pattern[i:i + 2])
-            i += 2
+            py_parts.append(pattern[i:i + step])
+            i += step
             continue
         if in_class:
             if ch == "[":

@@ -1424,6 +1424,19 @@ class EnvoyHardeningTest(unittest.TestCase):
         bs_res = migrate("envoy", yaml.safe_dump(buf_static))[0]
         self.assertEqual(one_proxy(self, bs_res.config, "=/old")["labels"]["ferrum-migration/status"], "refused")
         self.assertEqual(one_proxy(self, bs_res.config, "=/healthz")["labels"]["ferrum-migration/status"], "refused")
+        # Multiple Unicode \w shorthands exceed Ferrum's 64 KiB CORS regex compilation limit -> refused.
+        w_cors = minimal_bootstrap({"path_separated_prefix": "/cors-w"})
+        whcm = w_cors["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"]
+        whcm["http_filters"] = [{"name": "envoy.filters.http.cors"}, {"name": "envoy.filters.http.router"}]
+        whcm["route_config"]["virtual_hosts"][0]["routes"][0]["typed_per_filter_config"] = {
+            "envoy.filters.http.cors": {
+                "@type": "type.googleapis.com/envoy.extensions.filters.http.cors.v3.CorsPolicy",
+                "allow_credentials": {"value": False},
+                "allow_origin_string_match": [{"safe_regex": {"regex": r"https://\w\.\w\.\w\.example\.test"}}],
+            }
+        }
+        w_res = migrate("envoy", yaml.safe_dump(w_cors))[0]
+        self.assertEqual(one_proxy(self, w_res.config, "/cors-w")["labels"]["ferrum-migration/status"], "refused")
 
     def test_tls_only_plaintext_exact_and_case_insensitive_routes_do_not_shadow_or_poison_https(self):
         # Plaintext named exact =/extra (including case_sensitive: false) must neither poison a live HTTPS catch-all
