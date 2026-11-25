@@ -972,6 +972,29 @@ class NginxFrontendScopeTest(unittest.TestCase):
         self.assertEqual(root_proxy.get("listen_path"), "/")
         self.assertNotIn("hosts", root_proxy)
         self.assertEqual(root_proxy["labels"]["ferrum-migration/status"], "migrated")
+        # A dual-listener server that redirects HTTP via `if ($scheme = http)` owns its hostname on HTTP: in
+        # HTTP-only mode its HostScope stays active so HTTP requests for that host fail closed (404) instead of
+        # reaching the plaintext default backend.
+        redirect_owner_conf = """
+        server {
+            listen 80 default_server;
+            location / { proxy_pass http://public.internal:8080; }
+        }
+        server {
+            listen 80;
+            listen 443 ssl;
+            server_name secure.example.test;
+            ssl_certificate /etc/synthetic/server.crt;
+            ssl_certificate_key /etc/synthetic/server.key;
+            if ($scheme = http) { return 301 https://$host$request_uri; }
+            location = /secure { proxy_pass http://secure.internal:8080; }
+        }
+        """
+        ro_res, _ro_rep, _ = nginx(redirect_owner_conf)
+        assert_structurally_valid(self, ro_res.config)
+        self.assertEqual(ro_res.frontend_protocols, "http")
+        self.assertEqual(one_proxy(self, ro_res.config, None, "secure.example.test")["labels"][
+            "ferrum-migration/status"], "scope-default")
 
 
 if __name__ == "__main__":

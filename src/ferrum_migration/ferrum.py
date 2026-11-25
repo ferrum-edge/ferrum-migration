@@ -890,8 +890,6 @@ def _drop_off_protocol_slot_conflicts(plan: Plan, candidates: list[_Cand], mode:
         if cand.placeholder:
             continue
         live_any_idx.add(cand)
-        if cand.hosts:
-            on_protocol_scope_idx.add(cand)
         r = cand.route
         if r.case_insensitive:
             live_ci_idx.add(cand)
@@ -906,6 +904,10 @@ def _drop_off_protocol_slot_conflicts(plan: Plan, candidates: list[_Cand], mode:
                 live_prefix_by_path.setdefault(p, _PortHostIndex()).add(cand)
                 if r.prefix_semantics == "string" and not r.trailing_slash:
                     live_string_prefix_by_path.setdefault(p, _PortHostIndex()).add(cand)
+                if r.trailing_slash and r.prefix_semantics == "string":
+                    # Reserve the bare-path exact guard slot that _add_trailing_slash_placeholders will need so
+                    # an off-protocol placeholder on "=" + p cannot block the guard and force this route refused.
+                    on_protocol_by_path.setdefault("=" + p, _PortHostIndex()).add(cand)
             if not cand.hosts:
                 live_catchall_paths_set.setdefault(cand.listen_port, set()).add(p)
             else:
@@ -967,11 +969,11 @@ def _drop_off_protocol_slot_conflicts(plan: Plan, candidates: list[_Cand], mode:
         seg_prefix = p + "/"
 
         def _matches_list(paths: list[str]) -> bool:
+            # Emitted Ferrum prefix listen_path strips any trailing slash, so at runtime it matches bare `p` as well
+            # as `p/...` and can shadow a lower-tier exact `=p` route even when `r.trailing_slash` is True.
             if not seg_only:
                 return _has_sorted_prefix(paths, p)
-            if not r.trailing_slash and _has_sorted_exact(paths, p):
-                return True
-            return _has_sorted_prefix(paths, seg_prefix)
+            return _has_sorted_exact(paths, p) or _has_sorted_prefix(paths, seg_prefix)
 
         ca_paths = sorted_catchall_paths.get(port)
         if ca_paths and _matches_list(ca_paths):
@@ -1205,8 +1207,17 @@ def _resolve_conflicts(candidates: list[_Cand], report: Report) -> list[_Cand]:
             if sig in seen_sigs:
                 continue
             seen_sigs.add(sig)
-            if r.kind in ("regex", "hostonly") or r.case_insensitive:
+            if r.kind == "hostonly" or r.case_insensitive:
                 needs_all = True
+            elif r.kind == "regex":
+                lit = util.regex_literal_prefix(r.path or "") if (
+                    r.path and not util.regex_alternation_unproven(r.path)
+                ) else ""
+                if len(lit) >= 2 and lit.startswith("/"):
+                    literal_paths.add(lit)
+                    has_prefix = True
+                else:
+                    needs_all = True
             else:
                 literal_paths.add(r.path or "/")
                 if r.kind == "prefix":

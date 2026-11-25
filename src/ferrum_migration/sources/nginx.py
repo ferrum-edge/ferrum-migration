@@ -599,7 +599,7 @@ class _Nginx:
             self._note_catch_all(info, base, [route])
             if base["hosts"]:
                 self.plan.host_scopes.append(
-                    HostScope(ref, list(base["hosts"]), listen_port, protocols=self._base_protocols(base))
+                    HostScope(ref, list(base["hosts"]), listen_port, protocols=self._base_scope_protocols(base))
                 )
             return
         locations = [d for d in server.block or [] if d.name == "location"]
@@ -625,7 +625,7 @@ class _Nginx:
         self._note_catch_all(info, base, routes)
         if base["hosts"]:
             self.plan.host_scopes.append(
-                HostScope(ref, list(base["hosts"]), listen_port, protocols=self._base_protocols(base))
+                HostScope(ref, list(base["hosts"]), listen_port, protocols=self._base_scope_protocols(base))
             )
 
     def _note_catch_all(self, info: dict, base: dict, routes: list[RouteSpec]) -> None:
@@ -680,7 +680,7 @@ class _Nginx:
             self._note_catch_all(info, base, routes)
             if base["hosts"]:
                 self.plan.host_scopes.append(
-                    HostScope(ref, list(base["hosts"]), base["listen_port"], protocols=self._base_protocols(base))
+                    HostScope(ref, list(base["hosts"]), base["listen_port"], protocols=self._base_scope_protocols(base))
                 )
 
     def _apply_ssl_reject_handshake(self, infos: list[dict]) -> None:
@@ -774,10 +774,20 @@ class _Nginx:
         return False
 
     def _base_protocols(self, base: dict) -> frozenset[str]:
-        """Main listeners NGINX served this server on (redirect-only plaintext and extra ports excluded)."""
+        """Main listeners NGINX served this server's forwarding routes on (redirect-only HTTP excluded)."""
         protocols = set()
         if base["listen_port"] is None:
             if base["on_plain"] and not base["requires_tls"]:
+                protocols.add("http")
+            if base["on_tls"]:
+                protocols.add("https")
+        return frozenset(protocols)
+
+    def _base_scope_protocols(self, base: dict) -> frozenset[str]:
+        """Main listeners on which NGINX owns this server_name (including redirect-only HTTP listeners)."""
+        protocols = set()
+        if base["listen_port"] is None:
+            if base["on_plain"]:
                 protocols.add("http")
             if base["on_tls"]:
                 protocols.add("https")

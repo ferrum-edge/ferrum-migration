@@ -217,14 +217,22 @@ MAX_REGEX_EXPANDED_COST = 10_000
 MAX_REGEX_GROUP_DEPTH = 48
 
 
-def _rust_regex_syntax_problem(pattern: str) -> str | None:
-    """Scan escapes, braces, verbose comments, inline flags, nesting depth, and expanded repetition cost linearly."""
+def _rust_regex_syntax_problem(pattern: str) -> tuple[str | None, str]:
+    """Scan escapes, braces, verbose comments, inline flags, nesting depth, and expanded repetition cost linearly.
+
+    Returns ``(error_message, python_normalized_pattern)`` where valid POSIX classes inside ``[...]`` are replaced
+    with ``0`` in ``python_normalized_pattern`` so Python's ``re.compile`` validates the exact same class boundaries
+    and character ranges as Rust's ``regex-syntax``.
+    """
     n = len(pattern)
     i = 0
     in_class = False
+    class_start_item = False
+    class_prev_dash = False
     class_cost = 0
     flag_stack: list[tuple[bool, bool]] = [(False, True)]  # (verbose_x, unicode_u)
     cost_stack: list[list[int]] = [[0, 0]]  # [group_total_cost, last_atom_cost]
+    py_parts: list[str] = []
 
     def _charge(atom_cost: int) -> str | None:
         frame = cost_stack[-1]
@@ -246,81 +254,105 @@ def _rust_regex_syntax_problem(pattern: str) -> str | None:
         x_on, u_on = flag_stack[-1]
         if ch == "\\":
             if i + 1 >= n:
-                return "regex ends with a trailing backslash"
+                return "regex ends with a trailing backslash", ""
             nxt = pattern[i + 1]
             if "0" <= nxt <= "9":
-                return "regex uses backreferences or octal escapes unsupported by the Rust regex engine"
+                return "regex uses backreferences or octal escapes unsupported by the Rust regex engine", ""
             if not nxt.isascii() or nxt in ("<", ">"):
-                return "regex uses escapes unsupported or parsed differently by the Rust regex engine"
+                return "regex uses escapes unsupported or parsed differently by the Rust regex engine", ""
             if nxt.isalpha():
                 allowed = _RUST_CLASS_LETTER_ESCAPES if in_class else _RUST_OUTER_LETTER_ESCAPES
                 if nxt not in allowed:
-                    return "regex uses escapes unsupported by the Rust regex engine"
+                    return "regex uses escapes unsupported by the Rust regex engine", ""
             esc_cost = (100 if u_on else 4) if nxt in _UNICODE_CLASS_ESCAPES else 1
             if in_class:
                 class_cost += esc_cost
+                class_start_item = False
+                class_prev_dash = False
             else:
                 err = _charge(esc_cost)
                 if err:
-                    return err
+                    return err, ""
+            py_parts.append(pattern[i:i + 2])
             i += 2
             continue
         if in_class:
             if ch == "[":
                 pm = _POSIX_CLASS_RE.match(pattern, i)
                 if pm is not None:
+                    if class_prev_dash:
+                        return "regex uses a POSIX class as the end of a character range (rejected by Rust regex)", ""
+                    end_pos = pm.end()
+                    if end_pos < n and pattern[end_pos] == "-" and (end_pos + 1 >= n or pattern[end_pos + 1] != "]"):
+                        return "regex uses a POSIX class as the start of a character range (rejected by Rust regex)", ""
                     class_cost += 4
-                    i = pm.end()
+                    class_start_item = False
+                    class_prev_dash = False
+                    py_parts.append("0")
+                    i = end_pos
                     continue
-                return "regex uses unescaped '[' inside a character class (nested class syntax differs in Rust regex)"
+                return "regex uses unescaped '[' inside a character class (nested class syntax differs in Rust regex)", ""
             if i + 1 < n and pattern[i:i + 2] in ("&&", "--", "~~"):
                 return ("regex uses '&&', '--', or '~~' inside a character class, which Rust regex parses as a "
-                        "character-class set operator rather than literal characters")
+                        "character-class set operator rather than literal characters"), ""
             if x_on and (ch == "#" or ch.isspace()):
                 return ("regex uses unescaped '#' or whitespace inside a character class under verbose (?x) mode, "
-                        "which Rust regex parses differently from PCRE/Python")
+                        "which Rust regex parses differently from PCRE/Python"), ""
             if ch == "]":
                 in_class = False
+                class_start_item = False
+                class_prev_dash = False
                 err = _charge(max(2, class_cost))
                 if err:
-                    return err
+                    return err, ""
             else:
+                class_prev_dash = (ch == "-" and not class_start_item)
+                class_start_item = False
                 class_cost += 1
+            py_parts.append(ch)
             i += 1
             continue
         if x_on and ch == "#":
             nl = pattern.find("\n", i + 1)
             if nl == -1:
+                py_parts.append(pattern[i:])
                 break
+            py_parts.append(pattern[i:nl + 1])
             i = nl + 1
             continue
         if x_on and ch.isspace():
+            py_parts.append(ch)
             i += 1
             continue
         if ch == "[":
             in_class = True
+            class_start_item = True
+            class_prev_dash = False
             class_cost = 0
+            start_i = i
             i += 1
             if i < n and pattern[i] == "^":
                 i += 1
             if i < n and pattern[i] == "]":
                 class_cost += 1
+                class_start_item = False
                 i += 1
+            py_parts.append(pattern[start_i:i])
             continue
         if ch == "{":
             qm = _RUST_BRACE_QUANT.match(pattern, i)
             if qm is None:
-                return "regex contains an unescaped '{' that is not a valid counted repetition in Rust regex"
+                return "regex contains an unescaped '{' that is not a valid counted repetition in Rust regex", ""
             lo = int(qm.group(1))
             hi_raw = qm.group(2)
             if hi_raw:
                 hi = int(hi_raw)
                 if hi < lo or hi > 1000:
-                    return "regex counted repetition bounds are invalid or too large"
+                    return "regex counted repetition bounds are invalid or too large", ""
                 rep = hi
             else:
                 if lo > 1000:
-                    return "regex counted repetition bound is too large"
+                    return "regex counted repetition bound is too large", ""
                 rep = lo
             frame = cost_stack[-1]
             last = max(1, frame[1])
@@ -328,18 +360,21 @@ def _rust_regex_syntax_problem(pattern: str) -> str | None:
             frame[0] += last * (mult - 1)
             frame[1] = last * mult
             if frame[0] > MAX_REGEX_EXPANDED_COST:
-                return "regex expanded repetition cost exceeds safe Rust regex compilation limit"
+                return "regex expanded repetition cost exceeds safe Rust regex compilation limit", ""
+            py_parts.append(pattern[i:qm.end()])
             i = qm.end()
             if i < n and pattern[i] == "+":
-                return "regex uses possessive quantifiers unsupported by the Rust regex engine"
+                return "regex uses possessive quantifiers unsupported by the Rust regex engine", ""
             continue
         if ch in "*+?":
             if i + 1 < n and pattern[i + 1] == "+":
-                return "regex uses possessive quantifiers unsupported by the Rust regex engine"
+                return "regex uses possessive quantifiers unsupported by the Rust regex engine", ""
+            py_parts.append(ch)
             i += 1
             continue
         if ch == "|":
             cost_stack[-1][1] = 0
+            py_parts.append(ch)
             i += 1
             continue
         if ch == ")":
@@ -349,38 +384,44 @@ def _rust_regex_syntax_problem(pattern: str) -> str | None:
                 group_total, _ = cost_stack.pop()
                 err = _charge(max(1, group_total))
                 if err:
-                    return err
+                    return err, ""
+            py_parts.append(ch)
             i += 1
             continue
         if ch == "(":
             if i + 1 < n and pattern[i + 1] == "?":
                 if i + 2 >= n:
-                    return "regex has an incomplete group"
+                    return "regex has an incomplete group", ""
                 c2 = pattern[i + 2]
                 if c2 in ("=", "!", ">", "#", "|", "R", "&"):
-                    return "regex uses lookaround or group features unsupported by the Rust regex engine"
+                    return "regex uses lookaround or group features unsupported by the Rust regex engine", ""
                 if c2 == "<":
                     if i + 3 < n and pattern[i + 3] in ("=", "!"):
-                        return "regex uses lookbehind unsupported by the Rust regex engine"
+                        return "regex uses lookbehind unsupported by the Rust regex engine", ""
                     err = _push_group(flag_stack[-1])
                     if err:
-                        return err
+                        return err, ""
                     end = pattern.find(">", i + 3)
-                    i = (end + 1) if end != -1 else (i + 3)
+                    nxt_i = (end + 1) if end != -1 else (i + 3)
+                    py_parts.append(pattern[i:nxt_i])
+                    i = nxt_i
                     continue
                 if c2 == "P":
                     if i + 3 < n and pattern[i + 3] == "=":
-                        return "regex uses backreferences unsupported by the Rust regex engine"
+                        return "regex uses backreferences unsupported by the Rust regex engine", ""
                     err = _push_group(flag_stack[-1])
                     if err:
-                        return err
+                        return err, ""
                     end = pattern.find(">", i + 4) if (i + 3 < n and pattern[i + 3] == "<") else -1
-                    i = (end + 1) if end != -1 else (i + 3)
+                    nxt_i = (end + 1) if end != -1 else (i + 3)
+                    py_parts.append(pattern[i:nxt_i])
+                    i = nxt_i
                     continue
                 if c2 == ":":
                     err = _push_group(flag_stack[-1])
                     if err:
-                        return err
+                        return err, ""
+                    py_parts.append(pattern[i:i + 3])
                     i += 3
                     continue
                 # Inline flag group (?flags) or (?flags:...): Rust regex rejects duplicate flags and non-Rust flags.
@@ -393,21 +434,21 @@ def _rust_regex_syntax_problem(pattern: str) -> str | None:
                     flag = pattern[j]
                     if flag == "-":
                         if seen_dash:
-                            return "regex inline flag group repeats '-'"
+                            return "regex inline flag group repeats '-'", ""
                         seen_dash = True
                     elif flag in _RUST_REGEX_FLAGS:
                         if flag in seen_flags:
-                            return "regex inline flag group repeats a flag (rejected by Rust regex)"
+                            return "regex inline flag group repeats a flag (rejected by Rust regex)", ""
                         seen_flags.add(flag)
                         if flag == "x":
                             enable_x = not seen_dash
                         elif flag == "u":
                             enable_u = not seen_dash
                     else:
-                        return "regex uses inline flags unsupported by the Rust regex engine"
+                        return "regex uses inline flags unsupported by the Rust regex engine", ""
                     j += 1
                 if j >= n:
-                    return "regex has an unclosed inline flag group"
+                    return "regex has an unclosed inline flag group", ""
                 new_flags = (
                     x_on if enable_x is None else enable_x,
                     u_on if enable_u is None else enable_u,
@@ -415,25 +456,28 @@ def _rust_regex_syntax_problem(pattern: str) -> str | None:
                 if pattern[j] == ":":
                     err = _push_group(new_flags)
                     if err:
-                        return err
+                        return err, ""
                 else:
                     flag_stack[-1] = new_flags
+                py_parts.append(pattern[i:j + 1])
                 i = j + 1
                 continue
             err = _push_group(flag_stack[-1])
             if err:
-                return err
+                return err, ""
+            py_parts.append(ch)
             i += 1
             continue
         err = _charge(4 if ch == "." else 1)
         if err:
-            return err
+            return err, ""
+        py_parts.append(ch)
         i += 1
     if in_class:
-        return "regex has an unclosed character class"
+        return "regex has an unclosed character class", ""
     if len(flag_stack) > 1:
-        return "regex has an unclosed group"
-    return None
+        return "regex has an unclosed group", ""
+    return None, "".join(py_parts)
 
 
 def regex_problem(pattern: object, *, max_bytes: int = MAX_REGEX_LENGTH) -> str | None:
@@ -446,13 +490,13 @@ def regex_problem(pattern: object, *, max_bytes: int = MAX_REGEX_LENGTH) -> str 
         return "regex contains control characters"
     if "%" in pattern:
         return "regex contains percent-escapes, which never match canonical request paths"
-    syntax_err = _rust_regex_syntax_problem(pattern)
+    syntax_err, py_pattern = _rust_regex_syntax_problem(pattern)
     if syntax_err is not None:
         return syntax_err
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", FutureWarning)
-            re.compile(pattern)
+            re.compile(py_pattern)
     except (re.error, OverflowError, RecursionError):
         return "regex does not compile"
     return None

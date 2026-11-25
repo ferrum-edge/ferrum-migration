@@ -261,7 +261,10 @@ class MatchingTest(unittest.TestCase):
         self.assertIsNotNone(util.regex_problem(r"^/item/[a--b]$"))
         self.assertIsNotNone(util.regex_problem(r"^/item/[a~~b]$"))
         self.assertIsNotNone(util.regex_problem(r"^/item/[[:digit:]$"))
+        self.assertIsNotNone(util.regex_problem(r"^/item/[[:digit:]x-a]$"))
+        self.assertIsNotNone(util.regex_problem(r"^/item/[[:digit:]-a]$"))
         self.assertIsNone(util.regex_problem(r"^/item/[[:digit:]]+$"))
+        self.assertIsNone(util.regex_problem(r"^/item/[[:digit:](]$"))
         self.assertTrue(util.has_top_level_alternation(r"^/x[[:digit:](]|/y[[:digit:])]$"))
         self.assertIsNone(util.regex_problem(r"^/api/a}b$"))
         self.assertIsNone(util.regex_problem(r"^/api[\\0]$"))
@@ -803,6 +806,40 @@ class MatchingTest(unittest.TestCase):
         res2 = emit(plan2, EmitOptions(tls_only=True), Report("envoy", "synthetic"))
         assert_structurally_valid(self, res2.config)
         self.assertFalse(any(p.get("listen_path") == "=/extra" for p in res2.config["proxies"]))
+        ca2 = next(p for p in res2.config["proxies"] if p.get("listen_path") == "/")
+        self.assertEqual(ca2["labels"]["ferrum-migration/status"], "migrated")
+
+        # 2b. Without a closed HostScope (Traefik/Kong), a live HTTPS route on a.example.test /app must NOT keep a
+        # plaintext =/private placeholder that would shadow the live HTTPS catch-all '/'.
+        res2b, _ = run([
+            route("p-priv", "/private", kind="exact", hosts=["a.example.test"], protocols=PLAINTEXT),
+            route("h-app", "/app", hosts=["a.example.test"], requires_tls=True, protocols=HTTPS),
+            route("h-ca", "/", hosts=[], requires_tls=True, protocols=HTTPS),
+        ], tls_only=True)
+        assert_structurally_valid(self, res2b.config)
+        self.assertFalse(any(p.get("listen_path") == "=/private" for p in res2b.config["proxies"]))
+        self.assertEqual(next(p for p in res2b.config["proxies"] if p.get("listen_path") == "/")["labels"][
+            "ferrum-migration/status"], "migrated")
+
+        # 2c. Trailing-slash off-protocol interactions: plaintext named /api/ must not shadow HTTPS catch-all =/api,
+        # and plaintext catch-all =/api must not block the bare-path guard of live HTTPS named /api/.
+        res2c, _ = run([
+            route("p-ts", "/api/", hosts=["plain.example.test"], protocols=PLAINTEXT),
+            route("h-ex", "/api", kind="exact", hosts=[], requires_tls=True, protocols=HTTPS),
+        ], tls_only=True)
+        assert_structurally_valid(self, res2c.config)
+        self.assertEqual([p.get("listen_path") for p in res2c.config["proxies"]], ["=/api"])
+
+        res2d, _ = run([
+            route("p-ex", "/api", kind="exact", hosts=[], protocols=PLAINTEXT),
+            route("h-ts", "/api/", hosts=["app.example.test"], requires_tls=True, protocols=HTTPS),
+        ], tls_only=True)
+        assert_structurally_valid(self, res2d.config)
+        api_p = next(p for p in res2d.config["proxies"] if p.get("listen_path") == "/api")
+        self.assertEqual(api_p["labels"]["ferrum-migration/status"], "migrated")
+        bare_p = next(p for p in res2d.config["proxies"] if p.get("listen_path") == "=/api")
+        self.assertEqual(bare_p["hosts"], ["app.example.test"])
+        self.assertEqual(bare_p["labels"]["ferrum-migration/status"], "exact-guard")
 
         # 3. Plaintext catch-all =/admin must not merge with an already-refused HTTPS named =/admin and take down
         # the live HTTPS named '/' route.
