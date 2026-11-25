@@ -1,0 +1,30 @@
+{
+  "id": "traefik-smoke",
+  "adapter": "traefik",
+  "title": "Traefik file-provider smoke: Host + PathPrefix routers, stripPrefix, pass-through",
+  "source": "dynamic.yaml",
+  "allow_rejection": false,
+  "converter_assertions": ["traefik-input-includes-effective-controls"],
+  "claims": [
+    "router Host(app.example.test) && PathPrefix(/api) with stripPrefix /api forwards /api/items?x=1 to backend a as /items?x=1",
+    "router Host(app.example.test) && PathPrefix(/web) forwards /web/page to backend b unchanged",
+    "a request for another Host is not forwarded",
+    "an unrouted path is not forwarded"
+  ],
+  "not_claimed": [
+    "Traefik string-prefix matching of /website (Ferrum matches by path segment and answers 404, which is stricter)",
+    "entryPoint selection (static configuration is not part of the input)",
+    "passHostHeader effects on the upstream Host header"
+  ],
+  "source_semantics": "Traefik v3 file provider: a router matches when its rule matches; stripPrefix removes the first matching listed prefix before forwarding; without middlewares the path is forwarded unchanged; no router match answers 404. Documentation-inferred unless the upstream differential runs. The static configuration is the harness's own (upstream.example.json): the file provider alone, one plaintext loopback entryPoint `web` with no TLS, middlewares, redirections or forwarded-header settings, no router names entryPoints, and no TLS options or routers exist outside the input, so the input includes every effective routing, TLS and access control and the case passes the converter's operator statement traefik-input-includes-effective-controls (without it every forwarding router is refused).",
+  "probes": [
+    {"id": "strip-prefix", "host": "app.example.test", "path": "/api/items?x=1",
+     "expect": {"forward": {"backend": "a", "path": "/items?x=1"}}},
+    {"id": "pass-through", "host": "app.example.test", "path": "/web/page",
+     "expect": {"forward": {"backend": "b", "path": "/web/page"}}},
+    {"id": "other-host", "host": "other.example.test", "path": "/api/items",
+     "expect": {"deny": true, "status": [404]}},
+    {"id": "unrouted", "host": "app.example.test", "path": "/nothing",
+     "expect": {"deny": true, "status": [404]}}
+  ]
+}

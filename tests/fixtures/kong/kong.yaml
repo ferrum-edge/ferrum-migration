@@ -1,0 +1,97 @@
+# Synthetic Kong declarative config (decK / DB-less shape) for ferrum-migration tests.
+# All credential values are fake test strings, not real secrets.
+_format_version: "3.0"
+services:
+  - name: orders
+    url: http://orders.internal:8080/v1
+    connect_timeout: 5000
+    read_timeout: 30000
+    write_timeout: 30000
+    retries: 3
+    plugins:
+      - name: key-auth
+        config:
+          key_names: [apikey]
+          key_in_header: true
+          key_in_query: false
+          hide_credentials: true
+      - name: acl
+        config:
+          allow: [engineering]
+    routes:
+      - name: orders-api
+        paths: ["/orders"]
+        methods: [GET, POST]
+        strip_path: true
+        plugins:
+          - name: rate-limiting
+            config:
+              minute: 100
+              policy: local
+              limit_by: consumer
+  - name: catalog
+    host: catalog-upstream
+    protocol: http
+    port: 80
+    routes:
+      - name: catalog-public
+        hosts: [shop.example.com]
+        paths: ["/catalog/"]
+        strip_path: false
+        plugins:
+          - name: cors
+            config:
+              origins: ["https://shop.example.com"]
+              methods: [GET]
+              headers: [Content-Type]
+              credentials: false
+              max_age: 600
+          - name: request-transformer
+            config:
+              remove:
+                headers: [x-debug]
+              add:
+                headers: ["x-gateway:ferrum"]
+  - name: legacy
+    url: http://legacy.internal:9000
+    routes:
+      - name: legacy-admin
+        paths: ["/admin"]
+        plugins:
+          - name: oauth2
+            config:
+              scopes: [admin]
+      - name: legacy-root
+        paths: ["/"]
+upstreams:
+  - name: catalog-upstream
+    algorithm: round-robin
+    targets:
+      - target: catalog-a.internal:8080
+        weight: 100
+      - target: catalog-b.internal:8080
+        weight: 50
+    healthchecks:
+      active:
+        http_path: /healthz
+        healthy:
+          interval: 5
+          successes: 2
+        unhealthy:
+          interval: 5
+          http_failures: 3
+consumers:
+  - username: alice
+    custom_id: alice-001
+    acls:
+      - group: engineering
+    keyauth_credentials:
+      - key: test-only-key-alice-0001
+  - username: bob
+    keyauth_credentials:
+      - key: short-key
+    basicauth_credentials:
+      - username: bob
+        password: test-only-password-hash-bob
+plugins:
+  - name: prometheus

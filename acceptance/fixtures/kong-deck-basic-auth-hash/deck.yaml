@@ -1,0 +1,28 @@
+# Synthetic decK dump with a basic-auth credential. decK dumps carry the
+# *stored hash* in `password`, not the cleartext. ${CANARY_HASH} is random
+# 40-hex generated per run; it is nobody's password and nobody's hash.
+_format_version: "3.0"
+_info:
+  select_tags:
+    - acceptance
+services:
+  - name: svc-basic
+    host: 127.0.0.1
+    port: ${ECHO_A_PORT}
+    protocol: http
+    routes:
+      - name: r-basic
+        paths:
+          - /basic
+        hosts:
+          - api.example.test
+        strip_path: false
+        plugins:
+          - name: basic-auth
+            config:
+              hide_credentials: false
+consumers:
+  - username: synthetic-acceptance-basic
+    basicauth_credentials:
+      - username: synthetic-acceptance-basic
+        password: ${CANARY_HASH}

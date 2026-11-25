@@ -1,0 +1,12 @@
+{
+  "version": "1",
+  "proxies": [
+    {"id": "p-a", "listen_path": "/api", "backend_scheme": "http", "backend_host": "127.0.0.1",
+     "backend_port": ${ECHO_A_PORT}, "strip_listen_path": true, "backend_path": "/v1"},
+    {"id": "p-b", "listen_path": "/b", "backend_scheme": "http", "backend_host": "127.0.0.1",
+     "backend_port": ${ECHO_B_PORT}, "strip_listen_path": false, "allowed_methods": ["GET"]}
+  ],
+  "consumers": [],
+  "plugin_configs": [],
+  "x_synthetic_key": "${CANARY_KEY}"
+}

@@ -1,0 +1,91 @@
+# Synthetic Envoy v3 static bootstrap for ferrum-migration tests.
+admin:
+  address:
+    socket_address: {address: 127.0.0.1, port_value: 9901}
+static_resources:
+  listeners:
+    - name: http_listener
+      address:
+        socket_address: {address: 0.0.0.0, port_value: 8080}
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress_http
+                route_config:
+                  name: local_route
+                  virtual_hosts:
+                    - name: api
+                      domains: ["api.example.com"]
+                      routes:
+                        - name: users
+                          match: {prefix: "/users"}
+                          route:
+                            cluster: users_service
+                            timeout: 10s
+                            retry_policy:
+                              retry_on: "connect-failure,5xx"
+                              num_retries: 2
+                        - name: users-v2-shadowed
+                          match: {prefix: "/users/v2"}
+                          route: {cluster: users_service}
+                        - name: orders
+                          match: {path_separated_prefix: "/orders"}
+                          route:
+                            prefix_rewrite: "/api/orders"
+                            weighted_clusters:
+                              clusters:
+                                - {name: orders_v1, weight: 80}
+                                - {name: orders_v2, weight: 20}
+                        - name: health
+                          match: {path: "/healthz"}
+                          direct_response:
+                            status: 200
+                            body: {inline_string: "ok"}
+                        - name: beta
+                          match:
+                            prefix: "/beta"
+                            headers:
+                              - name: x-beta
+                                string_match: {exact: "1"}
+                          route: {cluster: users_service}
+                    - name: catchall
+                      domains: ["*"]
+                      routes:
+                        - match: {prefix: "/"}
+                          route: {cluster: users_service}
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters:
+    - name: users_service
+      type: STRICT_DNS
+      connect_timeout: 2s
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: users_service
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: {address: users.internal, port_value: 8080}
+    - name: orders_v1
+      type: STATIC
+      load_assignment:
+        cluster_name: orders_v1
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: {address: 10.0.1.10, port_value: 9000}
+    - name: orders_v2
+      type: STATIC
+      load_assignment:
+        cluster_name: orders_v2
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: {address: 10.0.1.20, port_value: 9000}

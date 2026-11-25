@@ -1,0 +1,30 @@
+{
+  "id": "envoy-static-routes",
+  "adapter": "envoy",
+  "title": "Envoy static v3: exact path, prefix_rewrite, virtual host domains",
+  "source": "envoy.yaml",
+  "allow_rejection": false,
+  "claims": [
+    "match.path /exact forwards only the exact path",
+    "prefix /svc/ with prefix_rewrite / forwards /svc/x?y=1 as /x?y=1",
+    "prefix /b/ forwards unchanged to its cluster",
+    "virtual host domains restrict routing; another Host is not forwarded"
+  ],
+  "not_claimed": [
+    "Host matching with an explicit port (domains without :* are matched against the bare Host sent by the probes)",
+    "retries, timeouts, header manipulation, weighted clusters"
+  ],
+  "source_semantics": "Envoy RouteConfiguration: virtual host chosen by domains, routes evaluated in order, first match wins; prefix_rewrite replaces the matched prefix; no matching virtual host or route yields 404. Documentation-inferred unless the upstream differential runs.",
+  "probes": [
+    {"id": "exact-hit", "path": "/exact",
+     "expect": {"forward": {"backend": "a", "path": "/exact"}}},
+    {"id": "exact-miss", "path": "/exact/more",
+     "expect": {"deny": true, "status": [404]}},
+    {"id": "prefix-rewrite", "path": "/svc/x?y=1",
+     "expect": {"forward": {"backend": "a", "path": "/x?y=1"}}},
+    {"id": "prefix-plain", "path": "/b/z",
+     "expect": {"forward": {"backend": "b", "path": "/b/z"}}},
+    {"id": "domain-mismatch", "host": "other.example.test", "path": "/b/z",
+     "expect": {"deny": true, "status": [404]}}
+  ]
+}

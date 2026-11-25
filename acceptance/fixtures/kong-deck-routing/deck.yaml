@@ -1,0 +1,42 @@
+# Synthetic decK dump shape (`deck gateway dump` style: _info, tags, nested routes).
+_format_version: "3.0"
+_info:
+  select_tags:
+    - acceptance
+  defaults: {}
+services:
+  - name: orders
+    host: 127.0.0.1
+    port: ${ECHO_A_PORT}
+    protocol: http
+    path: /internal
+    tags:
+      - acceptance
+    routes:
+      - name: orders-public
+        paths:
+          - /orders
+        hosts:
+          - shop.example.test
+        strip_path: true
+        preserve_host: false
+        tags:
+          - acceptance
+  - name: catalog
+    host: 127.0.0.1
+    port: ${ECHO_B_PORT}
+    protocol: http
+    tags:
+      - acceptance
+    routes:
+      - name: catalog-public
+        paths:
+          - /catalog
+        hosts:
+          - shop.example.test
+        methods:
+          - GET
+          - HEAD
+        strip_path: false
+        tags:
+          - acceptance

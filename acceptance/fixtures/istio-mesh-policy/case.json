@@ -1,0 +1,29 @@
+{
+  "id": "istio-mesh-policy",
+  "adapter": "istio",
+  "title": "Istio mesh-mode policy is not projected into open ingress routes",
+  "source": "istio.yaml",
+  "allow_rejection": true,
+  "mesh_policy": true,
+  "backend_host_rewrite": {
+    "acc-a.acceptance.svc.cluster.local": "127.0.0.1"
+  },
+  "report": {"min_findings": 1, "mentions_any": ["authorization", "peerauthentication", "mesh", "sidecar"]},
+  "claims": [
+    "workload-scoped AuthorizationPolicy/PeerAuthentication and a mesh-only VirtualService produce no reachable ingress route",
+    "the report flags the mesh-mode resources as not translated, deferred or mesh-only"
+  ],
+  "not_claimed": [
+    "DENY semantics of the AuthorizationPolicy (needs a mesh data plane with identity)"
+  ],
+  "not_established": [
+    "Istio full mesh: sidecar or ambient capture, SPIFFE identity, STRICT mTLS and mesh_authz enforcement with a real request. If the converter emits a mesh slice, only `validate -m mesh` is attempted (with --mesh-validate-env)."
+  ],
+  "source_semantics": "In Istio these resources apply to sidecar/ambient workload traffic and define no ingress route; a VirtualService without gateways binds to the mesh. Ferrum's Istio controller consumes CRDs in mesh mode and stock_xds is discovery-only with local policy (docs/mesh.md), so a file-mode ingress projection must not expose them.",
+  "probes": [
+    {"id": "admin-path", "host": "acc-a.acceptance.svc.cluster.local", "path": "/admin/x", "ferrum_only": true,
+     "expect": {"deny": true, "status": [404]}},
+    {"id": "any-path", "host": "acc-a.acceptance.svc.cluster.local", "path": "/public/x", "ferrum_only": true,
+     "expect": {"deny": true, "status": [404]}}
+  ]
+}

@@ -1,0 +1,120 @@
+# Synthetic Istio networking resources for ferrum-migration tests.
+apiVersion: networking.istio.io/v1
+kind: Gateway
+metadata:
+  name: public-gw
+  namespace: edge
+spec:
+  selector:
+    istio: ingressgateway
+  servers:
+    - port: {number: 80, name: http, protocol: HTTP}
+      hosts: ["*/shop.example.com"]
+      tls:
+        httpsRedirect: true
+    - port: {number: 443, name: https, protocol: HTTPS}
+      hosts: ["*/shop.example.com"]
+      tls:
+        mode: SIMPLE
+        serverCertificate: /etc/istio/certs/tls.crt
+        privateKey: /etc/istio/certs/tls.key
+---
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: shop
+  namespace: shop
+spec:
+  hosts: [shop.example.com]
+  gateways: [edge/public-gw]
+  http:
+    - name: cart-canary
+      match:
+        - uri: {prefix: /cart}
+      route:
+        - destination: {host: cart, port: {number: 8080}}
+          weight: 90
+        - destination: {host: cart-next, port: {number: 8080}}
+          weight: 10
+      timeout: 5s
+      retries:
+        attempts: 3
+        retryOn: "5xx,connect-failure"
+    - name: catalog
+      match:
+        - uri: {prefix: /catalog}
+          method: {exact: GET}
+      rewrite:
+        uri: /v1/catalog
+      route:
+        - destination: {host: catalog.shop.svc.cluster.local, port: {number: 80}}
+      corsPolicy:
+        allowOrigins:
+          - exact: https://shop.example.com
+        allowMethods: [GET]
+        maxAge: 24h
+    - name: reviews-subset
+      match:
+        - uri: {prefix: /reviews}
+      route:
+        - destination: {host: reviews, subset: v2, port: {number: 9080}}
+    - name: billing
+      match:
+        - uri: {prefix: /billing}
+      route:
+        - destination: {host: billing.partner.example}
+    - name: frontend
+      route:
+        - destination: {host: frontend, port: {number: 3000}}
+      headers:
+        request:
+          set: {x-gateway: ferrum}
+          remove: [x-internal-debug]
+---
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: mesh-only
+  namespace: shop
+spec:
+  hosts: [ratings]
+  http:
+    - route:
+        - destination: {host: ratings}
+---
+apiVersion: networking.istio.io/v1
+kind: DestinationRule
+metadata:
+  name: catalog
+  namespace: shop
+spec:
+  host: catalog.shop.svc.cluster.local
+  trafficPolicy:
+    loadBalancer: {simple: LEAST_REQUEST}
+    tls:
+      mode: SIMPLE
+      caCertificates: /etc/certs/internal-ca.pem
+---
+apiVersion: networking.istio.io/v1
+kind: ServiceEntry
+metadata:
+  name: partner-billing
+  namespace: shop
+spec:
+  hosts: [billing.partner.example]
+  location: MESH_EXTERNAL
+  resolution: STATIC
+  ports:
+    - {number: 8080, name: http, protocol: HTTP}
+  endpoints:
+    - address: 192.0.2.10
+    - address: 192.0.2.11
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: shop-tls
+  namespace: edge
+type: kubernetes.io/tls
+data:
+  tls.key: dGVzdC1vbmx5LW5vdC1hLXJlYWwta2V5LWZpeHR1cmU=

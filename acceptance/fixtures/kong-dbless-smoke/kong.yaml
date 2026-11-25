@@ -1,0 +1,23 @@
+# Synthetic Kong DB-less declarative config. Loopback only; the harness fills its upper-case placeholders.
+_format_version: "3.0"
+services:
+  - name: svc-a
+    url: http://127.0.0.1:${ECHO_A_PORT}/inner
+    routes:
+      - name: r-strip
+        paths:
+          - /api
+        hosts:
+          - app.example.test
+        methods:
+          - GET
+        strip_path: true
+  - name: svc-b
+    url: http://127.0.0.1:${ECHO_B_PORT}
+    routes:
+      - name: r-keep
+        paths:
+          - /raw
+        hosts:
+          - app.example.test
+        strip_path: false

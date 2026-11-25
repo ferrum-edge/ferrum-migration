@@ -1,0 +1,37 @@
+{
+  "id": "envoy-smoke",
+  "adapter": "envoy",
+  "title": "Envoy static bootstrap smoke: prefix_rewrite, exact path, direct_response deny, virtual-host scoping",
+  "source": "envoy.yaml",
+  "allow_rejection": false,
+  "claims": [
+    "route prefix /api/ with prefix_rewrite /v1/ forwards /api/x?q=1 to backend a as /v1/x?q=1",
+    "route path /status forwards exactly /status to backend b",
+    "a sub-path of the exact route is not forwarded",
+    "a direct_response 403 route answers 403 for its prefix without reaching a backend",
+    "a request for a Host outside the virtual host's domains is not forwarded",
+    "an unrouted path is not forwarded"
+  ],
+  "not_claimed": [
+    "Envoy string-prefix matching of /administrator (both deny; Envoy answers 403, Ferrum 404)",
+    "the direct_response body bytes",
+    "upstream Host header handling"
+  ],
+  "source_semantics": "Envoy v3 HCM: routes are evaluated in order within the virtual host selected by domains; prefix_rewrite replaces the matched prefix; path matches exactly; direct_response answers without an upstream; no virtual host or route match answers 404. Documentation-inferred unless the upstream differential runs.",
+  "probes": [
+    {"id": "prefix-rewrite", "host": "app.example.test", "path": "/api/x?q=1",
+     "expect": {"forward": {"backend": "a", "path": "/v1/x?q=1"}}},
+    {"id": "exact", "host": "app.example.test", "path": "/status",
+     "expect": {"forward": {"backend": "b", "path": "/status"}}},
+    {"id": "exact-sub-path", "host": "app.example.test", "path": "/status/x",
+     "expect": {"deny": true, "status": [404]}},
+    {"id": "direct-response", "host": "app.example.test", "path": "/admin",
+     "expect": {"deny": true, "status": [403]}},
+    {"id": "direct-response-sub-path", "host": "app.example.test", "path": "/admin/users",
+     "expect": {"deny": true, "status": [403]}},
+    {"id": "other-host", "host": "other.example.test", "path": "/status",
+     "expect": {"deny": true, "status": [404]}},
+    {"id": "unrouted", "host": "app.example.test", "path": "/nothing",
+     "expect": {"deny": true, "status": [404]}}
+  ]
+}

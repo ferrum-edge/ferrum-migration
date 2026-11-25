@@ -1,0 +1,36 @@
+{
+  "id": "istio-ingress-virtualservice",
+  "adapter": "istio",
+  "title": "Istio ingress projection: Gateway + VirtualService prefix routes and uri rewrite",
+  "source": "istio.yaml",
+  "allow_rejection": false,
+  "backend_host_rewrite": {
+    "acc-a.acceptance.svc.cluster.local": "127.0.0.1",
+    "acc-b.acceptance.svc.cluster.local": "127.0.0.1"
+  },
+  "claims": [
+    "a gateway-bound VirtualService prefix route forwards /reviews/1 unchanged",
+    "rewrite.uri /v1/ on prefix /ratings/ forwards /ratings/5?x=1 as /v1/5?x=1",
+    "VirtualService hosts restrict routing; another Host is not forwarded",
+    "unmatched paths are not forwarded"
+  ],
+  "not_claimed": [
+    "Kubernetes service discovery: synthetic service hosts are rewritten to 127.0.0.1 by the harness in a copy of the output",
+    "Istio prefix string matching of /reviews against /reviewsx (not probed)",
+    "TLS servers, weighted routes, retries, fault injection, mirrors"
+  ],
+  "not_established": [
+    "Istio full mesh: sidecar/ambient capture, SPIFFE identity, mTLS and mesh-mode routing are not exercised; this is ingress projection only"
+  ],
+  "source_semantics": "Istio ingress gateway applies VirtualService http[] routes in order for matching hosts; rewrite.uri replaces the matched prefix; no matching host/route yields 404. Documentation-inferred; no standalone upstream runner exists for Istio.",
+  "probes": [
+    {"id": "reviews", "host": "bookinfo.example.test", "path": "/reviews/1",
+     "expect": {"forward": {"backend": "a", "path": "/reviews/1"}}},
+    {"id": "ratings-rewrite", "host": "bookinfo.example.test", "path": "/ratings/5?x=1",
+     "expect": {"forward": {"backend": "b", "path": "/v1/5?x=1"}}},
+    {"id": "host-mismatch", "host": "other.example.test", "path": "/reviews/1",
+     "expect": {"deny": true, "status": [404]}},
+    {"id": "unmatched", "host": "bookinfo.example.test", "path": "/details/1",
+     "expect": {"deny": true, "status": [404]}}
+  ]
+}

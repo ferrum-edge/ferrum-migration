@@ -1,0 +1,48 @@
+# Synthetic Istio ingress resources: a header-conditioned route overlapping a
+# plain prefix route on the same path.
+apiVersion: networking.istio.io/v1
+kind: Gateway
+metadata:
+  name: acc-gateway
+  namespace: acceptance
+spec:
+  selector:
+    istio: ingressgateway
+  servers:
+    - port:
+        number: ${LISTEN_PORT}
+        name: http
+        protocol: HTTP
+      hosts:
+        - "app.example.test"
+---
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: acc-variant
+  namespace: acceptance
+spec:
+  hosts:
+    - "app.example.test"
+  gateways:
+    - acc-gateway
+  http:
+    - match:
+        - uri:
+            prefix: /h/
+          headers:
+            x-acceptance-variant:
+              exact: beta
+      route:
+        - destination:
+            host: acc-b.acceptance.svc.cluster.local
+            port:
+              number: ${ECHO_B_PORT}
+    - match:
+        - uri:
+            prefix: /h/
+      route:
+        - destination:
+            host: acc-a.acceptance.svc.cluster.local
+            port:
+              number: ${ECHO_A_PORT}

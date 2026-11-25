@@ -1,0 +1,32 @@
+{
+  "id": "kong-dbless-smoke",
+  "adapter": "kong-dbless",
+  "title": "Kong DB-less smoke: strip_path with a service path, pass-through path, method and host scoping",
+  "source": "kong.yaml",
+  "allow_rejection": false,
+  "claims": [
+    "route /api (strip_path: true) on a service with path /inner forwards /api/x?q=1 to backend a as /inner/x?q=1",
+    "route /raw (strip_path: false) forwards /raw/z?k=v to backend b unchanged",
+    "a method outside the route's methods list is not forwarded",
+    "a request for another Host is not forwarded",
+    "an unrouted path is not forwarded"
+  ],
+  "not_claimed": [
+    "Kong string-prefix matching of /apix (Ferrum matches by path segment and answers 404, which is stricter)",
+    "the exact forwarded path for a request to the bare /api prefix",
+    "upstream Host header (preserve_host is false on both sides)"
+  ],
+  "source_semantics": "Kong 3.x traditional router: paths are prefixes; with strip_path true the matched prefix is removed and the remainder is appended to the service path; with strip_path false the request path is appended unchanged; methods and hosts restrict the route; no match answers 404. Documentation-inferred unless the upstream differential runs.",
+  "probes": [
+    {"id": "strip-service-path", "host": "app.example.test", "path": "/api/x?q=1",
+     "expect": {"forward": {"backend": "a", "path": "/inner/x?q=1"}}},
+    {"id": "pass-through", "host": "app.example.test", "path": "/raw/z?k=v",
+     "expect": {"forward": {"backend": "b", "path": "/raw/z?k=v"}}},
+    {"id": "method-not-allowed", "method": "POST", "host": "app.example.test", "path": "/api/x",
+     "expect": {"deny": true, "status": [404, 405]}},
+    {"id": "other-host", "host": "other.example.test", "path": "/api/x",
+     "expect": {"deny": true, "status": [404]}},
+    {"id": "unrouted", "host": "app.example.test", "path": "/elsewhere",
+     "expect": {"deny": true, "status": [404]}}
+  ]
+}

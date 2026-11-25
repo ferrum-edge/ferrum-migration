@@ -1,0 +1,32 @@
+{
+  "_comment": "Example only, never required by CI. Each argv element is expanded on its own ({source} {workdir} {listen_port} {container} {python}) and executed without a shell. Locally installed binaries are assumed; container variants need host-loopback reachability to the echo backends, which this harness does not establish (on Docker Desktop, container loopback is not host loopback).",
+  "nginx": {
+    "argv": ["nginx", "-p", "{workdir}", "-e", "{workdir}/nginx-startup-error.log", "-c", "{source}", "-g", "daemon off;"],
+    "mkdirs": ["{workdir}/nginx-tmp", "{workdir}/logs"],
+    "ready_timeout_seconds": 15
+  },
+  "traefik": {
+    "argv": ["traefik", "--entryPoints.web.address=127.0.0.1:{listen_port}", "--providers.file.filename={source}", "--providers.file.watch=false", "--log.level=ERROR", "--global.checkNewVersion=false", "--global.sendAnonymousUsage=false"],
+    "ready_timeout_seconds": 20
+  },
+  "envoy": {
+    "argv": ["envoy", "-c", "{source}", "--disable-hot-restart", "--log-level", "warn"],
+    "ready_timeout_seconds": 20
+  },
+  "kong-dbless": {
+    "argv": ["kong", "start", "--vv"],
+    "env": {
+      "KONG_DATABASE": "off",
+      "KONG_DECLARATIVE_CONFIG": "{source}",
+      "KONG_PREFIX": "{workdir}/kong-prefix",
+      "KONG_PROXY_LISTEN": "127.0.0.1:{listen_port}",
+      "KONG_ADMIN_LISTEN": "off",
+      "KONG_STATUS_LISTEN": "off",
+      "KONG_NGINX_DAEMON": "off",
+      "KONG_ANONYMOUS_REPORTS": "off"
+    },
+    "mkdirs": ["{workdir}/kong-prefix"],
+    "ready_timeout_seconds": 30
+  },
+  "_kong-deck": "Deliberately absent: a decK dump is replayed with `deck gateway sync` against a database-backed Kong, which this harness does not run. decK-specific keys such as _info are not guaranteed to load in DB-less Kong, and replaying a dumped basic-auth hash re-hashes it, so kong-deck fixtures stay documentation-inferred."
+}
