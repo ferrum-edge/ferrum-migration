@@ -122,7 +122,7 @@ _TYPED_FIELDS: dict[str, dict[str, Any]] = {
                    "disableSessionTickets": None, "preferServerCipherSuites": None},
     "clientAuth": {"caFiles": None, "clientAuthType": None},
     "service": {"loadBalancer": "loadBalancer", "weighted": "weighted", "mirroring": "mirroring", "failover": None,
-                "highestRandomWeight": None},
+                "highestRandomWeight": None, "middlewares": None},
     "loadBalancer": {"sticky": "sticky", "servers": ("list", "server"), "strategy": None, "healthCheck": "healthCheck",
                      "passiveHealthCheck": None, "passHostHeader": None, "responseForwarding": None,
                      "serversTransport": None},
@@ -141,9 +141,10 @@ _TYPED_FIELDS: dict[str, dict[str, Any]] = {
     "serversTransport": {"serverName": None, "insecureSkipVerify": None, "rootCAs": None,
                          "certificates": ("list", "certificate"), "maxIdleConnsPerHost": None,
                          "forwardingTimeouts": "forwardingTimeouts", "disableHTTP2": None, "peerCertURI": None,
+                         "peerCertSANs": None, "minVersion": None, "maxVersion": None, "cipherSuites": None,
                          "spiffe": None},
     "forwardingTimeouts": {"dialTimeout": None, "responseHeaderTimeout": None, "idleConnTimeout": None,
-                           "readIdleTimeout": None, "pingTimeout": None},
+                           "readIdleTimeout": None, "pingTimeout": None, "readTimeout": None, "writeTimeout": None},
     # The middleware envelope: its one key names the middleware type. Types this translator reads get their config
     # checked; the others are refused or omitted by type and their configs are not read.
     "middleware": {"addPrefix": "addPrefix", "stripPrefix": "stripPrefix", "stripPrefixRegex": None,
@@ -1310,6 +1311,8 @@ class _Traefik:
         ref = f"traefik service '{safe_label(name)}'"
         if not isinstance(raw, dict):
             return {"problems": [f"service {safe_label(name, 48)} is undefined"]}
+        if raw.get("middlewares"):
+            return {"problems": ["service-level middlewares (Traefik v3.8+) are not migrated"]}
         if "loadBalancer" in raw:
             return self._load_balancer(name, mapping(raw["loadBalancer"]), ref)
         if "weighted" in raw and depth == 0:
@@ -1371,6 +1374,11 @@ class _Traefik:
                 dropped += 1
                 continue
             target_raw = mapping(self.services.get(base))
+            if target_raw.get("middlewares"):
+                self.report.warning("traefik-mirroring", ref,
+                                    "Mirror target configures service-level middlewares (Traefik v3.8+), which "
+                                    "Ferrum static request_mirror cannot enforce; mirror dropped.")
+                continue
             lb = mapping(target_raw.get("loadBalancer"))
             if not lb or lb.get("passHostHeader") is not False:
                 # Traefik's loadBalancer defaults passHostHeader to true (preserving client Host), whereas Ferrum
@@ -1395,20 +1403,14 @@ class _Traefik:
             if transport_name:
                 tbase, _, tprov = str(transport_name).partition("@")
                 if tprov in ("", "file"):
-                    tdoc = mapping(self.transports.get(tbase))
-                    if tdoc.get("disableHTTP2") not in (None, False):
-                        self.report.warning("traefik-mirroring", ref,
-                                            "Mirror target configures serversTransport.disableHTTP2, which Ferrum's "
-                                            "shared request_mirror client cannot enforce (it may negotiate HTTP/2 or "
-                                            "use HTTP/2 for native gRPC); mirror dropped.")
-                        continue
-                    raw_ft = mapping(tdoc.get("forwardingTimeouts"))
-                    if any(util.classify_go_duration(raw_ft.get(k)) != "zero"
-                           for k in ("dialTimeout", "responseHeaderTimeout")):
-                        self.report.warning("traefik-mirroring", ref,
-                                            "Mirror target configures serversTransport.forwardingTimeouts, which "
-                                            "Ferrum static request_mirror cannot reproduce per phase; mirror dropped.")
-                        continue
+                    tdoc = self.transports.get(tbase)
+                    if isinstance(tdoc, dict):
+                        t_prob = _mirror_transport_problem(tdoc)
+                        if t_prob is not None:
+                            self.report.warning("traefik-mirroring", ref,
+                                                f"Mirror target configures serversTransport.{t_prob}, which "
+                                                "Ferrum's shared request_mirror client cannot enforce; mirror dropped.")
+                            continue
             tls, timeouts, transport_problems = self._transport(transport_name, ref)
             if timeouts:
                 self.report.warning("traefik-mirroring", ref,
@@ -1468,8 +1470,14 @@ class _Traefik:
                 # paths; dropping the identity silently would change who the backend sees.
                 problems.append("serversTransport client certificates are inline, malformed or several; the backend "
                                 "client identity cannot be migrated")
-        for key_name, label in (("spiffe", "spiffe workload identity"),
-                                ("peerCertURI", "peerCertURI backend certificate pinning")):
+        for key_name, label in (
+            ("spiffe", "spiffe workload identity"),
+            ("peerCertURI", "peerCertURI backend certificate pinning"),
+            ("peerCertSANs", "peerCertSANs backend certificate SAN pinning"),
+            ("minVersion", "minVersion TLS protocol restriction"),
+            ("maxVersion", "maxVersion TLS protocol restriction"),
+            ("cipherSuites", "cipherSuites TLS cipher restriction"),
+        ):
             if transport.get(key_name):
                 problems.append(f"serversTransport {label} has no Ferrum equivalent")
         if isinstance(transport.get("serverName"), str):
@@ -1580,6 +1588,9 @@ class _Traefik:
                 problems.append(f"weighted child from provider {safe_label(provider, 32)} is not in the input")
                 continue
             child_raw = mapping(self.services.get(base))
+            if child_raw.get("middlewares"):
+                problems.append("weighted child service-level middlewares (Traefik v3.8+) are not migrated")
+                continue
             lb = mapping(child_raw.get("loadBalancer"))
             if not lb:
                 problems.append("weighted children must be load balancers")
@@ -1655,6 +1666,30 @@ class _Traefik:
                     reason = "Traefik priority and Ferrum's specificity order disagree for overlapping routes"
                     a.refuse(reason)
                     b.refuse(reason)
+
+
+def _mirror_transport_problem(tdoc: dict) -> str | None:
+    """Whether a Traefik ``serversTransport`` carries any option Ferrum's shared mirror client cannot enforce."""
+    for key, val in tdoc.items():
+        if val is None:
+            continue
+        if key in ("insecureSkipVerify", "disableHTTP2"):
+            if val is not False:
+                return str(key)
+            continue
+        if key == "maxIdleConnsPerHost":
+            if isinstance(val, bool) or val != 0:
+                return "maxIdleConnsPerHost"
+            continue
+        if key == "forwardingTimeouts":
+            if not isinstance(val, dict):
+                return "forwardingTimeouts"
+            for fk, fv in val.items():
+                if util.classify_go_duration(fv) != "zero":
+                    return f"forwardingTimeouts.{fk}"
+            continue
+        return str(key)
+    return None
 
 
 def translate(text: str, fmt: str, ctx: SourceContext) -> Plan:

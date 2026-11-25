@@ -1415,8 +1415,7 @@ class _Builder:
         for plugin in self.plan.global_plugins:
             self._note_plugin(plugin.name)
             pid = self.plugin_ids.take(self.plan.platform, "global", plugin.name)
-            self.plugin_configs.append(self._plugin_entry(pid, plugin.name, plugin.config, "global", None, plugin.ref,
-                                                          plugin.trigger))
+            self.plugin_configs.append(self._plugin_entry(pid, plugin.name, plugin.config, "global", None, plugin.ref))
         upstreams = self._build_upstreams(candidates)
         proxies = [self._build_proxy(cand) for cand in candidates]
         consumers = self._build_consumers()
@@ -1439,14 +1438,12 @@ class _Builder:
             self.basic_auth_used = True
 
     def _plugin_entry(self, pid: str, name: str, config: dict, scope: str, proxy_id: str | None,
-                      ref: str, trigger: dict | None = None) -> dict[str, Any]:
+                      ref: str) -> dict[str, Any]:
         entry: dict[str, Any] = {"id": pid, "plugin_name": name, "scope": scope}
         if proxy_id:
             entry["proxy_id"] = proxy_id
         entry["enabled"] = True
         entry["config"] = copy.deepcopy(config)
-        if trigger is not None:
-            entry["trigger"] = copy.deepcopy(trigger)
         entry["labels"] = self.labels(ref)
         return entry
 
@@ -1567,16 +1564,15 @@ class _Builder:
     def _attach_plugin(self, proxy_id: str, plugin: PluginSpec) -> str:
         self._note_plugin(plugin.name)
         if plugin.shared_key:
-            key = json.dumps([plugin.shared_key, plugin.name, plugin.config, plugin.trigger], sort_keys=True)
+            key = json.dumps([plugin.shared_key, plugin.name, plugin.config], sort_keys=True)
             if key not in self.group_ids:
                 pid = self.plugin_ids.take(self.plan.platform, "group", plugin.shared_key, plugin.name)
                 self.group_ids[key] = pid
                 self.plugin_configs.append(self._plugin_entry(pid, plugin.name, plugin.config, "proxy_group",
-                                                              None, plugin.ref, plugin.trigger))
+                                                              None, plugin.ref))
             return self.group_ids[key]
         pid = self.plugin_ids.take(proxy_id, plugin.name)
-        self.plugin_configs.append(self._plugin_entry(pid, plugin.name, plugin.config, "proxy", proxy_id, plugin.ref,
-                                                      plugin.trigger))
+        self.plugin_configs.append(self._plugin_entry(pid, plugin.name, plugin.config, "proxy", proxy_id, plugin.ref))
         return pid
 
     def _build_consumers(self) -> list[dict[str, Any]]:

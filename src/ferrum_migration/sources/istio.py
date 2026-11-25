@@ -738,6 +738,9 @@ class _Istio:
         if matcher_problem:
             spec.refuse(f"active CORS policy cannot be safely migrated ({matcher_problem})")
             return
+        if len(origins) > 64:
+            spec.refuse("active CORS policy cannot be safely migrated (more than 64 allowed origins)")
+            return
         # Istio/Envoy treats any origin matcher matching literal "*" (exact, prefix, or regex) as allow-all.
         star_probes = [cors_origin_star_probe(o) for o in origins]
         if "error" in star_probes:
@@ -1074,7 +1077,8 @@ def _translate_istio_fault(raw: Any) -> tuple[str, Any]:
                 grpc_code = util.as_int(grpc_raw)
             if grpc_code is None:
                 return "drop", "abort.grpcStatus is not representable"
-            http_status = 503
+            # Envoy/Istio send HTTP 200 for gRPC-status aborts; Ferrum uses status_code directly on HTTP requests.
+            http_status = 200
         if http_status is None:
             return "drop", "abort.httpStatus is missing or invalid"
         if pct > 0.0:

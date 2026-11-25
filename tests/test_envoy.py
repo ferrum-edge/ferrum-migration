@@ -628,8 +628,10 @@ class EnvoyHardeningTest(unittest.TestCase):
         self.assertIn("application/xml", cd_cfg["content_types"])
         self.assertIn("application/grpc-web+proto", cd_cfg["content_types"])
         self.assertEqual(len(cd_cfg["content_types"]), 20)
-        # Multiple compatible compressors merge into one Ferrum compression plugin preserving filter order;
-        # incompatible settings or choose_first: true across multiple compressors refuse fail-closed.
+        # Multiple compressor HTTP filters in one HCM (whether both active or one active + one disabled via
+        # common_config.enabled.default_value: false) refuse fail-closed because Envoy's client-order
+        # Accept-Encoding tie-breaking, inter-filter header removal, and disabled-compressor registry
+        # participation cannot be proven equivalent to one Ferrum compression plugin.
         multi_comp = minimal_bootstrap({"path_separated_prefix": "/api"})
         mchcm = multi_comp["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"]
         mchcm["http_filters"] = [
@@ -647,23 +649,15 @@ class EnvoyHardeningTest(unittest.TestCase):
             }},
             {"name": "envoy.filters.http.router"},
         ]
-        mc_res = migrate("envoy", yaml.safe_dump(multi_comp))[0]
-        mc_plugins = [p for p in mc_res.config["plugin_configs"] if p["plugin_name"] == "compression"]
-        self.assertEqual(len(mc_plugins), 1)
-        self.assertEqual(mc_plugins[0]["config"], {
-            "algorithms": ["gzip", "br"], "min_content_length": 128,
-            "content_types": ["text/plain"], "remove_accept_encoding": False,
-        })
-        for bad_multi_label, patch_fn in (
-            ("choose-first", lambda f: f[0]["typed_config"].__setitem__("choose_first", True)),
-            ("diff-min-len", lambda f: f[1]["typed_config"]["response_direction_config"]["common_config"].__setitem__(
-                "min_content_length", 256)),
-        ):
-            bad_mc = copy.deepcopy(multi_comp)
-            patch_fn(bad_mc["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"][
-                "http_filters"])
-            self.assertEqual(one_proxy(self, migrate("envoy", yaml.safe_dump(bad_mc))[0].config, "/api")[
-                "labels"]["ferrum-migration/status"], "refused", bad_multi_label)
+        self.assertEqual(one_proxy(self, migrate("envoy", yaml.safe_dump(multi_comp))[0].config, "/api")[
+            "labels"]["ferrum-migration/status"], "refused")
+        disabled_sibling = copy.deepcopy(multi_comp)
+        disabled_sibling["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"][
+            "http_filters"][1]["typed_config"]["response_direction_config"]["common_config"]["enabled"] = {
+            "default_value": False
+        }
+        self.assertEqual(one_proxy(self, migrate("envoy", yaml.safe_dump(disabled_sibling))[0].config, "/api")[
+            "labels"]["ferrum-migration/status"], "refused")
 
         for bad_min_val in ("--1", "9" * 4301):
             comp_bad_min = copy.deepcopy(comp_def)
@@ -1171,6 +1165,13 @@ class EnvoyHardeningTest(unittest.TestCase):
         ]
         self.assertEqual(one_proxy(self, migrate("envoy", yaml.safe_dump(gw_fault))[0].config, "/api")[
             "labels"]["ferrum-migration/status"], "refused")
+        # Standalone gRPC-status fault (without grpc_web ahead of it) emits HTTP status_code 200 matching Envoy.
+        grpc_fault = copy.deepcopy(gw_fault)
+        grpc_fault["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"][
+            "http_filters"].pop(0)
+        gf_res = migrate("envoy", yaml.safe_dump(grpc_fault))[0]
+        self.assertEqual(plugin(self, gf_res.config, one_proxy(self, gf_res.config, "/api"), "fault_injection")[
+            "config"], {"abort": {"status_code": 200, "grpc_status": 7, "percentage": 100.0}})
 
         for star_pattern in (r"\*", r"\x{2a}", r"\Q*\E", r"(?:a?|\*?){30}"):
             with self.subTest(star_pattern=star_pattern):
@@ -1195,7 +1196,8 @@ class EnvoyHardeningTest(unittest.TestCase):
         # Divergent/unsupported RE2/Python syntax and over-budget repetitions refuse (never turn into allow-all);
         # linear-time star probe evaluates backtracking-heavy valid Rust regexes without hanging, and escaped
         # backslash before x{2a} ([\\x{2a}]) must NOT match literal '*'.
-        for probe_err_pattern in (r".{,64}", r"(?=\*)\*", r"(?:a?|b?){100}x"):
+        for probe_err_pattern in (r".{,64}", r"(?=\*)\*", r"(?:a?|b?){100}x", r"\*{01}", r"\*{\x{31}}",
+                                  r"\*{\Q1\E}", r"\x{D800}"):
             with self.subTest(probe_err=probe_err_pattern):
                 pe_doc = minimal_bootstrap({"path_separated_prefix": "/api"})
                 pehcm = pe_doc["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"]
@@ -1209,6 +1211,19 @@ class EnvoyHardeningTest(unittest.TestCase):
                 }
                 self.assertEqual(one_proxy(self, migrate("envoy", yaml.safe_dump(pe_doc))[0].config, "/api")[
                     "labels"]["ferrum-migration/status"], "refused")
+        # More than 64 origin matchers refuse immediately (even if exact '*' is present) before probing.
+        many_doc = minimal_bootstrap({"path_separated_prefix": "/api"})
+        mhcm = many_doc["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"]
+        mhcm["http_filters"] = [{"name": "envoy.filters.http.cors"}, {"name": "envoy.filters.http.router"}]
+        mhcm["route_config"]["typed_per_filter_config"] = {
+            "envoy.filters.http.cors": {
+                "@type": "type.googleapis.com/envoy.extensions.filters.http.cors.v3.CorsPolicy",
+                "allow_origin_string_match": [{"exact": "*"}] + [{"exact": f"https://o{i}.example.test"} for i in range(64)],
+                "allow_credentials": {"value": False},
+            }
+        }
+        self.assertEqual(one_proxy(self, migrate("envoy", yaml.safe_dump(many_doc))[0].config, "/api")[
+            "labels"]["ferrum-migration/status"], "refused")
         for non_star_rx in (r"(?:a?|b?){30}x", r"a?" * 30 + "x", r"^https://([a-z0-9-]+\.)*example\.com$", r"[\\x{2a}]"):
             with self.subTest(non_star=non_star_rx):
                 ns_doc = minimal_bootstrap({"path_separated_prefix": "/api"})

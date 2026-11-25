@@ -881,8 +881,8 @@ class KongExtendedPluginsAndConsumersTest(unittest.TestCase):
                              for p in sc_res.config["plugin_configs"]))
         self.assertIn("kong-correlation-id", codes(sc_rep, "warning"))
 
-        # Protocol-scoped global correlation-id (https only): skipped on http-only route, omitted with warning
-        # on dual http+https route, and attached on https-only route.
+        # Restricted-protocol global correlation-id (https only): omitted with warning on all HTTP/HTTPS routes
+        # because Kong's plugin iterator qualifies by subsystem and Ferrum correlation_id rejects triggers.
         proto_cid = textwrap.dedent("""
             _format_version: "3.0"
             plugins:
@@ -907,59 +907,59 @@ class KongExtendedPluginsAndConsumersTest(unittest.TestCase):
         self.assertEqual(plugins_of(pc_res.config, one_proxy(self, pc_res.config, "/plain")), [])
         self.assertEqual(plugins_of(pc_res.config, one_proxy(self, pc_res.config, "/both")), [])
         self.assertIn("kong-correlation-id", codes(pc_rep, "warning"))
-        tls_res = migrate("kong", proto_cid, tls_only=True)[0]
+        tls_res, tls_rep, _ = migrate("kong", proto_cid, tls_only=True)
         tls_p = one_proxy(self, tls_res.config, "/tls")
         self.assertEqual(tls_p["labels"]["ferrum-migration/status"], "migrated")
-        tls_cid = plugin(self, tls_res.config, tls_p, "correlation_id")
-        self.assertEqual(tls_cid["config"]["header_name"], "x-tls-id")
-        self.assertEqual(tls_cid["trigger"], {"when": {"not": {"match": {"protocol": ["grpc", "websocket"]}}}})
+        self.assertEqual(plugins_of(tls_res.config, tls_p), [])
+        self.assertIn("kong-correlation-id", codes(tls_rep, "warning"))
 
-        # Distinct Kong protocols on the same plaintext listener (http vs grpc) are compared without collapsing,
-        # and Ferrum trigger.when enforces the wire flavor at runtime (excluding gRPC/WS on http-only, matching
-        # gRPC on grpc-only, and omitting when flavors disagree across HTTP and HTTPS listeners).
-        grpc_cid = textwrap.dedent("""
+        # Default-protocol correlation-id migrates without any Ferrum trigger (Ferrum v0.9.21 rejects triggers
+        # on correlation_id, and omitting triggers keeps WebSocket upgrades over HTTP/HTTPS routes tagged);
+        # stream-only protocols ([tcp]) are skipped, and a restricted route-level correlation-id suppresses the
+        # global plugin and omits with a warning.
+        default_cid = textwrap.dedent("""
             _format_version: "3.0"
             plugins:
               - name: correlation-id
-                protocols: [http]
-                config: {header_name: X-Http-Only, echo_downstream: false, generator: uuid}
+                config: {header_name: X-Global-ID, echo_downstream: false, generator: uuid}
             services:
               - name: s
                 url: http://s.internal:8080
                 routes:
-                  - name: grpc-only
-                    protocols: [grpc]
+                  - name: grpc-route
+                    protocols: [grpc, grpcs]
                     paths: [/grpc/]
-                    plugins:
-                      - name: correlation-id
-                        protocols: [grpc]
-                        config: {header_name: X-Grpc-Only, echo_downstream: false, generator: uuid}
-                  - name: http-and-grpc
-                    protocols: [http, grpc]
-                    paths: [/mixed/]
-                  - name: http-only
-                    protocols: [http]
+                  - name: http-route
+                    protocols: [http, https]
                     paths: [/http/]
-                  - name: cross-flavor
-                    protocols: [http, grpcs]
-                    paths: [/cross/]
+                  - name: narrowed-override
+                    protocols: [http, https]
+                    paths: [/narrow/]
                     plugins:
                       - name: correlation-id
-                        protocols: [http, grpcs]
-                        config: {header_name: X-Cross, echo_downstream: false, generator: uuid}
+                        protocols: [http]
+                        config: {header_name: X-Narrow, echo_downstream: false, generator: uuid}
+                  - name: tcp-noop-override
+                    protocols: [http, https]
+                    paths: [/tcp-noop/]
+                    plugins:
+                      - name: correlation-id
+                        protocols: [tcp]
+                        config: {header_name: X-Tcp, echo_downstream: false, generator: uuid}
         """)
-        gc_res, gc_rep, _ = migrate("kong", grpc_cid)
-        grpc_pl = plugin(self, gc_res.config, one_proxy(self, gc_res.config, "/grpc"), "correlation_id")
-        self.assertEqual(grpc_pl["config"]["header_name"], "x-grpc-only")
-        self.assertEqual(grpc_pl["trigger"], {"when": {"match": {"protocol": ["grpc"]}}})
-        self.assertEqual(plugins_of(gc_res.config, one_proxy(self, gc_res.config, "/mixed")), [])
-        http_pl = plugin(self, gc_res.config, one_proxy(self, gc_res.config, "/http"), "correlation_id")
-        self.assertEqual(http_pl["config"]["header_name"], "x-http-only")
-        self.assertEqual(http_pl["trigger"], {"when": {"not": {"match": {"protocol": ["grpc", "websocket"]}}}})
-        cross_p = one_proxy(self, gc_res.config, "/cross")
-        self.assertEqual(cross_p["labels"]["ferrum-migration/status"], "migrated")
-        self.assertEqual(plugins_of(gc_res.config, cross_p), [])
-        self.assertIn("kong-correlation-id", codes(gc_rep, "warning"))
+        dc_res, dc_rep, _ = migrate("kong", default_cid)
+        grpc_pl = plugin(self, dc_res.config, one_proxy(self, dc_res.config, "/grpc"), "correlation_id")
+        self.assertEqual(grpc_pl["config"]["header_name"], "x-global-id")
+        self.assertNotIn("trigger", grpc_pl)
+        http_pl = plugin(self, dc_res.config, one_proxy(self, dc_res.config, "/http"), "correlation_id")
+        self.assertEqual(http_pl["config"]["header_name"], "x-global-id")
+        self.assertNotIn("trigger", http_pl)
+        narrow_p = one_proxy(self, dc_res.config, "/narrow")
+        self.assertEqual(narrow_p["labels"]["ferrum-migration/status"], "migrated")
+        self.assertEqual(plugins_of(dc_res.config, narrow_p), [])
+        tcp_p = one_proxy(self, dc_res.config, "/tcp-noop")
+        self.assertEqual(plugin(self, dc_res.config, tcp_p, "correlation_id")["config"]["header_name"], "x-global-id")
+        self.assertIn("kong-correlation-id", codes(dc_rep, "warning"))
 
 
 if __name__ == "__main__":

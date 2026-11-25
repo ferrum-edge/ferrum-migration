@@ -1006,7 +1006,7 @@ class IstioCaseAndNamesTest(unittest.TestCase):
         })
         grpc_p = one_proxy(self, result.config, "=/grpc", "api.example.test")
         self.assertEqual(plugin(self, result.config, grpc_p, "fault_injection")["config"], {
-            "abort": {"status_code": 503, "grpc_status": 14, "percentage": 5.0},
+            "abort": {"status_code": 200, "grpc_status": 14, "percentage": 5.0},
         })
         # Active Istio mirrors are dropped with warning (-shadow authority + mesh Auto mTLS vs file-mode Host strip).
         self.assertNotIn("request_mirror", [p["plugin_name"] for p in plugins_of(result.config, api)])
@@ -1208,7 +1208,8 @@ class IstioCaseAndNamesTest(unittest.TestCase):
                 self.assertNotEqual(cred_star_rx, cred_cors_base)
                 self.assertEqual(one_proxy(self, migrate("istio", cred_star_rx)[0].config, "=/api", "api.example.test")[
                     "labels"]["ferrum-migration/status"], "refused")
-        for bad_probe_pat in (r".{,64}", r"(?=\*)\*", r"(?:a?|b?){100}x"):
+        for bad_probe_pat in (r".{,64}", r"(?=\*)\*", r"(?:a?|b?){100}x", r"\*{01}", r"\*{\x{31}}", r"\*{\Q1\E}",
+                              r"\x{D800}"):
             with self.subTest(bad_probe=bad_probe_pat):
                 bp_doc = cred_cors_base.replace(
                     "allowCredentials: true", "allowCredentials: false"
@@ -1223,9 +1224,10 @@ class IstioCaseAndNamesTest(unittest.TestCase):
             "exact: https://app.example.test", r"regex: '[\\x{2a}]'"
         )
         ebi_res = migrate("istio", esc_bs_istio)[0]
-        ebi_cors = [p for p in ebi_res.config["plugin_configs"] if p["plugin_name"] == "cors"]
-        if ebi_cors:
-            self.assertNotEqual(ebi_cors[0]["config"]["allowed_origins"], ["*"])
+        ebi_proxy = one_proxy(self, ebi_res.config, "=/api", "api.example.test")
+        self.assertEqual(ebi_proxy["labels"]["ferrum-migration/status"], "migrated")
+        self.assertEqual(plugin(self, ebi_res.config, ebi_proxy, "cors")["config"]["allowed_origins"],
+                         [{"regex": r"[\\x{2a}]"}])
         huge_age_doc = cred_cors_base + f"        maxAge: {'1' + '0' * 310}s\n"
         self.assertEqual(one_proxy(self, migrate("istio", huge_age_doc)[0].config, "=/api", "api.example.test")[
             "labels"]["ferrum-migration/status"], "refused")

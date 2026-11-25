@@ -464,12 +464,15 @@ class FerrumBinaryValidateTest(unittest.TestCase):
                     "mirrored": {"mirroring": {"service": "main", "mirrorBody": False,
                                                "mirrors": [{"name": "shadow", "percent": 20}]}},
                     "mirrored_abbr": {"mirroring": {"service": "main", "mirrorBody": False,
-                                                    "mirrors": [{"name": "shadow_abbr", "percent": 20}]}},
+                                                    "mirrors": [{"name": "shadow_abbr", "percent": 20},
+                                                                {"name": "shadow_puny", "percent": 20}]}},
                     "main": {"loadBalancer": {"servers": [{"url": "http://main.internal:8080"}]}},
                     "shadow": {"loadBalancer": {"passHostHeader": False,
                                                 "servers": [{"url": "http://shadow.internal:9090"}]}},
                     "shadow_abbr": {"loadBalancer": {"passHostHeader": False,
                                                      "servers": [{"url": "http://127.1:9090"}]}},
+                    "shadow_puny": {"loadBalancer": {"passHostHeader": False,
+                                                     "servers": [{"url": "https://xn--a.pt:9443"}]}},
                 },
             }
         })

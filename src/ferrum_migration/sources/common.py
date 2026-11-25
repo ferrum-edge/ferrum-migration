@@ -459,16 +459,10 @@ def _cors_regex_problem(pattern: str) -> str | None:
             close = pattern.find("}", i + 1)
             body = pattern[i + 1:close] if close > i + 1 else ""
             parts = body.split(",") if body else []
-            valid_rep = (
-                has_atom
-                and close > i + 1
-                and len(parts) in (1, 2)
-                and parts[0].isascii()
-                and parts[0].isdigit()
-                and (len(parts) == 1 or parts[1] == "" or (parts[1].isascii() and parts[1].isdigit()))
-            )
+            valid_rep = has_atom and close > i + 1 and _is_valid_re2_repeat_body(body)
             if not valid_rep:
-                return "an allowed origin regex contains an unescaped '{' that Rust regex rejects (escape it as \\{)"
+                return ("an allowed origin regex contains an unescaped '{' or leading-zero repeat bound that "
+                        "diverges between RE2 and Rust regex (escape literal braces as \\{)")
             lo = int(parts[0])
             hi = int(parts[1]) if len(parts) == 2 and parts[1] else lo
             if len(parts) == 2 and parts[1] and hi < lo:
@@ -520,11 +514,30 @@ def _cors_regex_problem(pattern: str) -> str | None:
     return None
 
 
+def _is_valid_re2_repeat_body(body: str) -> bool:
+    """Whether ``body`` inside ``{...}`` is a valid RE2/Rust repetition bound without leading zeros."""
+    if not body:
+        return False
+    parts = body.split(",")
+    if len(parts) not in (1, 2):
+        return False
+    for idx, part in enumerate(parts):
+        if idx == 1 and part == "":
+            continue
+        if not part or not (part.isascii() and part.isdigit()):
+            return False
+        if len(part) > 1 and part[0] == "0":
+            return False
+    return True
+
+
 def _re2_to_python_probe(pattern: str) -> str | None:
     """Translate RE2 literal quotes (``\\Q...\\E``) and ``\\x{...}`` escapes for probing literal ``*``.
 
     Walks escapes left-to-right so escaped backslashes (e.g. ``[\\\\x{2a}]``) are never misread as
-    RE2 escapes. Returns ``None`` on malformed RE2 ``\\Q``/``\\x{...}`` syntax.
+    RE2 escapes, and validates unescaped ``{...}`` quantifiers in the original pattern before
+    translating escapes so ``\\*{01}``, ``\\*{\\x{31}}``, or ``\\*{\\Q1\\E}`` never turn into
+    synthesized quantifiers. Returns ``None`` on malformed or divergent RE2 syntax.
     """
     out: list[str] = []
     in_class = False
@@ -552,7 +565,7 @@ def _re2_to_python_probe(pattern: str) -> str | None:
                 if not all(c in _CORS_HEX_DIGITS for c in hex_digits):
                     return None
                 code = int(hex_digits, 16)
-                if code > 0x10FFFF:
+                if code > 0x10FFFF or 0xD800 <= code <= 0xDFFF:
                     return None
                 out.append(re.escape(chr(code)))
                 i = close + 1
@@ -571,6 +584,13 @@ def _re2_to_python_probe(pattern: str) -> str | None:
                 class_state = 0
             out.append(ch)
             i += 1
+            continue
+        if ch == "{":
+            close = pattern.find("}", i + 1)
+            if close <= i + 1 or not _is_valid_re2_repeat_body(pattern[i + 1:close]):
+                return None
+            out.append(pattern[i:close + 1])
+            i = close + 1
             continue
         if ch == "[":
             in_class = True
@@ -744,12 +764,9 @@ def _regex_matches_star_linear(pattern: str) -> bool | None:
             if last is None:
                 return None
             close = pattern.find("}", i + 1)
-            if close <= i + 1:
+            if close <= i + 1 or not _is_valid_re2_repeat_body(pattern[i + 1:close]):
                 return None
             parts = pattern[i + 1:close].split(",")
-            if len(parts) not in (1, 2) or not (parts[0].isascii() and parts[0].isdigit()) \
-                    or (len(parts) == 2 and parts[1] != "" and not (parts[1].isascii() and parts[1].isdigit())):
-                return None
             lo = int(parts[0])
             hi = lo if len(parts) == 1 else (None if parts[1] == "" else int(parts[1]))
             seq_stack[-1] = _star_concat(seq_stack[-1], _star_repeat(last, lo, hi))
@@ -1056,8 +1073,9 @@ def fault_injection_config(
 def _is_valid_mirror_host(norm_host: str) -> bool:
     """Mirror Ferrum v0.9.21 ``request_mirror::parse_mirror_host`` host rules.
 
-    Accepts canonical IPv4/IPv6 literals (without IPv6 ``%`` zone identifiers) and DNS domain names
-    whose final label does not trigger WHATWG URL IPv4 parsing (such as ``127.1`` or ``foo.0x1``).
+    Accepts canonical IPv4/IPv6 literals (without IPv6 ``%`` zone identifiers) and plain ASCII DNS
+    domain names whose labels avoid IDNA/Punycode (``xn--``) UTS #46 edge cases and whose final
+    label does not trigger WHATWG URL IPv4 parsing (such as ``127.1`` or ``foo.0x1``).
     """
     if "%" in norm_host:
         return False
@@ -1070,9 +1088,10 @@ def _is_valid_mirror_host(norm_host: str) -> bool:
     trimmed = norm_host.rstrip(".")
     if not trimmed:
         return False
-    last = trimmed.rsplit(".", 1)[-1]
-    if not last:
+    labels = trimmed.split(".")
+    if any(not label or label.lower().startswith("xn--") for label in labels):
         return False
+    last = labels[-1]
     if last.isascii() and last.isdigit():
         return False
     if last.lower().startswith("0x") and all(ch in _CORS_HEX_DIGITS for ch in last[2:]):

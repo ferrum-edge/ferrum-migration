@@ -1423,6 +1423,97 @@ class TraefikHardeningTest(unittest.TestCase):
                     "serversTransports": {"no_h2": {"disableHTTP2": True}},
                 }
             }),
+            ("punycode-mirror", {
+                "http": {
+                    "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "m"}},
+                    "services": {
+                        "m": {"mirroring": {"service": "main", "mirrorBody": False,
+                                            "mirrors": [{"name": "shadow", "percent": 20}]}},
+                        "main": {"loadBalancer": {"servers": [{"url": "http://main.internal:8080"}]}},
+                        "shadow": {"loadBalancer": {"passHostHeader": False,
+                                                    "servers": [{"url": "https://xn--a.pt:9443"}]}},
+                    },
+                }
+            }),
+            ("shadow-service-middleware", {
+                "http": {
+                    "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "m"}},
+                    "middlewares": {"guard": {"ipAllowList": {"sourceRange": ["10.0.0.0/8"]}}},
+                    "services": {
+                        "m": {"mirroring": {"service": "main", "mirrorBody": False,
+                                            "mirrors": [{"name": "shadow", "percent": 20}]}},
+                        "main": {"loadBalancer": {"servers": [{"url": "http://main.internal:8080"}]}},
+                        "shadow": {"middlewares": ["guard"],
+                                   "loadBalancer": {"passHostHeader": False,
+                                                    "servers": [{"url": "http://shadow.internal:9090"}]}},
+                    },
+                }
+            }),
+            ("transport-read-idle-timeout-mirror", {
+                "http": {
+                    "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "m"}},
+                    "services": {
+                        "m": {"mirroring": {"service": "main", "mirrorBody": False,
+                                            "mirrors": [{"name": "shadow", "percent": 20}]}},
+                        "main": {"loadBalancer": {"servers": [{"url": "http://main.internal:8080"}]}},
+                        "shadow": {"loadBalancer": {"passHostHeader": False, "serversTransport": "t",
+                                                    "servers": [{"url": "https://shadow.internal:9443"}]}},
+                    },
+                    "serversTransports": {"t": {"forwardingTimeouts": {"readIdleTimeout": "10s"}}},
+                }
+            }),
+            ("transport-read-timeout-mirror", {
+                "http": {
+                    "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "m"}},
+                    "services": {
+                        "m": {"mirroring": {"service": "main", "mirrorBody": False,
+                                            "mirrors": [{"name": "shadow", "percent": 20}]}},
+                        "main": {"loadBalancer": {"servers": [{"url": "http://main.internal:8080"}]}},
+                        "shadow": {"loadBalancer": {"passHostHeader": False, "serversTransport": "t",
+                                                    "servers": [{"url": "https://shadow.internal:9443"}]}},
+                    },
+                    "serversTransports": {"t": {"forwardingTimeouts": {"readTimeout": "5s"}}},
+                }
+            }),
+            ("transport-max-idle-conns-mirror", {
+                "http": {
+                    "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "m"}},
+                    "services": {
+                        "m": {"mirroring": {"service": "main", "mirrorBody": False,
+                                            "mirrors": [{"name": "shadow", "percent": 20}]}},
+                        "main": {"loadBalancer": {"servers": [{"url": "http://main.internal:8080"}]}},
+                        "shadow": {"loadBalancer": {"passHostHeader": False, "serversTransport": "t",
+                                                    "servers": [{"url": "https://shadow.internal:9443"}]}},
+                    },
+                    "serversTransports": {"t": {"maxIdleConnsPerHost": -1}},
+                }
+            }),
+            ("transport-peer-cert-sans-mirror", {
+                "http": {
+                    "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "m"}},
+                    "services": {
+                        "m": {"mirroring": {"service": "main", "mirrorBody": False,
+                                            "mirrors": [{"name": "shadow", "percent": 20}]}},
+                        "main": {"loadBalancer": {"servers": [{"url": "http://main.internal:8080"}]}},
+                        "shadow": {"loadBalancer": {"passHostHeader": False, "serversTransport": "t",
+                                                    "servers": [{"url": "https://shadow.internal:9443"}]}},
+                    },
+                    "serversTransports": {"t": {"peerCertSANs": ["shadow.internal"]}},
+                }
+            }),
+            ("transport-min-version-mirror", {
+                "http": {
+                    "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "m"}},
+                    "services": {
+                        "m": {"mirroring": {"service": "main", "mirrorBody": False,
+                                            "mirrors": [{"name": "shadow", "percent": 20}]}},
+                        "main": {"loadBalancer": {"servers": [{"url": "http://main.internal:8080"}]}},
+                        "shadow": {"loadBalancer": {"passHostHeader": False, "serversTransport": "t",
+                                                    "servers": [{"url": "https://shadow.internal:9443"}]}},
+                    },
+                    "serversTransports": {"t": {"minVersion": "VersionTLS13"}},
+                }
+            }),
             ("huge-percent-mirror", {
                 "http": {
                     "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "m"}},
@@ -1498,10 +1589,65 @@ class TraefikHardeningTest(unittest.TestCase):
                 bc_res, _bc_rep, _ = asserted(combo_doc)
                 self.assertEqual(one_proxy(self, bc_res.config, "/api", "a.example.test")["labels"][
                     "ferrum-migration/status"], "refused")
-        # Canonical schema gate checks newly supported compress/grpcWeb/mirror fields.
-        bad = yaml.safe_dump({"http": {"middlewares": {"c": {"compress": {"Encodings": ["gzip"]}}}}})
-        with self.assertRaises(InputError):
-            asserted(bad)
+        # Service-level middlewares (Traefik v3.8+) on primary/mirroring services and serversTransport TLS
+        # restrictions (peerCertSANs, minVersion, maxVersion, cipherSuites) refuse fail-closed.
+        for label, bad_doc in (
+            ("primary-service-mw", {
+                "http": {
+                    "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "main"}},
+                    "middlewares": {"guard": {"ipAllowList": {"sourceRange": ["10.0.0.0/8"]}}},
+                    "services": {"main": {"middlewares": ["guard"],
+                                          "loadBalancer": {"servers": [{"url": "http://main.internal:8080"}]}}},
+                }
+            }),
+            ("mirroring-service-mw", {
+                "http": {
+                    "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "m"}},
+                    "middlewares": {"guard": {"ipAllowList": {"sourceRange": ["10.0.0.0/8"]}}},
+                    "services": {
+                        "m": {"middlewares": ["guard"],
+                              "mirroring": {"service": "main", "mirrorBody": False, "mirrors": []}},
+                        "main": {"loadBalancer": {"servers": [{"url": "http://main.internal:8080"}]}},
+                    },
+                }
+            }),
+            ("transport-peerCertSANs", {
+                "http": {
+                    "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "main"}},
+                    "services": {"main": {"loadBalancer": {"serversTransport": "t",
+                                                           "servers": [{"url": "https://main.internal:8443"}]}}},
+                    "serversTransports": {"t": {"peerCertSANs": ["main.internal"]}},
+                }
+            }),
+            ("transport-minVersion", {
+                "http": {
+                    "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "main"}},
+                    "services": {"main": {"loadBalancer": {"serversTransport": "t",
+                                                           "servers": [{"url": "https://main.internal:8443"}]}}},
+                    "serversTransports": {"t": {"minVersion": "VersionTLS13"}},
+                }
+            }),
+            ("transport-cipherSuites", {
+                "http": {
+                    "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "main"}},
+                    "services": {"main": {"loadBalancer": {"serversTransport": "t",
+                                                           "servers": [{"url": "https://main.internal:8443"}]}}},
+                    "serversTransports": {"t": {"cipherSuites": ["TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"]}},
+                }
+            }),
+        ):
+            with self.subTest(case=label):
+                res_bad, _rep_bad, _ = asserted(yaml.safe_dump(bad_doc))
+                self.assertEqual(one_proxy(self, res_bad.config, "/api", "a.example.test")["labels"][
+                    "ferrum-migration/status"], "refused")
+        # Canonical schema gate checks newly supported compress/grpcWeb/mirror/v3.8 fields.
+        for bad_case in (
+            {"http": {"middlewares": {"c": {"compress": {"Encodings": ["gzip"]}}}}},
+            {"http": {"services": {"s": {"Middlewares": ["m"]}}}},
+            {"http": {"serversTransports": {"t": {"peercertsans": ["a.internal"]}}}},
+        ):
+            with self.assertRaises(InputError):
+                asserted(yaml.safe_dump(bad_case))
 
 
 if __name__ == "__main__":

@@ -180,6 +180,7 @@ class _Envoy:
         self.plan = Plan(platform=PLATFORM)
         self.clusters: dict[str, dict] = {}
         self.has_runtime = bool(root.get("layered_runtime") or root.get("runtime"))
+        self._cors_origin_cache: dict[int, tuple[Any, list[Any], str | None, str]] = {}
 
     def run(self) -> Plan:
         if self.root.get("dynamic_resources"):
@@ -352,7 +353,8 @@ class _Envoy:
         filter_refusal = None
         buffer_limit = None
         hcm_plugins: list[PluginSpec] = []
-        hcm_compressors: list[tuple[str, dict[str, Any], bool]] = []
+        hcm_compressors: list[dict[str, Any]] = []
+        compressor_filter_count = 0
         hcm_fault: PluginSpec | None = None
         hcm_fault_error: str | None = None
         hcm_filter_kinds: dict[str, str] = {}
@@ -401,14 +403,15 @@ class _Envoy:
                         grpc_web_index = idx
                     hcm_plugins.append(PluginSpec("grpc_web", {}, ref))
             elif kind == "compressor":
+                compressor_filter_count += 1
                 comp_status, comp_val = _parse_envoy_compressor(typed)
                 if comp_status == "plugin":
-                    comp_cfg, dropped_wild, choose_first = comp_val
+                    comp_cfg, dropped_wild = comp_val
                     if dropped_wild:
                         self.report.warning("envoy-compressor", ref,
                                             "Envoy compressor content_type wildcard entries ('*' or 'type/*') were "
                                             "dropped (Envoy matches literally whereas Ferrum treats 'type/*' as a range).")
-                    hcm_compressors.append((comp_cfg["algorithms"][0], comp_cfg, choose_first))
+                    hcm_compressors.append(comp_cfg)
                 elif comp_status == "omit":
                     if comp_val:
                         self.report.warning("envoy-compressor", ref, comp_val)
@@ -433,22 +436,12 @@ class _Envoy:
                                   "confirming IdP token format")
             else:
                 filter_refusal = f"HTTP filter {safe_label(kind, 80)} has no safe Ferrum equivalent"
-        if len(hcm_compressors) == 1:
-            hcm_plugins.append(PluginSpec("compression", hcm_compressors[0][1], ref))
-        elif len(hcm_compressors) > 1:
-            algos = [item[0] for item in hcm_compressors]
-            base_settings = {k: v for k, v in hcm_compressors[0][1].items() if k != "algorithms"}
-            same_settings = all(
-                {k: v for k, v in cfg.items() if k != "algorithms"} == base_settings
-                for _, cfg, _ in hcm_compressors[1:]
-            )
-            any_choose_first = any(cf for _, _, cf in hcm_compressors)
-            if len(set(algos)) == len(algos) and same_settings and not any_choose_first:
-                merged_cfg = {"algorithms": algos, **base_settings}
-                hcm_plugins.append(PluginSpec("compression", merged_cfg, ref))
-            else:
-                filter_refusal = ("multiple compressor HTTP filters with incompatible settings, duplicate codecs, "
-                                  "or choose_first: true cannot be merged into one Ferrum compression plugin")
+        if len(hcm_compressors) == 1 and compressor_filter_count == 1:
+            hcm_plugins.append(PluginSpec("compression", hcm_compressors[0], ref))
+        elif hcm_compressors and compressor_filter_count > 1:
+            filter_refusal = ("multiple compressor HTTP filters (including disabled entries registered in Envoy's "
+                              "Accept-Encoding negotiation registry) cannot be proven equivalent to one Ferrum "
+                              "compression plugin")
         route_config = mapping(config.get("route_config"))
         shared = {"request_add": seq(route_config.get("request_headers_to_add")),
                   "request_remove": seq(route_config.get("request_headers_to_remove")),
@@ -877,6 +870,53 @@ class _Envoy:
         builder = request_header_rule if request else response_header_rule
         return builder(op, key, translated)
 
+    def _resolve_cors_origins(self, merged_origins: Any) -> tuple[list[Any], str | None, str]:
+        """Parse, bound (<= 64), and star-probe one CORS origin list once per shared source object."""
+        if merged_origins is None:
+            return [], None, "no_match"
+        cache_key = id(merged_origins)
+        cached = self._cors_origin_cache.get(cache_key)
+        if cached is not None and cached[0] is merged_origins:
+            return list(cached[1]), cached[2], cached[3]
+        raw_list = seq(merged_origins)
+        if len(raw_list) > 64:
+            res: tuple[list[Any], str | None, str] = ([], "more than 64 allowed origins", "no_match")
+            self._cors_origin_cache[cache_key] = (merged_origins, *res)
+            return list(res[0]), res[1], res[2]
+        origins: list[Any] = []
+        matcher_problem: str | None = None
+        for matcher in raw_list:
+            matcher = mapping(matcher)
+            extra_keys = set(matcher) - {"exact", "prefix", "safe_regex", "ignore_case"}
+            raw_ignore = matcher.get("ignore_case")
+            if extra_keys or (raw_ignore is not None and raw_ignore is not False):
+                origins = []
+                matcher_problem = "origin matcher uses ignore_case or unsupported StringMatcher options"
+                break
+            present = [k for k in ("exact", "prefix", "safe_regex") if k in matcher]
+            if len(present) != 1:
+                origins = []
+                matcher_problem = "origin matcher is invalid or ambiguous"
+                break
+            kind = present[0]
+            if kind == "exact":
+                origins.append({"exact": matcher["exact"]})
+            elif kind == "prefix":
+                origins.append({"prefix": matcher["prefix"]})
+            else:
+                origins.append({"regex": mapping(matcher["safe_regex"]).get("regex")})
+        star_state = "no_match"
+        if matcher_problem is None:
+            for o in origins:
+                probe = cors_origin_star_probe(o)
+                if probe == "error":
+                    star_state = "error"
+                    break
+                if probe == "star":
+                    star_state = "star"
+        self._cors_origin_cache[cache_key] = (merged_origins, list(origins), matcher_problem, star_state)
+        return origins, matcher_problem, star_state
+
     def _cors(self, spec: RouteSpec, raw: dict, vhost: dict, shared: dict, enabled: bool,
               hcm_filter_kinds: dict[str, str], ref: str) -> bool:
         # Match Envoy cors_filter.cc initializeCorsPolicies precedence:
@@ -960,28 +1000,7 @@ class _Envoy:
         merged_max_age = next((p["max_age"] for p in policies
                                if p.get("max_age") is not None and p.get("max_age") != ""), None)
         raw_creds = next((p["allow_credentials"] for p in policies if p.get("allow_credentials") is not None), None)
-        origins = []
-        matcher_problem: str | None = None
-        for matcher in seq(merged_origins):
-            matcher = mapping(matcher)
-            extra_keys = set(matcher) - {"exact", "prefix", "safe_regex", "ignore_case"}
-            raw_ignore = matcher.get("ignore_case")
-            if extra_keys or (raw_ignore is not None and raw_ignore is not False):
-                origins = []
-                matcher_problem = "origin matcher uses ignore_case or unsupported StringMatcher options"
-                break
-            present = [k for k in ("exact", "prefix", "safe_regex") if k in matcher]
-            if len(present) != 1:
-                origins = []
-                matcher_problem = "origin matcher is invalid or ambiguous"
-                break
-            kind = present[0]
-            if kind == "exact":
-                origins.append({"exact": matcher["exact"]})
-            elif kind == "prefix":
-                origins.append({"prefix": matcher["prefix"]})
-            else:
-                origins.append({"regex": mapping(matcher["safe_regex"]).get("regex")})
+        origins, matcher_problem, star_state = self._resolve_cors_origins(merged_origins)
         creds: bool | None = None
         if raw_creds is not None:
             creds = _proto_bool(raw_creds)
@@ -1004,11 +1023,10 @@ class _Envoy:
         parsed_headers = split_csv(merged_headers) or None
         parsed_expose = split_csv(merged_expose) or None
         # Envoy treats any origin matcher matching literal "*" (exact, prefix, or safe_regex) as allow-all.
-        star_probes = [cors_origin_star_probe(o) for o in origins]
-        if "error" in star_probes:
+        if star_state == "error":
             spec.refuse("active CORS policy contains an origin regex that cannot be safely verified or admitted")
             return False
-        if "star" in star_probes:
+        if star_state == "star":
             if creds is True:
                 spec.refuse("CORS policy combines allow_credentials=true with a wildcard '*' origin matcher, "
                             "which Ferrum downgrades by disabling credentials")
@@ -1415,10 +1433,9 @@ def _parse_envoy_compressor(typed: dict) -> tuple[str, Any]:
     raw_choose_first = typed.get("choose_first")
     if raw_choose_first is not None and not isinstance(raw_choose_first, bool):
         return "refuse", "choose_first must be a boolean"
-    choose_first = bool(raw_choose_first)
     cfg, err = compression_config([algo], min_content_length=min_len, content_types=content_types,
                                   allow_ranges=False, remove_accept_encoding=remove_ae)
-    return ("plugin", (cfg, dropped_wild, choose_first)) if cfg is not None else ("refuse", err)
+    return ("plugin", (cfg, dropped_wild)) if cfg is not None else ("refuse", err)
 
 
 def _parse_envoy_fault(typed: dict, *, has_runtime: bool = False) -> tuple[str, Any]:
@@ -1463,7 +1480,8 @@ def _parse_envoy_fault(typed: dict, *, has_runtime: bool = False) -> tuple[str, 
         if http_raw is not None and http_status is None:
             return "refuse", "abort.http_status is invalid"
         if http_status is None and grpc_status is not None:
-            http_status = 503
+            # Envoy fault_filter.cc responds with HTTP 200 for gRPC-status aborts; Ferrum uses status_code directly.
+            http_status = 200
         if http_status is None:
             return "refuse", "abort.http_status is missing or invalid"
         pct = _envoy_fractional_percent(raw_abort.get("percentage")) if raw_abort.get("percentage") is not None else 0.0
