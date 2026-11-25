@@ -952,8 +952,9 @@ def compression_config(
                 clean_algos.append(mapped)
         config["algorithms"] = clean_algos
     if min_content_length is not None:
-        if isinstance(min_content_length, bool) or not isinstance(min_content_length, int) or min_content_length < 0:
-            return None, "min_content_length must be a non-negative integer"
+        if isinstance(min_content_length, bool) or not isinstance(min_content_length, int) \
+                or not 0 <= min_content_length <= (1 << 64) - 1:
+            return None, "min_content_length must be an integer in 0..2^64-1"
         config["min_content_length"] = min_content_length
     if content_types is not None:
         if not isinstance(content_types, list) or not content_types:

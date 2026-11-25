@@ -1082,7 +1082,7 @@ def _translate_istio_fault(raw: Any) -> tuple[str, Any]:
         if http_status is None:
             return "drop", "abort.httpStatus is missing or invalid"
         if pct > 0.0:
-            abort_cfg = {"status_code": http_status, "percentage": pct}
+            abort_cfg = {"status_code": http_status, "percentage": pct, "body": "fault filter abort"}
             if grpc_code is not None:
                 abort_cfg["grpc_status"] = grpc_code
     if delay_cfg is None and abort_cfg is None:

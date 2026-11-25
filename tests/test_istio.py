@@ -1002,11 +1002,11 @@ class IstioCaseAndNamesTest(unittest.TestCase):
         self.assertEqual(api["labels"]["ferrum-migration/status"], "migrated")
         self.assertEqual(plugin(self, result.config, api, "fault_injection")["config"], {
             "delay": {"duration_ms": 250, "percentage": 15.0},
-            "abort": {"status_code": 503, "percentage": 5.0},
+            "abort": {"status_code": 503, "percentage": 5.0, "body": "fault filter abort"},
         })
         grpc_p = one_proxy(self, result.config, "=/grpc", "api.example.test")
         self.assertEqual(plugin(self, result.config, grpc_p, "fault_injection")["config"], {
-            "abort": {"status_code": 200, "grpc_status": 14, "percentage": 5.0},
+            "abort": {"status_code": 200, "grpc_status": 14, "percentage": 5.0, "body": "fault filter abort"},
         })
         # Active Istio mirrors are dropped with warning (-shadow authority + mesh Auto mTLS vs file-mode Host strip).
         self.assertNotIn("request_mirror", [p["plugin_name"] for p in plugins_of(result.config, api)])

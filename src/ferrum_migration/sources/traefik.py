@@ -1073,7 +1073,9 @@ class _Traefik:
                                     "chunked bodies up to max_bytes")
             resp_size = util.as_int(config.get("maxResponseBodyBytes"))
             if resp_size and resp_size > 0:
-                if acc.has_compress:
+                if resp_size > (1 << 64) - 1:
+                    acc.refusals.append("buffering.maxResponseBodyBytes exceeds Ferrum's u64::MAX limit")
+                elif acc.has_compress:
                     acc.refusals.append("combining compress and buffering.maxResponseBodyBytes changes size-limit "
                                         "semantics in Ferrum (Ferrum applies response_size_limiting to both the "
                                         "backend response and the compressed output buffer)")
@@ -1470,8 +1472,9 @@ class _Traefik:
                 # paths; dropping the identity silently would change who the backend sees.
                 problems.append("serversTransport client certificates are inline, malformed or several; the backend "
                                 "client identity cannot be migrated")
+        if transport.get("spiffe") is not None:
+            problems.append("serversTransport spiffe workload identity has no Ferrum equivalent")
         for key_name, label in (
-            ("spiffe", "spiffe workload identity"),
             ("peerCertURI", "peerCertURI backend certificate pinning"),
             ("peerCertSANs", "peerCertSANs backend certificate SAN pinning"),
             ("minVersion", "minVersion TLS protocol restriction"),
@@ -1483,6 +1486,10 @@ class _Traefik:
         if isinstance(transport.get("serverName"), str):
             tls.sni = transport["serverName"]
         forwarding = mapping(transport.get("forwardingTimeouts"))
+        for rw_key in ("readTimeout", "writeTimeout"):
+            if util.classify_go_duration(forwarding.get(rw_key)) != "zero":
+                problems.append(f"serversTransport forwardingTimeouts.{rw_key} (Traefik v3.8+ per-socket deadline) "
+                                "has no Ferrum equivalent")
         dial = util.parse_go_duration_ms(forwarding.get("dialTimeout"))
         header = util.parse_go_duration_ms(forwarding.get("responseHeaderTimeout"))
         if dial:
@@ -1668,8 +1675,22 @@ class _Traefik:
                     b.refuse(reason)
 
 
+_ZERO_DEFAULT_FORWARDING_TIMEOUTS = frozenset({
+    "responseHeaderTimeout",
+    "readIdleTimeout",
+    "readTimeout",
+    "writeTimeout",
+})
+
+
 def _mirror_transport_problem(tdoc: dict) -> str | None:
-    """Whether a Traefik ``serversTransport`` carries any option Ferrum's shared mirror client cannot enforce."""
+    """Whether a Traefik ``serversTransport`` carries any option Ferrum's shared mirror client cannot enforce.
+
+    Only fields whose Traefik default is zero (``responseHeaderTimeout``, ``readIdleTimeout``,
+    ``readTimeout``, ``writeTimeout``) accept an explicit zero duration; fields with non-zero
+    Traefik defaults (``dialTimeout`` 30s, ``idleConnTimeout`` 90s, ``pingTimeout`` 15s) drop on
+    any explicit non-null value because ``0s`` overrides those defaults.
+    """
     for key, val in tdoc.items():
         if val is None:
             continue
@@ -1685,7 +1706,12 @@ def _mirror_transport_problem(tdoc: dict) -> str | None:
             if not isinstance(val, dict):
                 return "forwardingTimeouts"
             for fk, fv in val.items():
-                if util.classify_go_duration(fv) != "zero":
+                if fv is None:
+                    continue
+                if fk in _ZERO_DEFAULT_FORWARDING_TIMEOUTS:
+                    if util.classify_go_duration(fv) != "zero":
+                        return f"forwardingTimeouts.{fk}"
+                else:
                     return f"forwardingTimeouts.{fk}"
             continue
         return str(key)

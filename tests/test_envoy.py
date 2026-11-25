@@ -592,7 +592,7 @@ class EnvoyHardeningTest(unittest.TestCase):
         })
         self.assertEqual(plugin(self, result.config, api, "fault_injection")["config"], {
             "delay": {"duration_ms": 500, "percentage": 10.0},
-            "abort": {"status_code": 503, "percentage": 5.0},
+            "abort": {"status_code": 503, "percentage": 5.0, "body": "fault filter abort"},
         })
         # Active Envoy mirrors are dropped with warning (Envoy -shadow authority vs Ferrum file-mode Host strip).
         self.assertNotIn("request_mirror", [p["plugin_name"] for p in result.config["plugin_configs"]])
@@ -657,6 +657,15 @@ class EnvoyHardeningTest(unittest.TestCase):
             "default_value": False
         }
         self.assertEqual(one_proxy(self, migrate("envoy", yaml.safe_dump(disabled_sibling))[0].config, "/api")[
+            "labels"]["ferrum-migration/status"], "refused")
+        # Even when the active compressor has a wildcard-only content_type (omitted if alone), pairing it with
+        # a disabled sibling still refuses because Envoy still registers and invokes the active filter.
+        wild_plus_disabled = copy.deepcopy(disabled_sibling)
+        wild_plus_disabled["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"][
+            "http_filters"][0]["typed_config"]["response_direction_config"]["common_config"]["content_type"] = [
+            "text/*"
+        ]
+        self.assertEqual(one_proxy(self, migrate("envoy", yaml.safe_dump(wild_plus_disabled))[0].config, "/api")[
             "labels"]["ferrum-migration/status"], "refused")
 
         for bad_min_val in ("--1", "9" * 4301):
@@ -802,7 +811,7 @@ class EnvoyHardeningTest(unittest.TestCase):
         ]
         ne_res = migrate("envoy", yaml.safe_dump(num_enum_fault))[0]
         self.assertEqual(plugin(self, ne_res.config, one_proxy(self, ne_res.config, "/api"), "fault_injection")[
-            "config"], {"abort": {"status_code": 503, "percentage": 10.0}})
+            "config"], {"abort": {"status_code": 503, "percentage": 10.0, "body": "fault filter abort"}})
         for bad_num in ("bad", "--1", "1" + "0" * 310):
             bad_num_fault = minimal_bootstrap({"path_separated_prefix": "/api"})
             bad_num_fault["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"][
@@ -1171,7 +1180,8 @@ class EnvoyHardeningTest(unittest.TestCase):
             "http_filters"].pop(0)
         gf_res = migrate("envoy", yaml.safe_dump(grpc_fault))[0]
         self.assertEqual(plugin(self, gf_res.config, one_proxy(self, gf_res.config, "/api"), "fault_injection")[
-            "config"], {"abort": {"status_code": 200, "grpc_status": 7, "percentage": 100.0}})
+            "config"], {"abort": {"status_code": 200, "grpc_status": 7, "percentage": 100.0,
+                                  "body": "fault filter abort"}})
 
         for star_pattern in (r"\*", r"\x{2a}", r"\Q*\E", r"(?:a?|\*?){30}"):
             with self.subTest(star_pattern=star_pattern):
@@ -1224,6 +1234,26 @@ class EnvoyHardeningTest(unittest.TestCase):
         }
         self.assertEqual(one_proxy(self, migrate("envoy", yaml.safe_dump(many_doc))[0].config, "/api")[
             "labels"]["ferrum-migration/status"], "refused")
+        # Inherited allow_private_network_access maps to allow_private_network, and routes sharing the same
+        # effective Envoy CORS policy deduplicate into one proxy_group PluginConfig.
+        pna_doc = minimal_bootstrap({"path_separated_prefix": "/a"})
+        pna_hcm = pna_doc["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"]
+        pna_hcm["http_filters"] = [{"name": "envoy.filters.http.cors"}, {"name": "envoy.filters.http.router"}]
+        pna_hcm["route_config"]["typed_per_filter_config"] = {
+            "envoy.filters.http.cors": {
+                "@type": "type.googleapis.com/envoy.extensions.filters.http.cors.v3.CorsPolicy",
+                "allow_origin_string_match": [{"exact": "https://app.example.test"}],
+                "allow_private_network_access": {"value": True},
+            }
+        }
+        pna_hcm["route_config"]["virtual_hosts"][0]["routes"].append(
+            {"name": "r2", "match": {"path_separated_prefix": "/b"}, "route": {"cluster": "c"}}
+        )
+        pna_res = migrate("envoy", yaml.safe_dump(pna_doc))[0]
+        cors_pcs = [pc for pc in pna_res.config["plugin_configs"] if pc["plugin_name"] == "cors"]
+        self.assertEqual(len(cors_pcs), 1)
+        self.assertEqual(cors_pcs[0]["scope"], "proxy_group")
+        self.assertIs(cors_pcs[0]["config"]["allow_private_network"], True)
         for non_star_rx in (r"(?:a?|b?){30}x", r"a?" * 30 + "x", r"^https://([a-z0-9-]+\.)*example\.com$", r"[\\x{2a}]"):
             with self.subTest(non_star=non_star_rx):
                 ns_doc = minimal_bootstrap({"path_separated_prefix": "/api"})

@@ -1061,7 +1061,7 @@ class _Kong:
                 spec.read_timeout_ms = backend_info.get("read")
                 spec.write_timeout_ms = backend_info.get("write")
                 spec.retry = backend_info.get("retry")
-                spec.plugins = [PluginSpec(p.name, p.config, p.ref, p.shared_key, p.trigger) for p in plugins]
+                spec.plugins = [PluginSpec(p.name, p.config, p.ref, p.shared_key) for p in plugins]
             self.plan.routes.append(spec)
 
     def _check_regex_overlaps(self) -> None:

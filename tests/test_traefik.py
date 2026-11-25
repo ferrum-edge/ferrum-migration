@@ -1475,6 +1475,19 @@ class TraefikHardeningTest(unittest.TestCase):
                     "serversTransports": {"t": {"forwardingTimeouts": {"readTimeout": "5s"}}},
                 }
             }),
+            ("transport-idle-conn-zero-mirror", {
+                "http": {
+                    "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "m"}},
+                    "services": {
+                        "m": {"mirroring": {"service": "main", "mirrorBody": False,
+                                            "mirrors": [{"name": "shadow", "percent": 20}]}},
+                        "main": {"loadBalancer": {"servers": [{"url": "http://main.internal:8080"}]}},
+                        "shadow": {"loadBalancer": {"passHostHeader": False, "serversTransport": "t",
+                                                    "servers": [{"url": "https://shadow.internal:9443"}]}},
+                    },
+                    "serversTransports": {"t": {"forwardingTimeouts": {"idleConnTimeout": "0s"}}},
+                }
+            }),
             ("transport-max-idle-conns-mirror", {
                 "http": {
                     "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "m"}},
@@ -1635,11 +1648,47 @@ class TraefikHardeningTest(unittest.TestCase):
                     "serversTransports": {"t": {"cipherSuites": ["TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"]}},
                 }
             }),
+            ("transport-empty-spiffe", {
+                "http": {
+                    "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "main"}},
+                    "services": {"main": {"loadBalancer": {"serversTransport": "t",
+                                                           "servers": [{"url": "https://main.internal:8443"}]}}},
+                    "serversTransports": {"t": {"spiffe": {}}},
+                }
+            }),
+            ("transport-readTimeout", {
+                "http": {
+                    "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "main"}},
+                    "services": {"main": {"loadBalancer": {"serversTransport": "t",
+                                                           "servers": [{"url": "https://main.internal:8443"}]}}},
+                    "serversTransports": {"t": {"forwardingTimeouts": {"readTimeout": "5s"}}},
+                }
+            }),
+            ("buffering-over-u64", {
+                "http": {
+                    "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "main",
+                                      "middlewares": ["b"]}},
+                    "middlewares": {"b": {"buffering": {"maxResponseBodyBytes": 1 << 64}}},
+                    "services": {"main": {"loadBalancer": {"servers": [{"url": "http://main.internal:8080"}]}}},
+                }
+            }),
         ):
             with self.subTest(case=label):
                 res_bad, _rep_bad, _ = asserted(yaml.safe_dump(bad_doc))
                 self.assertEqual(one_proxy(self, res_bad.config, "/api", "a.example.test")["labels"][
                     "ferrum-migration/status"], "refused")
+        # compress.minResponseBodyBytes above u64::MAX omits compression cleanly instead of emitting invalid config.
+        over_comp_doc = yaml.safe_dump({
+            "http": {
+                "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "main",
+                                  "middlewares": ["c"]}},
+                "middlewares": {"c": {"compress": {"minResponseBodyBytes": 1 << 64}}},
+                "services": {"main": {"loadBalancer": {"servers": [{"url": "http://main.internal:8080"}]}}},
+            }
+        })
+        oc_res, oc_rep, _ = asserted(over_comp_doc)
+        self.assertEqual(plugins_of(oc_res.config, one_proxy(self, oc_res.config, "/api", "a.example.test")), [])
+        self.assertIn("traefik-compress", codes(oc_rep, "warning"))
         # Canonical schema gate checks newly supported compress/grpcWeb/mirror/v3.8 fields.
         for bad_case in (
             {"http": {"middlewares": {"c": {"compress": {"Encodings": ["gzip"]}}}}},

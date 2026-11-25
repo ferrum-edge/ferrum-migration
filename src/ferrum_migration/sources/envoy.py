@@ -181,6 +181,7 @@ class _Envoy:
         self.clusters: dict[str, dict] = {}
         self.has_runtime = bool(root.get("layered_runtime") or root.get("runtime"))
         self._cors_origin_cache: dict[int, tuple[Any, list[Any], str | None, str]] = {}
+        self._cors_config_cache: dict[tuple, tuple[Any, dict | None, str | None]] = {}
 
     def run(self) -> Plan:
         if self.root.get("dynamic_resources"):
@@ -355,6 +356,7 @@ class _Envoy:
         hcm_plugins: list[PluginSpec] = []
         hcm_compressors: list[dict[str, Any]] = []
         compressor_filter_count = 0
+        active_compressor_count = 0
         hcm_fault: PluginSpec | None = None
         hcm_fault_error: str | None = None
         hcm_filter_kinds: dict[str, str] = {}
@@ -405,20 +407,23 @@ class _Envoy:
             elif kind == "compressor":
                 compressor_filter_count += 1
                 comp_status, comp_val = _parse_envoy_compressor(typed)
-                if comp_status == "plugin":
+                if comp_status == "disabled":
+                    self.report.info("envoy-compressor-disabled", ref,
+                                     "Envoy compressor filter has response compression disabled; omitted.")
+                elif comp_status == "plugin":
+                    active_compressor_count += 1
                     comp_cfg, dropped_wild = comp_val
                     if dropped_wild:
                         self.report.warning("envoy-compressor", ref,
                                             "Envoy compressor content_type wildcard entries ('*' or 'type/*') were "
                                             "dropped (Envoy matches literally whereas Ferrum treats 'type/*' as a range).")
                     hcm_compressors.append(comp_cfg)
-                elif comp_status == "omit":
+                elif comp_status == "omit_active":
+                    active_compressor_count += 1
                     if comp_val:
                         self.report.warning("envoy-compressor", ref, comp_val)
-                    else:
-                        self.report.info("envoy-compressor-disabled", ref,
-                                         "Envoy compressor filter has response compression disabled; omitted.")
                 else:
+                    active_compressor_count += 1
                     filter_refusal = f"HTTP filter compressor cannot be migrated ({comp_val})"
             elif kind == "fault":
                 fault_status, fault_val = _parse_envoy_fault(typed, has_runtime=self.has_runtime)
@@ -436,12 +441,12 @@ class _Envoy:
                                   "confirming IdP token format")
             else:
                 filter_refusal = f"HTTP filter {safe_label(kind, 80)} has no safe Ferrum equivalent"
-        if len(hcm_compressors) == 1 and compressor_filter_count == 1:
-            hcm_plugins.append(PluginSpec("compression", hcm_compressors[0], ref))
-        elif hcm_compressors and compressor_filter_count > 1:
+        if compressor_filter_count > 1 and active_compressor_count >= 1:
             filter_refusal = ("multiple compressor HTTP filters (including disabled entries registered in Envoy's "
                               "Accept-Encoding negotiation registry) cannot be proven equivalent to one Ferrum "
                               "compression plugin")
+        elif len(hcm_compressors) == 1 and compressor_filter_count == 1:
+            hcm_plugins.append(PluginSpec("compression", hcm_compressors[0], ref))
         route_config = mapping(config.get("route_config"))
         shared = {"request_add": seq(route_config.get("request_headers_to_add")),
                   "request_remove": seq(route_config.get("request_headers_to_remove")),
@@ -1019,6 +1024,14 @@ class _Envoy:
                 spec.refuse("CORS policy has an invalid forward_not_matching_preflights value")
                 return False
             unmatched_mode = "forward" if fnmp_bool else "ignore"
+        raw_pna = next((p["allow_private_network_access"] for p in policies
+                        if p.get("allow_private_network_access") is not None), None)
+        pna: bool | None = None
+        if raw_pna is not None:
+            pna = _proto_bool(raw_pna)
+            if pna is None:
+                spec.refuse("CORS policy has an invalid non-boolean allow_private_network_access value")
+                return False
         parsed_methods = split_csv(merged_methods) or None
         parsed_headers = split_csv(merged_headers) or None
         parsed_expose = split_csv(merged_expose) or None
@@ -1045,11 +1058,32 @@ class _Envoy:
         # Use Ferrum's unmatched_preflights mode so omitted allow_methods/allow_headers stay empty and omitted
         # max_age stays absent (matching Envoy cors_filter.cc instead of inheriting Ferrum's permissive defaults).
         # Pass raw merged_max_age so invalid or >u64 values fail cors_config rather than silently becoming None.
-        built, problem = cors_config(origins, parsed_methods, parsed_headers, parsed_expose,
-                                     creds, merged_max_age,
-                                     unmatched_preflights=unmatched_mode)
+        # Cache validated CORS config by shared origin object and effective fields, and emit as a shared
+        # proxy_group plugin so thousands of routes inheriting one large regex origin list emit one config entry.
+        cacheable_age = merged_max_age if isinstance(merged_max_age, (str, int, float, type(None))) else None
+        cfg_key = (
+            id(merged_origins),
+            star_state,
+            tuple(parsed_methods) if parsed_methods is not None else None,
+            tuple(parsed_headers) if parsed_headers is not None else None,
+            tuple(parsed_expose) if parsed_expose is not None else None,
+            creds,
+            type(merged_max_age).__name__,
+            cacheable_age,
+            pna,
+            unmatched_mode,
+        ) if isinstance(merged_max_age, (str, int, float, type(None))) else None
+        cached_cfg = self._cors_config_cache.get(cfg_key) if cfg_key is not None else None
+        if cached_cfg is not None and cached_cfg[0] is merged_origins:
+            built, problem = cached_cfg[1], cached_cfg[2]
+        else:
+            built, problem = cors_config(origins, parsed_methods, parsed_headers, parsed_expose,
+                                         creds, merged_max_age, private_network=pna,
+                                         unmatched_preflights=unmatched_mode)
+            if cfg_key is not None:
+                self._cors_config_cache[cfg_key] = (merged_origins, built, problem)
         if built:
-            spec.plugins.append(PluginSpec("cors", built, ref))
+            spec.plugins.append(PluginSpec("cors", built, ref, shared_key="envoy-cors"))
             return True
         spec.refuse(f"active CORS policy cannot be admitted by Ferrum ({problem})")
         return False
@@ -1397,7 +1431,7 @@ def _parse_envoy_compressor(typed: dict) -> tuple[str, Any]:
         if resp_enabled.get("default_value") is not None and default_enabled is None:
             return "refuse", "response_direction_config.common_config.enabled.default_value is invalid"
         if default_enabled is False:
-            return "omit", None
+            return "disabled", None
     raw_min = common.get("min_content_length")
     if raw_min is None:
         # Envoy CommonDirectionConfig defaults min_content_length to 30 bytes (Ferrum defaults to 256).
@@ -1421,8 +1455,8 @@ def _parse_envoy_compressor(typed: dict) -> tuple[str, Any]:
         exact_types = [ct for ct in content_types if "*" not in ct]
         dropped_wild = len(exact_types) != len(content_types)
         if not exact_types:
-            return "omit", ("Envoy compressor content_type contains only wildcard entries (literal in Envoy, "
-                            "range in Ferrum); omitted.")
+            return "omit_active", ("Envoy compressor content_type contains only wildcard entries (literal in Envoy, "
+                                   "range in Ferrum); omitted.")
         content_types = exact_types
     remove_ae = resp.get("remove_accept_encoding_header")
     if remove_ae is None:
@@ -1488,7 +1522,7 @@ def _parse_envoy_fault(typed: dict, *, has_runtime: bool = False) -> tuple[str, 
         if pct is None:
             return "refuse", "abort.percentage is invalid"
         if pct > 0.0:
-            abort_cfg = {"status_code": http_status, "percentage": pct}
+            abort_cfg = {"status_code": http_status, "percentage": pct, "body": "fault filter abort"}
             if grpc_status is not None:
                 abort_cfg["grpc_status"] = grpc_status
     if delay_cfg is None and abort_cfg is None:
