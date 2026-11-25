@@ -628,8 +628,14 @@ def _decide_frontend(plan: Plan, routes: list[RouteSpec], options: EmitOptions, 
                 route.refuse("the source serves this route over HTTPS only, but other routes are plaintext and "
                              "Ferrum would expose it on the plaintext listener too (re-run with --tls-only)")
         remaining = [route for route in active if not route.refusals]
-        if not remaining or all("https" in _effective_protocols(route) for route in remaining):
-            mode = "both"  # nothing live, or every live route was served on both main listeners
+        single_proto_scopes = [
+            scope for scope in plan.host_scopes
+            if scope.listen_port is None and scope.protocols is not None
+            and scope.protocols in (frozenset({"http"}), frozenset({"https"}))
+        ]
+        if (not remaining or all("https" in _effective_protocols(route) for route in remaining)) \
+                and not single_proto_scopes:
+            mode = "both"  # nothing live, or every live route and host scope was served on both main listeners
             http_port = plan.settings.main_http_port or 8000
             https_port = plan.settings.main_https_port or 8443
             if (plan.settings.main_https_port or _source_https_activity(plan, present)) and http_port == https_port:
@@ -645,13 +651,18 @@ def _decide_frontend(plan: Plan, routes: list[RouteSpec], options: EmitOptions, 
             plaintext_only = sum(1 for route in remaining if "https" not in _effective_protocols(route))
             dual = len(remaining) - plaintext_only
             if _source_https_activity(plan, present):
+                scope_note = (
+                    f" ({len(single_proto_scopes)} host scope(s) also existed on only one listener)"
+                    if single_proto_scopes else ""
+                )
                 report.error("frontend-https-disabled", "frontend listeners",
-                             f"{plaintext_only} migrated route(s) were served over plaintext only in the source. Ferrum "
-                             "serves every route on each listener it opens, whatever its host names, so with HTTPS "
-                             "open they would also answer HTTPS requests the source never sent to them. The profile "
-                             "therefore disables Ferrum's HTTPS listener (FERRUM_PROXY_HTTPS_PORT=0) and configures no "
-                             f"frontend TLS. {dual} migrated route(s) the source also served over HTTPS are served "
-                             "over plaintext only, and HTTPS-only routes were refused (fail closed).",
+                             f"{plaintext_only} migrated route(s) were served over plaintext only in the source"
+                             f"{scope_note}. Ferrum serves every route and scope closure on each listener it opens, "
+                             "whatever its host names, so with HTTPS open plaintext-only routes or closures would "
+                             "affect HTTPS requests the source routed differently. The profile therefore disables "
+                             "Ferrum's HTTPS listener (FERRUM_PROXY_HTTPS_PORT=0) and configures no frontend TLS. "
+                             f"{dual} migrated route(s) the source also served over HTTPS are served over plaintext "
+                             "only, and HTTPS-only routes were refused (fail closed).",
                              "Serve the source's HTTPS listener from a separately configured Ferrum instance (convert "
                              "a copy of the source that contains only it, or re-run with --tls-only to keep only the "
                              "routes the source served over HTTPS), then validate each instance.")
@@ -1190,6 +1201,8 @@ def _resolve_conflicts(candidates: list[_Cand], report: Report) -> list[_Cand]:
         all_idx = _PortHostIndex()
         prefix_by_path: dict[str, _PortHostIndex] = {}
         literal_by_path: dict[str, _PortHostIndex] = {}
+        ci_prefix_by_path: dict[str, _PortHostIndex] = {}
+        ci_literal_by_path: dict[str, _PortHostIndex] = {}
         regex_by_literal_prefix: dict[str, _PortHostIndex] = {}
         special_idx = _PortHostIndex()
         for item in candidates:
@@ -1197,7 +1210,7 @@ def _resolve_conflicts(candidates: list[_Cand], report: Report) -> list[_Cand]:
                 continue
             all_idx.add(item)
             r = item.route
-            if r.kind == "hostonly" or r.case_insensitive:
+            if r.kind == "hostonly":
                 special_idx.add(item)
             elif r.kind == "regex":
                 lit = util.regex_literal_prefix(r.path or "") if (
@@ -1207,6 +1220,11 @@ def _resolve_conflicts(candidates: list[_Cand], report: Report) -> list[_Cand]:
                     regex_by_literal_prefix.setdefault(lit, _PortHostIndex()).add(item)
                 else:
                     special_idx.add(item)
+            elif r.case_insensitive:
+                pl = (r.path or "/").lower()
+                ci_literal_by_path.setdefault(pl, _PortHostIndex()).add(item)
+                if r.kind == "prefix":
+                    ci_prefix_by_path.setdefault(pl, _PortHostIndex()).add(item)
             else:
                 p = r.path or "/"
                 literal_by_path.setdefault(p, _PortHostIndex()).add(item)
@@ -1217,6 +1235,9 @@ def _resolve_conflicts(candidates: list[_Cand], report: Report) -> list[_Cand]:
             "prefix_by_path": prefix_by_path,
             "literal_by_path": literal_by_path,
             "sorted_literal_paths": sorted(literal_by_path),
+            "ci_prefix_by_path": ci_prefix_by_path,
+            "ci_literal_by_path": ci_literal_by_path,
+            "sorted_ci_literal_paths": sorted(ci_literal_by_path),
             "regex_by_literal_prefix": regex_by_literal_prefix,
             "sorted_regex_prefixes": sorted(regex_by_literal_prefix),
             "special": special_idx,
@@ -1274,6 +1295,9 @@ def _resolve_conflicts(candidates: list[_Cand], report: Report) -> list[_Cand]:
             prefix_by_path: dict[str, _PortHostIndex] = outrank_indices["prefix_by_path"]
             literal_by_path: dict[str, _PortHostIndex] = outrank_indices["literal_by_path"]
             sorted_literal_paths: list[str] = outrank_indices["sorted_literal_paths"]
+            ci_prefix_by_path: dict[str, _PortHostIndex] = outrank_indices["ci_prefix_by_path"]
+            ci_literal_by_path: dict[str, _PortHostIndex] = outrank_indices["ci_literal_by_path"]
+            sorted_ci_literal_paths: list[str] = outrank_indices["sorted_ci_literal_paths"]
             regex_by_literal_prefix: dict[str, _PortHostIndex] = outrank_indices["regex_by_literal_prefix"]
             sorted_regex_prefixes: list[str] = outrank_indices["sorted_regex_prefixes"]
             seen_idx_ids: set[int] = set()
@@ -1285,17 +1309,24 @@ def _resolve_conflicts(candidates: list[_Cand], report: Report) -> list[_Cand]:
 
             _add_idx(outrank_indices["special"])
             for path_str in literal_paths:
+                pl = path_str.lower()
                 for k in range(1, len(path_str) + 1):
                     sub = path_str[:k]
                     _add_idx(prefix_by_path.get(sub))
+                    _add_idx(ci_prefix_by_path.get(pl[:k]))
                     if k >= 2:
                         _add_idx(regex_by_literal_prefix.get(sub))
                 _add_idx(literal_by_path.get(path_str))
+                _add_idx(ci_literal_by_path.get(pl))
                 if has_prefix:
                     lo = bisect.bisect_left(sorted_literal_paths, path_str)
                     while lo < len(sorted_literal_paths) and sorted_literal_paths[lo].startswith(path_str):
                         _add_idx(literal_by_path[sorted_literal_paths[lo]])
                         lo += 1
+                    clo = bisect.bisect_left(sorted_ci_literal_paths, pl)
+                    while clo < len(sorted_ci_literal_paths) and sorted_ci_literal_paths[clo].startswith(pl):
+                        _add_idx(ci_literal_by_path[sorted_ci_literal_paths[clo]])
+                        clo += 1
                     rlo = bisect.bisect_left(sorted_regex_prefixes, path_str)
                     while rlo < len(sorted_regex_prefixes) and sorted_regex_prefixes[rlo].startswith(path_str):
                         _add_idx(regex_by_literal_prefix[sorted_regex_prefixes[rlo]])
@@ -1316,14 +1347,21 @@ def _resolve_conflicts(candidates: list[_Cand], report: Report) -> list[_Cand]:
             else:
                 active_hosts = []
             for target_idx in target_indices:
+                pruned_any = False
                 for other in target_idx.query(p, active_hosts, path_slot=False):
                     oid = id(other)
-                    if oid in seen_other or oid in excluded_ids or oid in replacement or other.placeholder:
+                    if oid in seen_other or oid in excluded_ids or oid in replacement:
+                        continue
+                    if other.placeholder:
+                        pruned_any = True
                         continue
                     seen_other.add(oid)
                     if any(matching.route_overlaps(probe, other.route) for probe in probes):
                         _fail_close(other, reason)
                         refused_outrank += 1
+                        pruned_any = True
+                if pruned_any:
+                    target_idx.prune_placeholders(p, active_hosts)
             if covers_all_paths:
                 _mark_fully_closed(p, active_hosts)
                 all_idx.prune_placeholders(p, active_hosts)

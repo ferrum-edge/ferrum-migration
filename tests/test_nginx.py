@@ -1003,6 +1003,32 @@ class NginxFrontendScopeTest(unittest.TestCase):
         self.assertEqual(ro_noloc_res.frontend_protocols, "http")
         self.assertEqual(one_proxy(self, ro_noloc_res.config, None, "secure.example.test")["labels"][
             "ferrum-migration/status"], "scope-default")
+        # An HTTP-only location-less server alongside a dual-listener default disables HTTPS in default mode
+        # (frontend-https-disabled) and omits its HTTP-only closure in --tls-only mode so live HTTPS is not blocked.
+        http_noloc_dual_conf = """
+        server {
+            listen 80 default_server;
+            listen 443 ssl default_server;
+            ssl_certificate /etc/synthetic/server.crt;
+            ssl_certificate_key /etc/synthetic/server.key;
+            location / { proxy_pass http://dual.internal:8080; }
+        }
+        server {
+            listen 80;
+            server_name plainonly.example.test;
+        }
+        """
+        hn_def, hn_def_rep, _ = nginx(http_noloc_dual_conf)
+        assert_structurally_valid(self, hn_def.config)
+        self.assertEqual(hn_def.frontend_protocols, "http")
+        self.assertIn("frontend-https-disabled", codes(hn_def_rep, "error"))
+        self.assertEqual(one_proxy(self, hn_def.config, None, "plainonly.example.test")["labels"][
+            "ferrum-migration/status"], "scope-default")
+        hn_tls, _hn_tls_rep, _ = nginx(http_noloc_dual_conf, tls_only=True)
+        assert_structurally_valid(self, hn_tls.config)
+        self.assertEqual(hn_tls.frontend_protocols, "https")
+        self.assertEqual(proxies(hn_tls.config, None, "plainonly.example.test"), [])
+        self.assertEqual(one_proxy(self, hn_tls.config, "/")["labels"]["ferrum-migration/status"], "migrated")
 
 
 if __name__ == "__main__":

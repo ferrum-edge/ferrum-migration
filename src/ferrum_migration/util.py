@@ -306,7 +306,9 @@ def _rust_regex_syntax_problem(pattern: str) -> tuple[str | None, str]:
                 err = _charge(max(2, class_cost))
                 if err:
                     return err, ""
+                py_parts.append(ch)
             else:
+                py_parts.append(r"\-" if (ch == "-" and class_state == 0) else ch)
                 if ch == "-" and class_state == 1:
                     class_state = 2
                 elif class_state == 2:
@@ -314,7 +316,6 @@ def _rust_regex_syntax_problem(pattern: str) -> tuple[str | None, str]:
                 else:
                     class_state = 0 if ch == "-" else 1
                 class_cost += 1
-            py_parts.append(ch)
             i += 1
             continue
         if x_on and ch == "#":
