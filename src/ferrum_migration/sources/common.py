@@ -215,14 +215,6 @@ def response_header_rule(op: str, key: Any, value: Any = None, new_key: Any = No
 
 # ----------------------------------------------------------------- CORS
 
-_CORS_UNIVERSALITY_PROBE_GROUPS = (
-    ("https://a.invalid", "https://b.example", "https://z.test"),
-    ("http://a.invalid", "http://b.example", "http://z.test"),
-    ("chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "chrome-extension://bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
-    ("moz-extension://00000000-0000-4000-8000-000000000000", "moz-extension://11111111-1111-4111-8111-111111111111"),
-)
-
-
 def _cors_prefix_is_effectively_universal(prefix: str) -> bool:
     if "://" not in prefix:
         return True
@@ -234,12 +226,12 @@ def _cors_prefix_is_effectively_universal(prefix: str) -> bool:
 
 
 def _cors_origin_effectively_universal(origin: Any) -> bool:
+    # Under allow_credentials=true, Ferrum enforces PSL-backed host-constraint checks on wildcard suffixes
+    # (`*.suffix`) and regex origins (`origin_regex_host_is_provably_constrained`). Without embedding a Public
+    # Suffix List snapshot, fail closed on exact 'null', prefixes lacking a scheme://host: boundary, wildcard
+    # suffixes, and regex origins so generated resources never fail Ferrum admission.
     if isinstance(origin, str):
-        if origin == "null":
-            return True
-        if origin.startswith("*.") and origin[2:].count(".") < 1:
-            return True
-        return False
+        return origin == "null" or origin.startswith("*.")
     if isinstance(origin, dict) and len(origin) == 1:
         kind, value = next(iter(origin.items()))
         if kind == "exact":
@@ -247,13 +239,7 @@ def _cors_origin_effectively_universal(origin: Any) -> bool:
         if kind == "prefix":
             return _cors_prefix_is_effectively_universal(value)
         if kind == "regex":
-            try:
-                compiled = re.compile(value)
-            except re.error:
-                return True
-            if compiled.fullmatch("null"):
-                return True
-            return any(all(compiled.fullmatch(p) for p in group) for group in _CORS_UNIVERSALITY_PROBE_GROUPS)
+            return True
     return False
 
 

@@ -893,17 +893,27 @@ class EnvoyHardeningTest(unittest.TestCase):
         self.assertEqual(ti_cors["allowed_methods"], ["GET"])
         self.assertEqual(ti_cors["unmatched_preflights"], "forward")
 
-        # (D) Inherited allow_credentials: true combined with a route prefix origin lacking a scheme://host: boundary
-        #     refuses the route before emitting an un-admissible CORS plugin.
-        cred_prefix = copy.deepcopy(typed_inherit)
-        ch = cred_prefix["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"]
-        ch["route_config"]["typed_per_filter_config"]["envoy.filters.http.cors"]["allow_credentials"] = {"value": True}
-        ch["route_config"]["virtual_hosts"][0]["routes"][0]["typed_per_filter_config"]["envoy.filters.http.cors"][
-            "allow_origin_string_match"] = [{"prefix": "https://preview.example.test"}]
-        cp_res, _cp_rep, _ = migrate("envoy", yaml.safe_dump(cred_prefix))
-        self.assertEqual(one_proxy(self, cp_res.config, "/api")["labels"]["ferrum-migration/status"], "refused")
+        # (D) Inherited allow_credentials: true combined with non-boundary prefix, regex origin (PSL-sensitive), or
+        #     wildcard '*' allow_methods/allow_headers refuses the route before emitting an un-admissible/broken plugin.
+        for bad_override in (
+            {"allow_origin_string_match": [{"prefix": "https://preview.example.test"}]},
+            {"allow_origin_string_match": [{"safe_regex": {"regex": r"https://.*\.vercel\.app"}}]},
+            {"allow_origin_string_match": [{"safe_regex": {"regex": r"https://[a-z]{2,}\.com"}}]},
+            {"allow_origin_string_match": [{"exact": "https://app.example.test"}],
+             "allow_methods": "*", "allow_headers": "*"},
+        ):
+            cred_bad = copy.deepcopy(typed_inherit)
+            ch = cred_bad["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"]
+            ch["route_config"]["typed_per_filter_config"]["envoy.filters.http.cors"]["allow_credentials"] = {"value": True}
+            ch["route_config"]["virtual_hosts"][0]["routes"][0]["typed_per_filter_config"]["envoy.filters.http.cors"] = {
+                "@type": "type.googleapis.com/envoy.extensions.filters.http.cors.v3.CorsPolicy",
+                **bad_override,
+            }
+            cp_res, _cp_rep, _ = migrate("envoy", yaml.safe_dump(cred_bad))
+            self.assertEqual(one_proxy(self, cp_res.config, "/api")["labels"]["ferrum-migration/status"], "refused")
 
-        # (E) Active HCM fault filter on direct_response or HTTP-to-HTTPS redirect refuses (never folded away).
+        # (E) Active HCM fault filter on direct_response or HTTP-to-HTTPS redirect refuses (never folded away),
+        #     and multiple fault filters in one HCM refuse (so disabling fault-b cannot erase fault-a).
         fault_term = minimal_bootstrap({"path": "/healthz"})
         fhcm = fault_term["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"]
         fhcm["http_filters"] = [
@@ -927,6 +937,24 @@ class EnvoyHardeningTest(unittest.TestCase):
         ]
         fr_res, _fr_rep, _ = migrate("envoy", yaml.safe_dump(fault_term))
         self.assertEqual(one_proxy(self, fr_res.config, "/")["labels"]["ferrum-migration/status"], "refused")
+        # Two fault filters (fault-a active, fault-b disabled on route) refuse the whole HCM.
+        two_faults = minimal_bootstrap({"path": "/healthz"})
+        tfhcm = two_faults["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"]
+        tfhcm["http_filters"] = [
+            {"name": "fault-a",
+             "typed_config": {
+                 "@type": "type.googleapis.com/envoy.extensions.filters.http.fault.v3.HTTPFault",
+                 "abort": {"http_status": 503, "percentage": {"numerator": 100, "denominator": "HUNDRED"}},
+             }},
+            {"name": "fault-b", "disabled": True,
+             "typed_config": {"@type": "type.googleapis.com/envoy.extensions.filters.http.fault.v3.HTTPFault"}},
+            {"name": "envoy.filters.http.router"},
+        ]
+        tfhcm["route_config"]["virtual_hosts"][0]["routes"][0]["typed_per_filter_config"] = {
+            "fault-b": {"@type": "type.googleapis.com/envoy.config.route.v3.FilterConfig", "disabled": True}
+        }
+        self.assertEqual(one_proxy(self, migrate("envoy", yaml.safe_dump(two_faults))[0].config, "=/healthz")[
+            "labels"]["ferrum-migration/status"], "refused")
 
 
 if __name__ == "__main__":

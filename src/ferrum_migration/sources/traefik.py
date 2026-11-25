@@ -765,7 +765,7 @@ class _Traefik:
                 spec.plugins.append(PluginSpec(extra_plugin.name, extra_plugin.config, extra_plugin.ref,
                                                extra_plugin.shared_key))
             self._apply_paths(spec, acc)
-            if (spec.strip_listen_path or spec.backend_path) \
+            if (spec.strip or spec.backend_path) \
                     and any(p.name == "request_mirror" for p in spec.plugins):
                 spec.plugins = [p for p in spec.plugins if p.name != "request_mirror"]
                 self.report.warning("traefik-mirroring", ref,

@@ -292,6 +292,8 @@ class _Envoy:
         hcm_fault: PluginSpec | None = None
         hcm_jwt: PluginSpec | None = None
         hcm_filter_kinds: dict[str, str] = {}
+        fault_filter_count = 0
+        cors_filter_count = 0
         for http_filter in seq(config.get("http_filters")):
             raw_filter = mapping(http_filter)
             if raw_filter.get("config_discovery") is not None:
@@ -301,6 +303,14 @@ class _Envoy:
             fname = raw_filter.get("name")
             if isinstance(fname, str) and fname:
                 hcm_filter_kinds[fname] = kind
+            if kind == "fault":
+                fault_filter_count += 1
+                if fault_filter_count > 1:
+                    filter_refusal = "multiple fault HTTP filters in one connection manager are not supported"
+            elif kind == "cors":
+                cors_filter_count += 1
+                if cors_filter_count > 1:
+                    filter_refusal = "multiple cors HTTP filters in one connection manager are not supported"
             if raw_filter.get("disabled"):
                 continue
             typed = mapping(raw_filter.get("typed_config"))
@@ -847,11 +857,17 @@ class _Envoy:
                 spec.refuse("CORS policy has an invalid forward_not_matching_preflights value")
                 return
             unmatched_mode = "forward" if fnmp_bool else "ignore"
+        parsed_methods = split_csv(merged_methods) or None
+        parsed_headers = split_csv(merged_headers) or None
+        parsed_expose = split_csv(merged_expose) or None
+        if creds is True and any("*" in (lst or []) for lst in (parsed_methods, parsed_headers, parsed_expose)):
+            spec.refuse("CORS policy combines allow_credentials=true with wildcard '*' in "
+                        "allow_methods/allow_headers/expose_headers, which Ferrum returns literally; specify "
+                        "explicit method and header lists")
+            return
         # Use Ferrum's unmatched_preflights mode so omitted allow_methods/allow_headers stay empty and omitted
         # max_age stays absent (matching Envoy cors_filter.cc instead of inheriting Ferrum's permissive defaults).
-        built, problem = cors_config(origins, split_csv(merged_methods) or None,
-                                     split_csv(merged_headers) or None,
-                                     split_csv(merged_expose) or None,
+        built, problem = cors_config(origins, parsed_methods, parsed_headers, parsed_expose,
                                      creds, util.as_int(merged_max_age) if merged_max_age else None,
                                      unmatched_preflights=unmatched_mode)
         if built:
