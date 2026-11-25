@@ -42,9 +42,9 @@ CASES = [("kong", ("kong", "kong.yaml"), "yaml"), ("nginx", ("nginx", "nginx.con
 
 
 def ferrum_src():
-    explicit = os.environ.get("FERRUM_EDGE_SRC")
-    if explicit:
-        return os.path.abspath(explicit)
+    if "FERRUM_EDGE_SRC" in os.environ:
+        raw = os.environ["FERRUM_EDGE_SRC"]
+        return os.path.abspath(raw) if raw else ""
     default = os.path.join(ROOT, "..", "refs", "ferrum-edge")
     if os.path.exists(os.path.join(default, ".git")):
         return os.path.abspath(default)
@@ -80,16 +80,16 @@ def outputs():
         yield platform, parts, result, plan
 
 
-@unittest.skipUnless(ferrum_src(), "Ferrum Edge source not available (set FERRUM_EDGE_SRC)")
+@unittest.skipUnless(ferrum_src() is not None, "Ferrum Edge source not available (set FERRUM_EDGE_SRC)")
 class FerrumSourceSchemaTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.src = ferrum_src()
         git = shutil.which("git")
-        if not git or not os.path.exists(os.path.join(cls.src, ".git")):
+        if not git or not cls.src or not os.path.isdir(cls.src):
             raise AssertionError(
-                f"FERRUM_EDGE_SRC ({cls.src}) must be a git checkout containing pinned commit "
-                f"{FERRUM_EDGE_REFERENCE_COMMIT}; unpacked or non-git trees are rejected"
+                f"FERRUM_EDGE_SRC ({cls.src!r}) must be a git repository containing pinned commit "
+                f"{FERRUM_EDGE_REFERENCE_COMMIT}"
             )
         check = subprocess.run(
             [git, "-C", cls.src, "rev-parse", "--verify", f"{FERRUM_EDGE_REFERENCE_COMMIT}^{{commit}}"],
@@ -98,6 +98,14 @@ class FerrumSourceSchemaTest(unittest.TestCase):
         if check.returncode != 0 or check.stdout.strip() != FERRUM_EDGE_REFERENCE_COMMIT:
             raise AssertionError(
                 f"FERRUM_EDGE_SRC ({cls.src}) does not contain pinned commit {FERRUM_EDGE_REFERENCE_COMMIT}"
+            )
+        blob = subprocess.run(
+            [git, "-C", cls.src, "cat-file", "-e", f"{FERRUM_EDGE_REFERENCE_COMMIT}:src/config/types.rs"],
+            capture_output=True, text=True, check=False,
+        )
+        if blob.returncode != 0:
+            raise AssertionError(
+                f"FERRUM_EDGE_SRC ({cls.src}) cannot serve {FERRUM_EDGE_REFERENCE_COMMIT}:src/config/types.rs"
             )
         cls.git = git
         cls.pinned_commit = FERRUM_EDGE_REFERENCE_COMMIT

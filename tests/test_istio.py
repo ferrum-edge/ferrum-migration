@@ -1093,6 +1093,7 @@ class IstioCaseAndNamesTest(unittest.TestCase):
             ("numeric-namespace", "{group: gateway.networking.k8s.io, kind: Gateway, name: gw, namespace: 42}"),
             ("gateway-class", "{group: gateway.networking.k8s.io, kind: GatewayClass, name: istio}"),
             ("wrong-gateway-group", "{group: networking.istio.io, kind: Gateway, name: edge-api}"),
+            ("padded-core-group", "{group: ' ', kind: Service, name: api}"),
             ("cross-ns-service", "{group: '', kind: Service, name: api, namespace: other}"),
         ):
             with self.subTest(target_ref=bad_ref_label):
@@ -1155,6 +1156,22 @@ class IstioCaseAndNamesTest(unittest.TestCase):
                 bad_cc = cred_cors_base.replace("exact: https://app.example.test", bad_origin)
                 cc_res = migrate("istio", bad_cc)[0]
                 self.assertEqual(one_proxy(self, cc_res.config, "=/api", "api.example.test")["labels"][
+                    "ferrum-migration/status"], "refused")
+        # Empty allowOrigins: [] is authoritative (never falls back to deprecated allowOrigin) and
+        # non-string unmatchedPreflights (e.g. YAML bool true) refuses a credentialed route.
+        for label, bad_patch in (
+            ("empty-allowOrigins", cred_cors_base.replace(
+                "allowOrigins:\n                      - exact: https://app.example.test",
+                "allowOrigins: []",
+            )),
+            ("bool-unmatchedPreflights", cred_cors_base.replace(
+                "unmatchedPreflights: IGNORE",
+                "unmatchedPreflights: true",
+            )),
+        ):
+            with self.subTest(case=label):
+                ep_res = migrate("istio", bad_patch)[0]
+                self.assertEqual(one_proxy(self, ep_res.config, "=/api", "api.example.test")["labels"][
                     "ferrum-migration/status"], "refused")
 
 

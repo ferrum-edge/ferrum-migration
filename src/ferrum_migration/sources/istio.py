@@ -702,13 +702,9 @@ class _Istio:
         raw_unmatched = policy.get("unmatchedPreflights")
         unmatched_mode = "forward"
         if raw_unmatched is not None:
-            if isinstance(raw_unmatched, str) and raw_unmatched.upper() in ("UNSPECIFIED", "FORWARD"):
+            if isinstance(raw_unmatched, str) and raw_unmatched in ("UNSPECIFIED", "FORWARD"):
                 unmatched_mode = "forward"
-            elif isinstance(raw_unmatched, str) and raw_unmatched.upper() == "IGNORE":
-                unmatched_mode = "ignore"
-            elif raw_unmatched in (0, 1):
-                unmatched_mode = "forward"
-            elif raw_unmatched == 2:
+            elif isinstance(raw_unmatched, str) and raw_unmatched == "IGNORE":
                 unmatched_mode = "ignore"
             else:
                 if creds is True:
@@ -718,21 +714,25 @@ class _Istio:
                                         "CORS omitted (unsupported unmatchedPreflights value); browsers block "
                                         "cross-origin calls.")
                 return
-        # Istio prefers allowOrigins when present and ignores deprecated allowOrigin.
+        # Istio treats allowOrigins as authoritative whenever the key is present (even if empty []);
+        # fall back to deprecated allowOrigin only when allowOrigins is omitted or null.
         origins = []
         matcher_problem: str | None = None
-        modern_origins = seq(policy.get("allowOrigins"))
-        if modern_origins:
-            for raw_m in modern_origins:
-                matcher = mapping(raw_m)
-                extra_keys = set(matcher) - {"exact", "prefix", "regex"}
-                present = [k for k in ("exact", "prefix", "regex") if k in matcher]
-                if extra_keys or len(present) != 1:
-                    origins = []
-                    matcher_problem = "allowOrigins entry uses unsupported or ambiguous matcher fields"
-                    break
-                key = present[0]
-                origins.append({key: matcher[key]})
+        if "allowOrigins" in policy and policy.get("allowOrigins") is not None:
+            raw_modern = policy["allowOrigins"]
+            if not isinstance(raw_modern, list):
+                matcher_problem = "allowOrigins must be a list"
+            else:
+                for raw_m in raw_modern:
+                    matcher = mapping(raw_m)
+                    extra_keys = set(matcher) - {"exact", "prefix", "regex"}
+                    present = [k for k in ("exact", "prefix", "regex") if k in matcher]
+                    if extra_keys or len(present) != 1:
+                        origins = []
+                        matcher_problem = "allowOrigins entry uses unsupported or ambiguous matcher fields"
+                        break
+                    key = present[0]
+                    origins.append({key: matcher[key]})
         else:
             for origin in seq(policy.get("allowOrigin")):
                 origins.append({"exact": origin})
@@ -1116,16 +1116,17 @@ def _target_ref_may_apply(ref: dict, policy_ns: str, gw_ns: str, gw_name: str, g
     raw_name = ref.get("name")
     raw_ns = ref.get("namespace")
     raw_group = ref.get("group")
-    if not (isinstance(raw_kind, str) and raw_kind.strip() and isinstance(raw_name, str) and raw_name.strip()):
+    if not (isinstance(raw_kind, str) and raw_kind and raw_kind == raw_kind.strip()
+            and isinstance(raw_name, str) and raw_name and raw_name == raw_name.strip()):
         return True
-    if raw_ns is not None and (not isinstance(raw_ns, str) or not raw_ns.strip()):
+    if raw_ns is not None and (not isinstance(raw_ns, str) or not raw_ns or raw_ns != raw_ns.strip()):
         return True
-    if raw_group is not None and not isinstance(raw_group, str):
+    if raw_group is not None and (not isinstance(raw_group, str) or raw_group != raw_group.strip()):
         return True
-    ref_kind = raw_kind.strip()
-    ref_name = raw_name.strip()
-    ref_ns = raw_ns.strip() if isinstance(raw_ns, str) else policy_ns
-    ref_group = (raw_group or "").strip()
+    ref_kind = raw_kind
+    ref_name = raw_name
+    ref_ns = raw_ns if isinstance(raw_ns, str) else policy_ns
+    ref_group = raw_group if isinstance(raw_group, str) else ""
     # Istio targetRef attachment is strictly same-namespace; cross-namespace targetRefs are invalid and fail closed.
     if ref_ns != policy_ns:
         return True

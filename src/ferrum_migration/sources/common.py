@@ -566,7 +566,7 @@ def cors_config(origins: Any, methods: Any = None, headers: Any = None, exposed:
         config["allow_credentials"] = creds_bool
     if max_age is not None:
         age = util.as_int(max_age)
-        if age is None or age < 0:
+        if age is None or age < 0 or age > (1 << 64) - 1:
             return None, "max_age is not representable"
         config["max_age"] = age
     if preflight_continue is not None:
@@ -638,6 +638,7 @@ def compression_config(
     zstd_level: int | None = None,
     decompress_request: bool | None = None,
     remove_accept_encoding: bool | None = None,
+    weaken_strong_etag: bool | None = None,
 ) -> tuple[dict | None, str | None]:
     """Build a Ferrum v0.9.21 ``compression`` plugin config, rejecting unsupported values."""
     config: dict[str, Any] = {}
@@ -692,6 +693,10 @@ def compression_config(
         if not isinstance(remove_accept_encoding, bool):
             return None, "remove_accept_encoding must be a boolean"
         config["remove_accept_encoding"] = remove_accept_encoding
+    if weaken_strong_etag is not None:
+        if not isinstance(weaken_strong_etag, bool):
+            return None, "weaken_strong_etag must be a boolean"
+        config["weaken_strong_etag"] = weaken_strong_etag
     return config, None
 
 

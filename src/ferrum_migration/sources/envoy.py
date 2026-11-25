@@ -37,6 +37,10 @@ _ENVOY_TYPED_MAP_FIELDS = frozenset({
 _ENVOY_OPAQUE_FIELDS = frozenset({
     "filter_metadata", "static_layer", "dynamic_metadata", "labels",
 })
+# Protobuf Any @type message names whose 'value' payload is an opaque Struct/Value/ListValue.
+_ENVOY_OPAQUE_ANY_TYPES = frozenset({
+    "google.protobuf.struct", "google.protobuf.value", "google.protobuf.listvalue",
+})
 _CAMEL_BOUNDARY_RE = re.compile(r"([a-z0-9])([A-Z])")
 
 
@@ -53,6 +57,11 @@ def _normalize_envoy_proto(obj: Any, *, preserve_map_keys: bool = False, parent_
         return [_normalize_envoy_proto(item, preserve_map_keys=False, parent_key=parent_key) for item in obj]
     if not isinstance(obj, dict):
         return obj
+    raw_type = obj.get("@type")
+    is_opaque_any = (
+        isinstance(raw_type, str)
+        and raw_type.strip().rsplit("/", 1)[-1].lower() in _ENVOY_OPAQUE_ANY_TYPES
+    )
     out: dict[Any, Any] = {}
     for raw_key, raw_val in obj.items():
         if preserve_map_keys or not isinstance(raw_key, str):
@@ -61,9 +70,9 @@ def _normalize_envoy_proto(obj: Any, *, preserve_map_keys: bool = False, parent_
         norm_key = _proto_snake(raw_key)
         if norm_key in out:
             raise InputError(f"Envoy config contains duplicate protobuf field spelling for '{safe_label(norm_key, 60)}'")
-        # Node.metadata is a protobuf Struct (opaque user JSON), whereas cluster/listener/route metadata is
-        # envoy.config.core.v3.Metadata (whose filter_metadata field is opaque).
-        if norm_key in _ENVOY_OPAQUE_FIELDS or (parent_key == "node" and norm_key == "metadata"):
+        # Node.metadata and google.protobuf.Struct/Value/ListValue Any payloads are opaque JSON.
+        if norm_key in _ENVOY_OPAQUE_FIELDS or (parent_key == "node" and norm_key == "metadata") \
+                or (is_opaque_any and norm_key == "value"):
             out[norm_key] = raw_val
         else:
             out[norm_key] = _normalize_envoy_proto(
@@ -942,15 +951,16 @@ class _Envoy:
                         "allow_methods/allow_headers/expose_headers, which Ferrum returns literally; specify "
                         "explicit method and header lists")
             return False
-        if creds is not True and isinstance(merged_headers, str) and merged_headers.strip() == "*":
-            # For standalone allow_headers: "*" without credentials, emit ["*", "authorization"] so Fetch
-            # preflights for bearer-token requests succeed (Fetch does not cover Authorization with bare '*').
-            # Mixed lists such as "*, X-Trace" are left untouched so Authorization is never newly added there.
+        if creds is not True and merged_headers == "*":
+            # Envoy's header-reflection branch triggers only for the exact string "*"; padded (" * ") or mixed
+            # lists ("*, X-Trace") are returned literally. Without credentials, emit ["*", "authorization"] for
+            # exact "*" so Fetch preflights for bearer-token requests match Envoy's reflection behavior.
             parsed_headers = ["*", "authorization"]
         # Use Ferrum's unmatched_preflights mode so omitted allow_methods/allow_headers stay empty and omitted
         # max_age stays absent (matching Envoy cors_filter.cc instead of inheriting Ferrum's permissive defaults).
+        # Pass raw merged_max_age so invalid or >u64 values fail cors_config rather than silently becoming None.
         built, problem = cors_config(origins, parsed_methods, parsed_headers, parsed_expose,
-                                     creds, util.as_int(merged_max_age) if merged_max_age else None,
+                                     creds, merged_max_age,
                                      unmatched_preflights=unmatched_mode)
         if built:
             spec.plugins.append(PluginSpec("cors", built, ref))
@@ -1205,6 +1215,14 @@ class _Envoy:
                 "connect": first.get("connect")}
 
 
+_DENOMINATOR_MAX = {
+    "HUNDRED": 100,
+    "TEN_THOUSAND": 10_000,
+    "MILLION": 1_000_000,
+}
+_DENOMINATOR_ENUM = {0: 100, 1: 10_000, 2: 1_000_000}
+
+
 def _envoy_fractional_percent(value: Any) -> float | None:
     if not isinstance(value, dict):
         return None
@@ -1215,12 +1233,17 @@ def _envoy_fractional_percent(value: Any) -> float | None:
     if numerator is None or numerator < 0:
         return None
     raw_denom = value.get("denominator")
-    denom = "HUNDRED" if raw_denom is None else str(raw_denom).upper()
-    scale = {"HUNDRED": 1.0, "TEN_THOUSAND": 100.0, "MILLION": 10_000.0}.get(denom)
-    if scale is None:
+    if raw_denom is None:
+        denom_max = 100
+    elif isinstance(raw_denom, int) and not isinstance(raw_denom, bool):
+        denom_max = _DENOMINATOR_ENUM.get(raw_denom)
+    elif isinstance(raw_denom, str):
+        denom_max = _DENOMINATOR_MAX.get(raw_denom.upper())
+    else:
+        denom_max = None
+    if denom_max is None or numerator > denom_max:
         return None
-    pct = numerator / scale
-    return pct if 0.0 <= pct <= 100.0 else None
+    return (numerator * 100.0) / denom_max
 
 
 def _parse_envoy_compressor(typed: dict) -> tuple[str, Any]:

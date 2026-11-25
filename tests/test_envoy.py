@@ -633,11 +633,18 @@ class EnvoyHardeningTest(unittest.TestCase):
             self.assertEqual(one_proxy(self, migrate("envoy", yaml.safe_dump(comp_bad_min))[0].config, "/api")[
                 "labels"]["ferrum-migration/status"], "refused", len(bad_min_val))
 
-        # Opaque protobuf Structs (metadata.filterMetadata and node.metadata) keep arbitrary keys untouched.
+        # Opaque protobuf Structs (metadata.filterMetadata, typedFilterMetadata Struct Any, and node.metadata)
+        # keep arbitrary keys untouched without duplicate-spelling collisions.
         opaque_meta = minimal_bootstrap({"path_separated_prefix": "/api"})
         opaque_meta["node"] = {"id": "edge-1", "metadata": {"tenantId": "a", "tenant_id": "b"}}
         opaque_meta["static_resources"]["clusters"][0]["metadata"] = {
             "filterMetadata": {"envoy.lb": {"tenantId": "a", "tenant_id": "b"}},
+            "typedFilterMetadata": {
+                "envoy.lb": {
+                    "@type": "type.googleapis.com/google.protobuf.Struct",
+                    "value": {"tenantId": "a", "tenant_id": "b"},
+                }
+            },
         }
         self.assertEqual(one_proxy(self, migrate("envoy", yaml.safe_dump(opaque_meta))[0].config, "/api")[
             "labels"]["ferrum-migration/status"], "migrated")
@@ -746,7 +753,22 @@ class EnvoyHardeningTest(unittest.TestCase):
             self.assertEqual(one_proxy(self, zf_res.config, "/api")["labels"]["ferrum-migration/status"], "migrated")
             self.assertEqual(zf_res.config["plugin_configs"], [])
             self.assertIn("envoy-fault-noop", codes(zf_rep, "info"))
-        for bad_num in ("bad", "--1"):
+        # Numeric protobuf enum denominator (0 -> HUNDRED) migrates cleanly, while malformed or >100%
+        # (including 310-digit quoted) numerators refuse without crashing.
+        num_enum_fault = minimal_bootstrap({"path_separated_prefix": "/api"})
+        num_enum_fault["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"][
+            "http_filters"] = [
+            {"name": "envoy.filters.http.fault",
+             "typed_config": {
+                 "@type": "type.googleapis.com/envoy.extensions.filters.http.fault.v3.HTTPFault",
+                 "abort": {"http_status": 503, "percentage": {"numerator": 10, "denominator": 0}},
+             }},
+            {"name": "envoy.filters.http.router"},
+        ]
+        ne_res = migrate("envoy", yaml.safe_dump(num_enum_fault))[0]
+        self.assertEqual(plugin(self, ne_res.config, one_proxy(self, ne_res.config, "/api"), "fault_injection")[
+            "config"], {"abort": {"status_code": 503, "percentage": 10.0}})
+        for bad_num in ("bad", "--1", "1" + "0" * 310):
             bad_num_fault = minimal_bootstrap({"path_separated_prefix": "/api"})
             bad_num_fault["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"][
                 "http_filters"] = [
@@ -758,7 +780,7 @@ class EnvoyHardeningTest(unittest.TestCase):
                 {"name": "envoy.filters.http.router"},
             ]
             self.assertEqual(one_proxy(self, migrate("envoy", yaml.safe_dump(bad_num_fault))[0].config, "/api")[
-                "labels"]["ferrum-migration/status"], "refused", bad_num)
+                "labels"]["ferrum-migration/status"], "refused", bad_num[:12])
         for rt_fault in (
             {"@type": "type.googleapis.com/envoy.extensions.filters.http.fault.v3.HTTPFault",
              "abort": {"http_status": 503, "percentage": {"numerator": 0, "denominator": "HUNDRED"}}},
@@ -888,12 +910,24 @@ class EnvoyHardeningTest(unittest.TestCase):
         nc_cors = plugin(self, nc_res.config, one_proxy(self, nc_res.config, "/api"), "cors")["config"]
         self.assertEqual(nc_cors["allowed_headers"], ["*", "authorization"])
 
-        # Mixed allow_headers ("*, X-Trace") must NOT add authorization; CORS origin regexes exceeding
-        # Ferrum's Rust regex nesting/size/syntax limits omit CORS, while safe origin regexes emit.
-        nc_hcm["route_config"]["typed_per_filter_config"]["envoy.filters.http.cors"]["allow_headers"] = "*, X-Trace"
-        mix_res, _mix_rep, _ = migrate("envoy", yaml.safe_dump(non_cred_star))
-        mix_cors = plugin(self, mix_res.config, one_proxy(self, mix_res.config, "/api"), "cors")["config"]
-        self.assertEqual(mix_cors["allowed_headers"], ["*", "X-Trace"])
+        # Mixed ("*, X-Trace") and padded (" * ") allow_headers must NOT add authorization;
+        # max_age at u64::MAX migrates while u64::MAX + 1 omits/refuses cleanly.
+        for raw_hdrs, expected_hdrs in (("*, X-Trace", ["*", "X-Trace"]), (" * ", ["*"])):
+            nc_hcm["route_config"]["typed_per_filter_config"]["envoy.filters.http.cors"]["allow_headers"] = raw_hdrs
+            mix_res, _mix_rep, _ = migrate("envoy", yaml.safe_dump(non_cred_star))
+            mix_cors = plugin(self, mix_res.config, one_proxy(self, mix_res.config, "/api"), "cors")["config"]
+            self.assertEqual(mix_cors["allowed_headers"], expected_hdrs, raw_hdrs)
+        max_ok = copy.deepcopy(non_cred_star)
+        mo_cors = max_ok["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"][
+            "route_config"]["typed_per_filter_config"]["envoy.filters.http.cors"]
+        mo_cors["max_age"] = "18446744073709551615"
+        self.assertEqual(plugin(self, migrate("envoy", yaml.safe_dump(max_ok))[0].config,
+                                one_proxy(self, migrate("envoy", yaml.safe_dump(max_ok))[0].config, "/api"),
+                                "cors")["config"]["max_age"], 18446744073709551615)
+        mo_cors["max_age"] = "18446744073709551616"
+        over_res, over_rep, _ = migrate("envoy", yaml.safe_dump(max_ok))
+        self.assertEqual(over_res.config["plugin_configs"], [])
+        self.assertIn("envoy-cors", codes(over_rep, "warning"))
         for bad_rx in (
             r"https://(a(b(c(d(e(f(g(h(i(j(app\.example\.test)))))))))))",
             r"x|a(?:x|a(?:x|a(?:x|a(?:x|a(?:x|ab+)+)+)+)+)+",
@@ -929,6 +963,7 @@ class EnvoyHardeningTest(unittest.TestCase):
             cred_ic = copy.deepcopy(non_cred_star)
             ci_cors = cred_ic["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"][
                 "route_config"]["typed_per_filter_config"]["envoy.filters.http.cors"]
+            ci_cors["allow_headers"] = "X-Trace"
             ci_cors["allow_credentials"] = {"value": True}
             ci_cors["allow_origin_string_match"] = [cred_bad_matcher]
             self.assertEqual(one_proxy(self, migrate("envoy", yaml.safe_dump(cred_ic))[0].config, "/api")[

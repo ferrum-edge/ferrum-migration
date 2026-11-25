@@ -766,6 +766,7 @@ class NginxFrontendScopeTest(unittest.TestCase):
             "content_types": ["text/html", "application/json", "text/plain"],
             "gzip_level": 6,
             "remove_accept_encoding": False,
+            "weaken_strong_etag": True,
         })
         for path in ("/nogzip", "/wild", "/typewild", "/disabled-ua"):
             p = one_proxy(self, result.config, path, "app.example.test")
@@ -804,7 +805,7 @@ class NginxFrontendScopeTest(unittest.TestCase):
         html_p = one_proxy(self, def_res.config, "/html", "def.example.test")
         self.assertEqual(plugin(self, def_res.config, html_p, "compression")["config"], {
             "algorithms": ["gzip"], "min_content_length": 20, "content_types": ["text/html"],
-            "gzip_level": 1, "remove_accept_encoding": False,
+            "gzip_level": 1, "remove_accept_encoding": False, "weaken_strong_etag": True,
         })
         self.assertIn("nginx-gzip", codes(def_rep, "warning"))
 

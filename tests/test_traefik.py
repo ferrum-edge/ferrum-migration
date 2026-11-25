@@ -1347,6 +1347,19 @@ class TraefikHardeningTest(unittest.TestCase):
                     },
                 }
             }),
+            ("timeout-mirror", {
+                "http": {
+                    "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "m"}},
+                    "services": {
+                        "m": {"mirroring": {"service": "main", "mirrorBody": False,
+                                            "mirrors": [{"name": "shadow", "percent": 20}]}},
+                        "main": {"loadBalancer": {"servers": [{"url": "http://main.internal:8080"}]}},
+                        "shadow": {"loadBalancer": {"passHostHeader": False, "serversTransport": "fast",
+                                                    "servers": [{"url": "http://shadow.internal:9090"}]}},
+                    },
+                    "serversTransports": {"fast": {"forwardingTimeouts": {"responseHeaderTimeout": "100ms"}}},
+                }
+            }),
         ):
             with self.subTest(case=label):
                 mr_res, mr_rep, _ = asserted(yaml.safe_dump(extra_doc))

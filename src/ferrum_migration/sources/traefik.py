@@ -1081,7 +1081,9 @@ class _Traefik:
                                                   {"max_bytes": resp_size, "require_buffered_check": True}, ref))
                     self.report.warning("traefik-buffering", ref,
                                         "buffering.maxResponseBodyBytes returns HTTP 500 on oversized upstream "
-                                        "responses in Traefik, whereas Ferrum response_size_limiting returns HTTP 502.")
+                                        "responses in Traefik whereas Ferrum response_size_limiting returns HTTP 502, "
+                                        "and require_buffered_check: true rejects streaming/chunked responses without "
+                                        "Content-Length (such as text/event-stream) with HTTP 502 even under max_bytes.")
                 acc.resp_size_limited = True
             if any(config.get(k) for k in ("memRequestBodyBytes", "memResponseBodyBytes", "retryExpression")) \
                     or not ((req_size and req_size > 0) or (resp_size and resp_size > 0)):
@@ -1387,7 +1389,12 @@ class _Traefik:
                                     "the h2c mirror was dropped.")
                 continue
             scheme, targets, problems = self._servers(lb, ref)
-            tls, _timeouts, transport_problems = self._transport(lb.get("serversTransport"), ref)
+            tls, timeouts, transport_problems = self._transport(lb.get("serversTransport"), ref)
+            if timeouts:
+                self.report.warning("traefik-mirroring", ref,
+                                    "Mirror target configures serversTransport.forwardingTimeouts, which Ferrum "
+                                    "static request_mirror cannot reproduce per phase; mirror dropped.")
+                continue
             if problems or transport_problems or scheme is None or len(targets) != 1 \
                     or (scheme == "https" and (not tls.verify or tls.ca_path or tls.client_cert_path
                                                or tls.sni or tls.san_allow_list)):
