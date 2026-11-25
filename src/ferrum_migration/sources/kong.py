@@ -681,23 +681,23 @@ class _Kong:
         return handler(self, config, ref)
 
     def _effective_plugins(self, route_index: int, service_key: str | None,
-                           route_frontends: frozenset[str]) -> tuple[list[PluginSpec], dict | None, list[str]]:
+                           route_protocols: frozenset[str]) -> tuple[list[PluginSpec], dict | None, list[str]]:
         by_name: dict[str, tuple[_Plugin, str]] = {}
         if service_key is not None:
             for plugin in self.plugins_by_owner.get(("service", service_key), []):
                 if plugin.raw.get("enabled") is False:
                     continue
                 if plugin.name == "correlation-id":
-                    pf = _plugin_frontends(plugin.raw)
-                    if pf is not None and pf.isdisjoint(route_frontends):
+                    pp = _plugin_protocols(plugin.raw)
+                    if pp is not None and pp.isdisjoint(route_protocols):
                         continue
                 by_name.setdefault(plugin.name, (plugin, "service"))
         for plugin in self.plugins_by_owner.get(("route", str(route_index)), []):
             if plugin.raw.get("enabled") is False:
                 continue
             if plugin.name == "correlation-id":
-                pf = _plugin_frontends(plugin.raw)
-                if pf is not None and pf.isdisjoint(route_frontends):
+                pp = _plugin_protocols(plugin.raw)
+                if pp is not None and pp.isdisjoint(route_protocols):
                     continue
             by_name[plugin.name] = (plugin, "route")
         plugins: list[PluginSpec] = []
@@ -707,14 +707,14 @@ class _Kong:
         for name, (plugin, level) in by_name.items():
             ref = f"kong {level} plugin {safe_label(name, 40)}"
             if name == "correlation-id":
-                p_frontends = _plugin_frontends(plugin.raw)
-                if p_frontends is not None and p_frontends.isdisjoint(route_frontends):
+                p_protos = _plugin_protocols(plugin.raw)
+                if p_protos is not None and p_protos.isdisjoint(route_protocols):
                     continue
                 cid_suppressed = True
-                if p_frontends is None or not (route_frontends <= p_frontends):
+                if p_protos is None or not (route_protocols <= p_protos):
                     self.report.warning("kong-correlation-id", ref,
                                         "correlation-id omitted: plugin protocols do not cover every protocol of this "
-                                        "route (Ferrum cannot restrict correlation_id to a subset of listeners).")
+                                        "route (Ferrum cannot restrict correlation_id to a subset of protocols).")
                     continue
             outcome = self._translate_plugin(plugin, ref)
             if outcome[0] == "plugin":
@@ -726,16 +726,16 @@ class _Kong:
                 termination = outcome[1]
             elif outcome[0] == "refuse":
                 refusals.append(f"{level} plugin {safe_label(name, 40)}: {outcome[1]}")
-        if not cid_suppressed and self.global_correlation_id is not None and route_frontends:
+        if not cid_suppressed and self.global_correlation_id is not None and route_protocols:
             gplugin, gspec = self.global_correlation_id
-            g_frontends = _plugin_frontends(gplugin.raw)
-            if g_frontends is not None and g_frontends.isdisjoint(route_frontends):
+            g_protos = _plugin_protocols(gplugin.raw)
+            if g_protos is not None and g_protos.isdisjoint(route_protocols):
                 pass
-            elif g_frontends is None or not (route_frontends <= g_frontends):
+            elif g_protos is None or not (route_protocols <= g_protos):
                 self.report.warning("kong-correlation-id", gspec.ref,
                                     "global correlation-id omitted on route: plugin protocols do not cover every "
                                     "protocol of this route (Ferrum cannot restrict correlation_id to a subset of "
-                                    "listeners).")
+                                    "protocols).")
             else:
                 plugins.append(PluginSpec(gspec.name, dict(gspec.config), gspec.ref,
                                           shared_key="global-correlation-id"))
@@ -979,7 +979,7 @@ class _Kong:
         if hosts is None or methods is None or paths is None:
             extra.append("hosts/methods/paths with unexpected types")
             hosts, methods, paths = hosts or [], methods or [], paths or []
-        plugins, termination, plugin_refusals = self._effective_plugins(index, service_key, frontends)
+        plugins, termination, plugin_refusals = self._effective_plugins(index, service_key, frozenset(protocols))
         auth_composition = None if termination is not None else self._auth_composition(plugins, ref)
         effective_names = {p.name for p in plugins} | {p.name for p in self.plan.global_plugins}
         if termination is None and (effective_names & AUTH_PLUGINS) and self.unresolved_consumer_groups:
@@ -1418,15 +1418,15 @@ def _kong_redirect(self: _Kong, config: dict, ref: str) -> tuple:
     return ("termination", {"status_code": status, "headers": {"location": location}, "body": ""})
 
 
-def _plugin_frontends(raw_plugin: dict) -> frozenset[str] | None:
-    """HTTP/HTTPS frontend protocols a Kong plugin applies to (None if ``protocols`` is malformed)."""
+def _plugin_protocols(raw_plugin: dict) -> frozenset[str] | None:
+    """Exact Kong HTTP/gRPC protocols a plugin applies to (None if ``protocols`` is malformed)."""
     raw_protos = raw_plugin.get("protocols")
     if raw_protos is None:
-        return frozenset({"http", "https"})
+        return frozenset(HTTP_PROTOCOLS)
     protos = str_list(raw_protos)
     if protos is None or not protos:
         return None
-    return frozenset(("https" if p in TLS_PROTOCOLS else "http") for p in protos if p in HTTP_PROTOCOLS)
+    return frozenset(p for p in protos if p in HTTP_PROTOCOLS)
 
 
 def _kong_correlation_id(self: _Kong, config: dict, ref: str) -> tuple:

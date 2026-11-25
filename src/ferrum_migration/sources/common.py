@@ -520,6 +520,20 @@ def _cors_regex_problem(pattern: str) -> str | None:
     return None
 
 
+_RE2_HEX_ESCAPE_RE = re.compile(r"((?:\\\\)*)\\x\{([0-9A-Fa-f]{1,6})\}")
+
+
+def _re2_to_python_probe(pattern: str) -> str:
+    """Translate RE2 ``\\x{...}`` escapes to escaped literals for probing literal ``*``."""
+    def _sub(match: re.Match) -> str:
+        prefix, hex_digits = match.group(1), match.group(2)
+        code = int(hex_digits, 16)
+        if code > 0x10FFFF:
+            return match.group(0)
+        return prefix + re.escape(chr(code))
+    return _RE2_HEX_ESCAPE_RE.sub(_sub, pattern)
+
+
 def cors_origin_matches_star(origin: Any) -> bool:
     """Whether an Envoy/Istio CORS origin matcher matches the literal ``"*"`` (treated as allow-all by Envoy)."""
     if origin == "*":
@@ -533,10 +547,12 @@ def cors_origin_matches_star(origin: Any) -> bool:
         if kind == "prefix":
             return value in ("", "*")
         if kind == "regex":
-            if len(value.encode("utf-8")) > 512 or _cors_regex_problem(value) is not None:
+            if not value or len(value.encode("utf-8")) > 2048:
                 return False
+            # Probe with RE2-compatible \x{...} expansion before applying Ferrum's regex limits so
+            # valid RE2 wildcard matchers such as \x{2a} normalize cleanly to ["*"] (or refuse if credentialed).
             try:
-                return bool(re.fullmatch(value, "*"))
+                return bool(re.fullmatch(_re2_to_python_probe(value), "*"))
             except (re.error, OverflowError):
                 return False
     return False
@@ -808,7 +824,7 @@ def request_mirror_config(
 ) -> tuple[dict | None, str | None]:
     """Build a Ferrum v0.9.21 ``request_mirror`` config."""
     norm_host = util.normalize_backend_host(host)
-    if norm_host is None:
+    if norm_host is None or "%" in norm_host:
         return None, "mirror_host is not a valid hostname or IP address"
     parsed_port = util.parse_port(port)
     if parsed_port is None:

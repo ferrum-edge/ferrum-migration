@@ -1386,6 +1386,18 @@ class TraefikHardeningTest(unittest.TestCase):
                     "serversTransports": {"big": {"forwardingTimeouts": {"responseHeaderTimeout": "1" + "0" * 310 + "s"}}},
                 }
             }),
+            ("scoped-ipv6-mirror", {
+                "http": {
+                    "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "m"}},
+                    "services": {
+                        "m": {"mirroring": {"service": "main", "mirrorBody": False,
+                                            "mirrors": [{"name": "shadow", "percent": 20}]}},
+                        "main": {"loadBalancer": {"servers": [{"url": "http://main.internal:8080"}]}},
+                        "shadow": {"loadBalancer": {"passHostHeader": False,
+                                                    "servers": [{"url": "http://[fe80::1%25eth0]:9090"}]}},
+                    },
+                }
+            }),
             ("huge-percent-mirror", {
                 "http": {
                     "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "m"}},

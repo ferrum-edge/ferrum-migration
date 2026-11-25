@@ -1290,6 +1290,31 @@ def _envoy_fractional_percent(value: Any) -> float | None:
     return (numerator * 100.0) / denom_max
 
 
+# Default MIME types from Envoy compressor_filter.cc (defaultContentEncoding()) when content_type is unset/empty.
+_ENVOY_DEFAULT_COMPRESSOR_CONTENT_TYPES = [
+    "text/html",
+    "text/plain",
+    "text/css",
+    "application/javascript",
+    "application/x-javascript",
+    "text/javascript",
+    "text/x-javascript",
+    "text/ecmascript",
+    "text/js",
+    "text/jscript",
+    "text/x-js",
+    "application/ecmascript",
+    "application/x-json",
+    "application/xml",
+    "application/json",
+    "image/svg+xml",
+    "text/xml",
+    "application/xhtml+xml",
+    "application/grpc-web",
+    "application/grpc-web+proto",
+]
+
+
 def _parse_envoy_compressor(typed: dict) -> tuple[str, Any]:
     unknown_root = [str(k) for k in typed
                     if k not in ("@type", "compressor_library", "response_direction_config",
@@ -1344,10 +1369,14 @@ def _parse_envoy_compressor(typed: dict) -> tuple[str, Any]:
             return "refuse", "response_direction_config.common_config.min_content_length is invalid"
     raw_types = common.get("content_type")
     content_types = str_list(raw_types) if raw_types is not None else None
-    if raw_types is not None and not content_types:
+    if raw_types is not None and content_types is None:
         return "refuse", "response_direction_config.common_config.content_type is invalid"
     dropped_wild = False
-    if content_types is not None:
+    if not content_types:
+        # Protobuf repeated content_type defaults (when omitted or empty) to Envoy's defaultContentEncoding() list
+        # rather than inheriting Ferrum's smaller default MIME allow-list.
+        content_types = list(_ENVOY_DEFAULT_COMPRESSOR_CONTENT_TYPES)
+    else:
         # Envoy matches content_type literally; entries containing '*' never match real responses in Envoy,
         # whereas Ferrum treats 'type/*' as a range. Drop wildcard entries and omit if none remain.
         exact_types = [ct for ct in content_types if "*" not in ct]

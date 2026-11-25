@@ -906,9 +906,39 @@ class KongExtendedPluginsAndConsumersTest(unittest.TestCase):
         pc_res, pc_rep, _ = migrate("kong", proto_cid)
         self.assertEqual(plugins_of(pc_res.config, one_proxy(self, pc_res.config, "/plain")), [])
         self.assertEqual(plugins_of(pc_res.config, one_proxy(self, pc_res.config, "/both")), [])
-        self.assertEqual(plugin(self, pc_res.config, one_proxy(self, pc_res.config, "/tls"), "correlation_id")[
-            "config"]["header_name"], "x-tls-id")
         self.assertIn("kong-correlation-id", codes(pc_rep, "warning"))
+        tls_res = migrate("kong", proto_cid, tls_only=True)[0]
+        tls_p = one_proxy(self, tls_res.config, "/tls")
+        self.assertEqual(tls_p["labels"]["ferrum-migration/status"], "migrated")
+        self.assertEqual(plugin(self, tls_res.config, tls_p, "correlation_id")["config"]["header_name"], "x-tls-id")
+
+        # Distinct Kong protocols on the same plaintext listener (http vs grpc) are compared without collapsing.
+        grpc_cid = textwrap.dedent("""
+            _format_version: "3.0"
+            plugins:
+              - name: correlation-id
+                protocols: [http]
+                config: {header_name: X-Http-Only, echo_downstream: false, generator: uuid}
+            services:
+              - name: s
+                url: http://s.internal:8080
+                routes:
+                  - name: grpc-only
+                    protocols: [grpc]
+                    paths: [/grpc/]
+                  - name: http-and-grpc
+                    protocols: [http, grpc]
+                    paths: [/mixed/]
+                  - name: http-only
+                    protocols: [http]
+                    paths: [/http/]
+        """)
+        gc_res, gc_rep, _ = migrate("kong", grpc_cid)
+        self.assertEqual(plugins_of(gc_res.config, one_proxy(self, gc_res.config, "/grpc")), [])
+        self.assertEqual(plugins_of(gc_res.config, one_proxy(self, gc_res.config, "/mixed")), [])
+        self.assertEqual(plugin(self, gc_res.config, one_proxy(self, gc_res.config, "/http"), "correlation_id")[
+            "config"]["header_name"], "x-http-only")
+        self.assertIn("kong-correlation-id", codes(gc_rep, "warning"))
 
 
 if __name__ == "__main__":

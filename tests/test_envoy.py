@@ -621,9 +621,13 @@ class EnvoyHardeningTest(unittest.TestCase):
             {"name": "envoy.filters.http.router"},
         ]
         cd_res, _cd_rep, _ = migrate("envoy", yaml.safe_dump(comp_def))
-        self.assertEqual(plugin(self, cd_res.config, one_proxy(self, cd_res.config, "/api"), "compression")["config"], {
-            "algorithms": ["gzip"], "min_content_length": 30, "remove_accept_encoding": False,
-        })
+        cd_cfg = plugin(self, cd_res.config, one_proxy(self, cd_res.config, "/api"), "compression")["config"]
+        self.assertEqual(cd_cfg["algorithms"], ["gzip"])
+        self.assertEqual(cd_cfg["min_content_length"], 30)
+        self.assertIs(cd_cfg["remove_accept_encoding"], False)
+        self.assertIn("application/xml", cd_cfg["content_types"])
+        self.assertIn("application/grpc-web+proto", cd_cfg["content_types"])
+        self.assertEqual(len(cd_cfg["content_types"]), 20)
         for bad_min_val in ("--1", "9" * 4301):
             comp_bad_min = copy.deepcopy(comp_def)
             comp_bad_min["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"][
@@ -1131,22 +1135,26 @@ class EnvoyHardeningTest(unittest.TestCase):
         self.assertEqual(one_proxy(self, migrate("envoy", yaml.safe_dump(gw_fault))[0].config, "/api")[
             "labels"]["ferrum-migration/status"], "refused")
 
-        star_rx = minimal_bootstrap({"path_separated_prefix": "/api"})
-        srhcm = star_rx["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"]
-        srhcm["http_filters"] = [{"name": "envoy.filters.http.cors"}, {"name": "envoy.filters.http.router"}]
-        srhcm["route_config"]["typed_per_filter_config"] = {
-            "envoy.filters.http.cors": {
-                "@type": "type.googleapis.com/envoy.extensions.filters.http.cors.v3.CorsPolicy",
-                "allow_origin_string_match": [{"safe_regex": {"regex": r"\*"}}],
-                "allow_credentials": {"value": False},
-            }
-        }
-        sr_res = migrate("envoy", yaml.safe_dump(star_rx))[0]
-        self.assertEqual(plugin(self, sr_res.config, one_proxy(self, sr_res.config, "/api"), "cors")["config"][
-            "allowed_origins"], ["*"])
-        srhcm["route_config"]["typed_per_filter_config"]["envoy.filters.http.cors"]["allow_credentials"] = {"value": True}
-        self.assertEqual(one_proxy(self, migrate("envoy", yaml.safe_dump(star_rx))[0].config, "/api")[
-            "labels"]["ferrum-migration/status"], "refused")
+        for star_pattern in (r"\*", r"\x{2a}"):
+            with self.subTest(star_pattern=star_pattern):
+                star_rx = minimal_bootstrap({"path_separated_prefix": "/api"})
+                srhcm = star_rx["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"]
+                srhcm["http_filters"] = [{"name": "envoy.filters.http.cors"}, {"name": "envoy.filters.http.router"}]
+                srhcm["route_config"]["typed_per_filter_config"] = {
+                    "envoy.filters.http.cors": {
+                        "@type": "type.googleapis.com/envoy.extensions.filters.http.cors.v3.CorsPolicy",
+                        "allow_origin_string_match": [{"safe_regex": {"regex": star_pattern}}],
+                        "allow_credentials": {"value": False},
+                    }
+                }
+                sr_res = migrate("envoy", yaml.safe_dump(star_rx))[0]
+                self.assertEqual(plugin(self, sr_res.config, one_proxy(self, sr_res.config, "/api"), "cors")["config"][
+                    "allowed_origins"], ["*"])
+                srhcm["route_config"]["typed_per_filter_config"]["envoy.filters.http.cors"]["allow_credentials"] = {
+                    "value": True
+                }
+                self.assertEqual(one_proxy(self, migrate("envoy", yaml.safe_dump(star_rx))[0].config, "/api")[
+                    "labels"]["ferrum-migration/status"], "refused")
 
 
 if __name__ == "__main__":
