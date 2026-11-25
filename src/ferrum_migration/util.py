@@ -204,13 +204,15 @@ def canonical_path_problem(path: object) -> str | None:
 # --------------------------------------------------------------------- regex
 
 _RUST_REGEX_FLAGS = frozenset("imsURux")
+_RUST_BRACE_QUANT = re.compile(r"\{(\d+)(?:,(\d*))?\}", re.ASCII)
 
 
 def _rust_regex_syntax_problem(pattern: str) -> str | None:
-    """Scan escapes and inline flag groups linearly to catch Python-accepted syntax rejected by Rust regex."""
+    """Scan escapes, braces, verbose comments, and inline flags linearly for Rust-regex compatibility."""
     n = len(pattern)
     i = 0
     in_class = False
+    x_stack: list[bool] = [False]
     while i < n:
         ch = pattern[i]
         if ch == "\\":
@@ -228,6 +230,12 @@ def _rust_regex_syntax_problem(pattern: str) -> str | None:
                 in_class = False
             i += 1
             continue
+        if x_stack[-1] and ch == "#":
+            nl = pattern.find("\n", i + 1)
+            if nl == -1:
+                break
+            i = nl + 1
+            continue
         if ch == "[":
             in_class = True
             i += 1
@@ -236,25 +244,59 @@ def _rust_regex_syntax_problem(pattern: str) -> str | None:
             if i < n and pattern[i] == "]":
                 i += 1
             continue
-        if ch in "*+?}" and i + 1 < n and pattern[i + 1] == "+":
+        if ch == "{":
+            qm = _RUST_BRACE_QUANT.match(pattern, i)
+            if qm is None:
+                return "regex contains an unescaped '{' that is not a valid counted repetition in Rust regex"
+            lo = int(qm.group(1))
+            hi_raw = qm.group(2)
+            if hi_raw:
+                hi = int(hi_raw)
+                if hi < lo or hi > 1000:
+                    return "regex counted repetition bounds are invalid or too large"
+            elif lo > 1000:
+                return "regex counted repetition bound is too large"
+            i = qm.end()
+            if i < n and pattern[i] == "+":
+                return "regex uses possessive quantifiers unsupported by the Rust regex engine"
+            continue
+        if ch == "}":
+            return "regex contains an unescaped '}' rejected by Rust regex"
+        if ch in "*+?" and i + 1 < n and pattern[i + 1] == "+":
             return "regex uses possessive quantifiers unsupported by the Rust regex engine"
-        if ch == "(" and i + 1 < n and pattern[i + 1] == "?":
-            if i + 2 >= n:
-                return "regex has an incomplete group"
-            c2 = pattern[i + 2]
-            if c2 in ("=", "!", ">", "#", "|", "R", "&"):
-                return "regex uses lookaround or group features unsupported by the Rust regex engine"
-            if c2 == "<":
-                if i + 3 < n and pattern[i + 3] in ("=", "!"):
-                    return "regex uses lookbehind unsupported by the Rust regex engine"
-            elif c2 == "P":
-                if i + 3 < n and pattern[i + 3] == "=":
-                    return "regex uses backreferences unsupported by the Rust regex engine"
-            elif c2 != ":":
+        if ch == ")":
+            if len(x_stack) > 1:
+                x_stack.pop()
+            i += 1
+            continue
+        if ch == "(":
+            if i + 1 < n and pattern[i + 1] == "?":
+                if i + 2 >= n:
+                    return "regex has an incomplete group"
+                c2 = pattern[i + 2]
+                if c2 in ("=", "!", ">", "#", "|", "R", "&"):
+                    return "regex uses lookaround or group features unsupported by the Rust regex engine"
+                if c2 == "<":
+                    if i + 3 < n and pattern[i + 3] in ("=", "!"):
+                        return "regex uses lookbehind unsupported by the Rust regex engine"
+                    x_stack.append(x_stack[-1])
+                    i += 3
+                    continue
+                if c2 == "P":
+                    if i + 3 < n and pattern[i + 3] == "=":
+                        return "regex uses backreferences unsupported by the Rust regex engine"
+                    x_stack.append(x_stack[-1])
+                    i += 3
+                    continue
+                if c2 == ":":
+                    x_stack.append(x_stack[-1])
+                    i += 3
+                    continue
                 # Inline flag group (?flags) or (?flags:...): Rust regex rejects duplicate flags and non-Rust flags.
                 j = i + 2
                 seen_flags: set[str] = set()
                 seen_dash = False
+                enable_x: bool | None = None
                 while j < n and pattern[j] not in (":", ")"):
                     flag = pattern[j]
                     if flag == "-":
@@ -265,13 +307,21 @@ def _rust_regex_syntax_problem(pattern: str) -> str | None:
                         if flag in seen_flags:
                             return "regex inline flag group repeats a flag (rejected by Rust regex)"
                         seen_flags.add(flag)
+                        if flag == "x":
+                            enable_x = not seen_dash
                     else:
                         return "regex uses inline flags unsupported by the Rust regex engine"
                     j += 1
                 if j >= n:
                     return "regex has an unclosed inline flag group"
+                new_x = x_stack[-1] if enable_x is None else enable_x
+                if pattern[j] == ":":
+                    x_stack.append(new_x)
+                else:
+                    x_stack[-1] = new_x
                 i = j + 1
                 continue
+            x_stack.append(x_stack[-1])
         i += 1
     return None
 
