@@ -197,7 +197,7 @@ def canonical_path_problem(path: object) -> str | None:
 
 _REGEX_UNSUPPORTED = ("(?=", "(?!", "(?<=", "(?<!", "(?>", "(?#", "(?|", "(?R", "(?&", "(?P=",
                       "\\G", "\\K", "\\Z", "\\k<", "\\k{", "\\g")
-_BACKREF = re.compile(r"\\[1-9]")
+_BACKREF = re.compile(r"\\[0-9]")
 _POSSESSIVE = re.compile(r"(?<!\\)[*+?}]\+")
 
 

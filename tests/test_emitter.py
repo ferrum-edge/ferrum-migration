@@ -248,6 +248,7 @@ class MatchingTest(unittest.TestCase):
         self.assertEqual(util.regex_literal_prefix("/users/[0-9]+"), "/users/")
         self.assertEqual(util.regex_literal_prefix("/files?/x"), "/file")
         self.assertIsNotNone(util.regex_problem("/(?=x)y"))
+        self.assertIsNotNone(util.regex_problem(r"\057api"))
         self.assertIsNone(util.regex_problem("/users/(?P<id>[0-9]+)"))
 
     def test_durations_and_sizes(self):

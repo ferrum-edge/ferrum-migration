@@ -932,6 +932,19 @@ class NginxFrontendScopeTest(unittest.TestCase):
         catchall = [p for p in proxies(mr_res.config, "/") if "hosts" not in p]
         self.assertEqual(len(catchall), 1)
         self.assertEqual(catchall[0]["labels"]["ferrum-migration/status"], "migrated")
+        # Mixed upstream passive health thresholds (1000 vs 1001) are compared BEFORE clamping and omitted with warning.
+        mixed_hc_res, mixed_hc_rep, _ = nginx("""
+            upstream mixed {
+                server 10.0.0.1:8080 max_fails=1000 fail_timeout=10s;
+                server 10.0.0.2:8080 max_fails=1001 fail_timeout=10s;
+            }
+            server {
+                listen 80;
+                location /api/ { proxy_pass http://mixed; }
+            }
+        """)
+        self.assertNotIn("health_checks", mixed_hc_res.config["upstreams"][0])
+        self.assertIn("nginx-passive-health", codes(mixed_hc_rep, "warning"))
 
 
 if __name__ == "__main__":

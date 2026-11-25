@@ -165,11 +165,17 @@ def emit(plan: Plan, options: EmitOptions, report: Report) -> EmitResult:
     _resolve_frontend_client_ca(plan, routes, report, mode)
     candidates = _build_candidates(routes)
     candidates = _resolve_conflicts(candidates, report)
-    staged_report = Report(report.platform, report.source)
+    has_deferred_redirects = any(route.https_redirect_fold is not None for route in routes)
+    pre_closure_state = (
+        [(route, list(route.refusals), route.placeholder_emitted) for route in routes]
+        if has_deferred_redirects else None
+    )
+    staged_report = Report(report.platform, report.input_label)
     _add_scope_closures(plan, candidates, staged_report)
     _add_trailing_slash_placeholders(candidates, staged_report)
     _add_divergence_guards(plan, candidates, staged_report)
-    candidates = _finalize_https_redirects(plan, routes, candidates, mode, options, report, staged_report)
+    candidates = _finalize_https_redirects(plan, routes, candidates, mode, options, report, staged_report,
+                                           pre_closure_state)
     _assert_frontend_protocols(candidates, mode)
     builder = _Builder(plan, options, report)
     config = builder.build(candidates)
@@ -186,26 +192,32 @@ def emit(plan: Plan, options: EmitOptions, report: Report) -> EmitResult:
                       frontend_protocols=mode)
 
 
+def _replay_report(target: Report, staged: Report) -> None:
+    for item in staged.caveats:
+        target.add(item.severity, item.code, item.ref, item.message, item.action)
+
+
 def _finalize_https_redirects(plan: Plan, routes: list[RouteSpec], candidates: list[_Cand], mode: str,
-                              options: EmitOptions, report: Report, staged_report: Report) -> list[_Cand]:
+                              options: EmitOptions, report: Report, staged_report: Report,
+                              pre_closure_state: list[tuple[RouteSpec, list[str], bool]] | None) -> list[_Cand]:
     """Confirm deferred plaintext HTTP-to-HTTPS redirect folds only after final candidate resolution.
 
     A redirect candidate folds away (and emits its ``*-https-redirect`` info diagnostic) only if the final
     profile disables plaintext (``mode == "https"``) AND at least one live (non-placeholder) HTTPS candidate
     survived validation, precedence, poisoning, client-CA scope, slot conflict resolution, and scope closures.
-    Otherwise, discard provisional closure/guard diagnostics, un-skip and validate the restored redirect
-    candidates, and rebuild candidates, closures, and guards cleanly.
+    Otherwise, restore pre-pass route state, discard provisional closure/guard diagnostics, un-skip and validate
+    the restored redirect candidates, and rebuild candidates, closures, and guards cleanly.
     """
     deferred = [route for route in routes if route.https_redirect_fold is not None]
     if not deferred:
-        report.caveats.extend(staged_report.caveats)
+        _replay_report(report, staged_report)
         return candidates
     has_surviving_https = mode == "https" and any(
         not cand.placeholder and "https" in (_effective_protocols(cand.route) or ())
         for cand in candidates
     )
     if has_surviving_https:
-        report.caveats.extend(staged_report.caveats)
+        _replay_report(report, staged_report)
         plan.settings.https_redirect_seen = True
         seen: set[tuple[str, str]] = set()
         for route in deferred:
@@ -217,6 +229,10 @@ def _finalize_https_redirects(plan: Plan, routes: list[RouteSpec], candidates: l
                             "HTTP-to-HTTPS redirect: not emitted; Ferrum's TLS-only profile disables the plaintext "
                             "listener instead.")
         return candidates
+    if pre_closure_state is not None:
+        for route, saved_refusals, saved_placeholder in pre_closure_state:
+            route.refusals = saved_refusals
+            route.placeholder_emitted = saved_placeholder
     for route in deferred:
         route.skip = False
         route.skip_reason = ""
@@ -312,6 +328,7 @@ def _validate_route(route: RouteSpec, plan: Plan, options: EmitOptions, report: 
         return
     if route.hosts is not None:
         normalized: list[str] = []
+        seen_hosts: set[str] = set()
         for host in route.hosts:
             value = util.normalize_host(host)
             if value is None:
@@ -319,7 +336,8 @@ def _validate_route(route: RouteSpec, plan: Plan, options: EmitOptions, report: 
                 route.hosts = None
                 route.extra_conditions = True
                 break
-            if value not in normalized:
+            if value not in seen_hosts:
+                seen_hosts.add(value)
                 normalized.append(value)
         else:
             if len(normalized) > util.MAX_HOSTS_PER_PROXY:
@@ -1069,31 +1087,56 @@ def _refuse_nested_wildcard_scopes(plan: Plan, candidates: list[_Cand], report: 
     host for a path the narrower scope does not route more specifically. No closure can prevent that, so
     every route carrying the broader pattern becomes a fail-closed placeholder.
     """
-    scopes = [(scope, _scope_hosts(scope)) for scope in plan.host_scopes]
+    # Index only wildcard-bearing scopes by suffix (exact-host scopes cannot participate in wildcard nesting).
+    wild_by_suffix: dict[str, list[tuple[int | None, str, str]]] = {}
+    wild_scopes: list[tuple[Any, list[str], set[str]]] = []
+    for scope in plan.host_scopes:
+        wilds = [h for h in _scope_hosts(scope) if h.startswith("*.")]
+        if not wilds:
+            continue
+        wset = set(wilds)
+        wild_scopes.append((scope, wilds, wset))
+        for pattern in wset:
+            wild_by_suffix.setdefault(pattern[1:], []).append((scope.listen_port, scope.ref, pattern))
+    if not wild_scopes:
+        return
     leaky: list[tuple[str, int | None, str, str]] = []
-    for outer, outer_hosts in scopes:
-        for inner, inner_hosts in scopes:
-            # Scopes with the same ref come from one source scope (an Istio VirtualService bound through a plaintext
-            # and an HTTPS server) and carry the same route set, so nesting between them changes nothing.
-            if outer is inner or outer.ref == inner.ref \
-                    or not matching.ports_compatible(outer.listen_port, inner.listen_port):
-                continue
-            for pattern in outer_hosts:
-                if not pattern.startswith("*.") or pattern in inner_hosts:
-                    continue
-                if any(other.startswith("*.") and other != pattern and matching.host_cover(pattern, other)
-                       for other in inner_hosts):
-                    leaky.append((pattern, outer.listen_port, outer.ref, inner.ref))
+    seen_leaky: set[tuple[str, int | None, str, str]] = set()
+    for inner, inner_wilds, inner_set in wild_scopes:
+        for other in inner_wilds:
+            suffix = other[1:]
+            dot = suffix.find(".", 1)
+            while dot != -1:
+                parent = suffix[dot:]
+                for outer_port, outer_ref, pattern in wild_by_suffix.get(parent, ()):
+                    if outer_ref == inner.ref or pattern in inner_set \
+                            or not matching.ports_compatible(outer_port, inner.listen_port):
+                        continue
+                    entry = (pattern, outer_port, outer_ref, inner.ref)
+                    if entry not in seen_leaky:
+                        seen_leaky.add(entry)
+                        leaky.append(entry)
+                dot = suffix.find(".", dot + 1)
     if not leaky:
         return
+    leaky_by_pattern: dict[str, list[tuple[int | None, str, str]]] = {}
+    for pattern, port, outer_ref, inner_ref in leaky:
+        leaky_by_pattern.setdefault(pattern, []).append((port, outer_ref, inner_ref))
     reported: set[str] = set()
     for cand in candidates:
-        if cand.placeholder:
+        if cand.placeholder or not cand.hosts:
             continue
-        for pattern, port, outer_ref, inner_ref in leaky:
-            if pattern in cand.hosts and matching.ports_compatible(cand.listen_port, port):
-                _fail_close(cand, f"its wildcard host {pattern} covers the narrower wildcard scope {inner_ref}; "
-                                  "Ferrum's wildcard tier would let this route answer that scope's hosts")
+        for host in cand.hosts:
+            if not host.startswith("*."):
+                continue
+            hit = False
+            for port, _outer_ref, inner_ref in leaky_by_pattern.get(host, ()):
+                if matching.ports_compatible(cand.listen_port, port):
+                    _fail_close(cand, f"its wildcard host {host} covers the narrower wildcard scope {inner_ref}; "
+                                      "Ferrum's wildcard tier would let this route answer that scope's hosts")
+                    hit = True
+                    break
+            if hit:
                 break
     for pattern, _port, outer_ref, inner_ref in leaky:
         if outer_ref in reported:
@@ -1153,11 +1196,77 @@ def _refuse_fallthrough_targets(scope, hosts: list[str], candidates: list[_Cand]
 def _add_scope_closures(plan: Plan, candidates: list[_Cand], report: Report) -> None:
     _refuse_nested_wildcard_scopes(plan, candidates, report)
     scopes = sorted(plan.host_scopes, key=lambda s: matching.host_tier(s.hosts))
-    host_only: dict[int | None, list[_Cand]] = {}
+    # Per-port hash index of host-only candidates so overlap lookups stay O(|hosts| * labels) instead of O(S^2).
+    ho_catchall: dict[int | None, list[_Cand]] = {}
+    ho_exact: dict[int | None, dict[str, list[_Cand]]] = {}
+    ho_wild: dict[int | None, dict[str, list[_Cand]]] = {}
+    ho_exact_by_suffix: dict[int | None, dict[str, list[_Cand]]] = {}
+    ho_wild_by_parent: dict[int | None, dict[str, list[_Cand]]] = {}
     root_hosts: dict[int | None, set[str]] = {}
+
+    def _index_host_only(cand: _Cand) -> None:
+        port = cand.listen_port
+        if not cand.hosts:
+            ho_catchall.setdefault(port, []).append(cand)
+            return
+        ex_map = ho_exact.setdefault(port, {})
+        wi_map = ho_wild.setdefault(port, {})
+        ex_suf = ho_exact_by_suffix.setdefault(port, {})
+        wi_par = ho_wild_by_parent.setdefault(port, {})
+        for h in cand.hosts:
+            if h.startswith("*."):
+                suffix = h[1:]
+                wi_map.setdefault(suffix, []).append(cand)
+                dot = suffix.find(".", 1)
+                while dot != -1:
+                    wi_par.setdefault(suffix[dot:], []).append(cand)
+                    dot = suffix.find(".", dot + 1)
+            else:
+                ex_map.setdefault(h, []).append(cand)
+                dot = h.find(".")
+                while dot != -1:
+                    ex_suf.setdefault(h[dot:], []).append(cand)
+                    dot = h.find(".", dot + 1)
+
+    def _query_host_only(port: int | None, scope_hosts: list[str]) -> list[_Cand]:
+        found: list[_Cand] = []
+        seen_ids: set[int] = set()
+
+        def _add_all(items: list[_Cand] | None) -> None:
+            if not items:
+                return
+            for item in items:
+                iid = id(item)
+                if iid not in seen_ids:
+                    seen_ids.add(iid)
+                    found.append(item)
+
+        _add_all(ho_catchall.get(port))
+        ex_map = ho_exact.get(port, {})
+        wi_map = ho_wild.get(port, {})
+        ex_suf = ho_exact_by_suffix.get(port, {})
+        wi_par = ho_wild_by_parent.get(port, {})
+        for h in scope_hosts:
+            if h.startswith("*."):
+                suffix = h[1:]
+                _add_all(wi_map.get(suffix))
+                _add_all(ex_suf.get(suffix))
+                _add_all(wi_par.get(suffix))
+                dot = suffix.find(".", 1)
+                while dot != -1:
+                    _add_all(wi_map.get(suffix[dot:]))
+                    dot = suffix.find(".", dot + 1)
+            else:
+                _add_all(ex_map.get(h))
+                dot = h.find(".")
+                while dot != -1:
+                    _add_all(wi_map.get(h[dot:]))
+                    dot = h.find(".", dot + 1)
+        return found
+
     for cand in candidates:
         if cand.listen_path is None:
-            host_only.setdefault(cand.listen_port, []).append(cand)
+            _index_host_only(cand)
         elif cand.listen_path == "/":
             root_hosts.setdefault(cand.listen_port, set()).update(cand.hosts)
     for scope in scopes:
@@ -1167,7 +1276,7 @@ def _add_scope_closures(plan: Plan, candidates: list[_Cand], report: Report) -> 
         # A prefix route for "/" on exactly these host names already catches every unmatched path in their tier.
         if all(host in root_hosts.get(scope.listen_port, set()) for host in hosts):
             continue
-        overlapping = [c for c in host_only.get(scope.listen_port, []) if matching.hosts_overlap(c.hosts, hosts)]
+        overlapping = _query_host_only(scope.listen_port, hosts)
         # Only a closure for the very same host names closes this scope. A covering wildcard closure does not:
         # Ferrum tries every path route of every matching wildcard pattern (and of the exact tier) before any
         # wildcard host-only route, so another scope's routes would still receive these hosts' unmatched paths.
@@ -1194,7 +1303,7 @@ def _add_scope_closures(plan: Plan, candidates: list[_Cand], report: Report) -> 
             closure = _Cand(synthetic, True, chunk, None, scope.listen_port,
                             termination=NOT_FOUND_TERMINATION, kind_label="scope-default")
             candidates.append(closure)
-            host_only.setdefault(scope.listen_port, []).append(closure)
+            _index_host_only(closure)
         report.info("scope-closure", scope.ref,
                     "Added a host-only route answering 404 for paths this scope does not route, because the "
                     "source never falls through to other hosts' routes but Ferrum does.")

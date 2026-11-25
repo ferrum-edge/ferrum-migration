@@ -489,6 +489,7 @@ class _Envoy:
         if raw_domains is None or not raw_domains:
             host_problem = "domains missing or invalid"
         elif "*" not in raw_domains:
+            seen_hosts: set[str] = set()
             for domain in raw_domains:
                 host = domain.lower()
                 if ":" in host:
@@ -500,7 +501,8 @@ class _Envoy:
                 if host.endswith("*") or ("*" in host and not host.startswith("*.")):
                     host_problem = "prefix/embedded wildcard domain"
                     break
-                if host not in hosts:
+                if host not in seen_hosts:
+                    seen_hosts.add(host)
                     hosts.append(host)
         if host_problem:
             self.report.error("envoy-domains", ref, f"Domains not representable ({host_problem}).")
@@ -561,8 +563,10 @@ class _Envoy:
             )
         )
         if can_fold:
-            for ref, _hosts, _listen_port, routes in self.redirect_vhosts:
+            for ref, hosts, _listen_port, routes in self.redirect_vhosts:
                 for route in routes:
+                    if hosts and route.kind == "prefix" and route.path == "/" and route.methods is None:
+                        route.kind, route.path = "hostonly", None
                     route.skip = True
                     route.skip_reason = "HTTPS redirect"
                     route.https_redirect_fold = ("envoy-https-redirect", ref)

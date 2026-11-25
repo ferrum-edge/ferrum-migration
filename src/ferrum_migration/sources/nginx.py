@@ -226,6 +226,7 @@ class _Nginx:
         self.body_sizes: list[tuple[RouteSpec, int]] = []
         self.catch_all_routes: dict[int, list[RouteSpec]] = {}
         self.redirect_servers: list[tuple[str, dict, dict, list[RouteSpec]]] = []
+        self.listener_server_counts: dict[tuple[int, bool], int] = {}
 
     # --------------------------------------------------------- scope merge
 
@@ -435,11 +436,18 @@ class _Nginx:
                 if not listen.get("invalid") and listen["default"]:
                     explicit[(listen["port"], listen["ssl"])] = info["index"]
         first: dict[tuple[int, bool], int] = {}
+        counts: dict[tuple[int, bool], int] = {}
         for info in infos:
+            seen_keys: set[tuple[int, bool]] = set()
             for listen in info["listens"]:
                 if not listen.get("invalid"):
-                    first.setdefault((listen["port"], listen["ssl"]), info["index"])
+                    key = (listen["port"], listen["ssl"])
+                    first.setdefault(key, info["index"])
+                    if key not in seen_keys:
+                        seen_keys.add(key)
+                        counts[key] = counts.get(key, 0) + 1
         self.default_server = {key: explicit.get(key, index) for key, index in first.items()}
+        self.listener_server_counts = counts
         addresses = {listen.get("addr") for info in infos for listen in info["listens"] if not listen.get("invalid")}
         specific = {addr for addr in addresses if addr}
         if specific and None not in addresses and len(specific) == 1:
@@ -501,9 +509,16 @@ class _Nginx:
         is_default = ownership == {True}
         hosts, host_problem = _server_hosts(info["names"])
         explicit_default = any(listen.get("default") for listen in selected)
+        plain_shared_default = any(
+            not listen["ssl"]
+            and self.default_server.get((listen["port"], False)) == info["index"]
+            and self.listener_server_counts.get((listen["port"], False), 0) > 1
+            for listen in selected
+        )
         literal_redirect_host = (
             hosts[0].lower()
-            if (not host_problem and not explicit_default and len(hosts) == 1 and not hosts[0].startswith("*."))
+            if (not host_problem and not explicit_default and not plain_shared_default
+                and len(hosts) == 1 and not hosts[0].startswith("*."))
             else None
         )
         if ownership == {True, False}:
@@ -639,8 +654,11 @@ class _Nginx:
             )
         )
         if can_fold:
-            for ref, _info, _base, routes in self.redirect_servers:
+            for ref, _info, base, routes in self.redirect_servers:
                 for route in routes:
+                    if base["hosts"] and len(routes) == 1 and route.kind == "prefix" and route.path == "/" \
+                            and route.methods is None:
+                        route.kind, route.path = "hostonly", None
                     route.skip = True
                     route.skip_reason = "HTTPS redirect"
                     route.https_redirect_fold = ("nginx-https-redirect", ref)
@@ -1018,15 +1036,19 @@ class _Nginx:
                 if max_fails_val is not None or fail_timeout_raw is not None:
                     any_explicit_passive = True
                 # NGINX defaults max_fails=1 and fail_timeout=10s per peer; max_fails=0 disables passive checks.
+                # Keep raw source values for cross-peer comparison before clamping to Ferrum's bounds.
                 effective_fails = 1 if max_fails_val is None else max_fails_val
                 if effective_fails == 0:
                     peer_passive_policies.append(None)
                 else:
                     if fail_timeout_raw is not None:
-                        secs = (util.parse_nginx_time_ms(fail_timeout_raw, allow_ms=False) or 10_000) // 1000
+                        parsed_ms = util.parse_nginx_time_ms(fail_timeout_raw, allow_ms=False)
+                        if parsed_ms is None:
+                            peer_passive_policies.append((-1, -1))
+                        else:
+                            peer_passive_policies.append((effective_fails, parsed_ms // 1000))
                     else:
-                        secs = 10
-                    peer_passive_policies.append((min(effective_fails, 1000), max(1, secs)))
+                        peer_passive_policies.append((effective_fails, 10))
                 spec.targets.append(Target(parsed[0], parsed[1], weight))
             elif directive.name == "least_conn":
                 spec.algorithm = "least_connections"
@@ -1053,17 +1075,28 @@ class _Nginx:
                                     "omitted.")
             else:
                 only = next(iter(distinct_policies))
-                if only is not None:
-                    threshold, seconds = only
-                    clamped = min(seconds, 86_400)
-                    if seconds > 86_400:
+                if only == (-1, -1):
+                    self.report.warning("nginx-passive-health", ref,
+                                        "Upstream fail_timeout is invalid or oversized; passive health checks omitted.")
+                elif only is not None:
+                    raw_threshold, raw_seconds = only
+                    clamped_threshold = min(raw_threshold, 1000)
+                    if raw_threshold > 1000:
+                        self.report.warning("nginx-passive-health", ref,
+                                            "max_fails exceeds Ferrum's 1000-failure passive threshold ceiling and "
+                                            "was clamped to 1000.")
+                    clamped_seconds = min(max(1, raw_seconds), 86_400)
+                    if raw_seconds > 86_400:
                         self.report.warning("nginx-passive-health", ref,
                                             "fail_timeout exceeds Ferrum's 86400s passive health-check ceiling "
                                             "and was clamped to 86400s.")
+                    elif raw_seconds == 0:
+                        self.report.warning("nginx-passive-health", ref,
+                                            "fail_timeout=0s was clamped to Ferrum's 1s passive health-check minimum.")
                     spec.health_checks = {"passive": {
-                        "unhealthy_threshold": threshold,
-                        "unhealthy_window_seconds": clamped,
-                        "healthy_after_seconds": clamped,
+                        "unhealthy_threshold": clamped_threshold,
+                        "unhealthy_window_seconds": clamped_seconds,
+                        "healthy_after_seconds": clamped_seconds,
                     }}
                     self.report.warning("nginx-passive-health", ref, "max_fails/fail_timeout mapped approximately to "
                                         "passive health checks.")
