@@ -205,16 +205,30 @@ def canonical_path_problem(path: object) -> str | None:
 
 _RUST_REGEX_FLAGS = frozenset("imsURux")
 _RUST_BRACE_QUANT = re.compile(r"\{(\d+)(?:,(\d*))?\}", re.ASCII)
+_UNICODE_CLASS_ESCAPES = frozenset("wWdDsSpP")
+MAX_REGEX_EXPANDED_COST = 10_000
 
 
 def _rust_regex_syntax_problem(pattern: str) -> str | None:
-    """Scan escapes, braces, verbose comments, and inline flags linearly for Rust-regex compatibility."""
+    """Scan escapes, braces, verbose comments, inline flags, and expanded repetition cost linearly."""
     n = len(pattern)
     i = 0
     in_class = False
-    x_stack: list[bool] = [False]
+    class_cost = 0
+    flag_stack: list[tuple[bool, bool]] = [(False, True)]  # (verbose_x, unicode_u)
+    cost_stack: list[list[int]] = [[0, 0]]  # [group_total_cost, last_atom_cost]
+
+    def _charge(atom_cost: int) -> str | None:
+        frame = cost_stack[-1]
+        frame[0] += atom_cost
+        frame[1] = atom_cost
+        if frame[0] > MAX_REGEX_EXPANDED_COST:
+            return "regex expanded repetition cost exceeds safe Rust regex compilation limit"
+        return None
+
     while i < n:
         ch = pattern[i]
+        x_on, u_on = flag_stack[-1]
         if ch == "\\":
             if i + 1 >= n:
                 return "regex ends with a trailing backslash"
@@ -223,25 +237,45 @@ def _rust_regex_syntax_problem(pattern: str) -> str | None:
                 return "regex uses backreferences or octal escapes unsupported by the Rust regex engine"
             if nxt in ("G", "K", "Z", "g") or (nxt == "k" and i + 2 < n and pattern[i + 2] in ("<", "{")):
                 return "regex uses escapes unsupported by the Rust regex engine"
+            esc_cost = (100 if u_on else 4) if nxt in _UNICODE_CLASS_ESCAPES else 1
+            if in_class:
+                class_cost += esc_cost
+            else:
+                err = _charge(esc_cost)
+                if err:
+                    return err
             i += 2
             continue
         if in_class:
+            if x_on and (ch == "#" or ch.isspace()):
+                return ("regex uses unescaped '#' or whitespace inside a character class under verbose (?x) mode, "
+                        "which Rust regex parses differently from PCRE/Python")
             if ch == "]":
                 in_class = False
+                err = _charge(max(2, class_cost))
+                if err:
+                    return err
+            else:
+                class_cost += 1
             i += 1
             continue
-        if x_stack[-1] and ch == "#":
+        if x_on and ch == "#":
             nl = pattern.find("\n", i + 1)
             if nl == -1:
                 break
             i = nl + 1
             continue
+        if x_on and ch.isspace():
+            i += 1
+            continue
         if ch == "[":
             in_class = True
+            class_cost = 0
             i += 1
             if i < n and pattern[i] == "^":
                 i += 1
             if i < n and pattern[i] == "]":
+                class_cost += 1
                 i += 1
             continue
         if ch == "{":
@@ -254,19 +288,39 @@ def _rust_regex_syntax_problem(pattern: str) -> str | None:
                 hi = int(hi_raw)
                 if hi < lo or hi > 1000:
                     return "regex counted repetition bounds are invalid or too large"
-            elif lo > 1000:
-                return "regex counted repetition bound is too large"
+                rep = hi
+            else:
+                if lo > 1000:
+                    return "regex counted repetition bound is too large"
+                rep = lo
+            frame = cost_stack[-1]
+            last = max(1, frame[1])
+            mult = max(1, rep)
+            frame[0] += last * (mult - 1)
+            frame[1] = last * mult
+            if frame[0] > MAX_REGEX_EXPANDED_COST:
+                return "regex expanded repetition cost exceeds safe Rust regex compilation limit"
             i = qm.end()
             if i < n and pattern[i] == "+":
                 return "regex uses possessive quantifiers unsupported by the Rust regex engine"
             continue
-        if ch == "}":
-            return "regex contains an unescaped '}' rejected by Rust regex"
-        if ch in "*+?" and i + 1 < n and pattern[i + 1] == "+":
-            return "regex uses possessive quantifiers unsupported by the Rust regex engine"
+        if ch in "*+?":
+            if i + 1 < n and pattern[i + 1] == "+":
+                return "regex uses possessive quantifiers unsupported by the Rust regex engine"
+            i += 1
+            continue
+        if ch == "|":
+            cost_stack[-1][1] = 0
+            i += 1
+            continue
         if ch == ")":
-            if len(x_stack) > 1:
-                x_stack.pop()
+            if len(flag_stack) > 1:
+                flag_stack.pop()
+            if len(cost_stack) > 1:
+                group_total, _ = cost_stack.pop()
+                err = _charge(max(1, group_total))
+                if err:
+                    return err
             i += 1
             continue
         if ch == "(":
@@ -279,17 +333,22 @@ def _rust_regex_syntax_problem(pattern: str) -> str | None:
                 if c2 == "<":
                     if i + 3 < n and pattern[i + 3] in ("=", "!"):
                         return "regex uses lookbehind unsupported by the Rust regex engine"
-                    x_stack.append(x_stack[-1])
-                    i += 3
+                    end = pattern.find(">", i + 3)
+                    flag_stack.append(flag_stack[-1])
+                    cost_stack.append([0, 0])
+                    i = (end + 1) if end != -1 else (i + 3)
                     continue
                 if c2 == "P":
                     if i + 3 < n and pattern[i + 3] == "=":
                         return "regex uses backreferences unsupported by the Rust regex engine"
-                    x_stack.append(x_stack[-1])
-                    i += 3
+                    end = pattern.find(">", i + 4) if (i + 3 < n and pattern[i + 3] == "<") else -1
+                    flag_stack.append(flag_stack[-1])
+                    cost_stack.append([0, 0])
+                    i = (end + 1) if end != -1 else (i + 3)
                     continue
                 if c2 == ":":
-                    x_stack.append(x_stack[-1])
+                    flag_stack.append(flag_stack[-1])
+                    cost_stack.append([0, 0])
                     i += 3
                     continue
                 # Inline flag group (?flags) or (?flags:...): Rust regex rejects duplicate flags and non-Rust flags.
@@ -297,6 +356,7 @@ def _rust_regex_syntax_problem(pattern: str) -> str | None:
                 seen_flags: set[str] = set()
                 seen_dash = False
                 enable_x: bool | None = None
+                enable_u: bool | None = None
                 while j < n and pattern[j] not in (":", ")"):
                     flag = pattern[j]
                     if flag == "-":
@@ -309,19 +369,31 @@ def _rust_regex_syntax_problem(pattern: str) -> str | None:
                         seen_flags.add(flag)
                         if flag == "x":
                             enable_x = not seen_dash
+                        elif flag == "u":
+                            enable_u = not seen_dash
                     else:
                         return "regex uses inline flags unsupported by the Rust regex engine"
                     j += 1
                 if j >= n:
                     return "regex has an unclosed inline flag group"
-                new_x = x_stack[-1] if enable_x is None else enable_x
+                new_flags = (
+                    x_on if enable_x is None else enable_x,
+                    u_on if enable_u is None else enable_u,
+                )
                 if pattern[j] == ":":
-                    x_stack.append(new_x)
+                    flag_stack.append(new_flags)
+                    cost_stack.append([0, 0])
                 else:
-                    x_stack[-1] = new_x
+                    flag_stack[-1] = new_flags
                 i = j + 1
                 continue
-            x_stack.append(x_stack[-1])
+            flag_stack.append(flag_stack[-1])
+            cost_stack.append([0, 0])
+            i += 1
+            continue
+        err = _charge(4 if ch == "." else 1)
+        if err:
+            return err
         i += 1
     return None
 

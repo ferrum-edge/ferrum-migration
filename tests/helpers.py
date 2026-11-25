@@ -126,6 +126,31 @@ def assert_listener_contract(test, plan, result, mode: str, http_port: int, http
         test.assertNotIn("REQUIRED for HTTPS", profile)
 
 
+def _ferrum_wildcard_matches(pattern: str, host: str) -> bool:
+    """Mirror Ferrum Edge v0.9.21 ``wildcard_matches`` in ``src/config/types.rs``."""
+    if not pattern.startswith("*."):
+        return False
+    suffix = pattern[1:]  # ".domain.tld"
+    return host.endswith(suffix) and len(host) > len(suffix)
+
+
+def _ferrum_slot_hosts_conflict(a: list[str], b: list[str], *, host_only: bool) -> bool:
+    """Mirror Ferrum Edge v0.9.21 ``hosts_overlap`` (host-only) and ``ambiguous_path_host_overlap`` (path)."""
+    if not a or not b:
+        return True
+    if set(a) & set(b):
+        return True
+    for ha in a:
+        wa = ha.startswith("*.")
+        for hb in b:
+            wb = hb.startswith("*.")
+            if not host_only and wa != wb:
+                continue
+            if _ferrum_wildcard_matches(ha, hb) or _ferrum_wildcard_matches(hb, ha):
+                return True
+    return False
+
+
 def assert_structurally_valid(test, config: dict) -> None:
     """Invariants Ferrum enforces at load time that the emitter must always satisfy."""
     test.assertEqual(config["version"], "1")
@@ -150,7 +175,7 @@ def assert_structurally_valid(test, config: dict) -> None:
     plugin_ids = {p["id"] for p in config["plugin_configs"]}
     upstream_ids = {u["id"] for u in config["upstreams"]}
     proxy_ids = {p["id"] for p in config["proxies"]}
-    slots = {}
+    slots: dict[tuple, list[tuple[str, list[str]]]] = {}
     for proxy in config["proxies"]:
         test.assertTrue(proxy.get("hosts") or proxy.get("listen_path"), proxy["id"])
         test.assertNotIn("listen_port", proxy, f"listener-scoped proxy emitted: {proxy['id']}")
@@ -163,9 +188,15 @@ def assert_structurally_valid(test, config: dict) -> None:
             test.assertGreater(proxy["backend_port"], 0)
         test.assertIn(proxy["backend_scheme"], ("http", "https"))
         key = (proxy.get("listen_port"), proxy.get("listen_path"))
-        for host in proxy.get("hosts", []) or ["*any*"]:
-            test.assertNotIn((key, host), slots, f"duplicate route slot {key} {host}")
-            slots[(key, host)] = proxy["id"]
+        hosts = list(proxy.get("hosts") or [])
+        host_only = proxy.get("listen_path") is None
+        existing = slots.setdefault(key, [])
+        for other_id, other_hosts in existing:
+            test.assertFalse(
+                _ferrum_slot_hosts_conflict(hosts, other_hosts, host_only=host_only),
+                f"Ferrum slot conflict on {key}: {proxy['id']} ({hosts}) vs {other_id} ({other_hosts})",
+            )
+        existing.append((proxy["id"], hosts))
     for plugin_config in config["plugin_configs"]:
         if plugin_config["scope"] == "proxy":
             test.assertIn(plugin_config["proxy_id"], proxy_ids)

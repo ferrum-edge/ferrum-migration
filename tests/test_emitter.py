@@ -251,6 +251,11 @@ class MatchingTest(unittest.TestCase):
         self.assertIsNotNone(util.regex_problem(r"\057api"))
         self.assertIsNotNone(util.regex_problem(r"^/api(?xx:[ab])$"))
         self.assertIsNotNone(util.regex_problem(r"^/api{foo$"))
+        self.assertIsNotNone(util.regex_problem(r"^/api/(?x:[a#])$"))
+        self.assertIsNotNone(util.regex_problem(r"^/api/(?x:[a b])$"))
+        self.assertIsNotNone(util.regex_problem(r"^/(?:[ab]{0,1000}){0,1000}$"))
+        self.assertIsNotNone(util.regex_problem(r"^/items/\w{1000}$"))
+        self.assertIsNone(util.regex_problem(r"^/api/a}b$"))
         self.assertIsNone(util.regex_problem(r"^/api[\\0]$"))
         self.assertIsNone(util.regex_problem(r"(?x)^/api$ # (?xx:[ab])"))
         self.assertIsNone(util.regex_problem("/users/(?P<id>[0-9]+)"))
@@ -696,6 +701,52 @@ class MatchingTest(unittest.TestCase):
         self.assertEqual([c["username"] for c in result.config["consumers"]], ["bob"])
         self.assertNotIn("custom_id", result.config["consumers"][0])
         self.assertEqual(result.config["consumers"][0]["acl_groups"], ["ok"])
+
+    def test_trailing_slash_guard_is_computed_per_host_and_fails_closed_on_wildcard_overlap(self):
+        prefix_r = RouteSpec(ref="p", name="p", hosts=["a.example.test", "b.example.test"], kind="prefix",
+                             path="/api/", protocols=frozenset({"http"}),
+                             backend=BackendRef("http", "p.internal", 80))
+        exact_a = RouteSpec(ref="ea", name="ea", hosts=["a.example.test"], kind="exact", path="/api",
+                            protocols=frozenset({"http"}), backend=BackendRef("http", "ea.internal", 80))
+        result, _ = run([prefix_r, exact_a])
+        assert_structurally_valid(self, result.config)
+        exact_proxies = [p for p in result.config["proxies"] if p.get("listen_path") == "=/api"]
+        self.assertEqual(len(exact_proxies), 2)
+        guard = next(p for p in exact_proxies if p["labels"].get("ferrum-migration/status") == "exact-guard")
+        self.assertEqual(guard["hosts"], ["b.example.test"])
+        # Overlapping narrower wildcard exact route blocks a valid bare-path guard -> fail closed with diagnostic.
+        w_prefix = RouteSpec(ref="wp", name="wp", hosts=["*.example.test"], kind="prefix", path="/api/",
+                             protocols=frozenset({"http"}), backend=BackendRef("http", "wp.internal", 80))
+        w_exact = RouteSpec(ref="we", name="we", hosts=["*.sub.example.test"], kind="exact", path="/api",
+                            protocols=frozenset({"http"}), backend=BackendRef("http", "we.internal", 80))
+        w_res, w_rep = run([w_prefix, w_exact])
+        assert_structurally_valid(self, w_res.config)
+        self.assertIn("trailing-slash-guard-conflict", codes(w_rep, "error"))
+        wp_proxy = next(p for p in w_res.config["proxies"] if p.get("listen_path") == "/api")
+        self.assertEqual(wp_proxy["labels"]["ferrum-migration/status"], "refused")
+
+    def test_colliding_nested_wildcard_scope_labels_both_report_diagnostics(self):
+        from ferrum_migration.model import HostScope
+        plan = Plan(
+            platform="envoy",
+            routes=[
+                route("r1", "/a", hosts=["*.one.example.test"]),
+                route("r2", "/b", hosts=["*.two.example.test"]),
+                route("r3", "/c", hosts=["*.sub.one.example.test"]),
+                route("r4", "/d", hosts=["*.sub.two.example.test"]),
+            ],
+            host_scopes=[
+                HostScope("shared-label", ["*.one.example.test"]),
+                HostScope("shared-label", ["*.two.example.test"]),
+                HostScope("inner-1", ["*.sub.one.example.test"]),
+                HostScope("inner-2", ["*.sub.two.example.test"]),
+            ],
+        )
+        report = Report("envoy", "synthetic")
+        result = emit(plan, EmitOptions(), report)
+        assert_structurally_valid(self, result.config)
+        nested_errs = [c for c in report.caveats if c.code == "nested-wildcard-scope"]
+        self.assertEqual(len(nested_errs), 2)
 
 
 if __name__ == "__main__":

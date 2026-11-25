@@ -164,6 +164,7 @@ def emit(plan: Plan, options: EmitOptions, report: Report) -> EmitResult:
     _poison_case_variants(plan, routes)
     _resolve_frontend_client_ca(plan, routes, report, mode)
     candidates = _build_candidates(routes)
+    candidates = _drop_off_protocol_slot_conflicts(candidates, mode)
     candidates = _resolve_conflicts(candidates, report)
     has_deferred_redirects = any(route.https_redirect_fold is not None for route in routes)
     pre_closure_state = (
@@ -241,7 +242,9 @@ def _finalize_https_redirects(plan: Plan, routes: list[RouteSpec], candidates: l
         _validate_route(route, plan, options, report)
     _poison(routes)
     _poison_case_variants(plan, routes)
-    rebuilt = _resolve_conflicts(_build_candidates(routes), report)
+    rebuilt = _build_candidates(routes)
+    rebuilt = _drop_off_protocol_slot_conflicts(rebuilt, mode)
+    rebuilt = _resolve_conflicts(rebuilt, report)
     _add_scope_closures(plan, rebuilt, report)
     _add_trailing_slash_placeholders(rebuilt, report)
     _add_divergence_guards(plan, rebuilt, report)
@@ -708,13 +711,16 @@ def _resolve_frontend_client_ca(plan: Plan, routes: list[RouteSpec], report: Rep
 
 
 def _hosts_merge_in_slot(a: list[str], b: list[str], *, host_only: bool) -> bool:
-    """Whether ``a`` and ``b`` merge into one conflict component in ``_components``."""
+    """Whether Ferrum Edge v0.9.21 rejects two proxies sharing the same slot.
+
+    Mirrors ``hosts_overlap`` (host-only slots) and ``ambiguous_path_host_overlap`` (path slots) in
+    ``src/config/types.rs``: empty ``hosts`` (catch-all) conflicts with every host list on both slot kinds;
+    exact-to-wildcard overlap conflicts only in host-only slots.
+    """
+    if not a or not b:
+        return True
     if host_only:
         return matching.hosts_overlap(a, b)
-    if not a and not b:
-        return True
-    if not a or not b:
-        return False
     b_exact = {h for h in b if not h.startswith("*.")}
     b_wild = [h for h in b if h.startswith("*.")]
     for h in a:
@@ -821,6 +827,42 @@ def _build_candidates(routes: list[RouteSpec]) -> list[_Cand]:
                                     termination=route.termination,
                                     kind_label="terminated" if route.termination else "migrated"))
     return candidates
+
+
+def _drop_off_protocol_slot_conflicts(candidates: list[_Cand], mode: str) -> list[_Cand]:
+    """Omit refused off-protocol placeholders that would collide with a live route on the selected frontend.
+
+    When the profile disables a listener (for example ``mode == "https"`` with plaintext disabled), a refused
+    route that was served exclusively on the disabled listener never existed on the selected frontend. Keeping
+    its placeholder when it shares a ``(listen_port, listen_path)`` slot with a live route (such as a refused
+    named HTTP ``/`` vs a live HTTPS catch-all ``/``) would either conflict in Ferrum's validator or collapse
+    the live route into a 503. Omitting only such colliding off-protocol placeholders preserves the live
+    frontend route while keeping the route's refusal diagnostics in the report.
+    """
+    opened = FRONTEND_MODES[mode]
+    live_by_path: dict[str | None, _PortHostIndex] = {}
+    for cand in candidates:
+        if not cand.placeholder:
+            live_by_path.setdefault(cand.listen_path, _PortHostIndex()).add(cand)
+    if not live_by_path:
+        return candidates
+    kept: list[_Cand] = []
+    dropped_routes: list[RouteSpec] = []
+    for cand in candidates:
+        if cand.placeholder:
+            protos = _effective_protocols(cand.route)
+            if protos is not None and not (opened & protos):
+                idx = live_by_path.get(cand.listen_path)
+                if idx is not None and idx.query(cand.listen_port, cand.hosts, path_slot=cand.listen_path is not None):
+                    dropped_routes.append(cand.route)
+                    continue
+        kept.append(cand)
+    if dropped_routes:
+        remaining_ids = {id(c.route) for c in kept}
+        for route in dropped_routes:
+            if id(route) not in remaining_ids:
+                route.placeholder_emitted = False
+    return kept
 
 
 def _hosts_conflict_in_ferrum(a: str, b: str, host_only: bool) -> bool:
@@ -1037,22 +1079,16 @@ def _components(members: list[_Cand], *, host_only: bool = True) -> list[list[_C
         if ra != rb:
             parent[ra] = rb
 
-    # In host-only slots, catch-all overlaps every host; on path slots Ferrum keeps catch-all, exact, and
-    # wildcard tiers separate, so catch-all only conflicts with other catch-alls.
+    # Ferrum Edge v0.9.21 rejects any catch-all + named or catch-all + catch-all pair on the same slot
+    # (both hosts_overlap and ambiguous_path_host_overlap return true when either host list is empty).
     first_catchall = next((i for i, m in enumerate(members) if not m.hosts), None)
-    if first_catchall is not None and host_only:
+    if first_catchall is not None:
         for i in range(n):
             union(i, first_catchall)
     else:
-        if first_catchall is not None:
-            for i, m in enumerate(members):
-                if not m.hosts:
-                    union(i, first_catchall)
         exact_owner: dict[str, int] = {}
         wild_owner: dict[str, int] = {}
         for i, member in enumerate(members):
-            if not member.hosts:
-                continue
             for host in member.hosts:
                 if host.startswith("*."):
                     suffix = host[1:]
@@ -1144,7 +1180,7 @@ def _refuse_nested_wildcard_scopes(plan: Plan, candidates: list[_Cand], report: 
                 dot = suffix.find(".", dot + 1)
     if not wild_scopes:
         return
-    leaky: list[tuple[str, int | None, str, str]] = []
+    leaky: list[tuple[int, str, int | None, str, str]] = []
     seen_outer: set[tuple[str, int | None, int]] = set()
     for outer_idx, outer, outer_wilds in wild_scopes:
         for pattern in outer_wilds:
@@ -1161,14 +1197,14 @@ def _refuse_nested_wildcard_scopes(plan: Plan, candidates: list[_Cand], report: 
             for inner_idx, inner_ref, inner_wilds in cand_witnesses:
                 if inner_idx != outer_idx and pattern not in inner_wilds:
                     seen_outer.add(key)
-                    leaky.append((pattern, outer.listen_port, outer.ref, inner_ref))
+                    leaky.append((outer_idx, pattern, outer.listen_port, outer.ref, inner_ref))
                     break
     if not leaky:
         return
     leaky_by_pattern: dict[str, list[tuple[int | None, str, str]]] = {}
-    for pattern, port, outer_ref, inner_ref in leaky:
+    for _outer_idx, pattern, port, outer_ref, inner_ref in leaky:
         leaky_by_pattern.setdefault(pattern, []).append((port, outer_ref, inner_ref))
-    reported: set[str] = set()
+    reported: set[int] = set()
     for cand in candidates:
         if cand.placeholder or not cand.hosts:
             continue
@@ -1184,10 +1220,10 @@ def _refuse_nested_wildcard_scopes(plan: Plan, candidates: list[_Cand], report: 
                     break
             if hit:
                 break
-    for pattern, _port, outer_ref, inner_ref in leaky:
-        if outer_ref in reported:
+    for outer_idx, pattern, _port, outer_ref, inner_ref in leaky:
+        if outer_idx in reported:
             continue
-        reported.add(outer_ref)
+        reported.add(outer_idx)
         report.error("nested-wildcard-scope", outer_ref,
                      f"The wildcard host {pattern} covers the narrower wildcard host scope {inner_ref}. The source "
                      "sends those hosts only to the narrower scope, but Ferrum compares the path routes of every "
@@ -1198,9 +1234,10 @@ def _refuse_nested_wildcard_scopes(plan: Plan, candidates: list[_Cand], report: 
 
 
 class _PortHostIndex:
-    """Per-port hash index for O(|hosts| * labels) host-overlap queries on a single route slot."""
+    """Per-port hash index for O(|hosts| * labels) slot-conflict queries mirroring Ferrum Edge v0.9.21."""
 
     def __init__(self) -> None:
+        self.all_by_port: dict[int | None, list[_Cand]] = {}
         self.catchall: dict[int | None, list[_Cand]] = {}
         self.exact: dict[int | None, dict[str, list[_Cand]]] = {}
         self.wild: dict[int | None, dict[str, list[_Cand]]] = {}
@@ -1209,6 +1246,7 @@ class _PortHostIndex:
 
     def add(self, cand: _Cand) -> None:
         port = cand.listen_port
+        self.all_by_port.setdefault(port, []).append(cand)
         if not cand.hosts:
             self.catchall.setdefault(port, []).append(cand)
             return
@@ -1232,6 +1270,9 @@ class _PortHostIndex:
                     dot = h.find(".", dot + 1)
 
     def query(self, port: int | None, scope_hosts: list[str], *, path_slot: bool = False) -> list[_Cand]:
+        if not scope_hosts:
+            # Empty hosts (catch-all) conflicts with every proxy on the same slot in Ferrum v0.9.21.
+            return list(self.all_by_port.get(port, ()))
         found: list[_Cand] = []
         seen_ids: set[int] = set()
 
@@ -1244,10 +1285,7 @@ class _PortHostIndex:
                     seen_ids.add(iid)
                     found.append(item)
 
-        if not path_slot or not scope_hosts:
-            _add_all(self.catchall.get(port))
-        if not scope_hosts:
-            return found
+        _add_all(self.catchall.get(port))
         ex_map = self.exact.get(port, {})
         wi_map = self.wild.get(port, {})
         ex_suf = self.exact_by_suffix.get(port, {})
@@ -1399,9 +1437,10 @@ def _add_scope_closures(plan: Plan, candidates: list[_Cand], report: Report) -> 
         # Only a closure for the very same host names closes this scope. A covering wildcard closure does not:
         # Ferrum tries every path route of every matching wildcard pattern (and of the exact tier) before any
         # wildcard host-only route, so another scope's routes would still receive these hosts' unmatched paths.
-        if overlapping and all(c.route.methods is None for c in overlapping) and \
-                all(any(host in c.hosts for c in overlapping) for host in hosts):
-            continue
+        if overlapping and all(c.route.methods is None for c in overlapping):
+            covered = {h for c in overlapping for h in c.hosts}
+            if all(host in covered for host in hosts):
+                continue
         chunks = None if overlapping else _chunk_hosts_no_prune(hosts, host_only=True)
         if overlapping or chunks is None:
             if _add_regex_closure(scope, hosts, candidates, regex_idx, report):
@@ -1445,11 +1484,70 @@ def _add_trailing_slash_placeholders(candidates: list[_Cand], report: Report) ->
             _fail_close(cand, f"trailing-slash prefix bare-path exact guard exceeds {util.MAX_LISTEN_PATH_LENGTH} bytes")
             continue
         idx = exact_indexes.get(exact)
-        if idx is not None and idx.query(cand.listen_port, cand.hosts, path_slot=True):
-            continue
-        synthetic = RouteSpec(ref=route.ref, name=f"{route.name}-bare", hosts=list(cand.hosts), kind="exact",
+        port = cand.listen_port
+        guard_hosts: list[str]
+        if not cand.hosts:
+            if idx is not None and idx.catchall.get(port):
+                continue
+            if idx is not None and idx.all_by_port.get(port):
+                _fail_close(cand, f"a named exact route for {route.path} prevents adding a catch-all bare-path guard")
+                report.error("trailing-slash-guard-conflict", route.ref,
+                             f"The source prefix ends with '/', so bare {route.path} did not match it, but an "
+                             f"existing named exact route on {route.path} prevents emitting a catch-all 404 guard "
+                             "in Ferrum. This route was refused (fail closed).",
+                             "Add an explicit bare-path route or separate the conflicting host scopes, then convert again.")
+                continue
+            guard_hosts = []
+        else:
+            if idx is not None and idx.catchall.get(port):
+                _fail_close(cand, f"a catch-all exact route for {route.path} prevents adding a host-scoped bare-path guard")
+                report.error("trailing-slash-guard-conflict", route.ref,
+                             f"The source prefix ends with '/', so bare {route.path} did not match it, but an "
+                             f"existing catch-all exact route on {route.path} prevents emitting a host-scoped 404 "
+                             "guard in Ferrum (and Ferrum checks the named host tier before catch-all). This route "
+                             "was refused (fail closed).",
+                             "Add an explicit host-scoped bare-path route or separate the conflicting scopes, then convert again.")
+                continue
+            ex_map = idx.exact.get(port, {}) if idx is not None else {}
+            wi_map = idx.wild.get(port, {}) if idx is not None else {}
+            wi_par = idx.wild_by_parent.get(port, {}) if idx is not None else {}
+            guard_hosts = []
+            blocked = False
+            for host in cand.hosts:
+                if host.startswith("*."):
+                    suffix = host[1:]
+                    covered = suffix in wi_map
+                    if not covered:
+                        dot = suffix.find(".", 1)
+                        while dot != -1:
+                            if suffix[dot:] in wi_map:
+                                covered = True
+                                break
+                            dot = suffix.find(".", dot + 1)
+                    if covered:
+                        continue
+                    if suffix in wi_par:
+                        blocked = True
+                        break
+                    guard_hosts.append(host)
+                else:
+                    if host in ex_map:
+                        continue
+                    guard_hosts.append(host)
+            if blocked:
+                _fail_close(cand, f"an overlapping narrower wildcard exact route for {route.path} prevents adding a "
+                                  "valid bare-path guard")
+                report.error("trailing-slash-guard-conflict", route.ref,
+                             f"The source prefix ends with '/', so bare {route.path} did not match it, but a "
+                             f"narrower wildcard exact route on {route.path} overlaps this route's wildcard host in "
+                             "Ferrum and prevents emitting a valid bare-path 404 guard. This route was refused (fail closed).",
+                             "Add explicit bare-path routes or separate the overlapping wildcard hosts, then convert again.")
+                continue
+            if not guard_hosts:
+                continue
+        synthetic = RouteSpec(ref=route.ref, name=f"{route.name}-bare", hosts=list(guard_hosts), kind="exact",
                               path=route.path)
-        guard = _Cand(synthetic, True, list(cand.hosts), exact, cand.listen_port,
+        guard = _Cand(synthetic, True, list(guard_hosts), exact, port,
                       termination=NOT_FOUND_TERMINATION, kind_label="exact-guard")
         candidates.append(guard)
         exact_indexes.setdefault(exact, _PortHostIndex()).add(guard)
@@ -1531,10 +1629,13 @@ def _add_divergence_guards(plan: Plan, candidates: list[_Cand], report: Report) 
             and util.regex_problem(guard_pattern) is None
         ):
             return False
+        guard_key = (cand.listen_port, tuple(cand.hosts), guard_listen)
+        if guard_key in scoped_guards_added:
+            return True
         if any(
             c.listen_port == cand.listen_port and c.listen_path == guard_listen
-            and matching.hosts_overlap(c.hosts, cand.hosts)
-            for c in candidates
+            and _hosts_merge_in_slot(c.hosts, cand.hosts, host_only=False)
+            for c in (*candidates, *new_guard_cands)
         ):
             return False
         if any(

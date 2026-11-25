@@ -625,6 +625,28 @@ class FerrumBinaryValidateTest(unittest.TestCase):
                 self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
                 self.assertIn("Validation passed", completed.stdout)
 
+    def test_named_http_root_and_catchall_https_root_passes_ferrum_validate(self):
+        binary = os.environ["FERRUM_EDGE_BIN"]
+        conf = """
+        server {
+            listen 80;
+            server_name plain.example.test;
+            location / { proxy_pass http://plain.internal:8080; }
+            location /extra/ { proxy_pass http://plain.internal:8080; }
+        }
+        server {
+            listen 443 ssl default_server;
+            ssl_certificate /etc/synthetic/server.crt;
+            ssl_certificate_key /etc/synthetic/server.key;
+            location / { proxy_pass http://tls.internal:8080; }
+        }
+        """
+        result, _report, _plan = migrate("nginx", conf, fmt="nginx", tls_only=True)
+        with tempfile.TemporaryDirectory() as directory:
+            completed = self.validate(binary, directory, result.config, result.basic_auth_used)
+            self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+            self.assertIn("Validation passed", completed.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()
