@@ -718,6 +718,11 @@ class EnvoyHardeningTest(unittest.TestCase):
                 "http_filters"][3]["typed_config"]["providers"]["idp"].pop("audiences"),
             lambda d: d["static_resources"]["clusters"][2].update(
                 {"dns_resolvers": [{"socket_address": {"address": "10.0.0.53", "port_value": 53}}]}),
+            # Request header write colliding with jwks_auth claim destination (including underscore fold) refuses.
+            lambda d: d["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"][
+                "route_config"]["virtual_hosts"][0]["routes"][0].update(
+                    {"request_headers_to_add": [{"header": {"key": "X_JWT_SUB", "value": "spoof"},
+                                                 "append_action": "OVERWRITE_IF_EXISTS_OR_ADD"}]}),
         ):
             bad_jwt = copy.deepcopy(doc)
             mutate(bad_jwt)
@@ -894,13 +899,15 @@ class EnvoyHardeningTest(unittest.TestCase):
         self.assertEqual(ti_cors["unmatched_preflights"], "forward")
 
         # (D) Inherited allow_credentials: true combined with non-boundary prefix, regex origin (PSL-sensitive), or
-        #     wildcard '*' allow_methods/allow_headers refuses the route before emitting an un-admissible/broken plugin.
+        #     wildcard '*' in allow_methods / allow_headers / expose_headers refuses; non-credentialed allow_headers:
+        #     "*" emits ["*", "authorization"] for Fetch bearer-token preflights; duplicate cors filters refuse.
         for bad_override in (
             {"allow_origin_string_match": [{"prefix": "https://preview.example.test"}]},
             {"allow_origin_string_match": [{"safe_regex": {"regex": r"https://.*\.vercel\.app"}}]},
             {"allow_origin_string_match": [{"safe_regex": {"regex": r"https://[a-z]{2,}\.com"}}]},
-            {"allow_origin_string_match": [{"exact": "https://app.example.test"}],
-             "allow_methods": "*", "allow_headers": "*"},
+            {"allow_origin_string_match": [{"exact": "https://app.example.test"}], "allow_methods": "*"},
+            {"allow_origin_string_match": [{"exact": "https://app.example.test"}], "allow_headers": "*"},
+            {"allow_origin_string_match": [{"exact": "https://app.example.test"}], "expose_headers": "*"},
         ):
             cred_bad = copy.deepcopy(typed_inherit)
             ch = cred_bad["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"]
@@ -911,6 +918,24 @@ class EnvoyHardeningTest(unittest.TestCase):
             }
             cp_res, _cp_rep, _ = migrate("envoy", yaml.safe_dump(cred_bad))
             self.assertEqual(one_proxy(self, cp_res.config, "/api")["labels"]["ferrum-migration/status"], "refused")
+
+        non_cred_star = copy.deepcopy(typed_over_legacy)
+        nc_hcm = non_cred_star["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"]
+        nc_hcm["route_config"]["typed_per_filter_config"]["envoy.filters.http.cors"]["allow_headers"] = "*"
+        nc_res, _nc_rep, _ = migrate("envoy", yaml.safe_dump(non_cred_star))
+        nc_cors = plugin(self, nc_res.config, one_proxy(self, nc_res.config, "/api"), "cors")["config"]
+        self.assertEqual(nc_cors["allowed_headers"], ["*", "authorization"])
+
+        two_cors = minimal_bootstrap({"path_separated_prefix": "/api"})
+        tchcm = two_cors["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"]
+        tchcm["http_filters"] = [
+            {"name": "cors-a", "typed_config": {"@type": "type.googleapis.com/envoy.extensions.filters.http.cors.v3.Cors"}},
+            {"name": "cors-b", "disabled": True,
+             "typed_config": {"@type": "type.googleapis.com/envoy.extensions.filters.http.cors.v3.Cors"}},
+            {"name": "envoy.filters.http.router"},
+        ]
+        self.assertEqual(one_proxy(self, migrate("envoy", yaml.safe_dump(two_cors))[0].config, "/api")[
+            "labels"]["ferrum-migration/status"], "refused")
 
         # (E) Active HCM fault filter on direct_response or HTTP-to-HTTPS redirect refuses (never folded away),
         #     and multiple fault filters in one HCM refuse (so disabling fault-b cannot erase fault-a).

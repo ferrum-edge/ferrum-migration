@@ -545,15 +545,6 @@ class FerrumBinaryValidateTest(unittest.TestCase):
             "apiVersion: networking.istio.io/v1\nkind: Gateway\nmetadata: {name: gw, namespace: edge}\nspec:\n"
             "  selector: {istio: ingressgateway}\n"
             "  servers: [{port: {number: 80, name: http, protocol: HTTP}, hosts: [api.example.test]}]\n"
-            "---\napiVersion: security.istio.io/v1\nkind: RequestAuthentication\n"
-            "metadata: {name: jwt-policy, namespace: istio-system}\nspec:\n"
-            "  selector: {matchLabels: {istio: ingressgateway}}\n"
-            "  jwtRules:\n"
-            "    - issuer: https://idp.example.test\n"
-            "      jwksUri: https://idp.example.test/.well-known/jwks.json\n"
-            "      audiences: [api]\n"
-            "      fromHeaders: [{name: X-Jwt-Assertion}]\n"
-            "      outputClaimToHeaders: [{header: x-jwt-sub, claim: sub}]\n"
             "---\napiVersion: networking.istio.io/v1\nkind: VirtualService\n"
             "metadata: {name: vs, namespace: edge}\nspec:\n"
             "  hosts: [api.example.test]\n  gateways: [gw]\n  http:\n"
@@ -568,7 +559,7 @@ class FerrumBinaryValidateTest(unittest.TestCase):
             ("traefik-extended", "traefik", traefik_text, {"traefik_controls_asserted": True},
              {"compression", "response_size_limiting", "request_mirror"}),
             ("envoy-extended", "envoy", envoy_text, {}, {"cors", "grpc_web", "compression", "fault_injection", "jwks_auth"}),
-            ("istio-extended", "istio", istio_text, {}, {"jwks_auth", "fault_injection"}),
+            ("istio-extended", "istio", istio_text, {}, {"fault_injection"}),
         ):
             result, _report, _plan = migrate(platform, text, **kw)
             with self.subTest(case=label), tempfile.TemporaryDirectory() as directory:

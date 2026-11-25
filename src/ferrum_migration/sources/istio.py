@@ -14,18 +14,16 @@ Secrets are never read.
 from __future__ import annotations
 
 import ipaddress
-import json
 from typing import Any
 
 from .. import matching, util
 from ..errors import InputError
 from ..model import BackendRef, HostScope, Plan, PluginSpec, RouteSpec, Target, TlsSpec, UpstreamSpec
-from ..redact import contains_secret_reference, safe_label
+from ..redact import safe_label
 from ..safe_load import load_structured
 from .common import (SourceContext, apply_first_match_order, check_route_budget, choose_main_port, cors_config,
-                     fault_injection_config, header_value_ok, jwks_provider_config, literal_value, mapping,
-                     merge_weighted_targets, request_header_rule, response_header_rule, retry_from_policy, seq,
-                     str_list, validate_jwks_providers)
+                     fault_injection_config, header_value_ok, literal_value, mapping, merge_weighted_targets,
+                     request_header_rule, response_header_rule, retry_from_policy, seq, str_list)
 
 PLATFORM = "istio"
 ROOT_NAMESPACE = "istio-system"
@@ -179,33 +177,24 @@ class _Istio:
                                     "certificates (stricter).")
         return None
 
-    def _gateway_policies(self, gateway: dict, ref: str) -> tuple[list[str], list[PluginSpec]]:
-        """Policies that (may) apply to the gateway workloads: translate clean RequestAuthentication or refuse.
+    def _gateway_policies(self, gateway: dict, ref: str) -> list[str]:
+        """Policies that (may) apply to the gateway workloads and cannot be safely translated.
 
-        The namespace the ingress gateway *pods* run in is not part of the input (it is
-        often ``istio-system`` or ``istio-ingress``, not the Gateway resource's
-        namespace), and neither are the pods' labels. A workload selector is therefore
-        treated as applying in any namespace unless it is provably disjoint from the
-        Gateway's selector: a label key both selectors pin to different values. Extra
-        or different label keys are no proof, because one pod can carry all of them.
-        A namespace-wide policy (no selector) also applies in any namespace (fail
-        closed); outside the Gateway's and the root namespace it is also reported,
-        because it only matters if the gateway pods run there.
-
-        A ``RequestAuthentication`` in the mesh root namespace (``istio-system``) with
-        no ``targetRef``/``targetRefs`` and either no workload selector (mesh-wide) or
-        a workload selector whose labels are a non-empty subset of the Gateway's
-        selector, whose ``jwtRules`` all map cleanly to Ferrum ``jwks_auth`` providers,
-        is translated to a shared ``jwks_auth`` plugin with ``allow_missing_token: true``
-        (matching Istio semantics). Any unprovable scope (including ``targetRef`` on a
-        legacy Istio Gateway or non-root namespace policies) or untranslatable rule
-        refuses the Gateway's routes (fail closed).
+        Neither the namespace the ingress gateway *pods* run in nor the cluster's
+        ``meshConfig.rootNamespace`` is part of a static Istio CRD bundle. A workload
+        selector is therefore treated as applying in any namespace unless it is provably
+        disjoint from the Gateway's selector: a label key both selectors pin to different
+        values. Extra or different label keys are no proof, because one pod can carry all
+        of them. A namespace-wide policy (no selector) also applies in any namespace
+        (fail closed); outside the Gateway's and the default root namespace it is also
+        reported, because it only matters if the gateway pods run there.
+        ``RequestAuthentication`` is refused fail-closed alongside ``AuthorizationPolicy``,
+        ``EnvoyFilter``, and ``WasmPlugin`` because static CRDs cannot prove root-namespace
+        or workload-namespace scope without authoritative MeshConfig.
         """
         gw_ns, gw_name = _meta(gateway)
         selector = mapping(mapping(gateway.get("spec")).get("selector"))
         reasons: list[str] = []
-        jwks_providers: list[dict[str, Any]] = []
-        jwks_refs: list[str] = []
         for policy in self.policies:
             ns, name = _meta(policy)
             spec = mapping(policy.get("spec"))
@@ -216,11 +205,8 @@ class _Istio:
             labels = mapping(mapping(spec.get("selector")).get("matchLabels")) or \
                 mapping(mapping(spec.get("workloadSelector")).get("labels"))
             label = f"{kind} {safe_label(ns)}/{safe_label(name)}"
-            provably_bound = False
             if targeted:
                 applies = True
-                # Istio targetRef/targetRefs attaches to Kubernetes Gateway API Gateways, not legacy
-                # networking.istio.io/v1 Gateways; never assume attachment when translating RequestAuthentication.
             elif refs and all(isinstance(r.get("kind"), str) and r["kind"].strip()
                               and isinstance(r.get("name"), str) and r["name"].strip() for r in refs):
                 applies = False
@@ -228,51 +214,18 @@ class _Istio:
                 applies = True
             elif labels:
                 applies = not _selectors_disjoint(selector, labels)
-                # Workload-selector policies only provably apply across unknown gateway pod namespaces when defined
-                # in the mesh root namespace (istio-system); non-root policies might belong to a different namespace
-                # than the gateway pods and must not be merged into the gateway's trusted issuer set.
-                if applies and ns == ROOT_NAMESPACE and selector \
-                        and all(k in selector and str(selector[k]) == str(v) for k, v in labels.items()):
-                    provably_bound = True
             else:
                 applies = True
-                if ns == ROOT_NAMESPACE:
-                    provably_bound = True
-                elif ns != gw_ns:
+                if ns not in (gw_ns, ROOT_NAMESPACE):
                     self.report.error("istio-policy-scope-unknown", ref,
                                       f"{label} has no workload selector, so it applies to every workload in its "
                                       "namespace. The gateway pods' namespace is not part of the input, so it may "
                                       "apply to them; this gateway's routes were refused (fail closed).",
                                       "Confirm the gateway pods' namespace. If the policy does not apply to them, "
                                       "convert again without it; otherwise recreate its policy in Ferrum first.")
-            if not applies:
-                continue
-            if kind == "RequestAuthentication" and provably_bound:
-                providers, problem = _translate_request_auth(spec)
-                if providers is not None:
-                    jwks_providers.extend(providers)
-                    jwks_refs.append(label)
-                    continue
-                reasons.append(f"{label} applies to this gateway's workloads and cannot be translated ({problem})")
-                continue
-            reasons.append(f"{label} applies to this gateway's workloads and cannot be translated")
-        gw_plugins: list[PluginSpec] = []
-        if jwks_providers and not reasons:
-            bound_err = validate_jwks_providers(jwks_providers, allow_missing_token=True)
-            if bound_err is not None:
-                reasons.append(f"{', '.join(jwks_refs)} cannot be translated ({bound_err})")
-            else:
-                gw_plugins.append(PluginSpec(
-                    "jwks_auth",
-                    {"providers": jwks_providers, "allow_missing_token": True},
-                    ", ".join(jwks_refs),
-                    shared_key=f"gw-{gw_ns}-{gw_name}-jwks",
-                ))
-                self.report.warning("istio-request-auth", ref,
-                                    f"Translated {', '.join(jwks_refs)} to jwks_auth with allow_missing_token: true "
-                                    "(matching Istio RequestAuthentication: invalid tokens are rejected while requests "
-                                    "without a token proceed unless an authorization policy requires authentication).")
-        return reasons, gw_plugins
+            if applies:
+                reasons.append(f"{label} applies to this gateway's workloads and cannot be translated")
+        return reasons
 
     # --------------------------------------------------------- virtualservices
 
@@ -319,8 +272,7 @@ class _Istio:
         # One group per Ferrum projection: (listen_port, requires_tls, client CA, TLS refusal). HTTPS servers with
         # different client trust stay apart, so one server's trust requirement never covers another's hosts.
         groups: dict[tuple, dict] = {}
-        refusals, gw_plugins = self._gateway_policies(gateway, f"{ref} via {safe_label(gateway_ref)}")
-        gw_policy_sig = json.dumps([(p.name, p.config) for p in gw_plugins], sort_keys=True) if gw_plugins else ""
+        refusals = self._gateway_policies(gateway, f"{ref} via {safe_label(gateway_ref)}")
         for server in self._servers(gateway):
             hosts = _bind_hosts(vs_hosts, namespace, gw_ns, server["hosts"])
             if hosts is None:
@@ -400,23 +352,16 @@ class _Istio:
                 route.protocols = frontends
                 for reason in group["refusals"] + refusals:
                     route.refuse(reason)
-                if gw_plugins and not route.refusals:
-                    if route.termination is not None:
-                        route.refuse("RequestAuthentication runs before directResponse/redirect in Istio, whereas "
-                                     "Ferrum request_termination answers before jwks_auth")
-                    else:
-                        for gp in gw_plugins:
-                            route.plugins.append(PluginSpec(gp.name, gp.config, gp.ref, gp.shared_key))
             apply_first_match_order(routes, self.report)
             self.plan.routes.extend(routes)
             self.projections.append({
                 "binding": (ref, gateway_ref), "ref": f"{ref} via {safe_label(gateway_ref)}",
                 "hosts": list(hosts), "listen_port": listen_port, "routes": routes,
                 # What a request for these hosts gets from the source frontend before any route matches: the
-                # protocol, the client-certificate trust, gateway authentication policy, and whether the frontend
-                # itself is refused (TLS settings, shared-scope conflict, or a gateway policy).
+                # protocol, the client-certificate trust, and whether the frontend itself is refused (TLS settings,
+                # shared-scope conflict, or a gateway policy).
                 "frontend": (bool(requires_tls), tuple(sorted(group["client_cas"])),
-                             bool(group["refusals"] or refusals), gw_policy_sig),
+                             bool(group["refusals"] or refusals)),
             })
             if hosts:
                 self.plan.host_scopes.append(HostScope(f"{ref} via {safe_label(gateway_ref)}", list(hosts), listen_port))
@@ -1016,67 +961,12 @@ class _Istio:
         return tls, scheme, algorithm, hash_on, None
 
 
-_ISTIO_JWT_RULE_KEYS = frozenset({
-    "issuer", "audiences", "jwksUri", "jwks", "fromHeaders", "fromParams",
-    "forwardOriginalToken", "outputClaimToHeaders",
-})
 _GRPC_STATUS_NAMES = {
     "OK": 0, "CANCELLED": 1, "UNKNOWN": 2, "INVALID_ARGUMENT": 3, "DEADLINE_EXCEEDED": 4,
     "NOT_FOUND": 5, "ALREADY_EXISTS": 6, "PERMISSION_DENIED": 7, "RESOURCE_EXHAUSTED": 8,
     "FAILED_PRECONDITION": 9, "ABORTED": 10, "OUT_OF_RANGE": 11, "UNIMPLEMENTED": 12,
     "INTERNAL": 13, "UNAVAILABLE": 14, "DATA_LOSS": 15, "UNAUTHENTICATED": 16,
 }
-
-
-def _translate_request_auth(spec: dict) -> tuple[list[dict[str, Any]] | None, str | None]:
-    raw_rules = spec.get("jwtRules")
-    if not isinstance(raw_rules, list) or not raw_rules:
-        return None, "RequestAuthentication has no jwtRules"
-    if contains_secret_reference(raw_rules):
-        return None, "jwtRules contains a secret/vault reference"
-    providers: list[dict[str, Any]] = []
-    for rule in raw_rules:
-        if not isinstance(rule, dict):
-            return None, "jwtRules entry is not a mapping"
-        unknown = [str(k) for k in rule if k not in _ISTIO_JWT_RULE_KEYS]
-        if unknown:
-            return None, f"unsupported jwtRule field(s): {', '.join(sorted(unknown)[:4])}"
-        issuer = rule.get("issuer")
-        if not isinstance(issuer, str) or not issuer.strip():
-            return None, "jwtRule requires a non-empty issuer"
-        raw_och = rule.get("outputClaimToHeaders")
-        och: list[dict[str, Any]] | None = None
-        if raw_och is not None:
-            if not isinstance(raw_och, list):
-                return None, "outputClaimToHeaders must be a list"
-            och = []
-            for entry in raw_och:
-                if not isinstance(entry, dict) or set(entry) - {"header", "claim"}:
-                    return None, "outputClaimToHeaders entry has unsupported shape"
-                och.append({"claim": entry.get("claim"), "header": entry.get("header")})
-        raw_fh = rule.get("fromHeaders")
-        if raw_fh is not None:
-            if not isinstance(raw_fh, list) or any(not isinstance(h, dict) or set(h) - {"name", "prefix"} for h in raw_fh):
-                return None, "fromHeaders entry has unsupported shape"
-        # Istio defaults forwardOriginalToken to false (strips the original token); Ferrum defaults to true.
-        provider, problem = jwks_provider_config(
-            issuer=issuer,
-            jwks_uri=rule.get("jwksUri"),
-            jwks=rule.get("jwks"),
-            audiences=rule.get("audiences"),
-            from_headers=raw_fh,
-            from_params=rule.get("fromParams"),
-            forward_original_token=rule.get("forwardOriginalToken", False),
-            output_claim_headers=och,
-        )
-        if provider is None:
-            return None, problem
-        # Istio generates Envoy jwt_authn with require_expiration=false and default 60s clock skew (whereas Ferrum
-        # defaults require_exp to true and clock_skew_seconds to 0).
-        provider["require_exp"] = False
-        provider["clock_skew_seconds"] = 60
-        providers.append(provider)
-    return providers, None
 
 
 def _translate_istio_fault(raw: Any) -> tuple[str, Any]:

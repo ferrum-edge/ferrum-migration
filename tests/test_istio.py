@@ -961,27 +961,6 @@ class IstioCaseAndNamesTest(unittest.TestCase):
                 - port: {number: 80, name: http, protocol: HTTP}
                   hosts: [api.example.test]
             ---
-            apiVersion: security.istio.io/v1
-            kind: RequestAuthentication
-            metadata: {name: jwt-policy, namespace: istio-system}
-            spec:
-              selector:
-                matchLabels: {istio: ingressgateway}
-              jwtRules:
-                - issuer: https://idp.example.test
-                  jwksUri: https://idp.example.test/.well-known/jwks.json
-                  audiences: [api]
-                  fromHeaders: [{name: X-Jwt-Assertion}]
-                  outputClaimToHeaders: [{header: x-jwt-sub, claim: sub}]
-            ---
-            apiVersion: networking.istio.io/v1
-            kind: DestinationRule
-            metadata: {name: shadow-plain, namespace: edge}
-            spec:
-              host: shadow.edge.svc.cluster.local
-              trafficPolicy:
-                tls: {mode: DISABLE}
-            ---
             apiVersion: networking.istio.io/v1
             kind: VirtualService
             metadata: {name: vs, namespace: edge}
@@ -1002,28 +981,11 @@ class IstioCaseAndNamesTest(unittest.TestCase):
                   route: [{destination: {host: svc.edge.svc.cluster.local, port: {number: 8080}}}]
                   fault:
                     delay: {fixedDelay: 250ms, percentage: {value: 0}}
-                - name: health
-                  match: [{uri: {exact: /healthz}}]
-                  directResponse: {status: 200, body: {string: ok}}
         """)
         result, report, _ = migrate("istio", text)
         assert_structurally_valid(self, result.config)
         api = one_proxy(self, result.config, "=/api", "api.example.test")
         self.assertEqual(api["labels"]["ferrum-migration/status"], "migrated")
-        # Omitted forwardOriginalToken -> False; Istio defaults require_exp=False and clock_skew_seconds=60.
-        self.assertEqual(plugin(self, result.config, api, "jwks_auth")["config"], {
-            "providers": [{
-                "jwks_uri": "https://idp.example.test/.well-known/jwks.json",
-                "issuer": "https://idp.example.test",
-                "audiences": ["api"],
-                "from_headers": [{"name": "x-jwt-assertion"}],
-                "forward_original_token": False,
-                "output_claim_headers": [{"claim": "sub", "header": "x-jwt-sub"}],
-                "require_exp": False,
-                "clock_skew_seconds": 60,
-            }],
-            "allow_missing_token": True,
-        })
         self.assertEqual(plugin(self, result.config, api, "fault_injection")["config"], {
             "delay": {"duration_ms": 250, "percentage": 15.0},
             "abort": {"status_code": 503, "grpc_status": 14, "percentage": 5.0},
@@ -1035,30 +997,31 @@ class IstioCaseAndNamesTest(unittest.TestCase):
         zero_p = one_proxy(self, result.config, "=/zero", "api.example.test")
         self.assertNotIn("fault_injection", [p["plugin_name"] for p in plugins_of(result.config, zero_p)])
         self.assertIn("istio-fault-noop", codes(report, "info"))
-        self.assertIn("istio-request-auth", codes(report, "warning"))
-        # directResponse under RequestAuthentication refuses fail-closed.
-        self.assertEqual(one_proxy(self, result.config, "=/healthz", "api.example.test")["labels"][
-            "ferrum-migration/status"], "refused")
 
         # Empty mirrorPercentage: {} is 0% (inert) and produces no istio-dropped warning.
         inert_m = text.replace("mirrorPercentage: {value: 10}", "mirrorPercentage: {}")
         _im_res, im_rep, _ = migrate("istio", inert_m)
         self.assertNotIn("istio-dropped", codes(im_rep))
 
-        # Non-root namespace, prefixed Authorization under allow_missing_token, same-namespace targetRef on legacy
-        # Gateway, and fromCookies all refuse fail-closed.
-        for mutate in (
-            lambda s: s.replace("namespace: istio-system", "namespace: edge"),
-            lambda s: s.replace("fromHeaders: [{name: X-Jwt-Assertion}]",
-                                'fromHeaders: [{name: Authorization, prefix: "Bearer "}]'),
-            lambda s: s.replace("namespace: istio-system", "namespace: edge").replace(
-                "selector:\n    matchLabels: {istio: ingressgateway}",
-                "targetRef: {kind: Gateway, group: networking.istio.io, name: gw}"),
-            lambda s: s.replace("fromHeaders: [{name: X-Jwt-Assertion}]", "fromCookies: [session]"),
-        ):
-            bad_res, _bad_rep, _ = migrate("istio", mutate(text))
-            self.assertEqual(one_proxy(self, bad_res.config, "=/api", "api.example.test")["labels"][
-                "ferrum-migration/status"], "refused")
+        # RequestAuthentication in istio-system still refuses fail-closed because static CRDs omit
+        # meshConfig.rootNamespace and gateway pod namespaces (issuer policy scope cannot be proven authoritative).
+        ra_text = text + textwrap.dedent("""
+            ---
+            apiVersion: security.istio.io/v1
+            kind: RequestAuthentication
+            metadata: {name: jwt-policy, namespace: istio-system}
+            spec:
+              selector:
+                matchLabels: {istio: ingressgateway}
+              jwtRules:
+                - issuer: https://idp.example.test
+                  jwksUri: https://idp.example.test/.well-known/jwks.json
+                  audiences: [api]
+                  fromHeaders: [{name: X-Jwt-Assertion}]
+        """)
+        ra_res, _ra_rep, _ = migrate("istio", ra_text)
+        self.assertEqual(one_proxy(self, ra_res.config, "=/api", "api.example.test")["labels"][
+            "ferrum-migration/status"], "refused")
 
 
 if __name__ == "__main__":

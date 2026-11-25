@@ -428,6 +428,36 @@ class _Envoy:
             if not spec.termination:
                 for hp in shared.get("hcm_plugins", []):
                     spec.plugins.append(PluginSpec(hp.name, hp.config, hp.ref))
+            if shared.get("hcm_jwt") is not None and not spec.refusals:
+                jwt_cfg = shared["hcm_jwt"].config
+                owned_claims = {fold(entry["header"]) for prov in jwt_cfg.get("providers", [])
+                                for entry in prov.get("output_claim_headers", [])}
+                if owned_claims:
+                    has_grpc_web = any(p.name == "grpc_web" for p in spec.plugins)
+                    for pl in spec.plugins:
+                        if pl.name != "request_transformer":
+                            continue
+                        for rule in pl.config.get("rules", []):
+                            if rule.get("target") != "header":
+                                continue
+                            op = rule.get("operation")
+                            if op not in ("add", "update", "rename"):
+                                continue
+                            dest = rule.get("new_key") if op == "rename" else rule.get("key")
+                            if not isinstance(dest, str):
+                                continue
+                            folded_dest = fold(dest)
+                            if folded_dest in owned_claims:
+                                spec.refuse(f"request_transformer writes header {dest}, which jwks_auth owns as "
+                                            "a claim header destination (Ferrum rejects overlapping header writes)")
+                                break
+                            if not has_grpc_web and folded_dest == "content-type":
+                                val = rule.get("value")
+                                if not isinstance(val, str) or "$(" in val \
+                                        or val.strip().lower().startswith("application/grpc-web"):
+                                    spec.refuse("request_transformer writes a gRPC-Web or dynamic content-type on a "
+                                                "route with jwks_auth claim headers and no grpc_web plugin")
+                                    break
             routes.append(spec)
         if not tls and routes and all(getattr(r, "https_redirect", False) and not r.refusals for r in routes):
             self.plan.settings.https_redirect_seen = True
@@ -865,6 +895,11 @@ class _Envoy:
                         "allow_methods/allow_headers/expose_headers, which Ferrum returns literally; specify "
                         "explicit method and header lists")
             return
+        if creds is not True and parsed_headers and "*" in parsed_headers \
+                and not any(h.lower() == "authorization" for h in parsed_headers):
+            # In Fetch preflights, Access-Control-Allow-Headers: * does not authorize 'authorization' even without
+            # credentials, whereas Envoy's allow_headers: "*" reflects 'authorization'. Include both explicitly.
+            parsed_headers = list(parsed_headers) + ["authorization"]
         # Use Ferrum's unmatched_preflights mode so omitted allow_methods/allow_headers stay empty and omitted
         # max_age stays absent (matching Envoy cors_filter.cc instead of inheriting Ferrum's permissive defaults).
         built, problem = cors_config(origins, parsed_methods, parsed_headers, parsed_expose,
