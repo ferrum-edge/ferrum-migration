@@ -1029,6 +1029,21 @@ class NginxFrontendScopeTest(unittest.TestCase):
         self.assertEqual(hn_tls.frontend_protocols, "https")
         self.assertEqual(proxies(hn_tls.config, None, "plainonly.example.test"), [])
         self.assertEqual(one_proxy(self, hn_tls.config, "/")["labels"]["ferrum-migration/status"], "migrated")
+        # Symmetric location-less servers (same hostname on both HTTP and HTTPS) keep both listeners open.
+        sym_noloc_conf = http_noloc_dual_conf + """
+        server {
+            listen 443 ssl;
+            server_name plainonly.example.test;
+            ssl_certificate /etc/synthetic/server.crt;
+            ssl_certificate_key /etc/synthetic/server.key;
+        }
+        """
+        sym_res, sym_rep, _ = nginx(sym_noloc_conf)
+        assert_structurally_valid(self, sym_res.config)
+        self.assertEqual(sym_res.frontend_protocols, "both")
+        self.assertNotIn("frontend-https-disabled", codes(sym_rep))
+        self.assertEqual(one_proxy(self, sym_res.config, None, "plainonly.example.test")["labels"][
+            "ferrum-migration/status"], "scope-default")
 
 
 if __name__ == "__main__":

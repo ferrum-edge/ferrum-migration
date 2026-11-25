@@ -272,7 +272,9 @@ def _rust_regex_syntax_problem(pattern: str) -> tuple[str | None, str]:
                 if nxt in _UNICODE_CLASS_ESCAPES:
                     if class_state == 2:
                         return "regex uses a character class escape as the end of a range", ""
-                    class_state = 0
+                    # Rust rejects `[\w-a]` / `[\d-a]` as an invalid range endpoint (unlike POSIX `[[:digit:]-a]`);
+                    # keeping class_state = 1 preserves the raw '-' so Python re.compile rejects it too.
+                    class_state = 1
                 else:
                     class_state = 0 if class_state == 2 else 1
             else:

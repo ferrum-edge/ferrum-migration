@@ -628,14 +628,21 @@ def _decide_frontend(plan: Plan, routes: list[RouteSpec], options: EmitOptions, 
                 route.refuse("the source serves this route over HTTPS only, but other routes are plaintext and "
                              "Ferrum would expose it on the plaintext listener too (re-run with --tls-only)")
         remaining = [route for route in active if not route.refusals]
-        single_proto_scopes = [
-            scope for scope in plan.host_scopes
-            if scope.listen_port is None and scope.protocols is not None
-            and scope.protocols in (frozenset({"http"}), frozenset({"https"}))
+        scope_protos_by_host: dict[str, set[str]] = {}
+        for scope in plan.host_scopes:
+            if scope.listen_port is not None or scope.protocols is None:
+                continue
+            for host in _scope_hosts(scope):
+                scope_protos_by_host.setdefault(host, set()).update(scope.protocols)
+        asymmetric_scope_hosts = [
+            host for host, protos in scope_protos_by_host.items()
+            if protos in ({"http"}, {"https"})
         ]
-        if (not remaining or all("https" in _effective_protocols(route) for route in remaining)) \
-                and not single_proto_scopes:
-            mode = "both"  # nothing live, or every live route and host scope was served on both main listeners
+        if not remaining or (
+            all("https" in _effective_protocols(route) for route in remaining)
+            and not asymmetric_scope_hosts
+        ):
+            mode = "both"  # nothing live, or every live route and host scope covers both main listeners
             http_port = plan.settings.main_http_port or 8000
             https_port = plan.settings.main_https_port or 8443
             if (plan.settings.main_https_port or _source_https_activity(plan, present)) and http_port == https_port:
@@ -652,8 +659,8 @@ def _decide_frontend(plan: Plan, routes: list[RouteSpec], options: EmitOptions, 
             dual = len(remaining) - plaintext_only
             if _source_https_activity(plan, present):
                 scope_note = (
-                    f" ({len(single_proto_scopes)} host scope(s) also existed on only one listener)"
-                    if single_proto_scopes else ""
+                    f" ({len(asymmetric_scope_hosts)} host scope(s) also existed on only one listener)"
+                    if asymmetric_scope_hosts else ""
                 )
                 report.error("frontend-https-disabled", "frontend listeners",
                              f"{plaintext_only} migrated route(s) were served over plaintext only in the source"
@@ -1148,6 +1155,97 @@ def _chunk_hosts_no_prune(hosts: list[str], host_only: bool) -> list[list[str]] 
     return chunks
 
 
+class _HostPathBucket:
+    """Per-(port, host) path index so conflict-collapse queries touch only overlapping hosts and paths."""
+
+    def __init__(self) -> None:
+        self.all_cands: list[_Cand] = []
+        self.prefix_by_path: dict[str, list[_Cand]] = {}
+        self.literal_by_path: dict[str, list[_Cand]] = {}
+        self.sorted_literal_paths: list[str] = []
+        self.ci_prefix_by_path: dict[str, list[_Cand]] = {}
+        self.ci_literal_by_path: dict[str, list[_Cand]] = {}
+        self.sorted_ci_literal_paths: list[str] = []
+        self.regex_by_literal_prefix: dict[str, list[_Cand]] = {}
+        self.sorted_regex_prefixes: list[str] = []
+        self.special: list[_Cand] = []
+        self._finalized = False
+
+    def add(self, item: _Cand) -> None:
+        self.all_cands.append(item)
+        r = item.route
+        if r.kind == "hostonly":
+            self.special.append(item)
+        elif r.kind == "regex":
+            lit = util.regex_literal_prefix(r.path or "") if (
+                r.path and not util.regex_alternation_unproven(r.path)
+            ) else ""
+            if len(lit) >= 2 and lit.startswith("/"):
+                self.regex_by_literal_prefix.setdefault(lit, []).append(item)
+            else:
+                self.special.append(item)
+        elif r.case_insensitive:
+            pl = (r.path or "/").lower()
+            self.ci_literal_by_path.setdefault(pl, []).append(item)
+            if r.kind == "prefix":
+                self.ci_prefix_by_path.setdefault(pl, []).append(item)
+        else:
+            p = r.path or "/"
+            self.literal_by_path.setdefault(p, []).append(item)
+            if r.kind == "prefix":
+                self.prefix_by_path.setdefault(p, []).append(item)
+
+    def finalize(self) -> None:
+        if self._finalized:
+            return
+        self._finalized = True
+        self.sorted_literal_paths = sorted(self.literal_by_path)
+        self.sorted_ci_literal_paths = sorted(self.ci_literal_by_path)
+        self.sorted_regex_prefixes = sorted(self.regex_by_literal_prefix)
+
+    def candidate_lists(self, *, needs_all: bool, literal_paths: set[str], has_prefix: bool) -> list[list[_Cand]]:
+        if needs_all:
+            return [self.all_cands] if self.all_cands else []
+        self.finalize()
+        lists: list[list[_Cand]] = []
+        seen_ids: set[int] = set()
+
+        def _add(lst: list[_Cand] | None) -> None:
+            if lst and id(lst) not in seen_ids:
+                seen_ids.add(id(lst))
+                lists.append(lst)
+
+        _add(self.special)
+        for path_str in literal_paths:
+            pl = path_str.lower()
+            for k in range(1, len(path_str) + 1):
+                sub = path_str[:k]
+                _add(self.prefix_by_path.get(sub))
+                _add(self.ci_prefix_by_path.get(pl[:k]))
+                if k >= 2:
+                    _add(self.regex_by_literal_prefix.get(sub))
+            _add(self.literal_by_path.get(path_str))
+            _add(self.ci_literal_by_path.get(pl))
+            if has_prefix:
+                lo = bisect.bisect_left(self.sorted_literal_paths, path_str)
+                while lo < len(self.sorted_literal_paths) and self.sorted_literal_paths[lo].startswith(path_str):
+                    _add(self.literal_by_path[self.sorted_literal_paths[lo]])
+                    lo += 1
+                clo = bisect.bisect_left(self.sorted_ci_literal_paths, pl)
+                while clo < len(self.sorted_ci_literal_paths) and self.sorted_ci_literal_paths[clo].startswith(pl):
+                    _add(self.ci_literal_by_path[self.sorted_ci_literal_paths[clo]])
+                    clo += 1
+                rlo = bisect.bisect_left(self.sorted_regex_prefixes, path_str)
+                while rlo < len(self.sorted_regex_prefixes) and self.sorted_regex_prefixes[rlo].startswith(path_str):
+                    _add(self.regex_by_literal_prefix[self.sorted_regex_prefixes[rlo]])
+                    rlo += 1
+        return lists
+
+    def prune_all(self) -> None:
+        self.all_cands[:] = [c for c in self.all_cands if not c.placeholder]
+        self.special[:] = [c for c in self.special if not c.placeholder]
+
+
 def _resolve_conflicts(candidates: list[_Cand], report: Report) -> list[_Cand]:
     groups: dict[tuple[int | None, str | None], list[_Cand]] = {}
     for cand in candidates:
@@ -1198,63 +1296,100 @@ def _resolve_conflicts(candidates: list[_Cand], report: Report) -> list[_Cand]:
                 eset.add(h)
 
     def _build_outrank_indices() -> dict[str, Any]:
-        all_idx = _PortHostIndex()
-        prefix_by_path: dict[str, _PortHostIndex] = {}
-        literal_by_path: dict[str, _PortHostIndex] = {}
-        ci_prefix_by_path: dict[str, _PortHostIndex] = {}
-        ci_literal_by_path: dict[str, _PortHostIndex] = {}
-        regex_by_literal_prefix: dict[str, _PortHostIndex] = {}
-        special_idx = _PortHostIndex()
+        # Host-first indexing: lookup finds only _HostPathBuckets whose hosts overlap `named_hosts`, then
+        # queries only the matching path buckets inside each overlapping host (never enumerating unrelated hosts).
+        ports_present: set[int | None] = set()
+        exact_buckets: dict[int | None, dict[str, _HostPathBucket]] = {}
+        wild_buckets: dict[int | None, dict[str, _HostPathBucket]] = {}
+        exact_by_suffix: dict[int | None, dict[str, set[str]]] = {}
+        wild_by_parent: dict[int | None, dict[str, set[str]]] = {}
         for item in candidates:
             if item.placeholder or not item.hosts:
                 continue
-            all_idx.add(item)
-            r = item.route
-            if r.kind == "hostonly":
-                special_idx.add(item)
-            elif r.kind == "regex":
-                lit = util.regex_literal_prefix(r.path or "") if (
-                    r.path and not util.regex_alternation_unproven(r.path)
-                ) else ""
-                if len(lit) >= 2 and lit.startswith("/"):
-                    regex_by_literal_prefix.setdefault(lit, _PortHostIndex()).add(item)
+            port = item.listen_port
+            ports_present.add(port)
+            ex_map = exact_buckets.setdefault(port, {})
+            wi_map = wild_buckets.setdefault(port, {})
+            ex_suf = exact_by_suffix.setdefault(port, {})
+            wi_par = wild_by_parent.setdefault(port, {})
+            for h in item.hosts:
+                if h.startswith("*."):
+                    suffix = h[1:]
+                    bucket = wi_map.get(suffix)
+                    if bucket is None:
+                        bucket = _HostPathBucket()
+                        wi_map[suffix] = bucket
+                        dot = suffix.find(".", 1)
+                        while dot != -1:
+                            wi_par.setdefault(suffix[dot:], set()).add(suffix)
+                            dot = suffix.find(".", dot + 1)
+                    bucket.add(item)
                 else:
-                    special_idx.add(item)
-            elif r.case_insensitive:
-                pl = (r.path or "/").lower()
-                ci_literal_by_path.setdefault(pl, _PortHostIndex()).add(item)
-                if r.kind == "prefix":
-                    ci_prefix_by_path.setdefault(pl, _PortHostIndex()).add(item)
-            else:
-                p = r.path or "/"
-                literal_by_path.setdefault(p, _PortHostIndex()).add(item)
-                if r.kind == "prefix":
-                    prefix_by_path.setdefault(p, _PortHostIndex()).add(item)
+                    bucket = ex_map.get(h)
+                    if bucket is None:
+                        bucket = _HostPathBucket()
+                        ex_map[h] = bucket
+                        dot = h.find(".")
+                        while dot != -1:
+                            ex_suf.setdefault(h[dot:], set()).add(h)
+                            dot = h.find(".", dot + 1)
+                    bucket.add(item)
         return {
-            "all": all_idx,
-            "prefix_by_path": prefix_by_path,
-            "literal_by_path": literal_by_path,
-            "sorted_literal_paths": sorted(literal_by_path),
-            "ci_prefix_by_path": ci_prefix_by_path,
-            "ci_literal_by_path": ci_literal_by_path,
-            "sorted_ci_literal_paths": sorted(ci_literal_by_path),
-            "regex_by_literal_prefix": regex_by_literal_prefix,
-            "sorted_regex_prefixes": sorted(regex_by_literal_prefix),
-            "special": special_idx,
+            "ports": ports_present,
+            "exact": exact_buckets,
+            "wild": wild_buckets,
+            "exact_by_suffix": exact_by_suffix,
+            "wild_by_parent": wild_by_parent,
         }
+
+    def _matching_host_buckets(port: int | None, hosts: list[str]) -> list[_HostPathBucket]:
+        assert outrank_indices is not None
+        ex_map: dict[str, _HostPathBucket] = outrank_indices["exact"].get(port, {})
+        wi_map: dict[str, _HostPathBucket] = outrank_indices["wild"].get(port, {})
+        if not hosts:
+            return list(ex_map.values()) + list(wi_map.values())
+        ex_suf: dict[str, set[str]] = outrank_indices["exact_by_suffix"].get(port, {})
+        wi_par: dict[str, set[str]] = outrank_indices["wild_by_parent"].get(port, {})
+        found: list[_HostPathBucket] = []
+        seen_ids: set[int] = set()
+
+        def _add_bucket(b: _HostPathBucket | None) -> None:
+            if b is not None and id(b) not in seen_ids:
+                seen_ids.add(id(b))
+                found.append(b)
+
+        for h in hosts:
+            if h.startswith("*."):
+                suffix = h[1:]
+                _add_bucket(wi_map.get(suffix))
+                for ex_h in ex_suf.get(suffix, ()):
+                    _add_bucket(ex_map.get(ex_h))
+                for child_suf in wi_par.get(suffix, ()):
+                    _add_bucket(wi_map.get(child_suf))
+                dot = suffix.find(".", 1)
+                while dot != -1:
+                    _add_bucket(wi_map.get(suffix[dot:]))
+                    dot = suffix.find(".", dot + 1)
+            else:
+                _add_bucket(ex_map.get(h))
+                dot = h.find(".")
+                while dot != -1:
+                    _add_bucket(wi_map.get(h[dot:]))
+                    dot = h.find(".", dot + 1)
+        return found
 
     def _fail_close_outranking(named_hosts: list[str], slot_members: list[_Cand],
                                port: int | None, reason: str) -> int:
         nonlocal outrank_indices
         if outrank_indices is None:
             outrank_indices = _build_outrank_indices()
-        all_idx: _PortHostIndex = outrank_indices["all"]
-        if not all_idx.all_by_port:
+        ports_present: set[int | None] = outrank_indices["ports"]
+        if not ports_present:
             return 0
         ports = (
-            list(all_idx.all_by_port)
+            list(ports_present)
             if port is None
-            else [p for p in (port, None) if p in all_idx.all_by_port]
+            else [p for p in (port, None) if p in ports_present]
         )
         if not ports:
             return 0
@@ -1288,49 +1423,6 @@ def _resolve_conflicts(candidates: list[_Cand], report: Report) -> list[_Cand]:
             probes.append(RouteSpec(ref="", name="", hosts=list(named_hosts), kind=r.kind, path=r.path,
                                     prefix_semantics=r.prefix_semantics, trailing_slash=r.trailing_slash,
                                     case_insensitive=r.case_insensitive, listen_port=port))
-        target_indices: list[_PortHostIndex] = []
-        if needs_all:
-            target_indices.append(all_idx)
-        else:
-            prefix_by_path: dict[str, _PortHostIndex] = outrank_indices["prefix_by_path"]
-            literal_by_path: dict[str, _PortHostIndex] = outrank_indices["literal_by_path"]
-            sorted_literal_paths: list[str] = outrank_indices["sorted_literal_paths"]
-            ci_prefix_by_path: dict[str, _PortHostIndex] = outrank_indices["ci_prefix_by_path"]
-            ci_literal_by_path: dict[str, _PortHostIndex] = outrank_indices["ci_literal_by_path"]
-            sorted_ci_literal_paths: list[str] = outrank_indices["sorted_ci_literal_paths"]
-            regex_by_literal_prefix: dict[str, _PortHostIndex] = outrank_indices["regex_by_literal_prefix"]
-            sorted_regex_prefixes: list[str] = outrank_indices["sorted_regex_prefixes"]
-            seen_idx_ids: set[int] = set()
-
-            def _add_idx(idx: _PortHostIndex | None) -> None:
-                if idx is not None and id(idx) not in seen_idx_ids:
-                    seen_idx_ids.add(id(idx))
-                    target_indices.append(idx)
-
-            _add_idx(outrank_indices["special"])
-            for path_str in literal_paths:
-                pl = path_str.lower()
-                for k in range(1, len(path_str) + 1):
-                    sub = path_str[:k]
-                    _add_idx(prefix_by_path.get(sub))
-                    _add_idx(ci_prefix_by_path.get(pl[:k]))
-                    if k >= 2:
-                        _add_idx(regex_by_literal_prefix.get(sub))
-                _add_idx(literal_by_path.get(path_str))
-                _add_idx(ci_literal_by_path.get(pl))
-                if has_prefix:
-                    lo = bisect.bisect_left(sorted_literal_paths, path_str)
-                    while lo < len(sorted_literal_paths) and sorted_literal_paths[lo].startswith(path_str):
-                        _add_idx(literal_by_path[sorted_literal_paths[lo]])
-                        lo += 1
-                    clo = bisect.bisect_left(sorted_ci_literal_paths, pl)
-                    while clo < len(sorted_ci_literal_paths) and sorted_ci_literal_paths[clo].startswith(pl):
-                        _add_idx(ci_literal_by_path[sorted_ci_literal_paths[clo]])
-                        clo += 1
-                    rlo = bisect.bisect_left(sorted_regex_prefixes, path_str)
-                    while rlo < len(sorted_regex_prefixes) and sorted_regex_prefixes[rlo].startswith(path_str):
-                        _add_idx(regex_by_literal_prefix[sorted_regex_prefixes[rlo]])
-                        rlo += 1
         covers_all_paths = any(
             matching.path_space(probe.kind, probe.path) in (None, ("/", False), ("", False))
             for probe in probes
@@ -1346,25 +1438,30 @@ def _resolve_conflicts(candidates: list[_Cand], report: Report) -> list[_Cand]:
                     continue
             else:
                 active_hosts = []
-            for target_idx in target_indices:
-                pruned_any = False
-                for other in target_idx.query(p, active_hosts, path_slot=False):
-                    oid = id(other)
-                    if oid in seen_other or oid in excluded_ids or oid in replacement:
-                        continue
-                    if other.placeholder:
-                        pruned_any = True
-                        continue
-                    seen_other.add(oid)
-                    if any(matching.route_overlaps(probe, other.route) for probe in probes):
-                        _fail_close(other, reason)
-                        refused_outrank += 1
-                        pruned_any = True
-                if pruned_any:
-                    target_idx.prune_placeholders(p, active_hosts)
+            buckets = _matching_host_buckets(p, active_hosts)
+            for bucket in buckets:
+                for cand_list in bucket.candidate_lists(
+                    needs_all=needs_all, literal_paths=literal_paths, has_prefix=has_prefix
+                ):
+                    pruned_any = False
+                    for other in cand_list:
+                        oid = id(other)
+                        if oid in seen_other or oid in excluded_ids or oid in replacement:
+                            continue
+                        if other.placeholder:
+                            pruned_any = True
+                            continue
+                        seen_other.add(oid)
+                        if any(matching.route_overlaps(probe, other.route) for probe in probes):
+                            _fail_close(other, reason)
+                            refused_outrank += 1
+                            pruned_any = True
+                    if pruned_any:
+                        cand_list[:] = [c for c in cand_list if not c.placeholder]
+                if covers_all_paths:
+                    bucket.prune_all()
             if covers_all_paths:
                 _mark_fully_closed(p, active_hosts)
-                all_idx.prune_placeholders(p, active_hosts)
         return refused_outrank
 
     for (port, path), members in list(groups.items()):
