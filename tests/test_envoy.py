@@ -1437,6 +1437,13 @@ class EnvoyHardeningTest(unittest.TestCase):
         }
         w_res = migrate("envoy", yaml.safe_dump(w_cors))[0]
         self.assertEqual(one_proxy(self, w_res.config, "/cors-w")["labels"]["ferrum-migration/status"], "refused")
+        # Two \d shorthands stay well under Ferrum's 64 KiB CORS regex compilation limit -> migrated.
+        d_cors = copy.deepcopy(w_cors)
+        d_cors["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"][
+            "route_config"]["virtual_hosts"][0]["routes"][0]["typed_per_filter_config"]["envoy.filters.http.cors"][
+            "allow_origin_string_match"] = [{"safe_regex": {"regex": r"https://app\d+\.example\.com:\d+"}}]
+        d_res = migrate("envoy", yaml.safe_dump(d_cors))[0]
+        self.assertEqual(one_proxy(self, d_res.config, "/cors-w")["labels"]["ferrum-migration/status"], "migrated")
 
     def test_tls_only_plaintext_exact_and_case_insensitive_routes_do_not_shadow_or_poison_https(self):
         # Plaintext named exact =/extra (including case_sensitive: false) must neither poison a live HTTPS catch-all
