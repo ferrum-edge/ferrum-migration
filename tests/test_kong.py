@@ -817,17 +817,18 @@ class KongExtendedPluginsAndConsumersTest(unittest.TestCase):
         result, report, _ = migrate("kong", text)
         assert_structurally_valid(self, result.config)
 
-        # Consumer tags preserved as label (vault refs stripped, individually redacted); unsupported creds produce
-        # actionable errors without echoing secrets.
+        # Free-form consumer tags are withheld by default (value-free warning) so UUID/credential-like tags can never
+        # leak into labels; unsupported creds produce actionable errors without echoing secrets.
         alice = result.config["consumers"][0]
-        self.assertEqual(alice["labels"]["ferrum-migration/kong-tags"], "tier-gold,team-api")
+        self.assertNotIn("labels", alice)
         dumped = json.dumps(result.config) + json.dumps([c.to_dict() for c in report.caveats])
         self.assertNotIn("test-only-hmac-secret", dumped)
         self.assertNotIn("test-only-secret", dumped)
         self.assertNotIn("vault://env/secret", dumped)
         self.assertNotIn("token=abc123", dumped)
         self.assertNotIn("api-key-prod", dumped)
-        self.assertIn("kong-consumer-tags-withheld", codes(report, "warning"))
+        self.assertNotIn("tier-gold", dumped)
+        self.assertIn("kong-consumer-tags-omitted", codes(report, "warning"))
         cred_errs = [c.message for c in report.caveats if c.code == "kong-credentials-unsupported"]
         self.assertEqual(len(cred_errs), 3)
         self.assertTrue(any("Draft-Cavage" in m for m in cred_errs))

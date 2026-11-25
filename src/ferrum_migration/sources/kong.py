@@ -507,31 +507,9 @@ class _Kong:
                                 custom_id=custom_id if isinstance(custom_id, str) else None)
             tags = str_list(consumer.get("tags"))
             if tags:
-                sanitized_tags: list[str] = []
-                withheld_tags = 0
-                for raw_tag in tags:
-                    cleaned = "".join(ch for ch in raw_tag if not unicodedata.category(ch).startswith("C")).strip()
-                    if not cleaned or contains_secret_reference(raw_tag) \
-                            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,63}", cleaned) \
-                            or re.search(r"(secret|token|pass|pwd|key|cred|auth|bearer|jwt|private|session|cookie)",
-                                         cleaned, re.I):
-                        withheld_tags += 1
-                        continue
-                    redacted = safe_label(cleaned, 64)
-                    if redacted and redacted not in sanitized_tags:
-                        sanitized_tags.append(redacted)
-                if withheld_tags:
-                    self.report.warning("kong-consumer-tags-withheld", ref,
-                                        f"{withheld_tags} consumer tag(s) contained non-identifier characters or "
-                                        "secret-like terms and were withheld from labels.")
-                joined = ""
-                for tag in sanitized_tags:
-                    candidate = f"{joined},{tag}" if joined else tag
-                    if len(candidate.encode("utf-8")) > 512:
-                        break
-                    joined = candidate
-                if joined:
-                    spec.labels["ferrum-migration/kong-tags"] = joined
+                self.report.warning("kong-consumer-tags-omitted", ref,
+                                    f"{len(tags)} free-form consumer tag(s) were withheld from Ferrum consumer labels "
+                                    "by default to avoid exporting high-entropy or credential-like tag values.")
             for acl in seq(consumer.get("acls")):
                 group = acl.get("group") if isinstance(acl, dict) else None
                 if isinstance(group, str):

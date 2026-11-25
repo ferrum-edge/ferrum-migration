@@ -701,6 +701,8 @@ class EnvoyHardeningTest(unittest.TestCase):
             lambda d: d["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"][
                 "http_filters"][3]["typed_config"]["providers"]["idp"].update(
                     {"audiences": [" api"]}),
+            lambda d: d["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"][
+                "http_filters"][3]["typed_config"]["providers"]["idp"].pop("audiences"),
             lambda d: d["static_resources"]["clusters"][2].update(
                 {"dns_resolvers": [{"socket_address": {"address": "10.0.0.53", "port_value": 53}}]}),
         ):
@@ -708,7 +710,7 @@ class EnvoyHardeningTest(unittest.TestCase):
             mutate(bad_jwt)
             self.assertEqual(one_proxy(self, migrate("envoy", yaml.safe_dump(bad_jwt))[0].config, "/api")[
                 "labels"]["ferrum-migration/status"], "refused")
-        # 4) Inline JWKS: rebuilds public fields only (strips x5u), rejects noncanonical trailing base64url bits.
+        # 4) Inline JWKS: rebuilds public fields only (strips x5u), rejects noncanonical base64url & non-sig key_ops.
         valid_ed_x = "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo"
         noncanon_ed_x = "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURp"
         inline_doc = minimal_bootstrap({"path_separated_prefix": "/api"})
@@ -718,8 +720,10 @@ class EnvoyHardeningTest(unittest.TestCase):
                 "@type": "type.googleapis.com/envoy.extensions.filters.http.jwt_authn.v3.JwtAuthentication",
                 "providers": {"idp": {
                     "issuer": "https://idp.example.test",
+                    "audiences": ["api"],
                     "local_jwks": {"inline_string": json.dumps({"keys": [{
                         "kty": "OKP", "crv": "Ed25519", "kid": "k1", "x": valid_ed_x,
+                        "key_ops": ["verify"],
                         "x5u": "https://secret.example.test/cert?token=leak",
                     }]})},
                     "from_headers": [{"name": "Authorization", "value_prefix": "Bearer "}],
@@ -732,14 +736,19 @@ class EnvoyHardeningTest(unittest.TestCase):
         self.assertEqual(one_proxy(self, in_res.config, "/api")["labels"]["ferrum-migration/status"], "migrated")
         self.assertNotIn("token=leak", json.dumps(in_res.config))
         self.assertNotIn("x5u", json.dumps(in_res.config))
-        bad_b64 = copy.deepcopy(inline_doc)
-        bad_b64["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"][
-            "http_filters"][0]["typed_config"]["providers"]["idp"]["local_jwks"]["inline_string"] = json.dumps(
-                {"keys": [{"kty": "OKP", "crv": "Ed25519", "kid": "k1", "x": noncanon_ed_x}]})
-        self.assertEqual(one_proxy(self, migrate("envoy", yaml.safe_dump(bad_b64))[0].config, "/api")[
-            "labels"]["ferrum-migration/status"], "refused")
+        for bad_jwk in (
+            {"kty": "OKP", "crv": "Ed25519", "kid": "k1", "x": noncanon_ed_x},
+            {"kty": "OKP", "crv": "Ed25519", "kid": "k1", "x": valid_ed_x, "key_ops": ["verify", "leak=secret"]},
+        ):
+            bad_in = copy.deepcopy(inline_doc)
+            bad_in["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"][
+                "http_filters"][0]["typed_config"]["providers"]["idp"]["local_jwks"]["inline_string"] = json.dumps(
+                    {"keys": [bad_jwk]})
+            bad_in_res = migrate("envoy", yaml.safe_dump(bad_in))[0]
+            self.assertEqual(one_proxy(self, bad_in_res.config, "/api")["labels"]["ferrum-migration/status"], "refused")
+            self.assertNotIn("leak=secret", json.dumps(bad_in_res.config))
         # 5) Fault filter regressions: max_active_faults: 0 and header matchers refuse; 0% fault omits only without
-        #    runtime layers and refuses when layered_runtime is present.
+        #    runtime layers, and ANY fault filter (including positive delay + 0% abort) refuses under layered_runtime.
         for bad_fault in (
             {"@type": "type.googleapis.com/envoy.extensions.filters.http.fault.v3.HTTPFault",
              "abort": {"http_status": 503, "percentage": {"numerator": 5, "denominator": "HUNDRED"}},
@@ -770,12 +779,23 @@ class EnvoyHardeningTest(unittest.TestCase):
         self.assertEqual(one_proxy(self, zf_res.config, "/api")["labels"]["ferrum-migration/status"], "migrated")
         self.assertEqual(zf_res.config["plugin_configs"], [])
         self.assertIn("envoy-fault-noop", codes(zf_rep, "info"))
-        zero_fault_rt = copy.deepcopy(zero_fault)
-        zero_fault_rt["layered_runtime"] = {"layers": [{"name": "static", "static_layer": {}}]}
-        self.assertEqual(one_proxy(self, migrate("envoy", yaml.safe_dump(zero_fault_rt))[0].config, "/api")[
-            "labels"]["ferrum-migration/status"], "refused")
-        # 6) Shadow-only CORS (filter_enabled 0% + shadow_enabled 100%) is omitted (never activated), and
-        #    wildcard-only compressor content_type (text/*) omits compression instead of widening.
+        for rt_fault in (
+            {"@type": "type.googleapis.com/envoy.extensions.filters.http.fault.v3.HTTPFault",
+             "abort": {"http_status": 503, "percentage": {"numerator": 0, "denominator": "HUNDRED"}}},
+            {"@type": "type.googleapis.com/envoy.extensions.filters.http.fault.v3.HTTPFault",
+             "delay": {"fixed_delay": "0.1s", "percentage": {"numerator": 10, "denominator": "HUNDRED"}},
+             "abort": {"http_status": 503, "percentage": {"numerator": 0, "denominator": "HUNDRED"}}},
+        ):
+            rt_doc = minimal_bootstrap({"path_separated_prefix": "/api"})
+            rt_doc["layered_runtime"] = {"layers": [{"name": "static", "static_layer": {}}]}
+            rt_doc["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"][
+                "http_filters"] = [
+                {"name": "envoy.filters.http.fault", "typed_config": rt_fault},
+                {"name": "envoy.filters.http.router"},
+            ]
+            self.assertEqual(one_proxy(self, migrate("envoy", yaml.safe_dump(rt_doc))[0].config, "/api")[
+                "labels"]["ferrum-migration/status"], "refused")
+        # 6) Shadow-only CORS, route.cors override disabling credentialed vhost CORS, and wildcard-only compressor.
         shadow_cors = minimal_bootstrap({"path_separated_prefix": "/api"})
         shcm = shadow_cors["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"]
         shcm["http_filters"].insert(0, {"name": "envoy.filters.http.cors"})
@@ -791,6 +811,10 @@ class EnvoyHardeningTest(unittest.TestCase):
         shcm["route_config"]["virtual_hosts"][0]["cors"] = {
             "allow_origin_string_match": [{"exact": "https://app.example.test"}],
             "allow_credentials": {"value": True},
+        }
+        # RouteAction route.cors with filter_enabled: 0% must override the credentialed vhost CORS.
+        shcm["route_config"]["virtual_hosts"][0]["routes"][0]["route"]["cors"] = {
+            "allow_origin_string_match": [{"exact": "https://app.example.test"}],
             "filter_enabled": {"default_value": {"numerator": 0, "denominator": "HUNDRED"}},
             "shadow_enabled": {"default_value": {"numerator": 100, "denominator": "HUNDRED"}},
         }

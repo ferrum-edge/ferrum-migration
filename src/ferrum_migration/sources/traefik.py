@@ -1311,16 +1311,12 @@ class _Traefik:
         if raw_body is not None and not isinstance(raw_body, bool):
             return [], len(raw_mirrors)
         mirror_body = True if raw_body is None else raw_body
-        raw_max_val = mirroring.get("maxBodySize")
+        if mirror_body:
+            # Traefik forwards oversized bodies to the primary service unmirrored, whereas Ferrum's body-mirroring
+            # ceiling is applied during request collection and can return 413 on sampled chunked uploads. Only
+            # header-only mirrors (mirrorBody: false) preserve primary-route availability identically.
+            return [], len(raw_mirrors)
         max_body: int | None = None
-        if raw_max_val is not None:
-            parsed_max = util.as_int(raw_max_val)
-            if parsed_max is None or parsed_max == 0 or parsed_max < -1:
-                # Traefik maxBodySize=0 refuses mirroring any request carrying a body, whereas Ferrum would default to
-                # 10 MiB; drop mirrors rather than forwarding bodies Traefik suppressed.
-                return [], len(raw_mirrors)
-            if parsed_max > 0:
-                max_body = parsed_max
         for entry in raw_mirrors:
             if not isinstance(entry, dict) or not isinstance(entry.get("name"), str):
                 dropped += 1

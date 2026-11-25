@@ -1160,7 +1160,7 @@ class TraefikHardeningTest(unittest.TestCase):
                     },
                     "r_excl": {
                         "rule": "Host(`a.example.test`) && PathPrefix(`/excl/`)",
-                        "service": "mirrored_zero",
+                        "service": "mirrored_body",
                         "middlewares": ["comp_excl"],
                     },
                     "r_defmin": {
@@ -1192,21 +1192,22 @@ class TraefikHardeningTest(unittest.TestCase):
                     "mirrored": {
                         "mirroring": {
                             "service": "main",
-                            "mirrorBody": True,
-                            "maxBodySize": 65536,
+                            "mirrorBody": False,
                             "mirrors": [{"name": "shadow", "percent": 25}],
                         }
                     },
-                    "mirrored_zero": {
+                    "mirrored_body": {
                         "mirroring": {
                             "service": "main",
-                            "maxBodySize": 0,
+                            "mirrorBody": True,
+                            "maxBodySize": 65536,
                             "mirrors": [{"name": "shadow", "percent": 25}],
                         }
                     },
                     "mirrored_passhost": {
                         "mirroring": {
                             "service": "main",
+                            "mirrorBody": False,
                             "mirrors": [{"name": "shadow_passhost", "percent": 25}],
                         }
                     },
@@ -1234,8 +1235,7 @@ class TraefikHardeningTest(unittest.TestCase):
             "mirror_protocol": "http",
             "allow_plaintext": True,
             "percentage": 25.0,
-            "mirror_request_body": True,
-            "max_mirrored_request_body_bytes": 65536,
+            "mirror_request_body": False,
         })
         # Traefik grpcWeb and buffering.maxRequestBodyBytes are refused fail-closed.
         for refused_path in ("/grpc", "/upload"):
@@ -1248,7 +1248,8 @@ class TraefikHardeningTest(unittest.TestCase):
             "algorithms": ["gzip"], "min_content_length": 1024,
         })
         self.assertNotIn("request_mirror", [p["plugin_name"] for p in plugins_of(result.config, defmin)])
-        # excludedContentTypes omits compression; maxBodySize=0 drops mirror rather than mirroring 10 MiB.
+        # excludedContentTypes omits compression; body-enabled mirror (mirrorBody: true) is dropped so Ferrum's
+        # body-mirroring ceiling never returns 413 on chunked uploads that Traefik forwarded unmirrored.
         excl = one_proxy(self, result.config, "/excl", "a.example.test")
         self.assertEqual(plugins_of(result.config, excl), [])
         self.assertIn("traefik-compress", codes(report, "warning"))

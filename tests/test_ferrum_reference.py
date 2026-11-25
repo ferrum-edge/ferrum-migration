@@ -423,7 +423,7 @@ class FerrumBinaryValidateTest(unittest.TestCase):
                     "buf": {"buffering": {"maxResponseBodyBytes": 2097152}},
                 },
                 "services": {
-                    "mirrored": {"mirroring": {"service": "main", "mirrorBody": True, "maxBodySize": 65536,
+                    "mirrored": {"mirroring": {"service": "main", "mirrorBody": False,
                                                "mirrors": [{"name": "shadow", "percent": 20}]}},
                     "main": {"loadBalancer": {"servers": [{"url": "http://main.internal:8080"}]}},
                     "shadow": {"loadBalancer": {"passHostHeader": False,
@@ -551,10 +551,11 @@ class FerrumBinaryValidateTest(unittest.TestCase):
             with self.subTest(case=label), tempfile.TemporaryDirectory() as directory:
                 migrated = [p for p in result.config["proxies"]
                             if p["labels"].get("ferrum-migration/status") == "migrated"]
-                self.assertTrue(migrated, f"{label} produced no migrated proxies")
-                emitted_plugins = {pc["plugin_name"] for pc in result.config["plugin_configs"]}
-                self.assertLessEqual(expected_plugins, emitted_plugins,
-                                     f"{label} missing expected plugins: {expected_plugins - emitted_plugins}")
+                self.assertEqual(len(migrated), 1, f"{label} expected 1 migrated proxy, got {len(migrated)}")
+                by_id = {pc["id"]: pc["plugin_name"] for pc in result.config["plugin_configs"]}
+                attached = {by_id[ref["plugin_config_id"]] for ref in migrated[0].get("plugins", [])}
+                self.assertLessEqual(expected_plugins, attached,
+                                     f"{label} missing expected attached plugins: {expected_plugins - attached}")
                 completed = self.validate(binary, directory, result.config, result.basic_auth_used)
                 self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
                 self.assertIn("Validation passed", completed.stdout)

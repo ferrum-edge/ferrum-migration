@@ -623,8 +623,8 @@ def jwks_provider_config(
                     return None, "inline jwks key_ops must be a bounded list of strings"
                 if "verify" not in key_ops:
                     return None, "inline jwks key_ops must include 'verify' when specified"
-                if use == "sig" and any(op not in ("sign", "verify") for op in key_ops):
-                    return None, "inline jwks use 'sig' conflicts with key_ops"
+                if any(op not in ("sign", "verify") for op in key_ops):
+                    return None, "inline jwks key_ops may only contain 'sign' and 'verify'"
             alg = key_entry.get("alg")
             clean_key: dict[str, Any] = {"kty": kty, "kid": kid}
             if use is not None:
@@ -680,13 +680,11 @@ def jwks_provider_config(
                 or any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in issuer):
             return None, "issuer must be a non-empty printable string without leading or trailing whitespace"
         provider["issuer"] = issuer
-    if audiences is not None:
-        auds = str_list(audiences)
-        if auds is None or any(not a or a != a.strip() or any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in a)
-                               for a in auds):
-            return None, "audiences must be a list of non-empty printable strings without leading or trailing whitespace"
-        if auds:
-            provider["audiences"] = auds
+    auds = str_list(audiences) if audiences is not None else None
+    if not auds or any(not a or a != a.strip() or any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in a) for a in auds):
+        return None, ("provider must declare explicit non-empty audiences without leading or trailing whitespace "
+                      "(Envoy/Istio skip audience checking when omitted, whereas Ferrum rejects tokens carrying aud)")
+    provider["audiences"] = auds
     if from_headers is not None:
         if not isinstance(from_headers, list):
             return None, "from_headers must be a list"

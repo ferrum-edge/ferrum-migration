@@ -504,15 +504,18 @@ class _Envoy:
                     "envoy.config.route.v3.filterconfig",
                     "envoy.api.v2.route.filterconfig",
                 )
-                if filter_kind == "cors" and not is_filter_config and (
-                    not override_msg or override_msg in (
-                        "envoy.extensions.filters.http.cors.v3.corspolicy",
-                        "envoy.extensions.filters.http.cors.v3.cors",
-                        "envoy.config.filter.http.cors.v2.corspolicy",
-                        "envoy.config.filter.http.cors.v2.cors",
-                    )
-                ):
-                    continue
+                if filter_kind == "cors":
+                    if override.get("disabled") is True and (not override_msg or is_filter_config):
+                        continue
+                    if not is_filter_config and (
+                        not override_msg or override_msg in (
+                            "envoy.extensions.filters.http.cors.v3.corspolicy",
+                            "envoy.extensions.filters.http.cors.v3.cors",
+                            "envoy.config.filter.http.cors.v2.corspolicy",
+                            "envoy.config.filter.http.cors.v2.cors",
+                        )
+                    ):
+                        continue
                 if filter_kind == "fault":
                     if override.get("disabled") is True and (not override_msg or is_filter_config):
                         effective_fault = None
@@ -550,7 +553,7 @@ class _Envoy:
         if effective_fault is not None:
             spec.plugins.append(PluginSpec(effective_fault.name, effective_fault.config, effective_fault.ref))
         self._headers(spec, raw, vhost, shared, ref)
-        self._cors(spec, raw, vhost, cors_enabled, hcm_filter_kinds, ref)
+        self._cors(spec, raw, vhost, shared, cors_enabled, hcm_filter_kinds, ref)
         return spec
 
     def _direct_response(self, spec: RouteSpec, response: dict) -> None:
@@ -725,24 +728,43 @@ class _Envoy:
         builder = request_header_rule if request else response_header_rule
         return builder(op, key, translated)
 
-    def _cors(self, spec: RouteSpec, raw: dict, vhost: dict, enabled: bool, hcm_filter_kinds: dict[str, str],
-              ref: str) -> None:
-        policy = None
-        for source in (raw, vhost):
-            per_filter = mapping(source.get("typed_per_filter_config"))
-            candidate = next(
-                (mapping(v) for k, v in per_filter.items()
-                 if hcm_filter_kinds.get(str(k)) == "cors"
-                 and "filterconfig" not in str(mapping(v).get("@type", "")).lower()),
-                None,
-            )
-            if candidate:
-                policy = candidate
+    def _cors(self, spec: RouteSpec, raw: dict, vhost: dict, shared: dict, enabled: bool,
+              hcm_filter_kinds: dict[str, str], ref: str) -> None:
+        # Resolve effective CORS policy in Envoy's precedence order:
+        # route typed_per_filter_config -> route.cors (RouteAction) -> vhost typed_per_filter_config ->
+        # vhost.cors -> route_config typed_per_filter_config. A FilterConfig{disabled: true} at a more specific
+        # level disables any inherited CORS policy.
+        policy: dict | None = None
+        route_action = mapping(raw.get("route"))
+        levels: list[tuple[dict, Any]] = [
+            (mapping(raw.get("typed_per_filter_config")),
+             route_action.get("cors") if route_action.get("cors") is not None else raw.get("cors")),
+            (mapping(vhost.get("typed_per_filter_config")), vhost.get("cors")),
+            (mapping(shared.get("typed_per_filter_config")), None),
+        ]
+        for per_filter, legacy_cors in levels:
+            found_typed = False
+            for k, v in per_filter.items():
+                if hcm_filter_kinds.get(str(k)) != "cors":
+                    continue
+                override = mapping(v)
+                otype = str(override.get("@type", "")).strip().lower()
+                omsg = otype.rsplit("/", 1)[-1] if otype else ""
+                is_fc = omsg in ("envoy.config.route.v3.filterconfig", "envoy.api.v2.route.filterconfig")
+                if override.get("disabled") is True and (not omsg or is_fc):
+                    self.report.info("envoy-cors-inactive", ref,
+                                     "CORS filter disabled via typed_per_filter_config; omitted.")
+                    return
+                if not is_fc:
+                    policy = override
+                    found_typed = True
+                    break
+            if found_typed:
                 break
-            if mapping(source.get("cors")):
-                policy = mapping(source.get("cors"))
+            if isinstance(legacy_cors, dict):
+                policy = legacy_cors
                 break
-        if not policy:
+        if policy is None:
             return
         if not enabled:
             self.report.info("envoy-cors-inactive", ref, "CORS policy present without the cors HTTP filter; ignored "
@@ -1326,6 +1348,9 @@ def _parse_envoy_compressor(typed: dict) -> tuple[str, Any]:
 
 
 def _parse_envoy_fault(typed: dict, *, has_runtime: bool = False) -> tuple[str, Any]:
+    if has_runtime:
+        return "refuse", ("fault filter is runtime-backed when Envoy layered_runtime/runtime is configured and "
+                          "cannot be proven static")
     unknown_root = [str(k) for k in typed if k not in ("@type", "delay", "abort", "headers")]
     if unknown_root:
         return "refuse", f"unsupported fault field(s): {', '.join(sorted(unknown_root)[:4])}"
@@ -1369,8 +1394,6 @@ def _parse_envoy_fault(typed: dict, *, has_runtime: bool = False) -> tuple[str, 
             if grpc_status is not None:
                 abort_cfg["grpc_status"] = grpc_status
     if delay_cfg is None and abort_cfg is None:
-        if has_runtime:
-            return "refuse", "0% fault filter cannot be proven inert when Envoy runtime layers are configured"
         return "omit", None
     raw_headers = typed.get("headers")
     if raw_headers is not None:
