@@ -23,8 +23,7 @@ from ..safe_load import load_structured
 from .common import (MAX_JWKS_MAX_STALE_SECONDS, SourceContext, apply_first_match_order, check_route_budget,
                      choose_main_port, compression_config, cors_config, fault_injection_config, fold, header_value_ok,
                      jwks_provider_config, literal_value, mapping, merge_weighted_targets, request_header_rule,
-                     request_mirror_config, response_header_rule, retry_from_policy, seq, split_csv, str_list,
-                     validate_jwks_providers)
+                     response_header_rule, retry_from_policy, seq, split_csv, str_list, validate_jwks_providers)
 
 PLATFORM = "envoy"
 _REDIRECT_CODES = {"MOVED_PERMANENTLY": 301, "FOUND": 302, "SEE_OTHER": 303, "TEMPORARY_REDIRECT": 307,
@@ -117,6 +116,7 @@ class _Envoy:
         self.report = ctx.report
         self.plan = Plan(platform=PLATFORM)
         self.clusters: dict[str, dict] = {}
+        self.has_runtime = bool(root.get("layered_runtime") or root.get("runtime"))
 
     def run(self) -> Plan:
         if self.root.get("dynamic_resources"):
@@ -320,14 +320,22 @@ class _Envoy:
             elif kind == "compressor":
                 comp_status, comp_val = _parse_envoy_compressor(typed)
                 if comp_status == "plugin":
-                    hcm_plugins.append(PluginSpec("compression", comp_val, ref))
+                    comp_cfg, dropped_wild = comp_val
+                    if dropped_wild:
+                        self.report.warning("envoy-compressor", ref,
+                                            "Envoy compressor content_type wildcard entries ('*' or 'type/*') were "
+                                            "dropped (Envoy matches literally whereas Ferrum treats 'type/*' as a range).")
+                    hcm_plugins.append(PluginSpec("compression", comp_cfg, ref))
                 elif comp_status == "omit":
-                    self.report.info("envoy-compressor-disabled", ref,
-                                     "Envoy compressor filter has response compression disabled; omitted.")
+                    if comp_val:
+                        self.report.warning("envoy-compressor", ref, comp_val)
+                    else:
+                        self.report.info("envoy-compressor-disabled", ref,
+                                         "Envoy compressor filter has response compression disabled; omitted.")
                 else:
                     filter_refusal = f"HTTP filter compressor cannot be migrated ({comp_val})"
             elif kind == "fault":
-                fault_status, fault_val = _parse_envoy_fault(typed)
+                fault_status, fault_val = _parse_envoy_fault(typed, has_runtime=self.has_runtime)
                 if fault_status == "plugin":
                     hcm_fault = PluginSpec("fault_injection", fault_val, ref)
                 elif fault_status == "omit":
@@ -515,7 +523,7 @@ class _Envoy:
                             "envoy.config.filter.http.fault.v2.httpfault",
                         )
                     ):
-                        fault_status, fault_val = _parse_envoy_fault(override)
+                        fault_status, fault_val = _parse_envoy_fault(override, has_runtime=self.has_runtime)
                         if fault_status == "plugin":
                             effective_fault = PluginSpec("fault_injection", fault_val, ref)
                         elif fault_status == "omit":
@@ -639,61 +647,33 @@ class _Envoy:
             self._mirror_policies(spec, seq(action.get("request_mirror_policies")), ref)
 
     def _mirror_policies(self, spec: RouteSpec, policies: list, ref: str) -> None:
-        migrated = 0
+        # Envoy mirrors rewrite :authority (appending '-shadow' by default, or keeping client :authority when
+        # disable_shadow_host_suffix_append is true), whereas Ferrum file-mode request_mirror strips Host so the
+        # mirror target receives its own dial authority. Drop active Envoy mirror policies with a warning instead of
+        # replaying traffic to a different virtual host.
         dropped = 0
         for policy in policies:
-            if not isinstance(policy, dict) or not isinstance(policy.get("cluster"), str):
+            if not isinstance(policy, dict):
                 dropped += 1
                 continue
-            if set(policy) - {"cluster", "runtime_fraction"}:
-                # Mirror policies with header mutations, cluster_header, or other controls cannot be preserved faithfully.
-                dropped += 1
-                continue
-            cluster_raw = self.clusters.get(policy["cluster"])
-            if cluster_raw is None:
-                dropped += 1
-                continue
-            cluster_type = str(cluster_raw.get("type", "STATIC")).upper()
-            if cluster_raw.get("cluster_type") or cluster_type not in ("STATIC", "STRICT_DNS", "LOGICAL_DNS"):
-                dropped += 1
-                continue
-            targets, ep_problems = self._endpoints(cluster_raw, ref)
-            tls, scheme, tls_problems = self._upstream_tls(cluster_raw, ref)
-            if ep_problems or tls_problems or len(targets) != 1 \
-                    or (scheme == "https" and (tls.ca_path or tls.client_cert_path or tls.sni or tls.san_allow_list)):
-                dropped += 1
-                continue
-            pct = 100.0
             rf = policy.get("runtime_fraction")
             if rf is not None:
-                if not isinstance(rf, dict) or rf.get("runtime_key"):
-                    dropped += 1
-                    continue
-                default_val = rf.get("default_value")
-                if default_val is not None:
-                    parsed_pct = _envoy_fractional_percent(default_val)
-                    if parsed_pct is None:
-                        dropped += 1
+                # In Envoy protobuf, an explicit runtime_fraction wrapper without runtime_key and without default_value
+                # (or numerator 0) is 0% (disabled), not 100%.
+                if isinstance(rf, dict) and not rf.get("runtime_key") and not self.has_runtime:
+                    dv = rf.get("default_value")
+                    if dv is None:
                         continue
-                    pct = parsed_pct
-            if pct == 0.0:
-                continue
-            built, _problem = request_mirror_config(targets[0].host, targets[0].port, scheme, percentage=pct)
-            if built is None:
-                dropped += 1
-                continue
-            spec.plugins.append(PluginSpec("request_mirror", built, ref))
-            migrated += 1
-        if migrated:
-            self.report.warning("envoy-mirror", ref,
-                                f"Migrated {migrated} request_mirror_policies target(s) to request_mirror; Ferrum "
-                                "redacts credential-like headers and query parameters on mirrored requests by default "
-                                "(stricter).")
+                    parsed_pct = _envoy_fractional_percent(dv)
+                    if parsed_pct == 0.0:
+                        continue
+            dropped += 1
         if dropped:
             self.report.warning("envoy-mirror", ref,
-                                f"{dropped} request_mirror_policies entry(ies) could not be represented faithfully "
-                                "(dynamic runtime_key, header mutations, multi-endpoint or custom-TLS cluster) and "
-                                "were dropped.")
+                                f"{dropped} request_mirror_policies entry(ies) were dropped: Envoy mirrors preserve "
+                                "or append '-shadow' to :authority, whereas Ferrum file-mode request_mirror strips "
+                                "Host to the mirror endpoint's authority. Configure request_mirror manually if the "
+                                "shadow destination accepts its own endpoint Host.")
 
     def _headers(self, spec: RouteSpec, raw: dict, vhost: dict, shared: dict, ref: str) -> None:
         request_rules: list[dict] = []
@@ -767,6 +747,33 @@ class _Envoy:
         if not enabled:
             self.report.info("envoy-cors-inactive", ref, "CORS policy present without the cors HTTP filter; ignored "
                              "(it had no effect in Envoy).")
+            return
+        # Check Envoy enablement/shadow controls so 0% / shadow-only CORS policies never become active in Ferrum.
+        raw_legacy_enabled = policy.get("enabled")
+        if raw_legacy_enabled is not None:
+            legacy_bool = _proto_bool(raw_legacy_enabled)
+            if legacy_bool is False:
+                self.report.info("envoy-cors-inactive", ref, "CORS policy has enabled: false; omitted.")
+                return
+            if legacy_bool is None:
+                spec.refuse("CORS policy has an invalid enabled value")
+                return
+        raw_fe = policy.get("filter_enabled")
+        if raw_fe is not None:
+            if not isinstance(raw_fe, dict) or raw_fe.get("runtime_key"):
+                spec.refuse("CORS policy uses dynamic or malformed filter_enabled that cannot be preserved statically")
+                return
+            dv = raw_fe.get("default_value")
+            fe_pct = 0.0 if dv is None else _envoy_fractional_percent(dv)
+            if fe_pct is None or fe_pct not in (0.0, 100.0):
+                spec.refuse("CORS policy uses fractional or invalid filter_enabled that cannot be preserved statically")
+                return
+            if fe_pct == 0.0:
+                self.report.info("envoy-cors-inactive", ref,
+                                 "CORS policy has filter_enabled 0% (inactive or shadow-only); omitted.")
+                return
+        elif policy.get("shadow_enabled") is not None:
+            spec.refuse("CORS policy sets shadow_enabled without an explicit filter_enabled; review manually")
             return
         origins = []
         for matcher in seq(policy.get("allow_origin_string_match")):
@@ -1300,15 +1307,25 @@ def _parse_envoy_compressor(typed: dict) -> tuple[str, Any]:
     content_types = str_list(raw_types) if raw_types is not None else None
     if raw_types is not None and not content_types:
         return "refuse", "response_direction_config.common_config.content_type is invalid"
+    dropped_wild = False
+    if content_types is not None:
+        # Envoy matches content_type literally; entries containing '*' never match real responses in Envoy,
+        # whereas Ferrum treats 'type/*' as a range. Drop wildcard entries and omit if none remain.
+        exact_types = [ct for ct in content_types if "*" not in ct]
+        dropped_wild = len(exact_types) != len(content_types)
+        if not exact_types:
+            return "omit", ("Envoy compressor content_type contains only wildcard entries (literal in Envoy, "
+                            "range in Ferrum); omitted.")
+        content_types = exact_types
     remove_ae = resp.get("remove_accept_encoding_header")
     if remove_ae is not None and not isinstance(remove_ae, bool):
         return "refuse", "remove_accept_encoding_header must be a boolean"
     cfg, err = compression_config([algo], min_content_length=min_len, content_types=content_types,
-                                  remove_accept_encoding=remove_ae)
-    return ("plugin", cfg) if cfg is not None else ("refuse", err)
+                                  allow_ranges=False, remove_accept_encoding=remove_ae)
+    return ("plugin", (cfg, dropped_wild)) if cfg is not None else ("refuse", err)
 
 
-def _parse_envoy_fault(typed: dict) -> tuple[str, Any]:
+def _parse_envoy_fault(typed: dict, *, has_runtime: bool = False) -> tuple[str, Any]:
     unknown_root = [str(k) for k in typed if k not in ("@type", "delay", "abort", "headers")]
     if unknown_root:
         return "refuse", f"unsupported fault field(s): {', '.join(sorted(unknown_root)[:4])}"
@@ -1352,36 +1369,17 @@ def _parse_envoy_fault(typed: dict) -> tuple[str, Any]:
             if grpc_status is not None:
                 abort_cfg["grpc_status"] = grpc_status
     if delay_cfg is None and abort_cfg is None:
+        if has_runtime:
+            return "refuse", "0% fault filter cannot be proven inert when Envoy runtime layers are configured"
         return "omit", None
-    match_headers: dict[str, str] | None = None
     raw_headers = typed.get("headers")
     if raw_headers is not None:
         if not isinstance(raw_headers, list):
             return "refuse", "fault headers matcher must be a list"
         if raw_headers:
-            match_headers = {}
-            for hm in raw_headers:
-                if not isinstance(hm, dict) or not isinstance(hm.get("name"), str):
-                    return "refuse", "fault header matcher is malformed"
-                if hm.get("invert_match"):
-                    return "refuse", "inverted fault header matchers are not supported"
-                unsupported_hm = [k for k in hm if k not in ("name", "exact_match", "string_match", "invert_match")]
-                if unsupported_hm:
-                    return "refuse", f"fault header matcher field {unsupported_hm[0]} is not supported"
-                if isinstance(hm.get("exact_match"), str):
-                    val = hm["exact_match"]
-                elif isinstance(hm.get("string_match"), dict) \
-                        and isinstance(hm["string_match"].get("exact"), str) \
-                        and not any(k != "exact" and not (k == "ignore_case" and hm["string_match"][k] is False)
-                                    for k in hm["string_match"]):
-                    val = hm["string_match"]["exact"]
-                else:
-                    return "refuse", "only exact fault header matchers are supported"
-                lower_name = hm["name"].lower()
-                if lower_name in match_headers:
-                    return "refuse", f"duplicate fault header matcher for {lower_name} is not supported"
-                match_headers[lower_name] = val
-    cfg, err = fault_injection_config(abort=abort_cfg, delay=delay_cfg, match_headers=match_headers)
+            return "refuse", ("fault headers matchers are not migrated (Envoy compares comma-joined header values "
+                              "whereas Ferrum matches any individual header line)")
+    cfg, err = fault_injection_config(abort=abort_cfg, delay=delay_cfg)
     return ("plugin", cfg) if cfg is not None else ("refuse", err)
 
 

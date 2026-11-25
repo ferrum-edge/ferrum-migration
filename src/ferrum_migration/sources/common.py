@@ -15,7 +15,7 @@ from .. import matching, util
 from ..errors import InputError
 from ..limits import Limits
 from ..model import RouteSpec, Target
-from ..redact import safe_label
+from ..redact import contains_secret_reference, safe_label
 from ..report import Report
 
 
@@ -268,6 +268,7 @@ def cors_config(origins: Any, methods: Any = None, headers: Any = None, exposed:
 # ------------------------------------------- shared plugin config builders
 
 _MEDIA_TYPE_RULE_RE = re.compile(r"^[!#$%&'+.^_`|~0-9A-Za-z-]+/(?:\*|[!#$%&'+.^_`|~0-9A-Za-z-]+)$")
+_EXACT_MEDIA_TYPE_RE = re.compile(r"^[!#$%&'+.^_`|~0-9A-Za-z-]+/[!#$%&'+.^_`|~0-9A-Za-z-]+$")
 _B64URL_NO_PAD_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 _CORRELATION_ID_RESERVED_HEADERS = frozenset({
     "api-key", "authentication-info", "authorization", "connection", "content-encoding", "content-length",
@@ -317,9 +318,13 @@ def _decode_b64url_no_pad(raw: Any) -> bytes | None:
         return None
     pad = "=" * ((4 - len(raw) % 4) % 4)
     try:
-        return base64.urlsafe_b64decode(raw + pad)
+        decoded = base64.urlsafe_b64decode(raw + pad)
     except ValueError:
         return None
+    # Match Rust base64::URL_SAFE_NO_PAD (rejects non-zero trailing bits).
+    if base64.urlsafe_b64encode(decoded).rstrip(b"=").decode("ascii") != raw:
+        return None
+    return decoded
 
 
 def is_loopback_ip_literal(host: str) -> bool:
@@ -350,6 +355,7 @@ def compression_config(
     *,
     min_content_length: int | None = None,
     content_types: list[str] | None = None,
+    allow_ranges: bool = False,
     gzip_level: int | None = None,
     brotli_quality: int | None = None,
     zstd_level: int | None = None,
@@ -378,9 +384,10 @@ def compression_config(
     if content_types is not None:
         if not isinstance(content_types, list) or not content_types:
             return None, "content_types must be a non-empty list"
+        ct_re = _MEDIA_TYPE_RULE_RE if allow_ranges else _EXACT_MEDIA_TYPE_RE
         clean_types: list[str] = []
         for raw in content_types:
-            if not isinstance(raw, str) or not raw.isascii() or not _MEDIA_TYPE_RULE_RE.fullmatch(raw):
+            if not isinstance(raw, str) or not raw.isascii() or not ct_re.fullmatch(raw):
                 return None, f"content_type {safe_label(raw, 48)} is not a valid Ferrum media type rule"
             lower = raw.lower()
             if lower not in clean_types:
@@ -472,8 +479,8 @@ def fault_injection_config(
                 return None, f"match.headers cannot copy credential-like header {lower} into output"
             if lower in clean_headers:
                 return None, f"match.headers repeats header {lower}"
-            if not header_value_ok(raw_value):
-                return None, f"match.headers value for {lower} is not a valid HTTP header value"
+            if not header_value_ok(raw_value) or contains_secret_reference(raw_value):
+                return None, f"match.headers value for {lower} is invalid or contains a secret reference"
             clean_headers[lower] = raw_value
         config["match"] = {"headers": clean_headers}
     return config, None
@@ -587,14 +594,16 @@ def jwks_provider_config(
         if len(parsed_jwks["keys"]) > MAX_JWKS_KEYS:
             return None, f"inline jwks exceeds Ferrum's {MAX_JWKS_KEYS}-key limit"
         seen_kids: set[str] = set()
+        clean_keys: list[dict[str, Any]] = []
         for key_entry in parsed_jwks["keys"]:
             kty = key_entry.get("kty")
             if not isinstance(kty, str) or kty not in ("RSA", "EC", "OKP") \
                     or any(secret_field in key_entry for secret_field in ("d", "p", "q", "dp", "dq", "qi", "k", "oth")):
                 return None, "inline jwks contains unsupported, private, or symmetric key material"
             kid = key_entry.get("kid")
-            if not isinstance(kid, str) or not kid or len(kid.encode("utf-8")) > MAX_JWK_ID_BYTES:
-                return None, f"every inline jwks key must declare a non-empty kid <= {MAX_JWK_ID_BYTES} bytes"
+            if not isinstance(kid, str) or not kid.strip() or len(kid.encode("utf-8")) > MAX_JWK_ID_BYTES \
+                    or contains_secret_reference(kid) or any(ord(c) < 0x20 or ord(c) == 0x7F for c in kid):
+                return None, f"every inline jwks key must declare a safe non-empty kid <= {MAX_JWK_ID_BYTES} bytes"
             if kid in seen_kids:
                 return None, "inline jwks contains duplicate kid values"
             seen_kids.add(kid)
@@ -617,6 +626,13 @@ def jwks_provider_config(
                 if use == "sig" and any(op not in ("sign", "verify") for op in key_ops):
                     return None, "inline jwks use 'sig' conflicts with key_ops"
             alg = key_entry.get("alg")
+            clean_key: dict[str, Any] = {"kty": kty, "kid": kid}
+            if use is not None:
+                clean_key["use"] = use
+            if key_ops is not None:
+                clean_key["key_ops"] = list(key_ops)
+            if alg is not None:
+                clean_key["alg"] = alg
             if kty == "RSA":
                 if alg is not None and alg not in ("RS256", "RS384", "RS512", "PS256", "PS384", "PS512"):
                     return None, "inline jwks RSA key has unsupported alg"
@@ -626,8 +642,10 @@ def jwks_provider_config(
                     return None, "inline jwks RSA key has invalid base64url n/e"
                 n_int = int.from_bytes(n_bytes, "big")
                 e_int = int.from_bytes(e_bytes, "big")
-                if n_int.bit_length() < 2048 or e_int < 3 or e_int % 2 == 0:
+                if not (2048 <= n_int.bit_length() <= 8192) or e_int < 3 or e_int % 2 == 0:
                     return None, "inline jwks RSA key fails Ferrum modulus/exponent requirements"
+                clean_key["n"] = key_entry["n"]
+                clean_key["e"] = key_entry["e"]
             elif kty == "EC":
                 crv = key_entry.get("crv")
                 expected_len = {"P-256": 32, None: 32, "P-384": 48}.get(crv)
@@ -640,6 +658,10 @@ def jwks_provider_config(
                 y_bytes = _decode_b64url_no_pad(key_entry.get("y"))
                 if not x_bytes or not y_bytes or len(x_bytes) != expected_len or len(y_bytes) != expected_len:
                     return None, "inline jwks EC key has invalid x/y coordinates"
+                if crv is not None:
+                    clean_key["crv"] = crv
+                clean_key["x"] = key_entry["x"]
+                clean_key["y"] = key_entry["y"]
             else:  # OKP
                 if key_entry.get("crv") != "Ed25519":
                     return None, "inline jwks OKP key must use Ed25519 curve"
@@ -648,18 +670,23 @@ def jwks_provider_config(
                 x_bytes = _decode_b64url_no_pad(key_entry.get("x"))
                 if not x_bytes or len(x_bytes) != 32:
                     return None, "inline jwks OKP Ed25519 key x must decode to 32 bytes"
-        provider["jwks"] = parsed_jwks
+                clean_key["crv"] = "Ed25519"
+                clean_key["x"] = key_entry["x"]
+            # Rebuild strictly from validated public fields (never copies x5u URLs or arbitrary metadata).
+            clean_keys.append(clean_key)
+        provider["jwks"] = {"keys": clean_keys}
     if issuer is not None:
-        if not isinstance(issuer, str) or not issuer.strip() \
+        if not isinstance(issuer, str) or not issuer or issuer != issuer.strip() \
                 or any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in issuer):
-            return None, "issuer must be a non-empty printable string"
-        provider["issuer"] = issuer.strip()
+            return None, "issuer must be a non-empty printable string without leading or trailing whitespace"
+        provider["issuer"] = issuer
     if audiences is not None:
         auds = str_list(audiences)
-        if auds is None or any(not a.strip() for a in auds):
-            return None, "audiences must be a list of non-empty strings"
+        if auds is None or any(not a or a != a.strip() or any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in a)
+                               for a in auds):
+            return None, "audiences must be a list of non-empty printable strings without leading or trailing whitespace"
         if auds:
-            provider["audiences"] = [a.strip() for a in auds]
+            provider["audiences"] = auds
     if from_headers is not None:
         if not isinstance(from_headers, list):
             return None, "from_headers must be a list"

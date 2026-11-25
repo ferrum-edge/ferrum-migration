@@ -785,7 +785,7 @@ class KongExtendedPluginsAndConsumersTest(unittest.TestCase):
             _format_version: "3.0"
             consumers:
               - username: alice
-                tags: [tier-gold, team-api, tier-gold, "{vault://env/secret}"]
+                tags: [tier-gold, team-api, tier-gold, "{vault://env/secret}", "token=abc123", "api-key-prod"]
                 hmacauth_credentials: [{username: alice-hmac, secret: test-only-hmac-secret}]
                 oauth2_credentials: [{name: app, client_id: cid, client_secret: test-only-secret}]
                 mtls_auth_credentials: [{subject_name: alice@example.test}]
@@ -825,6 +825,9 @@ class KongExtendedPluginsAndConsumersTest(unittest.TestCase):
         self.assertNotIn("test-only-hmac-secret", dumped)
         self.assertNotIn("test-only-secret", dumped)
         self.assertNotIn("vault://env/secret", dumped)
+        self.assertNotIn("token=abc123", dumped)
+        self.assertNotIn("api-key-prod", dumped)
+        self.assertIn("kong-consumer-tags-withheld", codes(report, "warning"))
         cred_errs = [c.message for c in report.caveats if c.code == "kong-credentials-unsupported"]
         self.assertEqual(len(cred_errs), 3)
         self.assertTrue(any("Draft-Cavage" in m for m in cred_errs))

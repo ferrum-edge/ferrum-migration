@@ -1026,49 +1026,37 @@ class IstioCaseAndNamesTest(unittest.TestCase):
             "delay": {"duration_ms": 250, "percentage": 15.0},
             "abort": {"status_code": 503, "grpc_status": 14, "percentage": 5.0},
         })
-        self.assertEqual(plugin(self, result.config, api, "request_mirror")["config"], {
-            "mirror_host": "shadow.edge.svc.cluster.local",
-            "mirror_port": 9090,
-            "mirror_protocol": "http",
-            "allow_plaintext": True,
-            "percentage": 10.0,
-        })
+        # Active Istio mirrors are dropped with warning (-shadow authority + mesh Auto mTLS vs file-mode Host strip).
+        self.assertNotIn("request_mirror", [p["plugin_name"] for p in plugins_of(result.config, api)])
+        self.assertIn("istio-dropped", codes(report, "warning"))
         # 0%-probability fault is inert and omitted rather than emitting percentage: 0.0.
         zero_p = one_proxy(self, result.config, "=/zero", "api.example.test")
         self.assertNotIn("fault_injection", [p["plugin_name"] for p in plugins_of(result.config, zero_p)])
         self.assertIn("istio-fault-noop", codes(report, "info"))
         self.assertIn("istio-request-auth", codes(report, "warning"))
-        self.assertIn("istio-mirror", codes(report, "warning"))
         # directResponse under RequestAuthentication refuses fail-closed.
         self.assertEqual(one_proxy(self, result.config, "=/healthz", "api.example.test")["labels"][
             "ferrum-migration/status"], "refused")
 
-        # Non-root namespace, prefixed Authorization under allow_missing_token, targetRef, and fromCookies refuse.
+        # Empty mirrorPercentage: {} is 0% (inert) and produces no istio-dropped warning.
+        inert_m = text.replace("mirrorPercentage: {value: 10}", "mirrorPercentage: {}")
+        _im_res, im_rep, _ = migrate("istio", inert_m)
+        self.assertNotIn("istio-dropped", codes(im_rep))
+
+        # Non-root namespace, prefixed Authorization under allow_missing_token, same-namespace targetRef on legacy
+        # Gateway, and fromCookies all refuse fail-closed.
         for mutate in (
             lambda s: s.replace("namespace: istio-system", "namespace: edge"),
             lambda s: s.replace("fromHeaders: [{name: X-Jwt-Assertion}]",
                                 'fromHeaders: [{name: Authorization, prefix: "Bearer "}]'),
-            lambda s: s.replace("selector:\n    matchLabels: {istio: ingressgateway}",
-                                "targetRef: {kind: Gateway, group: networking.istio.io, name: gw}"),
+            lambda s: s.replace("namespace: istio-system", "namespace: edge").replace(
+                "selector:\n    matchLabels: {istio: ingressgateway}",
+                "targetRef: {kind: Gateway, group: networking.istio.io, name: gw}"),
             lambda s: s.replace("fromHeaders: [{name: X-Jwt-Assertion}]", "fromCookies: [session]"),
         ):
             bad_res, _bad_rep, _ = migrate("istio", mutate(text))
             self.assertEqual(one_proxy(self, bad_res.config, "=/api", "api.example.test")["labels"][
                 "ferrum-migration/status"], "refused")
-
-        # Mirror DestinationRule with restricted exportTo or portLevelSettings omitting tls drops the mirror.
-        for dr_patch in (
-            "  host: shadow.edge.svc.cluster.local\n  exportTo: ['.']\n  trafficPolicy:\n    tls: {mode: DISABLE}",
-            "  host: shadow.edge.svc.cluster.local\n  trafficPolicy:\n    tls: {mode: DISABLE}\n"
-            "    portLevelSettings:\n      - port: {number: 9090}",
-        ):
-            m_text = text.replace(
-                "  host: shadow.edge.svc.cluster.local\n  trafficPolicy:\n    tls: {mode: DISABLE}",
-                dr_patch,
-            )
-            m_res, _m_rep, _ = migrate("istio", m_text)
-            m_api = one_proxy(self, m_res.config, "=/api", "api.example.test")
-            self.assertNotIn("request_mirror", [p["plugin_name"] for p in plugins_of(m_res.config, m_api)])
 
 
 if __name__ == "__main__":

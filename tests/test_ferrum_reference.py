@@ -420,13 +420,14 @@ class FerrumBinaryValidateTest(unittest.TestCase):
                 "middlewares": {
                     "comp": {"compress": {"encodings": ["br", "gzip"], "minResponseBodyBytes": 1024,
                                           "includedContentTypes": ["application/json", "text/plain"]}},
-                    "buf": {"buffering": {"maxRequestBodyBytes": 1048576, "maxResponseBodyBytes": 2097152}},
+                    "buf": {"buffering": {"maxResponseBodyBytes": 2097152}},
                 },
                 "services": {
                     "mirrored": {"mirroring": {"service": "main", "mirrorBody": True, "maxBodySize": 65536,
                                                "mirrors": [{"name": "shadow", "percent": 20}]}},
                     "main": {"loadBalancer": {"servers": [{"url": "http://main.internal:8080"}]}},
-                    "shadow": {"loadBalancer": {"servers": [{"url": "http://shadow.internal:9090"}]}},
+                    "shadow": {"loadBalancer": {"passHostHeader": False,
+                                                "servers": [{"url": "http://shadow.internal:9090"}]}},
                 },
             }
         })
@@ -434,6 +435,7 @@ class FerrumBinaryValidateTest(unittest.TestCase):
             "http {\n"
             "  gzip on;\n"
             "  gzip_proxied any;\n"
+            "  gzip_http_version 1.0;\n"
             "  gzip_comp_level 6;\n"
             "  gzip_min_length 1024;\n"
             "  gzip_types application/json text/plain;\n"
@@ -458,13 +460,7 @@ class FerrumBinaryValidateTest(unittest.TestCase):
                                 "routes": [{
                                     "name": "r",
                                     "match": {"path_separated_prefix": "/api"},
-                                    "route": {
-                                        "cluster": "app",
-                                        "request_mirror_policies": [{
-                                            "cluster": "shadow",
-                                            "runtime_fraction": {"default_value": {"numerator": 20, "denominator": "HUNDRED"}},
-                                        }],
-                                    },
+                                    "route": {"cluster": "app"},
                                 }],
                             }]},
                             "http_filters": [
@@ -483,7 +479,6 @@ class FerrumBinaryValidateTest(unittest.TestCase):
                                      "@type": "type.googleapis.com/envoy.extensions.filters.http.fault.v3.HTTPFault",
                                      "delay": {"fixed_delay": "0.25s", "percentage": {"numerator": 10, "denominator": "HUNDRED"}},
                                      "abort": {"http_status": 503, "percentage": {"numerator": 5, "denominator": "HUNDRED"}},
-                                     "headers": [{"name": "x-chaos", "exact_match": "1"}],
                                  }},
                                 {"name": "envoy.filters.http.jwt_authn",
                                  "typed_config": {
@@ -510,8 +505,6 @@ class FerrumBinaryValidateTest(unittest.TestCase):
                 "clusters": [
                     {"name": "app", "type": "STRICT_DNS", "load_assignment": {"endpoints": [{"lb_endpoints": [
                         {"endpoint": {"address": {"socket_address": {"address": "app.internal", "port_value": 8080}}}}]}]}},
-                    {"name": "shadow", "type": "STRICT_DNS", "load_assignment": {"endpoints": [{"lb_endpoints": [
-                        {"endpoint": {"address": {"socket_address": {"address": "shadow.internal", "port_value": 9090}}}}]}]}},
                     {"name": "jwks", "type": "STRICT_DNS",
                      "load_assignment": {"endpoints": [{"lb_endpoints": [
                          {"endpoint": {"address": {"socket_address": {"address": "idp.example.test", "port_value": 443}}}}]}]},
@@ -538,9 +531,6 @@ class FerrumBinaryValidateTest(unittest.TestCase):
             "      audiences: [api]\n"
             "      fromHeaders: [{name: X-Jwt-Assertion}]\n"
             "      outputClaimToHeaders: [{header: x-jwt-sub, claim: sub}]\n"
-            "---\napiVersion: networking.istio.io/v1\nkind: DestinationRule\n"
-            "metadata: {name: shadow-plain, namespace: edge}\nspec:\n"
-            "  host: shadow.edge.svc.cluster.local\n  trafficPolicy: {tls: {mode: DISABLE}}\n"
             "---\napiVersion: networking.istio.io/v1\nkind: VirtualService\n"
             "metadata: {name: vs, namespace: edge}\nspec:\n"
             "  hosts: [api.example.test]\n  gateways: [gw]\n  http:\n"
@@ -548,18 +538,23 @@ class FerrumBinaryValidateTest(unittest.TestCase):
             "      route: [{destination: {host: svc.edge.svc.cluster.local, port: {number: 8080}}}]\n"
             "      fault:\n        delay: {fixedDelay: 250ms, percentage: {value: 15}}\n"
             "        abort: {httpStatus: 503, grpcStatus: UNAVAILABLE, percentage: {value: 5}}\n"
-            "      mirror: {host: shadow.edge.svc.cluster.local, port: {number: 9090}}\n"
-            "      mirrorPercentage: {value: 10}\n"
         )
-        for label, platform, text, kw in (
-            ("kong-extended", "kong", kong_text, {}),
-            ("nginx-extended", "nginx", nginx_text, {"fmt": "nginx"}),
-            ("traefik-extended", "traefik", traefik_text, {"traefik_controls_asserted": True}),
-            ("envoy-extended", "envoy", envoy_text, {}),
-            ("istio-extended", "istio", istio_text, {}),
+        for label, platform, text, kw, expected_plugins in (
+            ("kong-extended", "kong", kong_text, {}, {"correlation_id"}),
+            ("nginx-extended", "nginx", nginx_text, {"fmt": "nginx"}, {"compression"}),
+            ("traefik-extended", "traefik", traefik_text, {"traefik_controls_asserted": True},
+             {"compression", "response_size_limiting", "request_mirror"}),
+            ("envoy-extended", "envoy", envoy_text, {}, {"grpc_web", "compression", "fault_injection", "jwks_auth"}),
+            ("istio-extended", "istio", istio_text, {}, {"jwks_auth", "fault_injection"}),
         ):
             result, _report, _plan = migrate(platform, text, **kw)
             with self.subTest(case=label), tempfile.TemporaryDirectory() as directory:
+                migrated = [p for p in result.config["proxies"]
+                            if p["labels"].get("ferrum-migration/status") == "migrated"]
+                self.assertTrue(migrated, f"{label} produced no migrated proxies")
+                emitted_plugins = {pc["plugin_name"] for pc in result.config["plugin_configs"]}
+                self.assertLessEqual(expected_plugins, emitted_plugins,
+                                     f"{label} missing expected plugins: {expected_plugins - emitted_plugins}")
                 completed = self.validate(binary, directory, result.config, result.basic_auth_used)
                 self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
                 self.assertIn("Validation passed", completed.stdout)

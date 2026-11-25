@@ -157,7 +157,7 @@ SAFE_IGNORED = {
     "ssl_session_tickets", "ssl_prefer_server_ciphers", "ssl_ciphers", "ssl_protocols", "ssl_dhparam",
     "ssl_ecdh_curve", "ssl_stapling", "ssl_stapling_verify", "ssl_trusted_certificate", "ssl_buffer_size",
     "gzip_vary",
-    "gzip_http_version", "gzip_buffers", "open_file_cache", "open_file_cache_valid", "open_file_cache_min_uses",
+    "gzip_buffers", "open_file_cache", "open_file_cache_valid", "open_file_cache_min_uses",
     "open_file_cache_errors", "reset_timedout_connection", "index", "absolute_redirect", "port_in_redirect",
     "server_name_in_redirect", "chunked_transfer_encoding", "merge_slashes", "proxy_ignore_client_abort",
     "proxy_socket_keepalive", "keepalive_disable", "lingering_close", "lingering_time", "lingering_timeout",
@@ -191,7 +191,7 @@ STRUCTURAL = {"server", "location", "listen", "server_name", "proxy_pass", "grpc
               "proxy_ssl_certificate_key", "proxy_ssl_name", "proxy_ssl_server_name", "grpc_ssl_verify",
               "grpc_ssl_trusted_certificate", "grpc_ssl_certificate", "grpc_ssl_certificate_key", "grpc_ssl_name",
               "grpc_ssl_server_name", "gzip", "gzip_types", "gzip_comp_level", "gzip_min_length",
-              "gzip_proxied", "gzip_disable"} | INHERITED_ARRAYS
+              "gzip_proxied", "gzip_disable", "gzip_http_version"} | INHERITED_ARRAYS
 PROXY_PARAMS = [("Host", "$http_host"), ("X-Real-IP", "$remote_addr"),
                 ("X-Forwarded-For", "$proxy_add_x_forwarded_for"), ("X-Forwarded-Proto", "$scheme")]
 
@@ -211,6 +211,7 @@ class _Scope:
     gzip_comp_level: int | None = None
     gzip_proxied: list[str] | None = None
     gzip_disable: list[str] = field(default_factory=list)
+    gzip_http_version: str | None = None
     problems: list[str] = field(default_factory=list)
 
 
@@ -236,6 +237,7 @@ class _Nginx:
                        gzip_min_length=parent.gzip_min_length, gzip_comp_level=parent.gzip_comp_level,
                        gzip_proxied=list(parent.gzip_proxied) if parent.gzip_proxied is not None else None,
                        gzip_disable=list(parent.gzip_disable),
+                       gzip_http_version=parent.gzip_http_version,
                        problems=list(parent.problems))
         level: dict[str, list[list[str]]] = {}
         for directive in directives:
@@ -292,6 +294,8 @@ class _Nginx:
                 child.gzip_proxied = list(args)
             elif name == "gzip_disable" and args:
                 child.gzip_disable = list(args)
+            elif name == "gzip_http_version" and args:
+                child.gzip_http_version = args[0]
             elif name == "satisfy" and args and args[0] == "any":
                 child.problems.append("satisfy any (OR of access and auth) has no Ferrum equivalent")
             elif name in STRUCTURAL or name in SAFE_IGNORED or name in DEFINITIONS:
@@ -1058,6 +1062,12 @@ class _Nginx:
                                     "gzip omitted: NGINX gzip_proxied defaults to 'off' (skipping requests with a "
                                     "Via header) and Ferrum compression cannot reproduce proxied-request exclusions "
                                     "(only explicit 'gzip_proxied any' is migrated).")
+                omit_gzip = True
+            elif scope.gzip_http_version != "1.0":
+                self.report.warning("nginx-gzip", ref,
+                                    "gzip omitted: NGINX gzip_http_version defaults to 1.1 (skipping HTTP/1.0 "
+                                    "requests) whereas Ferrum compression compresses HTTP/1.0 responses too (only "
+                                    "explicit 'gzip_http_version 1.0' is migrated).")
                 omit_gzip = True
             elif scope.gzip_disable:
                 self.report.warning("nginx-gzip", ref,

@@ -23,9 +23,9 @@ from ..model import BackendRef, HostScope, Plan, PluginSpec, RouteSpec, Target, 
 from ..redact import contains_secret_reference, safe_label
 from ..safe_load import load_structured
 from .common import (SourceContext, apply_first_match_order, check_route_budget, choose_main_port, cors_config,
-                     fault_injection_config, header_value_ok, is_loopback_ip_literal, jwks_provider_config,
-                     literal_value, mapping, merge_weighted_targets, request_header_rule, request_mirror_config,
-                     response_header_rule, retry_from_policy, seq, str_list, validate_jwks_providers)
+                     fault_injection_config, header_value_ok, jwks_provider_config, literal_value, mapping,
+                     merge_weighted_targets, request_header_rule, response_header_rule, retry_from_policy, seq,
+                     str_list, validate_jwks_providers)
 
 PLATFORM = "istio"
 ROOT_NAMESPACE = "istio-system"
@@ -720,86 +720,38 @@ class _Istio:
             self._headers(spec, raw_headers)
 
     def _mirrors(self, spec: RouteSpec, entry: dict, namespace: str, gw_ns: str, ref: str) -> None:
-        raw_items: list[tuple[Any, Any]] = []
+        # Istio mirrors rewrite :authority with '-shadow' and apply mesh Auto mTLS / DestinationRule namespace
+        # precedence, whereas Ferrum file-mode request_mirror strips Host to the mirror endpoint's authority.
+        # Ignore explicitly 0%-percentage (inert) mirrors (including empty percentage wrappers, which default to 0.0
+        # in protobuf) and drop active mirrors with a warning.
+        dropped = 0
         if entry.get("mirror") is not None:
-            pct_obj = entry.get("mirrorPercentage")
-            if isinstance(pct_obj, dict) and pct_obj.get("value") is not None:
-                raw_pct = pct_obj.get("value")
-            elif entry.get("mirrorPercent") is not None:
-                raw_pct = entry.get("mirrorPercent")
+            if "mirrorPercentage" in entry and entry["mirrorPercentage"] is not None:
+                pct_obj = entry["mirrorPercentage"]
+                raw_pct = pct_obj.get("value", 0.0) if isinstance(pct_obj, dict) else None
+            elif "mirrorPercent" in entry and entry["mirrorPercent"] is not None:
+                raw_pct = entry["mirrorPercent"]
             else:
                 raw_pct = 100.0
-            raw_items.append((entry.get("mirror"), raw_pct))
+            if isinstance(raw_pct, bool) or not isinstance(raw_pct, (int, float)) or float(raw_pct) != 0.0:
+                dropped += 1
         for item in seq(entry.get("mirrors")):
             if not isinstance(item, dict):
-                raw_items.append((None, None))
-                continue
-            pct_obj = item.get("percentage")
-            raw_pct = pct_obj.get("value") if isinstance(pct_obj, dict) and pct_obj.get("value") is not None else 100.0
-            raw_items.append((item.get("destination"), raw_pct))
-        migrated = 0
-        dropped = 0
-        for dest_raw, raw_pct in raw_items:
-            if not isinstance(dest_raw, dict) or dest_raw.get("subset") or not isinstance(dest_raw.get("host"), str):
                 dropped += 1
                 continue
-            if isinstance(raw_pct, bool) or not isinstance(raw_pct, (int, float)):
+            if "percentage" in item and item["percentage"] is not None:
+                pct_obj = item["percentage"]
+                raw_pct = pct_obj.get("value", 0.0) if isinstance(pct_obj, dict) else None
+            else:
+                raw_pct = 100.0
+            if isinstance(raw_pct, bool) or not isinstance(raw_pct, (int, float)) or float(raw_pct) != 0.0:
                 dropped += 1
-                continue
-            pct = float(raw_pct)
-            if pct == 0.0:
-                continue
-            fqdn = _fqdn(dest_raw["host"], namespace)
-            port = util.parse_port(mapping(dest_raw.get("port")).get("number"))
-            targets, resolved_port, se_sans, ep_err = self._service_entry_targets(fqdn, port)
-            if ep_err or len(targets) != 1:
-                dropped += 1
-                continue
-            rule = self._destination_rule(fqdn, gw_ns)
-            # Only trust a DestinationRule for mirror transport when it applies globally (no workloadSelector and
-            # no restricted exportTo), and treat matching portLevelSettings as replacing destination-level tls
-            # (never inheriting DISABLE if the port-level entry omits tls).
-            rule_spec = mapping(rule.get("spec")) if rule is not None else {}
-            raw_export = rule_spec.get("exportTo")
-            export_global = raw_export is None or raw_export == ["*"]
-            rule_unscoped = rule is not None and not rule_spec.get("workloadSelector") and export_global
-            if rule is not None and not rule_unscoped:
-                dropped += 1
-                continue
-            tls, scheme, _algo, _hash, tls_err = self._traffic_policy(rule, resolved_port, ref, se_sans)
-            if tls_err or (scheme == "https" and (tls.ca_path or tls.client_cert_path or tls.sni or tls.san_allow_list)):
-                dropped += 1
-                continue
-            if scheme == "http" and not is_loopback_ip_literal(targets[0].host):
-                explicit_disable = False
-                if rule_unscoped:
-                    pol = mapping(rule_spec.get("trafficPolicy"))
-                    matched_port = next(
-                        (mapping(lvl) for lvl in seq(pol.get("portLevelSettings"))
-                         if util.parse_port(mapping(mapping(lvl).get("port")).get("number")) == resolved_port),
-                        None,
-                    )
-                    effective_tls = mapping(matched_port.get("tls")) if matched_port is not None \
-                        else mapping(pol.get("tls"))
-                    explicit_disable = str(effective_tls.get("mode", "")).upper() == "DISABLE"
-                if not explicit_disable:
-                    dropped += 1
-                    continue
-            built, _problem = request_mirror_config(targets[0].host, targets[0].port, scheme, percentage=pct)
-            if built is None:
-                dropped += 1
-                continue
-            spec.plugins.append(PluginSpec("request_mirror", built, ref))
-            migrated += 1
-        if migrated:
-            self.report.warning("istio-mirror", ref,
-                                f"Migrated {migrated} mirror destination(s) to request_mirror; Ferrum redacts "
-                                "credential-like headers and query parameters on mirrored requests by default "
-                                "(stricter).")
         if dropped:
             self.report.warning("istio-dropped", ref,
-                                f"{dropped} mirror destination(s) could not be represented as a single static "
-                                "request_mirror target and were dropped.")
+                                f"{dropped} mirror destination(s) were dropped: Istio mirrors append '-shadow' to "
+                                ":authority and apply mesh mTLS/DestinationRule precedence, whereas Ferrum file-mode "
+                                "request_mirror strips Host to the mirror endpoint's authority. Configure "
+                                "request_mirror manually if the shadow destination accepts its own endpoint Host.")
 
     def _cors(self, spec: RouteSpec, policy: dict) -> None:
         if not policy:

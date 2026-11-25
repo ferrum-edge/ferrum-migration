@@ -1058,7 +1058,9 @@ class _Traefik:
         elif mw_type == "buffering":
             req_size = util.as_int(config.get("maxRequestBodyBytes"))
             if req_size and req_size > 0:
-                acc.plugins.append(PluginSpec("request_size_limiting", {"max_bytes": req_size}, ref))
+                acc.refusals.append("buffering.maxRequestBodyBytes buffers and rejects oversized chunked uploads "
+                                    "before contacting the backend, whereas Ferrum request_size_limiting streams "
+                                    "chunked bodies up to max_bytes")
             resp_size = util.as_int(config.get("maxResponseBodyBytes"))
             if resp_size and resp_size > 0:
                 acc.plugins.append(PluginSpec("response_size_limiting",
@@ -1066,7 +1068,7 @@ class _Traefik:
             if any(config.get(k) for k in ("memRequestBodyBytes", "memResponseBodyBytes", "retryExpression")) \
                     or not ((req_size and req_size > 0) or (resp_size and resp_size > 0)):
                 self.report.info("traefik-buffering", ref,
-                                 "Only maxRequestBodyBytes and maxResponseBodyBytes are migrated from buffering.")
+                                 "Only maxResponseBodyBytes is migrated from buffering.")
         elif mw_type == "compress":
             self._compress(config, acc, ref)
         elif mw_type == "grpcWeb":
@@ -1102,12 +1104,14 @@ class _Traefik:
             self.report.warning("traefik-compress", ref, "compress omitted: encodings has unexpected types.")
             return
         raw_min = config.get("minResponseBodyBytes")
-        min_len: int | None = None
+        # Traefik compress defaults minResponseBodyBytes to 1024 (whereas Ferrum defaults to 256).
+        min_len: int = 1024
         if raw_min is not None:
-            min_len = util.as_int(raw_min)
-            if min_len is None or min_len < 0:
+            parsed_min = util.as_int(raw_min)
+            if parsed_min is None or parsed_min < 0:
                 self.report.warning("traefik-compress", ref, "compress omitted: invalid minResponseBodyBytes.")
                 return
+            min_len = parsed_min
         raw_inc = config.get("includedContentTypes")
         inc: list[str] | None = None
         if raw_inc is not None:
@@ -1115,7 +1119,17 @@ class _Traefik:
             if not inc:
                 self.report.warning("traefik-compress", ref, "compress omitted: invalid includedContentTypes.")
                 return
-        built, problem = compression_config(encodings, min_content_length=min_len, content_types=inc)
+            # Traefik matches media types literally via mime.ParseMediaType; wildcard entries like 'text/*' never match
+            # in Traefik but would widen compression as a range in Ferrum. Drop wildcard entries and omit if none stay.
+            exact_inc = [ct for ct in inc if "*" not in ct]
+            if len(exact_inc) != len(inc):
+                self.report.warning("traefik-compress", ref,
+                                    "compress.includedContentTypes wildcard entries ('*' or 'type/*') were dropped "
+                                    "(Traefik matches media types literally whereas Ferrum treats 'type/*' as a range).")
+            if not exact_inc:
+                return
+            inc = exact_inc
+        built, problem = compression_config(encodings, min_content_length=min_len, content_types=inc, allow_ranges=False)
         if built is None:
             self.report.warning("traefik-compress", ref, f"compress omitted ({problem}).")
             return
@@ -1324,7 +1338,10 @@ class _Traefik:
                 continue
             target_raw = mapping(self.services.get(base))
             lb = mapping(target_raw.get("loadBalancer"))
-            if not lb:
+            if not lb or lb.get("passHostHeader") is not False:
+                # Traefik's loadBalancer defaults passHostHeader to true (preserving client Host), whereas Ferrum
+                # file-mode request_mirror strips Host to the mirror target's authority. Only mirror when
+                # passHostHeader is explicitly false so the virtual-host boundary matches.
                 dropped += 1
                 continue
             scheme, targets, problems = self._servers(lb, ref)

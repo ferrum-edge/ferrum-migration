@@ -727,6 +727,7 @@ class NginxFrontendScopeTest(unittest.TestCase):
         http {
             gzip on;
             gzip_proxied any;
+            gzip_http_version 1.0;
             gzip_comp_level 6;
             gzip_min_length 1k;
             gzip_types application/json text/plain;
@@ -770,27 +771,30 @@ class NginxFrontendScopeTest(unittest.TestCase):
             self.assertNotIn("compression", [pl["plugin_name"] for pl in plugins_of(result.config, p)], path)
         self.assertIn("nginx-gzip", codes(report, "warning"))
 
-        # Default gzip_proxied (off) omits compression rather than widening to proxied requests with a Via header.
-        default_proxied_conf = """
-        server {
-            listen 80;
-            server_name def.example.test;
-            gzip on;
-            location /html/ { proxy_pass http://html.internal:8080; }
-        }
-        """
-        dp_res, dp_rep, _ = nginx(default_proxied_conf)
-        dp_p = one_proxy(self, dp_res.config, "/html", "def.example.test")
-        self.assertNotIn("compression", [pl["plugin_name"] for pl in plugins_of(dp_res.config, dp_p)])
-        self.assertIn("nginx-gzip", codes(dp_rep, "warning"))
+        # Default gzip_proxied (off) or default gzip_http_version (1.1) omits compression rather than widening.
+        for extra in ("", "gzip_proxied any;"):
+            default_conf = f"""
+            server {{
+                listen 80;
+                server_name def.example.test;
+                gzip on;
+                {extra}
+                location /html/ {{ proxy_pass http://html.internal:8080; }}
+            }}
+            """
+            dp_res, dp_rep, _ = nginx(default_conf)
+            dp_p = one_proxy(self, dp_res.config, "/html", "def.example.test")
+            self.assertNotIn("compression", [pl["plugin_name"] for pl in plugins_of(dp_res.config, dp_p)])
+            self.assertIn("nginx-gzip", codes(dp_rep, "warning"))
 
-        # Explicit gzip_proxied any without gzip_types compresses ONLY text/html (matching NGINX default).
+        # Explicit gzip_proxied any + gzip_http_version 1.0 without gzip_types compresses ONLY text/html.
         html_only_conf = """
         server {
             listen 80;
             server_name def.example.test;
             gzip on;
             gzip_proxied any;
+            gzip_http_version 1.0;
             location /html/ { proxy_pass http://html.internal:8080; }
         }
         """

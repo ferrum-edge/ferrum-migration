@@ -508,15 +508,22 @@ class _Kong:
             tags = str_list(consumer.get("tags"))
             if tags:
                 sanitized_tags: list[str] = []
+                withheld_tags = 0
                 for raw_tag in tags:
-                    if contains_secret_reference(raw_tag):
-                        continue
                     cleaned = "".join(ch for ch in raw_tag if not unicodedata.category(ch).startswith("C")).strip()
-                    if not cleaned:
+                    if not cleaned or contains_secret_reference(raw_tag) \
+                            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,63}", cleaned) \
+                            or re.search(r"(secret|token|pass|pwd|key|cred|auth|bearer|jwt|private|session|cookie)",
+                                         cleaned, re.I):
+                        withheld_tags += 1
                         continue
-                    redacted = safe_label(cleaned, 128)
+                    redacted = safe_label(cleaned, 64)
                     if redacted and redacted not in sanitized_tags:
                         sanitized_tags.append(redacted)
+                if withheld_tags:
+                    self.report.warning("kong-consumer-tags-withheld", ref,
+                                        f"{withheld_tags} consumer tag(s) contained non-identifier characters or "
+                                        "secret-like terms and were withheld from labels.")
                 joined = ""
                 for tag in sanitized_tags:
                     candidate = f"{joined},{tag}" if joined else tag

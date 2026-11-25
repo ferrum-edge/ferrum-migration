@@ -1153,10 +1153,20 @@ class TraefikHardeningTest(unittest.TestCase):
                         "service": "main",
                         "middlewares": ["gw"],
                     },
+                    "r_reqbuf": {
+                        "rule": "Host(`a.example.test`) && PathPrefix(`/upload/`)",
+                        "service": "main",
+                        "middlewares": ["reqbuf"],
+                    },
                     "r_excl": {
                         "rule": "Host(`a.example.test`) && PathPrefix(`/excl/`)",
                         "service": "mirrored_zero",
                         "middlewares": ["comp_excl"],
+                    },
+                    "r_defmin": {
+                        "rule": "Host(`a.example.test`) && PathPrefix(`/defmin/`)",
+                        "service": "mirrored_passhost",
+                        "middlewares": ["comp_defmin"],
                     },
                 },
                 "middlewares": {
@@ -1167,6 +1177,7 @@ class TraefikHardeningTest(unittest.TestCase):
                             "includedContentTypes": ["application/json", "text/plain"],
                         }
                     },
+                    "comp_defmin": {"compress": {"encodings": ["gzip"]}},
                     "comp_excl": {
                         "compress": {
                             "encodings": ["gzip"],
@@ -1174,7 +1185,8 @@ class TraefikHardeningTest(unittest.TestCase):
                         }
                     },
                     "gw": {"grpcWeb": {"allowOrigins": ["https://app.example.test"]}},
-                    "buf": {"buffering": {"maxRequestBodyBytes": 1048576, "maxResponseBodyBytes": 4194304}},
+                    "buf": {"buffering": {"maxResponseBodyBytes": 4194304}},
+                    "reqbuf": {"buffering": {"maxRequestBodyBytes": 1048576}},
                 },
                 "services": {
                     "mirrored": {
@@ -1192,8 +1204,16 @@ class TraefikHardeningTest(unittest.TestCase):
                             "mirrors": [{"name": "shadow", "percent": 25}],
                         }
                     },
+                    "mirrored_passhost": {
+                        "mirroring": {
+                            "service": "main",
+                            "mirrors": [{"name": "shadow_passhost", "percent": 25}],
+                        }
+                    },
                     "main": {"loadBalancer": {"servers": [{"url": "http://main.internal:8080"}]}},
-                    "shadow": {"loadBalancer": {"servers": [{"url": "http://shadow.internal:9090"}]}},
+                    "shadow": {"loadBalancer": {"passHostHeader": False,
+                                                "servers": [{"url": "http://shadow.internal:9090"}]}},
+                    "shadow_passhost": {"loadBalancer": {"servers": [{"url": "http://shadow.internal:9090"}]}},
                 },
             }
         }
@@ -1206,7 +1226,6 @@ class TraefikHardeningTest(unittest.TestCase):
             "min_content_length": 2048,
             "content_types": ["application/json", "text/plain"],
         })
-        self.assertEqual(plugin(self, result.config, proxy, "request_size_limiting")["config"], {"max_bytes": 1048576})
         self.assertEqual(plugin(self, result.config, proxy, "response_size_limiting")["config"],
                          {"max_bytes": 4194304, "require_buffered_check": True})
         self.assertEqual(plugin(self, result.config, proxy, "request_mirror")["config"], {
@@ -1218,16 +1237,24 @@ class TraefikHardeningTest(unittest.TestCase):
             "mirror_request_body": True,
             "max_mirrored_request_body_bytes": 65536,
         })
-        # Traefik grpcWeb is refused fail-closed (local CORS preflight + allowOrigins boundary).
-        gw_proxy = one_proxy(self, result.config, "/grpc", "a.example.test")
-        self.assertEqual(gw_proxy["labels"]["ferrum-migration/status"], "refused")
+        # Traefik grpcWeb and buffering.maxRequestBodyBytes are refused fail-closed.
+        for refused_path in ("/grpc", "/upload"):
+            self.assertEqual(one_proxy(self, result.config, refused_path, "a.example.test")["labels"][
+                "ferrum-migration/status"], "refused", refused_path)
+        # Omitted minResponseBodyBytes defaults explicitly to Traefik's 1024 bytes; mirror with default
+        # passHostHeader (true) is dropped so Host is never silently changed.
+        defmin = one_proxy(self, result.config, "/defmin", "a.example.test")
+        self.assertEqual(plugin(self, result.config, defmin, "compression")["config"], {
+            "algorithms": ["gzip"], "min_content_length": 1024,
+        })
+        self.assertNotIn("request_mirror", [p["plugin_name"] for p in plugins_of(result.config, defmin)])
         # excludedContentTypes omits compression; maxBodySize=0 drops mirror rather than mirroring 10 MiB.
         excl = one_proxy(self, result.config, "/excl", "a.example.test")
         self.assertEqual(plugins_of(result.config, excl), [])
         self.assertIn("traefik-compress", codes(report, "warning"))
         self.assertIn("traefik-mirroring", codes(report, "warning"))
-        # Invalid media type wildcards (*/*, */json, application/vnd.*+json) are rejected by media-type validator.
-        for bad_ct in ("*/*", "*/json", "application/vnd.*+json"):
+        # Wildcard/invalid media types (*/*, */json, text/*, application/vnd.*+json) omit compression (never widen).
+        for bad_ct in ("*/*", "*/json", "text/*", "application/vnd.*+json"):
             bad_ct_doc = yaml.safe_dump({
                 "http": {
                     "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "main",
