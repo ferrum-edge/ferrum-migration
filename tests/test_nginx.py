@@ -809,8 +809,9 @@ class NginxFrontendScopeTest(unittest.TestCase):
         })
         self.assertIn("nginx-gzip", codes(def_rep, "warning"))
 
-        # gzip_min_length exceeding u64::MAX or Python's int digit limit omits compression cleanly without crashing.
-        for huge_min in ("18446744073709551616", "9" * 4400):
+        # gzip_min_length exceeding u64::MAX, Python's int digit limit, or missing arguments omits compression cleanly.
+        for min_directive in ("gzip_min_length 18446744073709551616;", f"gzip_min_length {'9' * 4400};",
+                              "gzip_min_length;"):
             huge_min_conf = f"""
             server {{
                 listen 80;
@@ -818,13 +819,47 @@ class NginxFrontendScopeTest(unittest.TestCase):
                 gzip on;
                 gzip_proxied any;
                 gzip_http_version 1.0;
-                gzip_min_length {huge_min};
+                {min_directive}
                 location /html/ {{ proxy_pass http://html.internal:8080; }}
             }}
             """
             hm_res, hm_rep, _ = nginx(huge_min_conf)
             self.assertEqual(plugins_of(hm_res.config, one_proxy(self, hm_res.config, "/html", "def.example.test")), [])
             self.assertIn("nginx-gzip", codes(hm_rep, "warning"))
+
+        # Malformed or huge proxy_read_timeout values do not backtrack catastrophically or crash int().
+        for bad_to in ("1" * 37 + "x", "9" * 4400 + "s"):
+            bad_to_conf = f"""
+            server {{
+                listen 80;
+                server_name to.example.test;
+                proxy_read_timeout {bad_to};
+                location /api/ {{ proxy_pass http://api.internal:8080; }}
+            }}
+            """
+            bt_res, _bt_rep, _ = nginx(bad_to_conf)
+            self.assertEqual(one_proxy(self, bt_res.config, "/api", "to.example.test")["labels"][
+                "ferrum-migration/status"], "migrated")
+
+        # Redirect-only plaintext server alongside a wildcard/default plaintext server stays as a refused placeholder
+        # so the broader plaintext server cannot absorb the redirected host's traffic.
+        mixed_redir_conf = """
+        server {
+            listen 80;
+            server_name secure.example.test;
+            return 301 https://$host$request_uri;
+        }
+        server {
+            listen 80 default_server;
+            location / { proxy_pass http://public.internal:8080; }
+        }
+        """
+        mr_res, _mr_rep, _ = nginx(mixed_redir_conf)
+        self.assertEqual(one_proxy(self, mr_res.config, "/", "secure.example.test")["labels"][
+            "ferrum-migration/status"], "refused")
+        catchall = [p for p in proxies(mr_res.config, "/") if "hosts" not in p]
+        self.assertEqual(len(catchall), 1)
+        self.assertEqual(catchall[0]["labels"]["ferrum-migration/status"], "migrated")
 
 
 if __name__ == "__main__":

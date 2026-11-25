@@ -435,6 +435,7 @@ class _Acc:
     allowed_hosts: list[str] | None = None
     resp_size_limited: bool = False
     has_compress: bool = False
+    mutates_origin_header: bool = False
 
 
 class _Traefik:
@@ -732,6 +733,8 @@ class _Traefik:
             self.report.warning("traefik-rule-unsatisfiable", ref, "Rule can never match; not emitted.")
             return
         is_plain_https_redirect = acc.https_redirect and not requires_tls
+        if acc.https_redirect and requires_tls:
+            acc.refusals.append("redirectScheme on a TLS router is not migrated")
         for number, ((kind, path, methods, extra), group) in enumerate(groups.items()):
             spec = RouteSpec(ref=ref if len(groups) == 1 else f"{ref} alternative #{number + 1}",
                              name=name if number == 0 else f"{name}-{number + 1}")
@@ -791,8 +794,9 @@ class _Traefik:
         """
         if not self.https_redirects:
             return
+        has_https = any(spec.requires_tls and not spec.skip for spec in self.plan.routes)
         plaintext = [spec for spec in self.plan.routes if not spec.requires_tls and not spec.skip]
-        if plaintext and all(
+        if has_https and plaintext and all(
             id(spec) in self.https_redirects and not spec.refusals and not spec.plugins
             for spec in plaintext
         ):
@@ -1159,8 +1163,12 @@ class _Traefik:
                                 "allow-list), whereas Ferrum grpc_web forwards unhandled preflights upstream; "
                                 "configure grpc_web and cors manually in Ferrum")
         elif mw_type == "redirectScheme":
-            if config.get("scheme") == "https":
+            raw_port = config.get("port")
+            has_custom_port = raw_port is not None and raw_port != ""
+            if config.get("scheme") == "https" and not has_custom_port:
                 acc.https_redirect = True
+            elif config.get("scheme") == "https":
+                acc.refusals.append("redirectScheme with a custom port cannot be folded into Ferrum's TLS-only profile")
             else:
                 acc.refusals.append("redirectScheme to a scheme other than https")
         elif mw_type == "retry":
@@ -1260,7 +1268,8 @@ class _Traefik:
                 acc.refusals.append(f"headers.{key} is not supported")
                 return
         request_rules, response_rules = [], []
-        for header, value in mapping(config.get("customRequestHeaders")).items():
+        custom_req = mapping(config.get("customRequestHeaders"))
+        for header, value in custom_req.items():
             if value == "":
                 rule, problem = request_header_rule("remove", header)
             else:
@@ -1329,7 +1338,10 @@ class _Traefik:
                 ))
             )
             if has_cors:
-                if config.get("accessControlAllowOriginListRegex"):
+                if acc.mutates_origin_header:
+                    acc.refusals.append("an earlier headers middleware removes or rewrites the Origin request header "
+                                        "before CORS, whereas Ferrum runs cors before request_transformer")
+                elif config.get("accessControlAllowOriginListRegex"):
                     acc.refusals.append("headers.accessControlAllowOriginListRegex answers CORS preflights locally and "
                                         "cannot be migrated (omitting would forward preflights to the backend)")
                 else:
@@ -1366,6 +1378,8 @@ class _Traefik:
                         else:
                             acc.refusals.append(f"headers CORS policy answers preflights locally and cannot be "
                                                 f"migrated ({problem})")
+        if any(str(header).lower() == "origin" for header in custom_req):
+            acc.mutates_origin_header = True
         if config.get("allowedHosts"):
             hosts = [host.lower() for host in (str_list(config.get("allowedHosts")) or [])]
             # Every headers middleware in the chain checks its own list, so a request must pass all of them:
@@ -1683,14 +1697,18 @@ class _Traefik:
         return result
 
     def _health(self, health: dict, backend_scheme: str, ref: str) -> dict | None:
-        if not health or not isinstance(health.get("path"), str):
+        if not health:
             return None
         raw_mode = health.get("mode")
         if raw_mode is not None and (not isinstance(raw_mode, str) or raw_mode.lower() != "http"):
             self.report.warning("traefik-health", ref,
                                 "Active health check uses non-HTTP mode (such as grpc); omitted.")
             return None
-        http_path = health["path"]
+        http_path = health.get("path")
+        if not isinstance(http_path, str) or not http_path:
+            self.report.warning("traefik-health", ref,
+                                "Active health check omits a valid HTTP path; omitted.")
+            return None
         if not http_path.startswith("/") or len(http_path.encode("utf-8")) > util.MAX_BACKEND_PATH_LENGTH \
                 or any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in http_path):
             self.report.warning("traefik-health", ref,

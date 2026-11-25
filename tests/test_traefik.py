@@ -1820,6 +1820,49 @@ class TraefikHardeningTest(unittest.TestCase):
                     "serversTransports": {"t": {"forwardingTimeouts": {"dialTimeout": "0.25"}}},
                 }
             }),
+            ("transport-compound-subms-truncation", {
+                "http": {
+                    "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "main"}},
+                    "services": {"main": {"loadBalancer": {"serversTransport": "t",
+                                                           "servers": [{"url": "http://main.internal:8080"}]}}},
+                    "serversTransports": {"t": {"forwardingTimeouts": {"dialTimeout": "999999ns0.6ns0.6ns"}}},
+                }
+            }),
+            ("transport-decimal-overflow-timeout", {
+                "http": {
+                    "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "main"}},
+                    "services": {"main": {"loadBalancer": {"serversTransport": "t",
+                                                           "servers": [{"url": "http://main.internal:8080"}]}}},
+                    "serversTransports": {"t": {"forwardingTimeouts": {"dialTimeout": "9" * 5000 + "s"}}},
+                }
+            }),
+            ("headers-strip-origin-before-cors", {
+                "http": {
+                    "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "main",
+                                      "middlewares": ["strip_origin", "cors_mw"]}},
+                    "middlewares": {
+                        "strip_origin": {"headers": {"customRequestHeaders": {"Origin": ""}}},
+                        "cors_mw": {"headers": {"accessControlAllowOriginList": ["https://app.example.test"]}},
+                    },
+                    "services": {"main": {"loadBalancer": {"servers": [{"url": "http://main.internal:8080"}]}}},
+                }
+            }),
+            ("redirect-scheme-custom-port-on-tls", {
+                "http": {
+                    "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "main",
+                                      "tls": {}, "middlewares": ["redir"]}},
+                    "middlewares": {"redir": {"redirectScheme": {"scheme": "https", "port": "9443"}}},
+                    "services": {"main": {"loadBalancer": {"servers": [{"url": "http://main.internal:8080"}]}}},
+                }
+            }),
+            ("redirect-scheme-only-without-https-router", {
+                "http": {
+                    "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "main",
+                                      "middlewares": ["redir"]}},
+                    "middlewares": {"redir": {"redirectScheme": {"scheme": "https"}}},
+                    "services": {"main": {"loadBalancer": {"servers": [{"url": "http://main.internal:8080"}]}}},
+                }
+            }),
         ):
             with self.subTest(case=label):
                 res_bad, _rep_bad, _ = asserted(yaml.safe_dump(bad_doc))
@@ -1892,6 +1935,19 @@ class TraefikHardeningTest(unittest.TestCase):
         oc_res, oc_rep, _ = asserted(over_comp_doc)
         self.assertEqual(plugins_of(oc_res.config, one_proxy(self, oc_res.config, "/api", "a.example.test")), [])
         self.assertIn("traefik-compress", codes(oc_rep, "warning"))
+        # Pathless gRPC healthCheck emits a traefik-health warning instead of silently disappearing.
+        grpc_hc_doc = yaml.safe_dump({
+            "http": {
+                "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "main"}},
+                "services": {"main": {"loadBalancer": {
+                    "healthCheck": {"mode": "grpc"},
+                    "servers": [{"url": "http://main.internal:8080"}],
+                }}},
+            }
+        })
+        ghc_res, ghc_rep, _ = asserted(grpc_hc_doc)
+        self.assertEqual(ghc_res.config["upstreams"], [])
+        self.assertIn("traefik-health", codes(ghc_rep, "warning"))
         # Canonical schema gate checks newly supported compress/grpcWeb/mirror/v3.8 fields.
         for bad_case in (
             {"http": {"middlewares": {"c": {"compress": {"Encodings": ["gzip"]}}}}},

@@ -859,6 +859,26 @@ def has_explicit_default_origin_port(origin: str) -> bool:
     return False
 
 
+def has_leading_zero_origin_port(origin: str) -> bool:
+    """Whether an ``http(s)://`` origin specifies a zero-padded port (such as ``:08443``)."""
+    lower = origin.lower()
+    if lower.startswith("http://"):
+        authority = origin[7:]
+    elif lower.startswith("https://"):
+        authority = origin[8:]
+    else:
+        return False
+    if authority.startswith("["):
+        end = authority.find("]")
+        rest = authority[end + 1:] if end >= 0 else ""
+        port_text = rest[1:] if rest.startswith(":") else ""
+    elif authority.count(":") == 1:
+        _, _, port_text = authority.partition(":")
+    else:
+        port_text = ""
+    return len(port_text) > 1 and port_text.startswith("0")
+
+
 def cors_config(origins: Any, methods: Any = None, headers: Any = None, exposed: Any = None,
                 credentials: Any = None, max_age: Any = None, preflight_continue: Any = None,
                 private_network: Any = None, unmatched_preflights: str | None = None) -> tuple[dict | None, str | None]:

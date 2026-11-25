@@ -20,8 +20,9 @@ from ..model import BackendRef, ConsumerSpec, Plan, PluginSpec, RouteSpec, Targe
 from ..redact import contains_secret_reference, safe_label
 from ..safe_load import load_structured
 from .common import (SourceContext, check_route_budget, correlation_id_header_ok, cors_config,
-                     has_explicit_default_origin_port, header_name_ok, header_value_ok, is_canonical_http_origin,
-                     mapping, query_rule, request_header_rule, response_header_rule, seq, str_list)
+                     has_explicit_default_origin_port, has_leading_zero_origin_port, header_name_ok, header_value_ok,
+                     is_canonical_http_origin, mapping, query_rule, request_header_rule, response_header_rule, seq,
+                     str_list)
 
 PLATFORM = "kong"
 HTTP_PROTOCOLS = {"http", "https", "grpc", "grpcs", "ws", "wss"}
@@ -652,8 +653,8 @@ class _Kong:
                     if self.global_correlation_id is None:
                         self.global_correlation_id = (plugin, outcome[1])
                 elif plugin.name == "cors":
-                    # Resolve global cors per route so an omitted scoped override (e.g. preflight_continue: true
-                    # with regex origins) never lets a broader global Ferrum CORS plugin activate on that route.
+                    # Resolve global cors per route so scoped cors overrides (or refusals) apply cleanly without
+                    # leaking global cors onto routes with their own policy.
                     if self.global_cors is None:
                         self.global_cors = outcome[1]
                 else:
@@ -1070,7 +1071,11 @@ class _Kong:
                 spec.refuse(auth_composition)
             if termination is not None:
                 spec.termination = termination
-                if plugins:
+                if any(p.name == "cors" for p in plugins):
+                    spec.refuse("route combines cors with request-termination; Kong runs cors before "
+                                "request-termination (answering preflights), whereas Ferrum request_termination "
+                                "answers before cors")
+                elif plugins:
                     self.report.warning("kong-termination-order", spec.ref,
                                         "Ferrum's request_termination runs before authentication, so callers get the "
                                         "termination response without authenticating first.")
@@ -1258,6 +1263,7 @@ def _kong_cors(self: _Kong, config: dict, ref: str) -> tuple:
     if raw_origins is not None and origins is None:
         return ("refuse", "CORS origins has unexpected types")
     origins = origins or ["*"]
+    single_origin = len(origins) == 1
     ferrum_origins: list[Any] = []
     for origin in origins:
         if origin == "*":
@@ -1272,19 +1278,22 @@ def _kong_cors(self: _Kong, config: dict, ref: str) -> tuple:
         if not is_canonical_http_origin(origin):
             return ("refuse", "CORS origin is not a canonical http(s)://host[:port] URL or 'null'; Kong's loose "
                               "host/URL origin matching cannot be proven equivalent in Ferrum")
-        # Plain-string Ferrum origins canonicalize default ports (:80/:443) and case, whereas Kong compares
-        # single-origin literals verbatim; wrap explicit default-port or non-lowercase origins as {'exact': ...}.
-        if has_explicit_default_origin_port(origin) or origin != origin.lower():
+        # In Kong, a single-origin literal is emitted verbatim (so default ports like :443 or zero-padded ports
+        # like :08443 are NOT normalized), whereas multi-origin lists parse URLs (stripping default ports and
+        # normalizing numeric ports). Match both behaviors cleanly.
+        if (single_origin and (has_explicit_default_origin_port(origin) or has_leading_zero_origin_port(origin))) \
+                or origin != origin.lower():
             ferrum_origins.append({"exact": origin})
         else:
             ferrum_origins.append(origin)
     methods = _KONG_DEFAULT_CORS_METHODS if config.get("methods") is None else config.get("methods")
-    if config.get("headers") is None:
+    raw_headers = config.get("headers")
+    if raw_headers is None or raw_headers == []:
         self.report.warning("kong-cors-headers", ref, "Kong reflected requested headers; Ferrum allows its default "
                             "header list (stricter).")
         headers: Any = _FERRUM_DEFAULT_CORS_HEADERS
     else:
-        headers = config.get("headers")
+        headers = raw_headers
     # Use unmatched_preflights='ignore' so unmatched normal requests forward without 403 (matching Kong),
     # unmatched preflights are answered locally without CORS headers, and explicit empty lists (methods: [])
     # stay empty instead of inheriting Ferrum's native defaults.

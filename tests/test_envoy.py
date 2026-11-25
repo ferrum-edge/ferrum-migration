@@ -1313,6 +1313,23 @@ class EnvoyHardeningTest(unittest.TestCase):
                 self.assertEqual(plugin(self, ns_res.config, ns_p, "cors")["config"]["allowed_origins"],
                                  [{"regex": non_star_rx}])
 
+        # Pure plaintext redirect vhost alongside a plaintext wildcard vhost stays as a refused placeholder so
+        # plaintext traffic for the redirected host cannot fall through to the wildcard backend.
+        mixed_redir = minimal_bootstrap({"prefix": "/"})
+        mrhcm = mixed_redir["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"]
+        mrhcm["route_config"]["virtual_hosts"] = [
+            {"name": "redir_vh", "domains": ["secure.example.test"],
+             "routes": [{"name": "r", "match": {"prefix": "/"}, "redirect": {"https_redirect": True}}]},
+            {"name": "catchall_vh", "domains": ["*"],
+             "routes": [{"name": "c", "match": {"prefix": "/"}, "route": {"cluster": "c"}}]},
+        ]
+        mr_res = migrate("envoy", yaml.safe_dump(mixed_redir))[0]
+        self.assertEqual(one_proxy(self, mr_res.config, "/", "secure.example.test")["labels"][
+            "ferrum-migration/status"], "refused")
+        catchall = [p for p in proxies(mr_res.config, "/") if "hosts" not in p]
+        self.assertEqual(len(catchall), 1)
+        self.assertEqual(catchall[0]["labels"]["ferrum-migration/status"], "migrated")
+
 
 if __name__ == "__main__":
     unittest.main()

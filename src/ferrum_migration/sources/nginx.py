@@ -225,6 +225,7 @@ class _Nginx:
         self.zones: dict[str, dict] = {}
         self.body_sizes: list[tuple[RouteSpec, int]] = []
         self.catch_all_routes: dict[int, list[RouteSpec]] = {}
+        self.redirect_servers: list[tuple[str, dict, dict, list[RouteSpec]]] = []
 
     # --------------------------------------------------------- scope merge
 
@@ -284,8 +285,8 @@ class _Nginx:
                 gzip_level = util.as_int(args[0])
                 if gzip_level is not None and 1 <= gzip_level <= 9:
                     child.gzip_comp_level = gzip_level
-            elif name == "gzip_min_length" and args:
-                length = util.parse_nginx_size(args[0])
+            elif name == "gzip_min_length":
+                length = util.parse_nginx_size(args[0]) if args else None
                 child.gzip_min_length = length if (length is not None and length >= 0) else -1
             elif name == "gzip_types" and args:
                 child.gzip_types = list(args)
@@ -351,6 +352,7 @@ class _Nginx:
         self._elect_ports(infos)
         for info in infos:
             self._translate_server(info)
+        self._resolve_https_redirects()
         self._apply_ssl_reject_handshake(infos)
         self._refuse_conflicting_defaults()
         # Each route records the main listeners its server was served on (RouteSpec.protocols). The emitter keeps a
@@ -557,9 +559,11 @@ class _Nginx:
             scope.problems.append("an 'if' block is not supported")
         if server_return is not None:
             if _is_https_redirect(server_return.args) and not tls_ports:
-                settings.https_redirect_seen = True
-                self.report.info("nginx-https-redirect", ref, "HTTP-to-HTTPS redirect server: not emitted; Ferrum's "
-                                 "TLS-only profile disables the plaintext listener instead.")
+                route = self._new_route(base, "/", "prefix", ref + " return")
+                self._apply_return(route, server_return.args)
+                for problem in scope.problems:
+                    route.refuse(problem)
+                self.redirect_servers.append((ref, info, base, [route]))
                 return
             route = self._new_route(base, "/", "prefix", ref + " return")
             self._apply_return(route, server_return.args)
@@ -579,8 +583,7 @@ class _Nginx:
                 routes.append(route)
         if all(route.termination and _is_https_redirect_termination(route.termination) for route in routes) \
                 and routes and not tls_ports:
-            settings.https_redirect_seen = True
-            self.report.info("nginx-https-redirect", ref, "HTTP-to-HTTPS redirect server: not emitted.")
+            self.redirect_servers.append((ref, info, base, routes))
             return
         _check_precedence(routes)
         self.plan.routes.extend(routes)
@@ -592,6 +595,42 @@ class _Nginx:
         """Remember port-agnostic catch-all routes per server (checked for conflicting defaults in run())."""
         if base["hosts"] == [] and base["listen_port"] is None and routes:
             self.catch_all_routes.setdefault(info["index"], []).extend(routes)
+
+    def _resolve_https_redirects(self) -> None:
+        """Fold plaintext HTTP-to-HTTPS redirect servers away only when no other main plaintext routes exist.
+
+        If another plaintext server keeps Ferrum's HTTP listener open, no HTTPS server exists in the input, or a
+        redirect server carries refusals or plugins, keep its routes as fail-closed refused placeholders so a
+        broader wildcard/default plaintext server cannot absorb the redirected host's traffic.
+        """
+        if not self.redirect_servers:
+            return
+        has_https = any(not r.skip and (r.requires_tls or "https" in (r.protocols or ())) for r in self.plan.routes)
+        has_other_plain = any(not r.skip and not r.requires_tls and r.listen_port is None for r in self.plan.routes)
+        can_fold = (
+            has_https
+            and not has_other_plain
+            and all(
+                base["listen_port"] is None and not base["extra"]
+                and all(not r.refusals and not r.plugins for r in routes)
+                for _, _, base, routes in self.redirect_servers
+            )
+        )
+        if can_fold:
+            self.plan.settings.https_redirect_seen = True
+            for ref, _, _, _ in self.redirect_servers:
+                self.report.info("nginx-https-redirect", ref, "HTTP-to-HTTPS redirect server: not emitted; Ferrum's "
+                                 "TLS-only profile disables the plaintext listener instead.")
+            return
+        for ref, info, base, routes in self.redirect_servers:
+            for route in routes:
+                route.refuse("HTTP-to-HTTPS redirect server cannot be folded away alongside other plaintext routes, "
+                             "without an HTTPS server, or with local policies/errors")
+            _check_precedence(routes)
+            self.plan.routes.extend(routes)
+            self._note_catch_all(info, base, routes)
+            if base["hosts"]:
+                self.plan.host_scopes.append(HostScope(ref, list(base["hosts"]), base["listen_port"]))
 
     def _apply_ssl_reject_handshake(self, infos: list[dict]) -> None:
         """If any server on the main TLS listener enables ssl_reject_handshake, refuse every HTTPS route."""

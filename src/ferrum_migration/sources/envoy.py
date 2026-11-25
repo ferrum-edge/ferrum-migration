@@ -180,6 +180,7 @@ class _Envoy:
         self.plan = Plan(platform=PLATFORM)
         self.clusters: dict[str, dict] = {}
         self.has_runtime = bool(root.get("layered_runtime") or root.get("runtime"))
+        self.redirect_vhosts: list[tuple[str, list[str] | None, int | None, list[RouteSpec]]] = []
         self._cors_origin_cache: dict[int, tuple[Any, list[Any], str | None, str]] = {}
         self._cors_config_cache: dict[tuple, tuple[Any, dict | None, str | None]] = {}
 
@@ -201,6 +202,7 @@ class _Envoy:
         self._elect_ports(infos)
         for info in infos:
             self._listener(info)
+        self._resolve_https_redirects()
         # Each route records its one source frontend (RouteSpec.protocols). The emitter keeps a plaintext
         # listener's routes off Ferrum's HTTPS listener (and vice versa) for every host, which also covers TLS
         # listeners that were skipped (RDS, filter_chain_match) after their port and certificate were recorded.
@@ -516,9 +518,8 @@ class _Envoy:
                 for hp in shared.get("hcm_plugins", []):
                     spec.plugins.append(PluginSpec(hp.name, hp.config, hp.ref))
             routes.append(spec)
-        if not tls and routes and all(getattr(r, "https_redirect", False) and not r.refusals for r in routes):
-            self.plan.settings.https_redirect_seen = True
-            self.report.info("envoy-https-redirect", ref, "HTTP-to-HTTPS redirect virtual host: not emitted.")
+        if not tls and routes and all(getattr(r, "https_redirect", False) for r in routes):
+            self.redirect_vhosts.append((ref, hosts, listen_port, routes))
             return
         for route in routes:
             if getattr(route, "https_redirect", False):
@@ -531,6 +532,38 @@ class _Envoy:
         self.plan.routes.extend(routes)
         if hosts:
             self.plan.host_scopes.append(HostScope(ref, list(hosts), listen_port))
+
+    def _resolve_https_redirects(self) -> None:
+        """Fold plaintext HTTP-to-HTTPS redirect virtual hosts away only when no other main plaintext routes exist."""
+        if not self.redirect_vhosts:
+            return
+        has_https = any(not r.skip and (r.requires_tls or "https" in (r.protocols or ())) for r in self.plan.routes)
+        has_other_plain = any(not r.skip and not r.requires_tls and r.listen_port is None for r in self.plan.routes)
+        can_fold = (
+            has_https
+            and not has_other_plain
+            and all(
+                listen_port is None and all(not r.refusals and not r.plugins for r in routes)
+                for _, _, listen_port, routes in self.redirect_vhosts
+            )
+        )
+        if can_fold:
+            self.plan.settings.https_redirect_seen = True
+            for ref, _, _, _ in self.redirect_vhosts:
+                self.report.info("envoy-https-redirect", ref,
+                                 "HTTP-to-HTTPS redirect virtual host: not emitted; Ferrum's TLS-only profile "
+                                 "disables the plaintext listener instead.")
+            return
+        for ref, hosts, listen_port, routes in self.redirect_vhosts:
+            for route in routes:
+                route.skip = False
+                route.skip_reason = ""
+                route.refuse("HTTP-to-HTTPS redirect virtual host cannot be folded away alongside other plaintext "
+                             "routes, without an HTTPS listener, or with local filters/errors")
+            apply_first_match_order(routes, self.report)
+            self.plan.routes.extend(routes)
+            if hosts:
+                self.plan.host_scopes.append(HostScope(ref, list(hosts), listen_port))
 
     # ------------------------------------------------------------------ routes
 

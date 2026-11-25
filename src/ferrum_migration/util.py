@@ -9,7 +9,7 @@ problem so the caller can refuse it instead of emitting an invalid route.
 from __future__ import annotations
 
 import hashlib
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, DecimalException
 import ipaddress
 import math
 import re
@@ -445,7 +445,7 @@ def parse_go_duration_ns(value: object, *, allow_unitless_float: bool = True) ->
             return None
         try:
             dec_f = Decimal(str(value)) * Decimal(1_000_000_000)
-        except (InvalidOperation, ValueError, OverflowError):
+        except (DecimalException, ValueError, OverflowError):
             return None
         if dec_f < 0 or dec_f > _MAX_DURATION_NS:
             return None
@@ -471,7 +471,7 @@ def parse_go_duration_ns(value: object, *, allow_unitless_float: bool = True) ->
     if allow_unitless_float and num_body and num_body.isascii() and num_body.isdigit():
         try:
             dec = Decimal(unsigned) * Decimal(1_000_000_000)
-        except (InvalidOperation, ValueError):
+        except (DecimalException, ValueError, OverflowError):
             return None
         if dec == 0:
             return 0
@@ -480,25 +480,26 @@ def parse_go_duration_ns(value: object, *, allow_unitless_float: bool = True) ->
         return int(dec)
     if not _GO_DURATION.match(text):
         return None
-    total = Decimal(0)
+    total_ns = 0
     any_nonzero = False
     for number, unit in _GO_PART.findall(unsigned):
         if any(ch != "0" and ch != "." for ch in number):
             any_nonzero = True
         try:
             part = Decimal(number) * _GO_UNIT_NS[unit]
-        except (InvalidOperation, ValueError):
+        except (DecimalException, ValueError, OverflowError):
             return None
-        if part < 0:
+        if part < 0 or part > _MAX_DURATION_NS:
             return None
-        total += part
-        if total > _MAX_DURATION_NS:
+        # Go time.ParseDuration truncates each component's fractional nanoseconds before summing.
+        total_ns += int(part)
+        if total_ns > _MAX_DURATION_NS:
             return None
     if not any_nonzero:
         return 0
     if neg:
         return None
-    return int(total)
+    return total_ns
 
 
 def classify_go_duration(value: object, *, allow_unitless_float: bool = True) -> str:
@@ -533,7 +534,7 @@ def proto_duration_ms(value: object) -> int | None:
             return None
         return seconds * 1000 + nanos // 1_000_000
     if isinstance(value, str):
-        match = re.fullmatch(r"(\d+(?:\.\d+)?)s", value.strip())
+        match = re.fullmatch(r"(\d+(?:\.\d+)?)s", value.strip(), re.ASCII)
         if match:
             try:
                 secs = float(match.group(1))
@@ -546,19 +547,32 @@ def proto_duration_ms(value: object) -> int | None:
     return None
 
 
-_NGINX_TIME = re.compile(r"^(?:\d+(?:ms|s|m|h|d|w|M|y)?)+$")
-_NGINX_TIME_PART = re.compile(r"(\d+)(ms|s|m|h|d|w|M|y)?")
+_NGINX_TIME_PART = re.compile(r"(\d+)(ms|s|m|h|d|w|M|y)?", re.ASCII)
 _NGINX_TIME_MS = {"ms": 1, "s": 1000, None: 1000, "m": 60_000, "h": 3_600_000, "d": 86_400_000,
                   "w": 604_800_000, "M": 2_592_000_000, "y": 31_536_000_000}
 
 
 def parse_nginx_time_ms(value: object) -> int | None:
-    if not isinstance(value, str) or not _NGINX_TIME.match(value.strip()):
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
         return None
     total = 0
-    for number, unit in _NGINX_TIME_PART.findall(value.strip()):
-        total += int(number) * _NGINX_TIME_MS[unit or None]
-    return total
+    pos = 0
+    for match in _NGINX_TIME_PART.finditer(text):
+        if match.start() != pos:
+            return None
+        if match.group(2) is None and match.end() != len(text):
+            return None
+        try:
+            total += int(match.group(1)) * _NGINX_TIME_MS[match.group(2) or None]
+        except ValueError:
+            return None
+        if total > _MAX_DURATION_MS:
+            return None
+        pos = match.end()
+    return total if pos == len(text) else None
 
 
 def parse_nginx_size(value: object) -> int | None:

@@ -95,6 +95,7 @@ class _Istio:
                            self.ctx.limits)
         for vs in self.virtual_services:
             self._virtual_service(vs)
+        self._resolve_https_redirects()
         self._check_frontend_scopes()
         check_route_budget(len(self.plan.routes), self.ctx.limits)
         return self.plan
@@ -285,9 +286,6 @@ class _Istio:
                                   "Run a separate Ferrum instance bound to that address for these routes.")
                 continue
             if server["redirect"]:
-                settings.https_redirect_seen = True
-                self.report.info("istio-https-redirect", server["ref"], "httpsRedirect server: not emitted; the "
-                                 "TLS-only profile disables the plaintext listener instead.")
                 continue
             refusal = None
             client_ca = None
@@ -360,6 +358,69 @@ class _Istio:
             })
             if hosts:
                 self.plan.host_scopes.append(HostScope(f"{ref} via {safe_label(gateway_ref)}", list(hosts), listen_port))
+
+    def _resolve_https_redirects(self) -> None:
+        """Fold Gateway ``httpsRedirect`` servers away only when no other main plaintext routes exist.
+
+        Istio enforces ``httpsRedirect: true`` at the Gateway server level before VirtualService routing. If another
+        plaintext route keeps Ferrum's HTTP listener open or no HTTPS route exists, emit a fail-closed refused
+        placeholder for each redirect server's host scope so a broader wildcard plaintext route cannot absorb its
+        traffic.
+        """
+        settings = self.plan.settings
+        redirects: list[tuple[tuple[str, str], int, dict, list[str]]] = []
+        for (gw_ns, gw_name), gateway in self.gateways.items():
+            for srv_idx, server in enumerate(self._servers(gateway), start=1):
+                if not server["redirect"]:
+                    continue
+                if server["protocol"] not in ("HTTP", "HTTP2", "GRPC"):
+                    continue
+                if server["bind"] and server["bind"] != self.shared_bind:
+                    continue
+                stripped: list[str] = []
+                any_host = False
+                for entry in server["hosts"]:
+                    _, _, host = entry.rpartition("/")
+                    host = host.lower().strip()
+                    if host == "*":
+                        any_host = True
+                    elif host and host not in stripped:
+                        stripped.append(host)
+                if not any_host and not stripped:
+                    continue
+                redirects.append(((gw_ns, gw_name), srv_idx, server, [] if any_host else stripped))
+        if not redirects:
+            return
+        has_https = any(not r.skip and (r.requires_tls or "https" in (r.protocols or ())) for r in self.plan.routes)
+        has_other_plain = any(not r.skip and not r.requires_tls and r.listen_port is None for r in self.plan.routes)
+        can_fold = (
+            has_https
+            and not has_other_plain
+            and all(server["port"] == settings.main_http_port for _, _, server, _ in redirects)
+        )
+        if can_fold:
+            settings.https_redirect_seen = True
+            for _, _, server, _ in redirects:
+                self.report.info("istio-https-redirect", server["ref"], "httpsRedirect server: not emitted; the "
+                                 "TLS-only profile disables the plaintext listener instead.")
+            return
+        for (gw_ns, gw_name), srv_idx, server, hosts in redirects:
+            listen_port = None if server["port"] == settings.main_http_port else server["port"]
+            route = RouteSpec(
+                ref=server["ref"],
+                name=f"{gw_ns}-{gw_name}-https-redirect-{srv_idx}",
+                hosts=list(hosts),
+                kind="prefix",
+                path="/",
+                listen_port=listen_port,
+                requires_tls=False,
+                protocols=frozenset() if listen_port is not None else frozenset({"http"}),
+            )
+            route.refuse("Gateway httpsRedirect server cannot be folded away alongside other plaintext routes or "
+                         "without an HTTPS server")
+            self.plan.routes.append(route)
+            if hosts:
+                self.plan.host_scopes.append(HostScope(server["ref"], list(hosts), listen_port))
 
     def _check_frontend_scopes(self) -> None:
         """Refuse overlapping projections from different bindings whose source frontends differ.

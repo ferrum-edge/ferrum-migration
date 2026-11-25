@@ -1243,6 +1243,36 @@ class IstioCaseAndNamesTest(unittest.TestCase):
         self.assertEqual(plugins_of(hp_res.config, hp_api), [])
         self.assertIn("istio-dropped", codes(hp_rep, "warning"))
 
+        # Gateway httpsRedirect server alongside a wildcard plaintext server stays as a refused placeholder so
+        # plaintext traffic for the redirected host cannot fall through to the wildcard backend.
+        mixed_redir = textwrap.dedent("""
+            apiVersion: networking.istio.io/v1
+            kind: Gateway
+            metadata: {name: gw, namespace: default}
+            spec:
+              servers:
+                - port: {number: 80, name: http-redir, protocol: HTTP}
+                  hosts: ["*/secure.example.test"]
+                  tls: {httpsRedirect: true}
+                - port: {number: 80, name: http-pub, protocol: HTTP}
+                  hosts: ["*/*.example.test"]
+            ---
+            apiVersion: networking.istio.io/v1
+            kind: VirtualService
+            metadata: {name: vs, namespace: default}
+            spec:
+              hosts: ["*.example.test"]
+              gateways: [gw]
+              http:
+                - match: [{uri: {prefix: /}}]
+                  route: [{destination: {host: pub.default.svc.cluster.local, port: {number: 8080}}}]
+        """)
+        mr_res = migrate("istio", mixed_redir)[0]
+        self.assertEqual(one_proxy(self, mr_res.config, "/", "secure.example.test")["labels"][
+            "ferrum-migration/status"], "refused")
+        self.assertEqual(one_proxy(self, mr_res.config, "/", "*.example.test")["labels"][
+            "ferrum-migration/status"], "migrated")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -516,8 +516,9 @@ class KongHardeningTest(unittest.TestCase):
         assert_structurally_valid(self, alt_res.config)
         self.assertEqual(one_proxy(self, alt_res.config, "~/a|/b")["labels"]["ferrum-migration/status"], "refused")
         # Untranslatable CORS (malformed origins, regex origins, preflight_continue: true, host-only/bare-IPv6
-        # origins) refuses fail-closed; 'null' and explicit default-port origins ('https://app.example.test:443')
-        # wrap as {'exact': ...}; explicit methods: [] stays empty under unmatched_preflights: ignore.
+        # origins, or cors combined with request-termination) refuses fail-closed; single-origin default/leading-zero
+        # ports wrap as {'exact': ...}, while multi-origin canonical lowercase URLs stay plain strings (matching
+        # Kong's url.parse normalization); explicit methods: [] stays empty and headers: [] warns + defaults.
         cors_text = textwrap.dedent("""
             _format_version: "3.0"
             plugins:
@@ -547,17 +548,29 @@ class KongHardeningTest(unittest.TestCase):
                     plugins:
                       - name: cors
                         config: {origins: ["http://::1"]}
+                  - name: bad-cors-term
+                    paths: [/term/]
+                    plugins:
+                      - name: cors
+                        config: {origins: ["https://ok.example.test"]}
+                      - name: request-termination
+                        config: {status_code: 410, message: gone}
                   - name: null-and-default-port
                     paths: [/exact/]
                     plugins:
                       - name: cors
-                        config: {origins: ["null", "https://app.example.test:443"], methods: [], credentials: false}
+                        config: {origins: ["null", "https://app.example.test:443"], methods: [], headers: [], credentials: false}
+                  - name: single-leading-zero-port
+                    paths: [/zport/]
+                    plugins:
+                      - name: cors
+                        config: {origins: ["https://app.example.test:08443"], credentials: false}
                   - name: inherits-global
                     paths: [/g/]
         """)
-        cors_res, _cors_rep, _ = migrate("kong", cors_text)
+        cors_res, cors_rep, _ = migrate("kong", cors_text)
         assert_structurally_valid(self, cors_res.config)
-        for refused_path in ("/c", "/cp", "/host", "/v6"):
+        for refused_path in ("/c", "/cp", "/host", "/v6", "/term"):
             self.assertEqual(one_proxy(self, cors_res.config, refused_path)["labels"]["ferrum-migration/status"],
                              "refused", refused_path)
         self.assertFalse(any(p["plugin_name"] == "cors" and p["scope"] == "global"
@@ -565,9 +578,14 @@ class KongHardeningTest(unittest.TestCase):
         exact_p = one_proxy(self, cors_res.config, "/exact")
         exact_cors = plugin(self, cors_res.config, exact_p, "cors")["config"]
         self.assertEqual(exact_cors["allowed_origins"],
-                         [{"exact": "null"}, {"exact": "https://app.example.test:443"}])
+                         [{"exact": "null"}, "https://app.example.test:443"])
         self.assertEqual(exact_cors["unmatched_preflights"], "ignore")
         self.assertNotIn("allowed_methods", exact_cors)
+        self.assertIn("authorization", exact_cors["allowed_headers"])
+        self.assertIn("kong-cors-headers", codes(cors_rep, "warning"))
+        zport_p = one_proxy(self, cors_res.config, "/zport")
+        self.assertEqual(plugin(self, cors_res.config, zport_p, "cors")["config"]["allowed_origins"],
+                         [{"exact": "https://app.example.test:08443"}])
         g_p = one_proxy(self, cors_res.config, "/g")
         g_cors = plugin(self, cors_res.config, g_p, "cors")["config"]
         self.assertEqual(g_cors["allowed_origins"], ["https://global.example.test"])
