@@ -353,6 +353,7 @@ class _Envoy:
         buffer_limit = None
         hcm_plugins: list[PluginSpec] = []
         hcm_fault: PluginSpec | None = None
+        hcm_fault_error: str | None = None
         hcm_filter_kinds: dict[str, str] = {}
         fault_filter_count = 0
         cors_filter_count = 0
@@ -420,7 +421,7 @@ class _Envoy:
                     self.report.info("envoy-fault-noop", ref,
                                      "Envoy fault filter has 0% abort/delay probability (inert); omitted.")
                 else:
-                    filter_refusal = f"HTTP filter fault cannot be migrated ({fault_val})"
+                    hcm_fault_error = f"HTTP filter fault cannot be migrated ({fault_val})"
             elif kind == "jwt_authn":
                 filter_refusal = ("HTTP filter jwt_authn is not auto-migrated: Ferrum jwks_auth requires every JWT "
                                   "header to include a matching kid (whereas Envoy verifies kid-less tokens) and "
@@ -437,6 +438,7 @@ class _Envoy:
                   "hcm_filter_kinds": hcm_filter_kinds,
                   "hcm_plugins": hcm_plugins,
                   "hcm_fault": hcm_fault,
+                  "hcm_fault_error": hcm_fault_error,
                   "fault_index": fault_index,
                   "cors_index": cors_index}
         for index, vhost in enumerate(seq(route_config.get("virtual_hosts"))):
@@ -559,7 +561,12 @@ class _Envoy:
         # re-enable an authentication filter for this route only. Resolve every key against hcm_filter_kinds and its
         # override @type rather than matching substrings on the filter name.
         hcm_filter_kinds: dict[str, str] = shared.get("hcm_filter_kinds", {})
-        effective_fault: PluginSpec | None = shared.get("hcm_fault")
+        # Resolve the winning fault configuration (most-specific of route > vhost > route_config > HCM)
+        # before translating or refusing it, so disabling fault on a route clears an untranslatable parent fault.
+        winning_fault: tuple[str, Any] = (
+            ("hcm_error", shared["hcm_fault_error"]) if shared.get("hcm_fault_error")
+            else ("hcm_plugin", shared.get("hcm_fault"))
+        )
         for source, label in ((shared, "route configuration"), (vhost, "virtual host"), (raw, "route")):
             per_filter = mapping(source.get("typed_per_filter_config"))
             others = []
@@ -587,7 +594,7 @@ class _Envoy:
                         continue
                 if filter_kind == "fault":
                     if override.get("disabled") is True and (not override_msg or is_filter_config):
-                        effective_fault = None
+                        winning_fault = ("disabled", None)
                         continue
                     if not is_filter_config and (
                         not override_msg or override_msg in (
@@ -595,19 +602,27 @@ class _Envoy:
                             "envoy.config.filter.http.fault.v2.httpfault",
                         )
                     ):
-                        fault_status, fault_val = _parse_envoy_fault(override, has_runtime=self.has_runtime)
-                        if fault_status == "plugin":
-                            effective_fault = PluginSpec("fault_injection", fault_val, ref)
-                        elif fault_status == "omit":
-                            effective_fault = None
-                        else:
-                            spec.refuse(f"{label} typed_per_filter_config for fault cannot be migrated ({fault_val})")
+                        winning_fault = ("override", (label, override))
                         continue
                 others.append(key_str)
             if others:
                 names = ", ".join(safe_label(key, 80) for key in others[:3])
                 spec.refuse(f"{label} typed_per_filter_config for HTTP filter(s) {names} can enable or change a "
                             "filter for this route, which is not migrated")
+        effective_fault: PluginSpec | None = None
+        if winning_fault[0] == "hcm_plugin":
+            effective_fault = winning_fault[1]
+        elif winning_fault[0] == "hcm_error":
+            spec.refuse(winning_fault[1])
+        elif winning_fault[0] == "override":
+            fault_label, fault_override = winning_fault[1]
+            fault_status, fault_val = _parse_envoy_fault(fault_override, has_runtime=self.has_runtime)
+            if fault_status == "plugin":
+                effective_fault = PluginSpec("fault_injection", fault_val, ref)
+            elif fault_status == "omit":
+                effective_fault = None
+            else:
+                spec.refuse(f"{fault_label} typed_per_filter_config for fault cannot be migrated ({fault_val})")
         if raw.get("direct_response") is not None:
             self._direct_response(spec, mapping(raw.get("direct_response")))
             if effective_fault is not None:
@@ -919,16 +934,10 @@ class _Envoy:
         if raw_creds is not None:
             creds = _proto_bool(raw_creds)
             if creds is None:
-                self.report.warning("envoy-cors", ref,
-                                    "CORS omitted (allow_credentials has an invalid non-boolean value); browsers block "
-                                    "cross-origin calls.")
+                spec.refuse("CORS policy has an invalid non-boolean allow_credentials value")
                 return False
         if matcher_problem:
-            if creds is True:
-                spec.refuse(f"CORS policy with allow_credentials cannot be migrated ({matcher_problem})")
-            else:
-                self.report.warning("envoy-cors", ref,
-                                    f"CORS omitted ({matcher_problem}); browsers block cross-origin calls.")
+            spec.refuse(f"CORS policy cannot be safely migrated ({matcher_problem})")
             return False
         raw_fnmp = next((p["forward_not_matching_preflights"] for p in policies
                          if p.get("forward_not_matching_preflights") is not None), None)
@@ -965,10 +974,7 @@ class _Envoy:
         if built:
             spec.plugins.append(PluginSpec("cors", built, ref))
             return True
-        if creds is True:
-            spec.refuse(f"CORS policy with allow_credentials cannot be admitted by Ferrum ({problem})")
-        else:
-            self.report.warning("envoy-cors", ref, f"CORS omitted ({problem}); browsers block cross-origin calls.")
+        spec.refuse(f"active CORS policy cannot be admitted by Ferrum ({problem})")
         return False
 
     # ---------------------------------------------------------------- clusters

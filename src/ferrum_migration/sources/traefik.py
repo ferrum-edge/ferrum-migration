@@ -56,8 +56,8 @@ from ..model import BackendRef, Plan, PluginSpec, RouteSpec, Target, TlsSpec, Up
 from ..redact import safe_label
 from ..safe_load import load_structured
 from .common import (SourceContext, check_route_budget, compression_config, cors_config, literal_value, mapping,
-                     merge_weighted_targets, request_header_rule, request_mirror_config, response_header_rule, seq,
-                     str_list)
+                     merge_weighted_targets, parse_percentage, request_header_rule, request_mirror_config,
+                     response_header_rule, seq, str_list)
 
 PLATFORM = "traefik"
 REPRESENTABLE_MATCHERS = {"Host", "HostHeader", "Path", "PathPrefix", "Method"}
@@ -1079,11 +1079,14 @@ class _Traefik:
                 else:
                     acc.plugins.append(PluginSpec("response_size_limiting",
                                                   {"max_bytes": resp_size, "require_buffered_check": True}, ref))
-                    self.report.warning("traefik-buffering", ref,
-                                        "buffering.maxResponseBodyBytes returns HTTP 500 on oversized upstream "
-                                        "responses in Traefik whereas Ferrum response_size_limiting returns HTTP 502, "
-                                        "and require_buffered_check: true rejects streaming/chunked responses without "
-                                        "Content-Length (such as text/event-stream) with HTTP 502 even under max_bytes.")
+                    msg = ("buffering.maxResponseBodyBytes returns HTTP 500 on oversized upstream responses in "
+                           "Traefik whereas Ferrum response_size_limiting returns HTTP 502, and "
+                           "require_buffered_check: true rejects text/event-stream (SSE) responses without a provable "
+                           "Content-Length with HTTP 502 even when under max_bytes.")
+                    if resp_size > 10 * 1024 * 1024:
+                        msg += (" Configured maxResponseBodyBytes exceeds Ferrum's 10 MiB default global ceiling; "
+                                "raise FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES to honor this route limit.")
+                    self.report.warning("traefik-buffering", ref, msg)
                 acc.resp_size_limited = True
             if any(config.get(k) for k in ("memRequestBodyBytes", "memResponseBodyBytes", "retryExpression")) \
                     or not ((req_size and req_size > 0) or (resp_size and resp_size > 0)):
@@ -1357,11 +1360,10 @@ class _Traefik:
             if not isinstance(entry, dict) or not isinstance(entry.get("name"), str):
                 dropped += 1
                 continue
-            raw_pct = entry.get("percent")
-            if isinstance(raw_pct, bool) or not isinstance(raw_pct, (int, float)):
+            pct = parse_percentage(entry.get("percent"))
+            if pct is None:
                 dropped += 1
                 continue
-            pct = float(raw_pct)
             if pct == 0.0:
                 continue
             base, _, provider = entry["name"].partition("@")
@@ -1389,8 +1391,18 @@ class _Traefik:
                                     "the h2c mirror was dropped.")
                 continue
             scheme, targets, problems = self._servers(lb, ref)
-            tls, timeouts, transport_problems = self._transport(lb.get("serversTransport"), ref)
-            if timeouts:
+            transport_name = lb.get("serversTransport")
+            tls, timeouts, transport_problems = self._transport(transport_name, ref)
+            raw_ft: dict = {}
+            if transport_name:
+                tbase, _, tprov = str(transport_name).partition("@")
+                if tprov in ("", "file"):
+                    raw_ft = mapping(mapping(self.transports.get(tbase)).get("forwardingTimeouts"))
+            has_raw_phase_timeout = any(
+                raw_ft.get(k) is not None and str(raw_ft.get(k)).strip() not in ("", "0", "0s", "0ms", "0us", "0ns")
+                for k in ("dialTimeout", "responseHeaderTimeout")
+            )
+            if timeouts or has_raw_phase_timeout:
                 self.report.warning("traefik-mirroring", ref,
                                     "Mirror target configures serversTransport.forwardingTimeouts, which Ferrum "
                                     "static request_mirror cannot reproduce per phase; mirror dropped.")

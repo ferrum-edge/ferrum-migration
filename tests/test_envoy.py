@@ -925,9 +925,9 @@ class EnvoyHardeningTest(unittest.TestCase):
                                 one_proxy(self, migrate("envoy", yaml.safe_dump(max_ok))[0].config, "/api"),
                                 "cors")["config"]["max_age"], 18446744073709551615)
         mo_cors["max_age"] = "18446744073709551616"
-        over_res, over_rep, _ = migrate("envoy", yaml.safe_dump(max_ok))
-        self.assertEqual(over_res.config["plugin_configs"], [])
-        self.assertIn("envoy-cors", codes(over_rep, "warning"))
+        over_res, _over_rep, _ = migrate("envoy", yaml.safe_dump(max_ok))
+        self.assertEqual(one_proxy(self, over_res.config, "/api")["labels"]["ferrum-migration/status"], "refused")
+        self.assertFalse(any(p["plugin_name"] == "cors" for p in over_res.config["plugin_configs"]))
         for bad_rx in (
             r"https://(a(b(c(d(e(f(g(h(i(j(app\.example\.test)))))))))))",
             r"x|a(?:x|a(?:x|a(?:x|a(?:x|a(?:x|ab+)+)+)+)+)+",
@@ -947,15 +947,20 @@ class EnvoyHardeningTest(unittest.TestCase):
             with self.subTest(regex=bad_rx):
                 nc_hcm["route_config"]["typed_per_filter_config"]["envoy.filters.http.cors"][
                     "allow_origin_string_match"] = [{"safe_regex": {"regex": bad_rx}}]
-                nest_res, nest_rep, _ = migrate("envoy", yaml.safe_dump(non_cred_star))
-                self.assertEqual(nest_res.config["plugin_configs"], [])
-                self.assertIn("envoy-cors", codes(nest_rep, "warning"))
-        # ignoreCase origin matcher omits uncredentialed CORS and refuses credentialed CORS; credentialed exact '*' refuses.
+                nest_res, _nest_rep, _ = migrate("envoy", yaml.safe_dump(non_cred_star))
+                self.assertEqual(one_proxy(self, nest_res.config, "/api")["labels"]["ferrum-migration/status"], "refused")
+                self.assertFalse(any(p["plugin_name"] == "cors" for p in nest_res.config["plugin_configs"]))
+        # Active Envoy CORS with ignoreCase (even uncredentialed + forward_not_matching_preflights: false)
+        # refuses fail-closed rather than dropping CORS and forwarding preflights to the backend.
         nc_hcm["route_config"]["typed_per_filter_config"]["envoy.filters.http.cors"][
             "allow_origin_string_match"] = [{"exact": "https://APP.example.test", "ignoreCase": True}]
-        ic_res, ic_rep, _ = migrate("envoy", yaml.safe_dump(non_cred_star))
-        self.assertEqual(ic_res.config["plugin_configs"], [])
-        self.assertIn("envoy-cors", codes(ic_rep, "warning"))
+        nc_hcm["route_config"]["typed_per_filter_config"]["envoy.filters.http.cors"][
+            "forward_not_matching_preflights"] = {"value": False}
+        ic_res, _ic_rep, _ = migrate("envoy", yaml.safe_dump(non_cred_star))
+        self.assertEqual(one_proxy(self, ic_res.config, "/api")["labels"]["ferrum-migration/status"], "refused")
+        self.assertFalse(any(p["plugin_name"] == "cors" for p in ic_res.config["plugin_configs"]))
+        del nc_hcm["route_config"]["typed_per_filter_config"]["envoy.filters.http.cors"][
+            "forward_not_matching_preflights"]
         for cred_bad_matcher in (
             {"exact": "https://APP.example.test", "ignoreCase": True},
             {"exact": "*"},
@@ -1064,6 +1069,32 @@ class EnvoyHardeningTest(unittest.TestCase):
         }
         self.assertEqual(one_proxy(self, migrate("envoy", yaml.safe_dump(two_faults))[0].config, "=/healthz")[
             "labels"]["ferrum-migration/status"], "refused")
+
+
+        # A route that disables an untranslatable vhost fault (FilterConfig{disabled: true}) migrates cleanly.
+        dis_fault = minimal_bootstrap({"path_separated_prefix": "/api"})
+        dfhcm = dis_fault["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"]
+        dfhcm["http_filters"] = [
+            {"name": "envoy.filters.http.fault",
+             "typed_config": {"@type": "type.googleapis.com/envoy.extensions.filters.http.fault.v3.HTTPFault"}},
+            {"name": "envoy.filters.http.router"},
+        ]
+        dfhcm["route_config"]["virtual_hosts"][0]["typed_per_filter_config"] = {
+            "envoy.filters.http.fault": {
+                "@type": "type.googleapis.com/envoy.extensions.filters.http.fault.v3.HTTPFault",
+                "abort": {"http_status": 503, "percentage": {"numerator": 100, "denominator": "HUNDRED"}},
+                "headers": [{"name": "x-chaos", "exact_match": "1"}],
+            }
+        }
+        dfhcm["route_config"]["virtual_hosts"][0]["routes"][0]["typed_per_filter_config"] = {
+            "envoy.filters.http.fault": {
+                "@type": "type.googleapis.com/envoy.config.route.v3.FilterConfig",
+                "disabled": True,
+            }
+        }
+        df_res = migrate("envoy", yaml.safe_dump(dis_fault))[0]
+        self.assertEqual(one_proxy(self, df_res.config, "/api")["labels"]["ferrum-migration/status"], "migrated")
+        self.assertEqual(df_res.config["plugin_configs"], [])
 
 
 if __name__ == "__main__":

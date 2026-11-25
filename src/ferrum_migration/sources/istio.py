@@ -14,6 +14,7 @@ Secrets are never read.
 from __future__ import annotations
 
 import ipaddress
+import math
 from typing import Any
 
 from .. import matching, util
@@ -23,7 +24,7 @@ from ..redact import safe_label
 from ..safe_load import load_structured
 from .common import (SourceContext, apply_first_match_order, check_route_budget, choose_main_port, cors_config,
                      fault_injection_config, header_value_ok, literal_value, mapping, merge_weighted_targets,
-                     request_header_rule, response_header_rule, retry_from_policy, seq, str_list)
+                     parse_percentage, request_header_rule, response_header_rule, retry_from_policy, seq, str_list)
 
 PLATFORM = "istio"
 ROOT_NAMESPACE = "istio-system"
@@ -671,7 +672,8 @@ class _Istio:
                 raw_pct = entry["mirrorPercent"]
             else:
                 raw_pct = 100.0
-            if isinstance(raw_pct, bool) or not isinstance(raw_pct, (int, float)) or float(raw_pct) != 0.0:
+            if isinstance(raw_pct, bool) or not isinstance(raw_pct, (int, float)) \
+                    or (isinstance(raw_pct, float) and not math.isfinite(raw_pct)) or raw_pct != 0:
                 dropped += 1
         for item in seq(entry.get("mirrors")):
             if not isinstance(item, dict):
@@ -682,7 +684,8 @@ class _Istio:
                 raw_pct = pct_obj.get("value", 0.0) if isinstance(pct_obj, dict) else None
             else:
                 raw_pct = 100.0
-            if isinstance(raw_pct, bool) or not isinstance(raw_pct, (int, float)) or float(raw_pct) != 0.0:
+            if isinstance(raw_pct, bool) or not isinstance(raw_pct, (int, float)) \
+                    or (isinstance(raw_pct, float) and not math.isfinite(raw_pct)) or raw_pct != 0:
                 dropped += 1
         if dropped:
             self.report.warning("istio-dropped", ref,
@@ -707,12 +710,7 @@ class _Istio:
             elif isinstance(raw_unmatched, str) and raw_unmatched == "IGNORE":
                 unmatched_mode = "ignore"
             else:
-                if creds is True:
-                    spec.refuse("CORS policy has an unsupported unmatchedPreflights value")
-                else:
-                    self.report.warning("istio-cors", spec.ref,
-                                        "CORS omitted (unsupported unmatchedPreflights value); browsers block "
-                                        "cross-origin calls.")
+                spec.refuse("CORS policy has an unsupported unmatchedPreflights value")
                 return
         # Istio treats allowOrigins as authoritative whenever the key is present (even if empty []);
         # fall back to deprecated allowOrigin only when allowOrigins is omitted or null.
@@ -737,11 +735,7 @@ class _Istio:
             for origin in seq(policy.get("allowOrigin")):
                 origins.append({"exact": origin})
         if matcher_problem:
-            if creds is True:
-                spec.refuse(f"CORS policy with allowCredentials=true cannot be safely migrated ({matcher_problem})")
-            else:
-                self.report.warning("istio-cors", spec.ref,
-                                    f"CORS omitted ({matcher_problem}); browsers block cross-origin calls.")
+            spec.refuse(f"active CORS policy cannot be safely migrated ({matcher_problem})")
             return
         if creds is True and any(o == "*" or o == {"exact": "*"} for o in origins):
             spec.refuse("CORS policy combines allowCredentials=true with wildcard '*' origin, which Ferrum "
@@ -755,11 +749,7 @@ class _Istio:
         raw_max_age = policy.get("maxAge")
         max_age = util.parse_go_duration_ms(raw_max_age) if raw_max_age is not None else None
         if raw_max_age is not None and max_age is None:
-            if creds is True:
-                spec.refuse("CORS policy with allowCredentials=true has an invalid maxAge")
-            else:
-                self.report.warning("istio-cors", spec.ref,
-                                    "CORS omitted (invalid maxAge); browsers block cross-origin calls.")
+            spec.refuse("active CORS policy has an invalid maxAge")
             return
         # Pass unmatched_preflights explicitly so Ferrum preserves omitted allowMethods/allowHeaders/maxAge
         # rather than supplying permissive defaults that could broaden credentialed CORS.
@@ -769,10 +759,8 @@ class _Istio:
                                      unmatched_preflights=unmatched_mode)
         if built:
             spec.plugins.append(PluginSpec("cors", built, spec.ref))
-        elif creds is True:
-            spec.refuse(f"CORS policy with allowCredentials=true cannot be safely migrated ({problem})")
         else:
-            self.report.warning("istio-cors", spec.ref, f"CORS omitted ({problem}); browsers block cross-origin calls.")
+            spec.refuse(f"active CORS policy cannot be safely migrated ({problem})")
 
     def _headers(self, spec: RouteSpec, headers: dict) -> None:
         raw_req = headers.get("request")
@@ -1037,14 +1025,15 @@ def _translate_istio_fault(raw: Any) -> tuple[str, Any]:
             return "drop", "delay.fixedDelay is missing or invalid"
         pct_obj = delay.get("percentage")
         if isinstance(pct_obj, dict) and pct_obj.get("value") is not None:
-            pct = pct_obj["value"]
+            raw_pct = pct_obj["value"]
         elif delay.get("percent") is not None:
-            pct = delay["percent"]
+            raw_pct = delay["percent"]
         else:
             return "drop", "delay requires an explicit percentage"
-        if isinstance(pct, bool) or not isinstance(pct, (int, float)):
+        pct = parse_percentage(raw_pct)
+        if pct is None:
             return "drop", "delay percentage is invalid"
-        if float(pct) > 0.0:
+        if pct > 0.0:
             delay_cfg = {"duration_ms": duration_ms, "percentage": pct}
     if raw.get("abort") is not None:
         abort = raw.get("abort")
@@ -1053,8 +1042,8 @@ def _translate_istio_fault(raw: Any) -> tuple[str, Any]:
         pct_obj = abort.get("percentage")
         if not isinstance(pct_obj, dict) or pct_obj.get("value") is None:
             return "drop", "abort requires an explicit percentage"
-        pct = pct_obj["value"]
-        if isinstance(pct, bool) or not isinstance(pct, (int, float)):
+        pct = parse_percentage(pct_obj["value"])
+        if pct is None:
             return "drop", "abort percentage is invalid"
         http_raw = abort.get("httpStatus")
         grpc_raw = abort.get("grpcStatus")
@@ -1072,7 +1061,7 @@ def _translate_istio_fault(raw: Any) -> tuple[str, Any]:
             http_status = 503
         if http_status is None:
             return "drop", "abort.httpStatus is missing or invalid"
-        if float(pct) > 0.0:
+        if pct > 0.0:
             abort_cfg = {"status_code": http_status, "percentage": pct}
             if grpc_code is not None:
                 abort_cfg["grpc_status"] = grpc_code

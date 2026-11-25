@@ -1360,6 +1360,31 @@ class TraefikHardeningTest(unittest.TestCase):
                     "serversTransports": {"fast": {"forwardingTimeouts": {"responseHeaderTimeout": "100ms"}}},
                 }
             }),
+            ("subms-timeout-mirror", {
+                "http": {
+                    "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "m"}},
+                    "services": {
+                        "m": {"mirroring": {"service": "main", "mirrorBody": False,
+                                            "mirrors": [{"name": "shadow", "percent": 20}]}},
+                        "main": {"loadBalancer": {"servers": [{"url": "http://main.internal:8080"}]}},
+                        "shadow": {"loadBalancer": {"passHostHeader": False, "serversTransport": "subms",
+                                                    "servers": [{"url": "http://shadow.internal:9090"}]}},
+                    },
+                    "serversTransports": {"subms": {"forwardingTimeouts": {"responseHeaderTimeout": "100us"}}},
+                }
+            }),
+            ("huge-percent-mirror", {
+                "http": {
+                    "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "m"}},
+                    "services": {
+                        "m": {"mirroring": {"service": "main", "mirrorBody": False,
+                                            "mirrors": [{"name": "shadow", "percent": 10**310}]}},
+                        "main": {"loadBalancer": {"servers": [{"url": "http://main.internal:8080"}]}},
+                        "shadow": {"loadBalancer": {"passHostHeader": False,
+                                                    "servers": [{"url": "http://shadow.internal:9090"}]}},
+                    },
+                }
+            }),
         ):
             with self.subTest(case=label):
                 mr_res, mr_rep, _ = asserted(yaml.safe_dump(extra_doc))
@@ -1367,6 +1392,24 @@ class TraefikHardeningTest(unittest.TestCase):
                 self.assertEqual(mr_p["labels"]["ferrum-migration/status"], "migrated")
                 self.assertNotIn("request_mirror", [p["plugin_name"] for p in plugins_of(mr_res.config, mr_p)])
                 self.assertIn("traefik-mirroring", codes(mr_rep, "warning"))
+                if label == "subms-timeout-mirror":
+                    msgs = [c.message for c in mr_rep.caveats if c.code == "traefik-mirroring"]
+                    self.assertTrue(any("forwardingTimeouts" in m for m in msgs), msgs)
+        # Buffering > 10 MiB warns about SSE rejection and raising FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES.
+        big_buf = yaml.safe_dump({
+            "http": {
+                "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/big/`)", "service": "main",
+                                  "middlewares": ["b"]}},
+                "middlewares": {"b": {"buffering": {"maxResponseBodyBytes": 20 * 1024 * 1024}}},
+                "services": {"main": {"loadBalancer": {"servers": [{"url": "http://main.internal:8080"}]}}},
+            }
+        })
+        bb_res, bb_rep, _ = asserted(big_buf)
+        self.assertEqual(one_proxy(self, bb_res.config, "/big", "a.example.test")["labels"][
+            "ferrum-migration/status"], "migrated")
+        bb_msgs = [c.message for c in bb_rep.caveats if c.code == "traefik-buffering"]
+        self.assertTrue(any("text/event-stream" in m and "FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES" in m for m in bb_msgs),
+                        bb_msgs)
         # Combining buffering.maxResponseBodyBytes and compress in EITHER order (including via chain) refuses.
         for order in (["buf", "comp"], ["comp", "buf"]):
             with self.subTest(order=order):

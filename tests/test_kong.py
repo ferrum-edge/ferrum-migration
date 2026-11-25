@@ -852,6 +852,35 @@ class KongExtendedPluginsAndConsumersTest(unittest.TestCase):
         self.assertEqual(plugins_of(result.config, cache_proxy), [])
         self.assertIn("kong-plugin-omitted", codes(report, "warning"))
 
+        # Global correlation-id is resolved per route so an omitted scoped override (e.g. reserved header_name
+        # X-Geo-Country) never activates the global correlation-id header on that overridden route.
+        scoped_cid = textwrap.dedent("""
+            _format_version: "3.0"
+            plugins:
+              - name: correlation-id
+                config: {header_name: X-Audit-ID, echo_downstream: true, generator: uuid}
+            services:
+              - name: s
+                url: http://s.internal:8080
+                routes:
+                  - name: inherit
+                    paths: [/inherit/]
+                  - name: overridden
+                    paths: [/overridden/]
+                    plugins:
+                      - name: correlation-id
+                        config: {header_name: X-Geo-Country, echo_downstream: true, generator: uuid}
+        """)
+        sc_res, sc_rep, _ = migrate("kong", scoped_cid)
+        inherit_p = one_proxy(self, sc_res.config, "/inherit")
+        override_p = one_proxy(self, sc_res.config, "/overridden")
+        self.assertEqual(plugin(self, sc_res.config, inherit_p, "correlation_id")["config"],
+                         {"header_name": "x-audit-id", "echo_downstream": True, "inbound_policy": "preserve"})
+        self.assertEqual(plugins_of(sc_res.config, override_p), [])
+        self.assertFalse(any(p["plugin_name"] == "correlation_id" and p["scope"] == "global"
+                             for p in sc_res.config["plugin_configs"]))
+        self.assertIn("kong-correlation-id", codes(sc_rep, "warning"))
+
 
 if __name__ == "__main__":
     unittest.main()

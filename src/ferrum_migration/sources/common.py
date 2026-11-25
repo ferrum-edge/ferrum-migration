@@ -700,13 +700,19 @@ def compression_config(
     return config, None
 
 
-def _parse_percentage(value: Any) -> float | None:
+def parse_percentage(value: Any) -> float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    val = float(value)
-    if not math.isfinite(val) or not 0.0 <= val <= 100.0:
+    if isinstance(value, int):
+        if not 0 <= value <= 100:
+            return None
+        return float(value)
+    if not math.isfinite(value) or not 0.0 <= value <= 100.0:
         return None
-    return val
+    return float(value)
+
+
+_parse_percentage = parse_percentage
 
 
 def fault_injection_config(

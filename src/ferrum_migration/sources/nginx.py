@@ -1103,9 +1103,11 @@ class _Nginx:
                 if comp_cfg is not None:
                     route.plugins.append(PluginSpec("compression", comp_cfg, ref))
                     self.report.warning("nginx-gzip", ref,
-                                        "Ferrum compression returns HTTP 406 when a client's Accept-Encoding excludes "
-                                        "both gzip and identity (e.g. 'br, identity;q=0'), whereas NGINX skips gzip "
-                                        "and forwards the unencoded backend response.")
+                                        "Ferrum compression skips chunked/unknown-length responses lacking "
+                                        "Content-Length when min_content_length > 0 (whereas NGINX compresses "
+                                        "eligible chunked responses), and returns HTTP 406 when Accept-Encoding "
+                                        "excludes identity and the response cannot be encoded (e.g. 'br, identity;q=0' "
+                                        "or unknown-length responses under 'gzip, identity;q=0').")
                 else:
                     self.report.warning("nginx-gzip", ref, f"gzip omitted ({comp_problem}).")
         size = scope.body_size if scope.body_size is not None else 1024 * 1024

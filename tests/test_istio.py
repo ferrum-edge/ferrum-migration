@@ -1157,22 +1157,42 @@ class IstioCaseAndNamesTest(unittest.TestCase):
                 cc_res = migrate("istio", bad_cc)[0]
                 self.assertEqual(one_proxy(self, cc_res.config, "=/api", "api.example.test")["labels"][
                     "ferrum-migration/status"], "refused")
-        # Empty allowOrigins: [] is authoritative (never falls back to deprecated allowOrigin) and
-        # non-string unmatchedPreflights (e.g. YAML bool true) refuses a credentialed route.
+        # Empty allowOrigins: [] is authoritative (never falls back to deprecated allowOrigin),
+        # non-string unmatchedPreflights (e.g. YAML bool true) refuses, and an uncredentialed active
+        # IGNORE policy with an untranslatable regex also refuses fail-closed.
         for label, bad_patch in (
             ("empty-allowOrigins", cred_cors_base.replace(
-                "allowOrigins:\n                      - exact: https://app.example.test",
+                "allowOrigins:\n          - exact: https://app.example.test",
                 "allowOrigins: []",
             )),
             ("bool-unmatchedPreflights", cred_cors_base.replace(
                 "unmatchedPreflights: IGNORE",
                 "unmatchedPreflights: true",
             )),
+            ("uncred-ignore-bad-regex", cred_cors_base.replace(
+                "allowCredentials: true",
+                "allowCredentials: false",
+            ).replace(
+                "exact: https://app.example.test",
+                "regex: '^https://a{5000}\\.example\\.test$'",
+            )),
         ):
             with self.subTest(case=label):
+                self.assertNotEqual(bad_patch, cred_cors_base, label)
                 ep_res = migrate("istio", bad_patch)[0]
                 self.assertEqual(one_proxy(self, ep_res.config, "=/api", "api.example.test")["labels"][
                     "ferrum-migration/status"], "refused")
+
+        # Oversized unquoted 310-digit integer percentages in fault/mirror drop cleanly without OverflowError.
+        huge_pct = "1" + "0" * 310
+        huge_doc = text.replace("percentage: {value: 15}", f"percentage: {{value: {huge_pct}}}").replace(
+            "mirrorPercentage: {value: 10}", f"mirrorPercentage: {{value: {huge_pct}}}"
+        )
+        hp_res, hp_rep, _ = migrate("istio", huge_doc)
+        hp_api = one_proxy(self, hp_res.config, "=/api", "api.example.test")
+        self.assertEqual(hp_api["labels"]["ferrum-migration/status"], "migrated")
+        self.assertEqual(plugins_of(hp_res.config, hp_api), [])
+        self.assertIn("istio-dropped", codes(hp_rep, "warning"))
 
 
 if __name__ == "__main__":

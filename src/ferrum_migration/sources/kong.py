@@ -101,6 +101,7 @@ class _Kong:
         self.jwt_algorithm = "HS256"
         self.format_version = "3.0"
         self.pretransformed = False
+        self.global_correlation_id_plugin: PluginSpec | None = None
 
     # ------------------------------------------------------------ indexing
 
@@ -641,7 +642,14 @@ class _Kong:
             ref = f"kong global plugin {safe_label(plugin.name, 40)}"
             outcome = self._translate_plugin(plugin, ref)
             if outcome[0] == "plugin":
-                self.plan.global_plugins.append(outcome[1])
+                if plugin.name == "correlation-id":
+                    # Resolve correlation-id per route rather than emitting a global Ferrum plugin so an
+                    # omitted scoped override (e.g. a Ferrum-reserved header_name) never activates the global
+                    # correlation_id policy on that route.
+                    if self.global_correlation_id_plugin is None:
+                        self.global_correlation_id_plugin = outcome[1]
+                else:
+                    self.plan.global_plugins.append(outcome[1])
             elif outcome[0] == "termination":
                 self.plan.global_plugins.append(PluginSpec("request_termination", outcome[1], ref))
             elif outcome[0] == "refuse":
@@ -696,6 +704,10 @@ class _Kong:
                 termination = outcome[1]
             elif outcome[0] == "refuse":
                 refusals.append(f"{level} plugin {safe_label(name, 40)}: {outcome[1]}")
+        if "correlation-id" not in by_name and self.global_correlation_id_plugin is not None:
+            gspec = self.global_correlation_id_plugin
+            plugins.append(PluginSpec(gspec.name, dict(gspec.config), gspec.ref,
+                                      shared_key="global-correlation-id"))
         return plugins, termination, refusals
 
     def _auth_composition(self, plugins: list[PluginSpec], ref: str) -> str | None:

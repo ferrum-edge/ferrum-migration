@@ -600,7 +600,7 @@ class FerrumBinaryValidateTest(unittest.TestCase):
             ("nginx-extended", "nginx", nginx_text, {"fmt": "nginx"}, 1, {"compression"}),
             ("traefik-extended", "traefik", traefik_text, {"traefik_controls_asserted": True}, 2,
              {"compression", "response_size_limiting", "request_mirror"}),
-            ("envoy-extended", "envoy", envoy_text, {}, 3, {"cors", "grpc_web", "compression", "fault_injection"}),
+            ("envoy-extended", "envoy", envoy_text, {}, 1, {"cors", "grpc_web", "compression", "fault_injection"}),
             ("istio-extended", "istio", istio_text, {}, 1, {"fault_injection"}),
         ):
             result, _report, _plan = migrate(platform, text, **kw)
