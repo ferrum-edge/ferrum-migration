@@ -398,7 +398,11 @@ class _Envoy:
             elif kind in ("grpc_stats", "health_check"):
                 self.report.warning("envoy-http-filter-omitted", ref, f"HTTP filter {kind} is not migrated.")
             elif kind == "buffer":
-                buffer_limit = util.as_int(typed.get("max_request_bytes"))
+                parsed_max = _proto_uint32(typed.get("max_request_bytes"))
+                if parsed_max is None or parsed_max <= 0:
+                    filter_refusal = "HTTP filter buffer has an unreadable or non-positive max_request_bytes"
+                else:
+                    buffer_limit = parsed_max
             elif kind == "grpc_web":
                 if set(typed) - {"@type"}:
                     filter_refusal = "HTTP filter grpc_web has unsupported configuration fields"
@@ -567,6 +571,8 @@ class _Envoy:
             for route in routes:
                 route.skip = False
                 route.skip_reason = ""
+                if hosts and route.kind == "prefix" and route.path == "/" and route.methods is None:
+                    route.kind, route.path = "hostonly", None
                 route.refuse("HTTP-to-HTTPS redirect virtual host cannot be folded away alongside other plaintext "
                              "routes, without a live HTTPS listener, or with local filters/errors")
             apply_first_match_order(routes, self.report)

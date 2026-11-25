@@ -165,10 +165,10 @@ def emit(plan: Plan, options: EmitOptions, report: Report) -> EmitResult:
     _resolve_frontend_client_ca(plan, routes, report, mode)
     candidates = _build_candidates(routes)
     candidates = _resolve_conflicts(candidates, report)
-    candidates = _finalize_https_redirects(plan, routes, candidates, mode, options, report)
     _add_scope_closures(plan, candidates, report)
     _add_trailing_slash_placeholders(candidates, report)
     _add_divergence_guards(plan, candidates, report)
+    candidates = _finalize_https_redirects(plan, routes, candidates, mode, options, report)
     _assert_frontend_protocols(candidates, mode)
     builder = _Builder(plan, options, report)
     config = builder.build(candidates)
@@ -221,7 +221,11 @@ def _finalize_https_redirects(plan: Plan, routes: list[RouteSpec], candidates: l
         _validate_route(route, plan, options, report)
     _poison(routes)
     _poison_case_variants(plan, routes)
-    return _resolve_conflicts(_build_candidates(routes), report)
+    rebuilt = _resolve_conflicts(_build_candidates(routes), report)
+    _add_scope_closures(plan, rebuilt, report)
+    _add_trailing_slash_placeholders(rebuilt, report)
+    _add_divergence_guards(plan, rebuilt, report)
+    return rebuilt
 
 
 def _assert_frontend_protocols(candidates: list[_Cand], mode: str) -> None:
@@ -328,6 +332,8 @@ def _validate_route(route: RouteSpec, plan: Plan, options: EmitOptions, report: 
             route.trailing_slash = True
             path = path[:-1]
         problem = util.canonical_path_problem(path)
+        if not problem and route.kind == "exact" and len(path.encode("utf-8")) + 1 > util.MAX_LISTEN_PATH_LENGTH:
+            problem = f"serialized exact listen_path exceeds {util.MAX_LISTEN_PATH_LENGTH} bytes"
         if problem:
             route.refuse(f"path is not representable ({problem})")
             route.path_ok = False
@@ -336,6 +342,8 @@ def _validate_route(route: RouteSpec, plan: Plan, options: EmitOptions, report: 
             route.path = path
     elif route.kind == "regex":
         problem = util.regex_problem(route.path)
+        if not problem and len((route.path or "").encode("utf-8")) + 1 > util.MAX_LISTEN_PATH_LENGTH:
+            problem = f"serialized regex listen_path exceeds {util.MAX_LISTEN_PATH_LENGTH} bytes"
         if problem:
             route.refuse(f"path regex is not representable ({problem})")
             route.path_ok = False
@@ -938,7 +946,8 @@ def _resolve_conflicts(candidates: list[_Cand], report: Report) -> list[_Cand]:
 
 
 def _components(members: list[_Cand]) -> list[list[_Cand]]:
-    parent = list(range(len(members)))
+    n = len(members)
+    parent = list(range(n))
 
     def find(index: int) -> int:
         while parent[index] != index:
@@ -946,10 +955,49 @@ def _components(members: list[_Cand]) -> list[list[_Cand]]:
             index = parent[index]
         return index
 
-    for i in range(len(members)):
-        for j in range(i + 1, len(members)):
-            if matching.hosts_overlap(members[i].hosts, members[j].hosts):
-                parent[find(i)] = find(j)
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    # Any catch-all candidate (hosts == []) overlaps every other candidate in the same slot.
+    first_catchall = next((i for i, m in enumerate(members) if not m.hosts), None)
+    if first_catchall is not None:
+        for i in range(n):
+            union(i, first_catchall)
+    else:
+        exact_owner: dict[str, int] = {}
+        wild_owner: dict[str, int] = {}
+        for i, member in enumerate(members):
+            for host in member.hosts:
+                if host.startswith("*."):
+                    suffix = host[1:]
+                    prev = wild_owner.get(suffix)
+                    if prev is None:
+                        wild_owner[suffix] = i
+                    else:
+                        union(i, prev)
+                else:
+                    prev = exact_owner.get(host)
+                    if prev is None:
+                        exact_owner[host] = i
+                    else:
+                        union(i, prev)
+        if wild_owner:
+            for host, owner in exact_owner.items():
+                dot = host.find(".")
+                while dot != -1:
+                    w = wild_owner.get(host[dot:])
+                    if w is not None:
+                        union(owner, w)
+                    dot = host.find(".", dot + 1)
+            for suffix, owner in wild_owner.items():
+                dot = suffix.find(".", 1)
+                while dot != -1:
+                    w = wild_owner.get(suffix[dot:])
+                    if w is not None:
+                        union(owner, w)
+                    dot = suffix.find(".", dot + 1)
     grouped: dict[int, list[_Cand]] = {}
     for index, member in enumerate(members):
         grouped.setdefault(find(index), []).append(member)

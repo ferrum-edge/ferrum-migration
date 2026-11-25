@@ -1026,14 +1026,16 @@ def compression_config(
             return None, "content_types must be a non-empty list"
         ct_re = _MEDIA_TYPE_RULE_RE if allow_ranges else _EXACT_MEDIA_TYPE_RE
         clean_types: list[str] = []
+        seen_types: set[str] = set()
         for raw in content_types:
             if not isinstance(raw, str) or not raw.isascii() or not ct_re.fullmatch(raw):
                 return None, f"content_type {safe_label(raw, 48)} is not a valid Ferrum media type rule"
             lower = raw.lower()
-            if lower not in clean_types:
+            if lower not in seen_types:
+                seen_types.add(lower)
                 clean_types.append(lower)
-        if len(clean_types) > MAX_COMPRESSION_CONTENT_TYPES:
-            return None, f"content_types exceeds Ferrum's {MAX_COMPRESSION_CONTENT_TYPES}-entry limit"
+                if len(clean_types) > MAX_COMPRESSION_CONTENT_TYPES:
+                    return None, f"content_types exceeds Ferrum's {MAX_COMPRESSION_CONTENT_TYPES}-entry limit"
         config["content_types"] = clean_types
     if gzip_level is not None:
         if isinstance(gzip_level, bool) or not isinstance(gzip_level, int) or not 0 <= gzip_level <= 9:

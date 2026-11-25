@@ -2048,13 +2048,17 @@ class TraefikHardeningTest(unittest.TestCase):
         unasserted_res, unasserted_rep, _ = migrate("traefik", redir_443_doc)
         self.assertNotIn("traefik-https-redirect", codes(unasserted_rep, "info"))
         self.assertEqual(live_routes(unasserted_res.config), [])
-        # When colliding HTTPS routes collapse to a 503 placeholder in _resolve_conflicts, a deferred redirect
-        # with an uncanonical path (/legacy;v=1) is NOT folded and is validated cleanly so output stays valid.
+        # When colliding HTTPS routes collapse to a 503 placeholder in _resolve_conflicts, deferred redirects with
+        # uncanonical (/legacy;v=1) or 500-byte exact paths (501 bytes serialized with '=') are NOT folded and are
+        # validated cleanly so no invalid listen_path is ever emitted.
+        path_500 = "/" + "a" * 499
         conflict_https_doc = yaml.safe_dump({
             "http": {
                 "routers": {
-                    "plain_redir": {"rule": "Host(`a.example.test`) && Path(`/legacy;v=1`)", "service": "main",
-                                    "middlewares": ["r443"]},
+                    "plain_redir_semi": {"rule": "Host(`a.example.test`) && Path(`/legacy;v=1`)", "service": "main",
+                                         "middlewares": ["r443"]},
+                    "plain_redir_500": {"rule": f"Host(`a.example.test`) && Path(`{path_500}`)", "service": "main",
+                                        "middlewares": ["r443"]},
                     "tls_get": {"rule": "Host(`a.example.test`) && Path(`/api`) && Method(`GET`)", "service": "main",
                                 "tls": {}},
                     "tls_post": {"rule": "Host(`a.example.test`) && Path(`/api`) && Method(`POST`)", "service": "main",
@@ -2068,6 +2072,10 @@ class TraefikHardeningTest(unittest.TestCase):
         assert_structurally_valid(self, ch_res.config)
         self.assertNotIn("traefik-https-redirect", codes(ch_rep, "info"))
         self.assertEqual(live_routes(ch_res.config), [])
+        for proxy in ch_res.config["proxies"]:
+            if "listen_path" in proxy:
+                self.assertLessEqual(len(proxy["listen_path"].encode("utf-8")), 500)
+                self.assertNotIn(";", proxy["listen_path"])
         # Canonical schema gate checks newly supported compress/grpcWeb/mirror/v3.8 fields.
         for bad_case in (
             {"http": {"middlewares": {"c": {"compress": {"Encodings": ["gzip"]}}}}},

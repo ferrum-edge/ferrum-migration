@@ -1324,7 +1324,7 @@ class EnvoyHardeningTest(unittest.TestCase):
              "routes": [{"name": "c", "match": {"prefix": "/"}, "route": {"cluster": "c"}}]},
         ]
         mr_res = migrate("envoy", yaml.safe_dump(mixed_redir))[0]
-        self.assertEqual(one_proxy(self, mr_res.config, "/", "secure.example.test")["labels"][
+        self.assertEqual(one_proxy(self, mr_res.config, None, "secure.example.test")["labels"][
             "ferrum-migration/status"], "refused")
         catchall = [p for p in proxies(mr_res.config, "/") if "hosts" not in p]
         self.assertEqual(len(catchall), 1)
@@ -1397,29 +1397,32 @@ class EnvoyHardeningTest(unittest.TestCase):
             "http_filters"] = [
             {"name": "envoy.filters.http.buffer",
              "typed_config": {"@type": "type.googleapis.com/envoy.extensions.filters.http.buffer.v3.Buffer",
-                              "max_request_bytes": 1024}},
+                              "max_request_bytes": {"value": 1024}}},
             {"name": "envoy.filters.http.router"},
         ]
         br_res, br_rep, _ = migrate("envoy", yaml.safe_dump(buf_redir))
         self.assertNotIn("envoy-https-redirect", codes(br_rep, "info"))
-        self.assertEqual(one_proxy(self, br_res.config, "/", "app.example.test")["labels"][
+        self.assertEqual(one_proxy(self, br_res.config, None, "app.example.test")["labels"][
             "ferrum-migration/status"], "refused")
-        # Active buffer filter also refuses static redirects and direct_response routes.
+        # Active buffer filter (including wrapped {value: N}) also refuses static redirects and direct_response routes.
         buf_static = minimal_bootstrap({"path": "/old"})
         bshcm = buf_static["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"]
         bshcm["http_filters"] = [
             {"name": "envoy.filters.http.buffer",
              "typed_config": {"@type": "type.googleapis.com/envoy.extensions.filters.http.buffer.v3.Buffer",
-                              "max_request_bytes": 1024}},
+                              "max_request_bytes": {"value": 1024}}},
             {"name": "envoy.filters.http.router"},
         ]
         bshcm["route_config"]["virtual_hosts"][0]["routes"] = [
             {"name": "static_redir", "match": {"path": "/old"},
              "redirect": {"scheme_redirect": "https", "host_redirect": "new.example.test",
                           "path_redirect": "/new", "strip_query": True}},
+            {"name": "direct_ok", "match": {"path": "/healthz"},
+             "direct_response": {"status": 200, "body": {"inline_string": "ok"}}},
         ]
         bs_res = migrate("envoy", yaml.safe_dump(buf_static))[0]
         self.assertEqual(one_proxy(self, bs_res.config, "=/old")["labels"]["ferrum-migration/status"], "refused")
+        self.assertEqual(one_proxy(self, bs_res.config, "=/healthz")["labels"]["ferrum-migration/status"], "refused")
 
 
 if __name__ == "__main__":

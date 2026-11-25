@@ -500,7 +500,7 @@ class _Nginx:
         ownership = {self.default_server.get((listen["port"], listen["ssl"])) == info["index"] for listen in selected}
         is_default = ownership == {True}
         hosts, host_problem = _server_hosts(info["names"])
-        declared_hosts = [] if host_problem else list(hosts)
+        declared_hosts_lower = frozenset(h.lower() for h in hosts) if not host_problem else frozenset()
         if ownership == {True, False}:
             # Ferrum serves the same port-agnostic routes on every selected listener, so a catch-all would also take
             # unknown host names from the listener where another server is the default.
@@ -548,7 +548,7 @@ class _Nginx:
                               "Keep SNI handshake rejection on a front proxy, or review whether accepting handshakes "
                               "for unknown SNIs is acceptable before migrating.")
             scope.problems.append("ssl_reject_handshake cannot be reproduced by Ferrum's HTTPS listener")
-        base = {"hosts": None if host_problem else hosts, "declared_hosts": declared_hosts,
+        base = {"hosts": None if host_problem else hosts, "declared_hosts_lower": declared_hosts_lower,
                 "listen_port": listen_port, "requires_tls": requires_tls,
                 "server_label": info["label"], "server_ref": ref, "extra": bool(host_problem),
                 "client_cas": client_cas, "client_ca_problem": client_ca_problem,
@@ -556,26 +556,29 @@ class _Nginx:
         server_return = next((d for d in server.block or [] if d.name == "return"), None)
         server_if = [d for d in server.block or [] if d.name == "if"]
         for condition in server_if:
-            if _is_https_redirect_if(condition):
+            if _is_https_redirect_if(condition, declared_hosts_lower):
                 if tls_ports:
                     base["requires_tls"] = True
                     settings.https_redirect_seen = True
                     continue
             scope.problems.append("an 'if' block is not supported")
         if server_return is not None:
-            if _is_https_redirect(server_return.args, base["declared_hosts"]) and not tls_ports:
-                route = self._new_route(base, "/", "prefix", ref + " return")
+            ret_kind, ret_path = ("hostonly", None) if base["hosts"] else ("prefix", "/")
+            if _is_https_redirect(server_return.args, declared_hosts_lower) and not tls_ports:
+                route = self._new_route(base, ret_path, ret_kind, ref + " return")
                 route.https_redirect = True  # type: ignore[attr-defined]
                 for problem in scope.problems:
                     route.refuse(problem)
                 self.redirect_servers.append((ref, info, base, [route]))
                 return
-            route = self._new_route(base, "/", "prefix", ref + " return")
+            route = self._new_route(base, ret_path, ret_kind, ref + " return")
             self._apply_return(route, server_return.args)
             for problem in scope.problems:
                 route.refuse(problem)
             self.plan.routes.append(route)
             self._note_catch_all(info, base, [route])
+            if base["hosts"]:
+                self.plan.host_scopes.append(HostScope(ref, list(base["hosts"]), listen_port))
             return
         locations = [d for d in server.block or [] if d.name == "location"]
         if not locations:
@@ -838,7 +841,7 @@ class _Nginx:
         if access_problem:
             route.refuse(access_problem)
         if returns:
-            if allow_https_redirect and _is_https_redirect(returns[0].args, base["declared_hosts"]):
+            if allow_https_redirect and _is_https_redirect(returns[0].args, base["declared_hosts_lower"]):
                 route.https_redirect = True  # type: ignore[attr-defined]
                 return route
             self._apply_return(route, returns[0].args)
@@ -992,22 +995,31 @@ class _Nginx:
                 if parsed is None:
                     return None
                 weight = 1
+                max_fails_val: int | None = None
+                fail_timeout_raw: str | None = None
                 for flag in flags:
                     if flag.startswith("weight="):
                         weight = util.as_int(flag[7:]) or 1
                     elif flag.startswith("max_fails="):
-                        fails = util.as_int(flag[10:]) or 0
-                        if fails > 0:
-                            passive = {"unhealthy_threshold": min(fails, 1000)}
-                    elif flag.startswith("fail_timeout=") and passive is not None:
-                        seconds = (util.parse_nginx_time_ms(flag[13:], allow_ms=False) or 10_000) // 1000
-                        clamped = min(max(1, seconds), 86_400)
-                        if seconds > 86_400:
-                            self.report.warning("nginx-passive-health", ref,
-                                                "fail_timeout exceeds Ferrum's 86400s passive health-check ceiling "
-                                                "and was clamped to 86400s.")
-                        passive["unhealthy_window_seconds"] = clamped
-                        passive["healthy_after_seconds"] = clamped
+                        parsed_fails = util.as_int(flag[10:])
+                        if parsed_fails is not None and parsed_fails >= 0:
+                            max_fails_val = parsed_fails
+                    elif flag.startswith("fail_timeout="):
+                        fail_timeout_raw = flag[13:]
+                if max_fails_val is not None or fail_timeout_raw is not None:
+                    # NGINX defaults max_fails to 1 when fail_timeout is given alone, and disables passive checks when 0.
+                    effective_fails = 1 if max_fails_val is None else max_fails_val
+                    if effective_fails > 0:
+                        passive = {"unhealthy_threshold": min(effective_fails, 1000)}
+                        if fail_timeout_raw is not None:
+                            seconds = (util.parse_nginx_time_ms(fail_timeout_raw, allow_ms=False) or 10_000) // 1000
+                            clamped = min(max(1, seconds), 86_400)
+                            if seconds > 86_400:
+                                self.report.warning("nginx-passive-health", ref,
+                                                    "fail_timeout exceeds Ferrum's 86400s passive health-check ceiling "
+                                                    "and was clamped to 86400s.")
+                            passive["unhealthy_window_seconds"] = clamped
+                            passive["healthy_after_seconds"] = clamped
                 spec.targets.append(Target(parsed[0], parsed[1], weight))
             elif directive.name == "least_conn":
                 spec.algorithm = "least_connections"
@@ -1251,11 +1263,12 @@ def _server_hosts(names: list[str]) -> tuple[list[str], str | None]:
     return hosts, None
 
 
-def _is_https_redirect(args: list[str], server_hosts: list[str] | None = None) -> bool:
-    """Whether an NGINX ``return`` is an HTTP-to-HTTPS scheme upgrade (preserving the request URI).
+def _is_https_redirect(args: list[str], server_hosts_lower: frozenset[str] = frozenset()) -> bool:
+    """Whether an NGINX ``return`` is an HTTP-to-HTTPS scheme upgrade preserving the full request URI.
 
-    Static redirects to fixed destinations (such as ``return 301 https://auth.example.test/login;``) or
-    custom-port HTTPS redirects are NOT listener-level scheme upgrades and stay as termination routes.
+    Static redirects to fixed destinations (such as ``return 301 https://auth.example.test/login;``),
+    ``$uri`` forms (which drop query strings), and custom-port HTTPS redirects are NOT listener-level
+    scheme upgrades and stay as termination routes.
     """
     if len(args) == 1:
         url = args[0]
@@ -1266,16 +1279,12 @@ def _is_https_redirect(args: list[str], server_hosts: list[str] | None = None) -
     if not url.startswith("https://"):
         return False
     target = url[len("https://"):]
-    if target in ("$host$request_uri", "$server_name$request_uri", "$http_host$request_uri",
-                  "$host$uri", "$server_name$uri"):
+    if target in ("$host$request_uri", "$server_name$request_uri", "$http_host$request_uri"):
         return True
     if target.endswith("$request_uri"):
         host_part = target[:-len("$request_uri")]
         if host_part and "/" not in host_part and ":" not in host_part and "$" not in host_part:
-            if server_hosts is None:
-                return True
-            if server_hosts and host_part.lower() in {h.lower() for h in server_hosts}:
-                return True
+            return host_part.lower() in server_hosts_lower
     return False
 
 
@@ -1293,13 +1302,13 @@ def mapping_get(data: dict, *keys: str):
     return data
 
 
-def _is_https_redirect_if(directive: Directive) -> bool:
+def _is_https_redirect_if(directive: Directive, server_hosts_lower: frozenset[str] = frozenset()) -> bool:
     condition = " ".join(directive.args)
     if condition not in ("($scheme = http)", "($scheme != https)", "($scheme != \"https\")", "($scheme = \"http\")",
                          "($scheme != 'https')"):
         return False
     body = directive.block or []
-    return len(body) == 1 and body[0].name == "return" and _is_https_redirect(body[0].args)
+    return len(body) == 1 and body[0].name == "return" and _is_https_redirect(body[0].args, server_hosts_lower)
 
 
 def _nginx_regex(pattern: str, case_insensitive: bool) -> str | None:

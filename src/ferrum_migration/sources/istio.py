@@ -404,9 +404,9 @@ class _Istio:
                     continue
                 bucket = main_redirects if server["port"] == settings.main_http_port else extra_redirects
                 bucket.append(((gw_ns, gw_name), srv_idx, server, [] if any_host else stripped))
-        seen_extra_scopes: set[tuple[int | None, tuple[str, ...]]] = set()
+        seen_extra_scopes: set[tuple[int | None, frozenset[str]]] = set()
         for (gw_ns, gw_name), srv_idx, server, hosts in extra_redirects:
-            scope_key = (server["port"], tuple(hosts))
+            scope_key = (server["port"], frozenset(hosts))
             if scope_key in seen_extra_scopes:
                 continue
             seen_extra_scopes.add(scope_key)
@@ -429,10 +429,10 @@ class _Istio:
         has_live_https = any(not r.skip and not r.refusals and "https" in (r.protocols or ())
                              for r in self.plan.routes)
         has_other_plain = any(not r.skip and not r.requires_tls and r.listen_port is None for r in self.plan.routes)
-        seen_main_scopes: set[tuple[str, ...]] = set()
+        seen_main_scopes: set[frozenset[str]] = set()
         if has_live_https and not has_other_plain:
             for (gw_ns, gw_name), srv_idx, server, hosts in main_redirects:
-                scope_key_m = tuple(hosts)
+                scope_key_m = frozenset(hosts)
                 if scope_key_m in seen_main_scopes:
                     continue
                 seen_main_scopes.add(scope_key_m)
@@ -455,7 +455,7 @@ class _Istio:
         exact_redir: dict[str, str] = {}
         wild_redir: dict[str, str] = {}
         for (gw_ns, gw_name), srv_idx, server, hosts in main_redirects:
-            scope_key_m = tuple(hosts)
+            scope_key_m = frozenset(hosts)
             if scope_key_m in seen_main_scopes:
                 continue
             seen_main_scopes.add(scope_key_m)

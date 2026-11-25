@@ -884,31 +884,35 @@ class NginxFrontendScopeTest(unittest.TestCase):
         self.assertTrue(one_arg_res.tls_only)
         self.assertIn("nginx-https-redirect", codes(one_arg_rep, "info"))
         # Plaintext server returning a static fixed HTTPS destination (not a $request_uri scheme upgrade) stays a
-        # static 301 termination route even alongside an unrelated HTTPS server; fail_timeout > 86400s clamps cleanly.
-        fixed_dest_res, fixed_dest_rep, _ = nginx("""
-            upstream slow {
-                server 10.0.0.1:8080 max_fails=2 fail_timeout=2d;
-            }
-            server {
-                listen 80;
-                server_name legacy.example.test;
-                return 301 https://auth.example.test/login;
-            }
-            server {
-                listen 80 default_server;
-                location /api/ { proxy_pass http://slow; }
-            }
-        """)
-        legacy_p = one_proxy(self, fixed_dest_res.config, "/", "legacy.example.test")
-        self.assertEqual(legacy_p["labels"]["ferrum-migration/status"], "terminated")
-        self.assertEqual(plugin(self, fixed_dest_res.config, legacy_p, "request_termination")["config"]["headers"][
-            "location"], "https://auth.example.test/login")
-        self.assertEqual(fixed_dest_res.config["upstreams"][0]["health_checks"]["passive"][
-            "unhealthy_window_seconds"], 86_400)
-        self.assertIn("nginx-passive-health", codes(fixed_dest_rep, "warning"))
+        # static 301 host-only termination route even alongside a default server; fail_timeout > 86400s clamps
+        # regardless of flag order (max_fails before or after fail_timeout).
+        for flags in ("max_fails=2 fail_timeout=2d", "fail_timeout=2d max_fails=2"):
+            fixed_dest_res, fixed_dest_rep, _ = nginx(f"""
+                upstream slow {{
+                    server 10.0.0.1:8080 {flags};
+                }}
+                server {{
+                    listen 80;
+                    server_name legacy.example.test;
+                    return 301 https://auth.example.test/login;
+                }}
+                server {{
+                    listen 80 default_server;
+                    location /api/ {{ proxy_pass http://slow; }}
+                }}
+            """)
+            legacy_p = one_proxy(self, fixed_dest_res.config, None, "legacy.example.test")
+            self.assertEqual(legacy_p["labels"]["ferrum-migration/status"], "terminated")
+            self.assertEqual(plugin(self, fixed_dest_res.config, legacy_p, "request_termination")["config"]["headers"][
+                "location"], "https://auth.example.test/login")
+            passive = fixed_dest_res.config["upstreams"][0]["health_checks"]["passive"]
+            self.assertEqual(passive["unhealthy_window_seconds"], 86_400)
+            self.assertEqual(passive["healthy_after_seconds"], 86_400)
+            self.assertTrue(any(c.code == "nginx-passive-health" and "86400" in c.message
+                                for c in fixed_dest_rep.caveats))
 
-        # Redirect-only plaintext server alongside a wildcard/default plaintext server stays as a refused placeholder
-        # so the broader plaintext server cannot absorb the redirected host's traffic.
+        # Redirect-only plaintext server alongside a wildcard/default plaintext server stays as a refused host-only
+        # placeholder so the default server's '/' route stays live for unrelated hosts.
         mixed_redir_conf = """
         server {
             listen 80;
@@ -921,7 +925,7 @@ class NginxFrontendScopeTest(unittest.TestCase):
         }
         """
         mr_res, _mr_rep, _ = nginx(mixed_redir_conf)
-        self.assertEqual(one_proxy(self, mr_res.config, "/", "secure.example.test")["labels"][
+        self.assertEqual(one_proxy(self, mr_res.config, None, "secure.example.test")["labels"][
             "ferrum-migration/status"], "refused")
         catchall = [p for p in proxies(mr_res.config, "/") if "hosts" not in p]
         self.assertEqual(len(catchall), 1)
