@@ -240,38 +240,185 @@ def _cors_origin_effectively_universal(origin: Any) -> bool:
     return False
 
 
-def _regex_nesting_depth(pattern: str) -> int:
-    """Upper bound on regex nesting depth (groups and character classes) to stay under Ferrum's limit of 24."""
-    depth = 0
-    max_depth = 0
-    in_class = False
+_CORS_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+_CORS_UNICODE_SHORTHANDS = frozenset("wWdDsS")
+_CORS_MAX_REPEAT = 64
+_CORS_MAX_TOTAL_REPEATS = 128
+_CORS_MAX_UNICODE_SHORTHANDS = 4
+
+
+def _cors_regex_problem(pattern: str) -> str | None:
+    """Validate that a CORS origin regex stays within Ferrum v0.9.21's Rust regex limits.
+
+    Ferrum wraps each origin regex as ``^(?:<pattern>)$`` and compiles it with
+    ``nest_limit(24)``, ``size_limit(64 KiB)``, and ``dfa_size_limit(64 KiB)``.
+    We check printable ASCII, reject constructs whose syntax diverges between Python
+    ``re`` and Rust ``regex-syntax``, bound AST nesting conservatively (``3 + 4*group
+    + 2*class + quant <= 24``), and cap bounded repetitions and Unicode shorthands so
+    compiled NFA/DFA size cannot approach 64 KiB.
+    """
+    problem = util.regex_problem(pattern)
+    if problem:
+        return problem
+    if any(ord(ch) < 0x20 or ord(ch) > 0x7E for ch in pattern):
+        return "an allowed origin regex must be printable ASCII"
+    group_depth = 0
+    class_depth = 0
+    class_state = 0  # 2: right after '[', 1: right after '[^', 0: normal inside class
+    class_has_unicode = False
+    unicode_shorthands = 0
+    total_bounded_repeats = 0
+    group_mult_stack = [1]
+    group_unicode_stack = [False]
+    last_atom_mult = 1
+    last_atom_unicode = False
     i = 0
     n = len(pattern)
     while i < n:
         ch = pattern[i]
         if ch == "\\":
+            if i + 1 >= n:
+                return "an allowed origin regex has a trailing escape"
+            nxt = pattern[i + 1]
+            if nxt in "01234567uUN":
+                return "an allowed origin regex uses an escape not portable to Rust regex"
+            if nxt == "x":
+                if i + 3 >= n or pattern[i + 2] not in _CORS_HEX_DIGITS or pattern[i + 3] not in _CORS_HEX_DIGITS:
+                    return "an allowed origin regex has an invalid hex escape"
+                i += 4
+                last_atom_mult = 1
+                last_atom_unicode = False
+                class_state = 0
+                continue
+            if nxt in _CORS_UNICODE_SHORTHANDS:
+                unicode_shorthands += 1
+                if unicode_shorthands > _CORS_MAX_UNICODE_SHORTHANDS:
+                    return "an allowed origin regex exceeds safe Rust regex size bounds"
+                group_unicode_stack[-1] = True
+                if class_depth > 0:
+                    class_has_unicode = True
+                    last_atom_unicode = False
+                else:
+                    last_atom_unicode = True
+            else:
+                last_atom_unicode = False
+            last_atom_mult = 1
+            class_state = 0
             i += 2
             continue
-        if in_class:
+        if class_depth > 0:
+            if class_state == 2 and ch == "^":
+                class_state = 1
+                i += 1
+                continue
+            if ch == "]" and class_state == 0:
+                class_depth = 0
+                last_atom_mult = 1
+                last_atom_unicode = class_has_unicode
+                class_has_unicode = False
+                i += 1
+                continue
+            class_state = 0
             if ch == "[":
-                depth += 1
-                max_depth = max(max_depth, depth)
-            elif ch == "]":
-                depth = max(0, depth - 1)
-                if depth == 0:
-                    in_class = False
-        else:
-            if ch == "(":
-                depth += 1
-                max_depth = max(max_depth, depth)
-            elif ch == ")":
-                depth = max(0, depth - 1)
-            elif ch == "[":
-                in_class = True
-                depth += 1
-                max_depth = max(max_depth, depth)
+                return "an allowed origin regex contains an unescaped '[' inside a character class"
+            if i + 1 < n and pattern[i:i + 2] in ("--", "&&", "~~"):
+                return "an allowed origin regex contains Rust character-class set operators"
+            i += 1
+            continue
+        if ch == "(":
+            step = 1
+            if i + 1 < n and pattern[i + 1] == "?":
+                if pattern.startswith("(?:", i):
+                    step = 3
+                elif pattern.startswith("(?i:", i):
+                    step = 4
+                elif pattern.startswith("(?i)", i):
+                    i += 4
+                    last_atom_mult = 1
+                    last_atom_unicode = False
+                    continue
+                else:
+                    return "an allowed origin regex uses a group construct not supported for CORS migration"
+            group_depth += 1
+            if 3 + 4 * group_depth > 24:
+                return "an allowed origin regex exceeds Ferrum nesting limits"
+            group_mult_stack.append(1)
+            group_unicode_stack.append(False)
+            last_atom_mult = 1
+            last_atom_unicode = False
+            i += step
+            continue
+        if ch == ")":
+            if group_depth > 0:
+                group_depth -= 1
+                child_mult = group_mult_stack.pop()
+                child_unicode = group_unicode_stack.pop()
+                group_mult_stack[-1] = max(group_mult_stack[-1], child_mult)
+                group_unicode_stack[-1] = group_unicode_stack[-1] or child_unicode
+                last_atom_mult = child_mult
+                last_atom_unicode = child_unicode
+            else:
+                last_atom_mult = 1
+                last_atom_unicode = False
+            i += 1
+            continue
+        if ch == "[":
+            class_depth = 1
+            class_state = 2
+            class_has_unicode = False
+            if 3 + 4 * group_depth + 2 * class_depth > 24:
+                return "an allowed origin regex exceeds Ferrum nesting limits"
+            last_atom_mult = 1
+            last_atom_unicode = False
+            i += 1
+            continue
+        if ch in "*+?":
+            if 3 + 4 * group_depth + 1 > 24:
+                return "an allowed origin regex exceeds Ferrum nesting limits"
+            i += 1
+            if i < n and pattern[i] == "?":
+                i += 1
+            last_atom_mult = 1
+            last_atom_unicode = False
+            continue
+        if ch == "{":
+            close = pattern.find("}", i + 1)
+            if close > i + 1:
+                body = pattern[i + 1:close]
+                parts = body.split(",")
+                if len(parts) in (1, 2) and parts[0].isdigit() and (len(parts) == 1 or parts[1] == "" or parts[1].isdigit()):
+                    if 3 + 4 * group_depth + 1 > 24:
+                        return "an allowed origin regex exceeds Ferrum nesting limits"
+                    lo = int(parts[0])
+                    hi = int(parts[1]) if len(parts) == 2 and parts[1] else lo
+                    factor = max(lo, hi)
+                    if factor > _CORS_MAX_REPEAT:
+                        return "an allowed origin regex repetition bound exceeds safe Ferrum size limits"
+                    effective = last_atom_mult * max(1, factor)
+                    if effective > _CORS_MAX_REPEAT:
+                        return "an allowed origin regex nested repetition exceeds safe Ferrum size limits"
+                    total_bounded_repeats += effective
+                    if total_bounded_repeats > _CORS_MAX_TOTAL_REPEATS:
+                        return "an allowed origin regex total repetition budget exceeds safe Ferrum size limits"
+                    if last_atom_unicode and factor > 1:
+                        unicode_shorthands += factor - 1
+                        if unicode_shorthands > _CORS_MAX_UNICODE_SHORTHANDS:
+                            return "an allowed origin regex exceeds safe Rust regex size bounds"
+                    group_mult_stack[-1] = max(group_mult_stack[-1], effective)
+                    i = close + 1
+                    if i < n and pattern[i] == "?":
+                        i += 1
+                    last_atom_mult = 1
+                    last_atom_unicode = False
+                    continue
+            last_atom_mult = 1
+            last_atom_unicode = False
+            i += 1
+            continue
+        last_atom_mult = 1
+        last_atom_unicode = False
         i += 1
-    return max_depth
+    return None
 
 
 def cors_config(origins: Any, methods: Any = None, headers: Any = None, exposed: Any = None,
@@ -293,8 +440,10 @@ def cors_config(origins: Any, methods: Any = None, headers: Any = None, exposed:
                 return None, "an allowed origin matcher is not representable"
             if kind in ("exact", "prefix") and not header_value_ok(value, nonempty=True, strict_ws=True):
                 return None, "an allowed origin matcher is not representable"
-            if kind == "regex" and (util.regex_problem(value) or _regex_nesting_depth(value) > 20):
-                return None, "an allowed origin regex is not representable or exceeds Ferrum nesting limits"
+            if kind == "regex":
+                rx_problem = _cors_regex_problem(value)
+                if rx_problem:
+                    return None, rx_problem
             clean.append({kind: value})
         else:
             return None, "an allowed origin matcher is not representable"

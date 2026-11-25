@@ -1,7 +1,7 @@
 # Runtime acceptance harness
 
 Standalone, Python-stdlib-only acceptance tests for `ferrum-migration` output
-against **Ferrum Edge v0.9.21** (reference commit `c1d73c35`). For each
+against **Ferrum Edge v0.9.21** (reference commit `f9915358`). For each
 synthetic fixture the harness:
 
 1. starts two loopback echo backends (`127.0.0.1`, OS-assigned ports, held

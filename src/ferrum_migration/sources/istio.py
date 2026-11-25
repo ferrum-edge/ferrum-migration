@@ -194,31 +194,17 @@ class _Istio:
         """
         gw_ns, gw_name = _meta(gateway)
         selector = mapping(mapping(gateway.get("spec")).get("selector"))
-        gw_label_name = selector.get("gateway.networking.k8s.io/gateway-name")
         reasons: list[str] = []
         for policy in self.policies:
             ns, name = _meta(policy)
             spec = mapping(policy.get("spec"))
             kind = str(policy.get("kind"))
             refs = [mapping(r) for r in seq(spec.get("targetRefs")) + seq(spec.get("targetRef"))]
-            targeted = any(
-                r.get("kind") == "Gateway"
-                and (
-                    (r.get("name") == gw_name and (r.get("namespace") or ns) == gw_ns)
-                    or (isinstance(gw_label_name, str) and r.get("name") == gw_label_name)
-                )
-                for r in refs
-            )
             labels = mapping(mapping(spec.get("selector")).get("matchLabels")) or \
                 mapping(mapping(spec.get("workloadSelector")).get("labels"))
             label = f"{kind} {safe_label(ns)}/{safe_label(name)}"
-            if targeted:
-                applies = True
-            elif refs and all(isinstance(r.get("kind"), str) and r["kind"].strip()
-                              and isinstance(r.get("name"), str) and r["name"].strip() for r in refs):
-                applies = False
-            elif refs:
-                applies = True
+            if refs:
+                applies = any(_target_ref_may_apply(r, ns, gw_ns, gw_name, selector) for r in refs)
             elif labels:
                 applies = not _selectors_disjoint(selector, labels)
             else:
@@ -1009,10 +995,11 @@ def _translate_istio_fault(raw: Any) -> tuple[str, Any]:
         pct = pct_obj["value"]
         if isinstance(pct, bool) or not isinstance(pct, (int, float)):
             return "drop", "abort percentage is invalid"
-        http_status = util.as_int(abort.get("httpStatus"))
+        http_raw = abort.get("httpStatus")
         grpc_raw = abort.get("grpcStatus")
-        if http_status is not None and grpc_raw is not None:
+        if http_raw is not None and grpc_raw is not None:
             return "drop", "abort cannot set both httpStatus and grpcStatus (mutually exclusive in Istio)"
+        http_status = util.as_int(http_raw) if http_raw is not None else None
         grpc_code: int | None = None
         if grpc_raw is not None:
             if isinstance(grpc_raw, str) and grpc_raw.upper() in _GRPC_STATUS_NAMES:
@@ -1021,8 +1008,7 @@ def _translate_istio_fault(raw: Any) -> tuple[str, Any]:
                 grpc_code = util.as_int(grpc_raw)
             if grpc_code is None:
                 return "drop", "abort.grpcStatus is not representable"
-            if http_status is None:
-                http_status = 503
+            http_status = 503
         if http_status is None:
             return "drop", "abort.httpStatus is missing or invalid"
         if float(pct) > 0.0:
@@ -1053,6 +1039,33 @@ def _selectors_disjoint(gateway_selector: dict, policy_labels: dict) -> bool:
     """
     return any(key in gateway_selector and str(gateway_selector[key]) != str(value)
                for key, value in policy_labels.items())
+
+
+def _target_ref_may_apply(ref: dict, policy_ns: str, gw_ns: str, gw_name: str, gateway_selector: dict) -> bool:
+    """Whether a policy ``targetRef`` entry may apply to the legacy Gateway's workloads (fail closed).
+
+    A Kubernetes Gateway API ``targetRef`` (``kind: Gateway``) attaches to gateway pods carrying either
+    ``gateway.networking.k8s.io/gateway-name: <name>`` or legacy ``istio.io/gateway-name: <name>``. Under the
+    same disjointness invariant as workload selectors, a ``kind: Gateway`` targetRef is provably unrelated only
+    when it does not name this Gateway AND ``gateway_selector`` pins BOTH gateway-name label keys to values
+    different from the referenced Gateway name. ``kind: GatewayClass`` and malformed refs always apply.
+    """
+    raw_kind = ref.get("kind")
+    raw_name = ref.get("name")
+    if not (isinstance(raw_kind, str) and raw_kind.strip() and isinstance(raw_name, str) and raw_name.strip()):
+        return True
+    ref_kind = raw_kind.strip()
+    ref_name = raw_name.strip()
+    if ref_kind == "GatewayClass":
+        return True
+    if ref_kind != "Gateway":
+        return False
+    if ref_name == gw_name and (ref.get("namespace") or policy_ns) == gw_ns:
+        return True
+    return not (
+        _selectors_disjoint(gateway_selector, {"gateway.networking.k8s.io/gateway-name": ref_name})
+        and _selectors_disjoint(gateway_selector, {"istio.io/gateway-name": ref_name})
+    )
 
 
 def _is_ip_literal(value: str) -> bool:

@@ -1,6 +1,6 @@
 """Drive the Ferrum Edge v0.9.21 CLI: ``version``, ``validate`` and file-mode ``run``.
 
-Runtime contract (verified by reading ferrum-edge @ c1d73c35, Cargo version 0.9.21):
+Runtime contract (verified by reading ferrum-edge @ f9915358, Cargo version 0.9.21):
 
 * ``ferrum-edge version --json`` prints ``{"version":"…","target":"…"}``
   (src/cli.rs ``execute_version``).

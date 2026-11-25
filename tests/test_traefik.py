@@ -1146,7 +1146,12 @@ class TraefikHardeningTest(unittest.TestCase):
                     "r": {
                         "rule": "Host(`a.example.test`) && PathPrefix(`/api/`)",
                         "service": "mirrored",
-                        "middlewares": ["comp", "buf"],
+                        "middlewares": ["comp"],
+                    },
+                    "r_buf": {
+                        "rule": "Host(`a.example.test`) && PathPrefix(`/buf/`)",
+                        "service": "main",
+                        "middlewares": ["buf"],
                     },
                     "r_gw": {
                         "rule": "Host(`a.example.test`) && PathPrefix(`/grpc/`)",
@@ -1227,7 +1232,9 @@ class TraefikHardeningTest(unittest.TestCase):
             "min_content_length": 2048,
             "content_types": ["application/json", "text/plain"],
         })
-        self.assertEqual(plugin(self, result.config, proxy, "response_size_limiting")["config"],
+        buf_proxy = one_proxy(self, result.config, "/buf", "a.example.test")
+        self.assertEqual(buf_proxy["labels"]["ferrum-migration/status"], "migrated")
+        self.assertEqual(plugin(self, result.config, buf_proxy, "response_size_limiting")["config"],
                          {"max_bytes": 4194304, "require_buffered_check": True})
         self.assertEqual(plugin(self, result.config, proxy, "request_mirror")["config"], {
             "mirror_host": "shadow.internal",
@@ -1305,21 +1312,24 @@ class TraefikHardeningTest(unittest.TestCase):
                 self.assertEqual(mr_p["labels"]["ferrum-migration/status"], "migrated")
                 self.assertNotIn("request_mirror", [p["plugin_name"] for p in plugins_of(mr_res.config, mr_p)])
                 self.assertIn("traefik-mirroring", codes(mr_rep, "warning"))
-        buf_before_comp = yaml.safe_dump({
-            "http": {
-                "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "main",
-                                  "middlewares": ["ch"]}},
-                "middlewares": {
-                    "ch": {"chain": {"middlewares": ["buf", "comp"]}},
-                    "buf": {"buffering": {"maxResponseBodyBytes": 1048576}},
-                    "comp": {"compress": {"encodings": ["gzip"]}},
-                },
-                "services": {"main": {"loadBalancer": {"servers": [{"url": "http://main.internal:8080"}]}}},
-            }
-        })
-        bc_res, _bc_rep, _ = asserted(buf_before_comp)
-        self.assertEqual(one_proxy(self, bc_res.config, "/api", "a.example.test")["labels"][
-            "ferrum-migration/status"], "refused")
+        # Combining buffering.maxResponseBodyBytes and compress in EITHER order (including via chain) refuses.
+        for order in (["buf", "comp"], ["comp", "buf"]):
+            with self.subTest(order=order):
+                combo_doc = yaml.safe_dump({
+                    "http": {
+                        "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "main",
+                                          "middlewares": ["ch"]}},
+                        "middlewares": {
+                            "ch": {"chain": {"middlewares": order}},
+                            "buf": {"buffering": {"maxResponseBodyBytes": 1048576}},
+                            "comp": {"compress": {"encodings": ["gzip"]}},
+                        },
+                        "services": {"main": {"loadBalancer": {"servers": [{"url": "http://main.internal:8080"}]}}},
+                    }
+                })
+                bc_res, _bc_rep, _ = asserted(combo_doc)
+                self.assertEqual(one_proxy(self, bc_res.config, "/api", "a.example.test")["labels"][
+                    "ferrum-migration/status"], "refused")
         # Canonical schema gate checks newly supported compress/grpcWeb/mirror fields.
         bad = yaml.safe_dump({"http": {"middlewares": {"c": {"compress": {"Encodings": ["gzip"]}}}}})
         with self.assertRaises(InputError):

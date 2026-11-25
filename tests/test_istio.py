@@ -92,8 +92,17 @@ class IstioSecurityTest(unittest.TestCase):
 
     def test_policy_for_other_workloads_does_not_affect_gateway(self):
         # Provably disjoint: the policy pins the Gateway selector's own label key to another value, so no pod
-        # can match both. A targetRef naming another Gateway is unrelated too.
-        text = read_fixture("istio", "istio.yaml") + textwrap.dedent("""
+        # can match both. A kind: Gateway targetRef is provably unrelated only when the legacy Gateway selector
+        # pins both gateway.networking.k8s.io/gateway-name and istio.io/gateway-name to a different value.
+        pinned_fixture = read_fixture("istio", "istio.yaml").replace(
+            "  selector:\n    istio: ingressgateway\n",
+            "  selector:\n"
+            "    istio: ingressgateway\n"
+            "    gateway.networking.k8s.io/gateway-name: public-gw\n"
+            "    istio.io/gateway-name: public-gw\n",
+            1,
+        )
+        text = pinned_fixture + textwrap.dedent("""
             ---
             apiVersion: security.istio.io/v1
             kind: AuthorizationPolicy
@@ -1012,9 +1021,24 @@ class IstioCaseAndNamesTest(unittest.TestCase):
         _im_res, im_rep, _ = migrate("istio", inert_m)
         self.assertNotIn("istio-dropped", codes(im_rep))
 
-        # RequestAuthentication in istio-system still refuses fail-closed because static CRDs omit
-        # meshConfig.rootNamespace and gateway pod namespaces; a targetRef matching a legacy Gateway's
-        # gateway.networking.k8s.io/gateway-name workload label also refuses fail-closed.
+        # Mutually exclusive abort fields (httpStatus + grpcStatus, even when httpStatus is invalid) are dropped.
+        for bad_abort in (
+            "abort: {httpStatus: 503, grpcStatus: UNAVAILABLE, percentage: {value: 5}}",
+            "abort: {httpStatus: invalid, grpcStatus: UNAVAILABLE, percentage: {value: 5}}",
+        ):
+            bad_fault_doc = text.replace(
+                "abort: {grpcStatus: UNAVAILABLE, percentage: {value: 5}}",
+                bad_abort,
+            )
+            bf_res, bf_rep, _ = migrate("istio", bad_fault_doc)
+            bf_grpc = one_proxy(self, bf_res.config, "=/grpc", "api.example.test")
+            self.assertNotIn("fault_injection", [p["plugin_name"] for p in plugins_of(bf_res.config, bf_grpc)])
+            self.assertIn("istio-dropped", codes(bf_rep, "warning"))
+
+        # RequestAuthentication in istio-system refuses fail-closed because static CRDs omit
+        # meshConfig.rootNamespace and gateway pod namespaces. A kind: Gateway targetRef also refuses
+        # unless the legacy Gateway selector pins BOTH gateway.networking.k8s.io/gateway-name and
+        # istio.io/gateway-name to a different value (covering unspecified labels and legacy istio.io labels).
         ra_text = text + textwrap.dedent("""
             ---
             apiVersion: security.istio.io/v1
@@ -1033,10 +1057,7 @@ class IstioCaseAndNamesTest(unittest.TestCase):
         self.assertEqual(one_proxy(self, ra_res.config, "=/api", "api.example.test")["labels"][
             "ferrum-migration/status"], "refused")
 
-        k8s_gw_label_text = text.replace(
-            "selector: {istio: ingressgateway}",
-            "selector: {gateway.networking.k8s.io/gateway-name: edge-api}",
-        ) + textwrap.dedent("""
+        target_ref_policy = textwrap.dedent("""
             ---
             apiVersion: security.istio.io/v1
             kind: RequestAuthentication
@@ -1051,9 +1072,17 @@ class IstioCaseAndNamesTest(unittest.TestCase):
                   jwksUri: https://idp.example.test/.well-known/jwks.json
                   audiences: [api]
         """)
-        k8s_res, _k8s_rep, _ = migrate("istio", k8s_gw_label_text)
-        self.assertEqual(one_proxy(self, k8s_res.config, "=/api", "api.example.test")["labels"][
-            "ferrum-migration/status"], "refused")
+        for gw_sel in (
+            "selector: {istio: ingressgateway}",
+            "selector: {gateway.networking.k8s.io/gateway-name: edge-api}",
+            "selector: {istio.io/gateway-name: edge-api}",
+            "selector: {gateway.networking.k8s.io/gateway-name: other-gw}",
+        ):
+            with self.subTest(selector=gw_sel):
+                k8s_doc = text.replace("selector: {istio: ingressgateway}", gw_sel) + target_ref_policy
+                k8s_res, _k8s_rep, _ = migrate("istio", k8s_doc)
+                self.assertEqual(one_proxy(self, k8s_res.config, "=/api", "api.example.test")["labels"][
+                    "ferrum-migration/status"], "refused")
 
 
 if __name__ == "__main__":

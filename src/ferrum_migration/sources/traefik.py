@@ -432,6 +432,7 @@ class _Acc:
     retry: dict | None = None
     allowed_hosts: list[str] | None = None
     resp_size_limited: bool = False
+    has_compress: bool = False
 
 
 class _Traefik:
@@ -1071,18 +1072,25 @@ class _Traefik:
                                     "chunked bodies up to max_bytes")
             resp_size = util.as_int(config.get("maxResponseBodyBytes"))
             if resp_size and resp_size > 0:
-                acc.plugins.append(PluginSpec("response_size_limiting",
-                                              {"max_bytes": resp_size, "require_buffered_check": True}, ref))
+                if acc.has_compress:
+                    acc.refusals.append("combining compress and buffering.maxResponseBodyBytes changes size-limit "
+                                        "semantics in Ferrum (Ferrum applies response_size_limiting to both the "
+                                        "backend response and the compressed output buffer)")
+                else:
+                    acc.plugins.append(PluginSpec("response_size_limiting",
+                                                  {"max_bytes": resp_size, "require_buffered_check": True}, ref))
                 acc.resp_size_limited = True
             if any(config.get(k) for k in ("memRequestBodyBytes", "memResponseBodyBytes", "retryExpression")) \
                     or not ((req_size and req_size > 0) or (resp_size and resp_size > 0)):
                 self.report.info("traefik-buffering", ref,
                                  "Only maxResponseBodyBytes is migrated from buffering.")
         elif mw_type == "compress":
+            acc.has_compress = True
             if acc.resp_size_limited:
-                acc.refusals.append("buffering.maxResponseBodyBytes ordered before compress measures compressed "
-                                    "response size in Traefik, whereas Ferrum response_size_limiting checks the "
-                                    "uncompressed backend Content-Length")
+                acc.refusals.append("combining buffering.maxResponseBodyBytes and compress changes size-limit "
+                                    "semantics in Ferrum (Traefik measures compressed size when buffering wraps "
+                                    "compress, whereas Ferrum applies response_size_limiting to both backend and "
+                                    "compressed output buffers)")
             else:
                 self._compress(config, acc, ref)
         elif mw_type == "grpcWeb":

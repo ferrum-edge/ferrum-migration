@@ -29,6 +29,38 @@ _REDIRECT_CODES = {"MOVED_PERMANENTLY": 301, "FOUND": 302, "SEE_OTHER": 303, "TE
                    "PERMANENT_REDIRECT": 308}
 
 
+_ENVOY_MAP_FIELDS = frozenset({
+    "typed_per_filter_config", "per_filter_config", "filter_metadata", "typed_filter_metadata", "dynamic_metadata",
+    "metadata", "static_layer", "labels", "providers", "requirement_map",
+})
+_CAMEL_BOUNDARY_RE = re.compile(r"([a-z0-9])([A-Z])")
+
+
+def _proto_snake(key: str) -> str:
+    """Convert a protobuf canonical JSON camelCase field name to snake_case."""
+    if not key or key.startswith("@") or key.islower():
+        return key
+    return _CAMEL_BOUNDARY_RE.sub(r"\1_\2", key).lower()
+
+
+def _normalize_envoy_proto(obj: Any, *, preserve_map_keys: bool = False) -> Any:
+    """Normalize protobuf JSON camelCase field aliases to snake_case, rejecting duplicate spellings."""
+    if isinstance(obj, list):
+        return [_normalize_envoy_proto(item, preserve_map_keys=False) for item in obj]
+    if not isinstance(obj, dict):
+        return obj
+    out: dict[Any, Any] = {}
+    for raw_key, raw_val in obj.items():
+        if preserve_map_keys or not isinstance(raw_key, str):
+            out[raw_key] = _normalize_envoy_proto(raw_val, preserve_map_keys=False)
+            continue
+        norm_key = _proto_snake(raw_key)
+        if norm_key in out:
+            raise InputError(f"Envoy config contains duplicate protobuf field spelling for '{safe_label(norm_key, 60)}'")
+        out[norm_key] = _normalize_envoy_proto(raw_val, preserve_map_keys=norm_key in _ENVOY_MAP_FIELDS)
+    return out
+
+
 def _proto_bool(value: Any) -> bool | None:
     """Read a protobuf BoolValue in either JSON bool or ``{value: bool}`` shape."""
     if isinstance(value, bool):
@@ -36,6 +68,16 @@ def _proto_bool(value: Any) -> bool | None:
     if isinstance(value, dict) and isinstance(value.get("value"), bool):
         return value["value"]
     return None
+
+
+def _proto_uint32(value: Any) -> int | None:
+    """Read a protobuf UInt32Value in either JSON int or ``{value: int}`` shape."""
+    if isinstance(value, dict):
+        if set(value) != {"value"}:
+            return None
+        value = value.get("value")
+    parsed = util.as_int(value)
+    return parsed if parsed is not None and 0 <= parsed <= 0xFFFFFFFF else None
 
 
 _EXACT_TYPE_KINDS = {
@@ -292,7 +334,9 @@ class _Envoy:
         hcm_filter_kinds: dict[str, str] = {}
         fault_filter_count = 0
         cors_filter_count = 0
-        for http_filter in seq(config.get("http_filters")):
+        fault_index: int | None = None
+        cors_index: int | None = None
+        for idx, http_filter in enumerate(seq(config.get("http_filters"))):
             raw_filter = mapping(http_filter)
             if raw_filter.get("config_discovery") is not None:
                 filter_refusal = "HTTP filter uses dynamic config_discovery, which is not migrated"
@@ -303,10 +347,14 @@ class _Envoy:
                 hcm_filter_kinds[fname] = kind
             if kind == "fault":
                 fault_filter_count += 1
+                if fault_index is None:
+                    fault_index = idx
                 if fault_filter_count > 1:
                     filter_refusal = "multiple fault HTTP filters in one connection manager are not supported"
             elif kind == "cors":
                 cors_filter_count += 1
+                if cors_index is None:
+                    cors_index = idx
                 if cors_filter_count > 1:
                     filter_refusal = "multiple cors HTTP filters in one connection manager are not supported"
             if raw_filter.get("disabled"):
@@ -366,7 +414,9 @@ class _Envoy:
                   "typed_per_filter_config": mapping(route_config.get("typed_per_filter_config")),
                   "hcm_filter_kinds": hcm_filter_kinds,
                   "hcm_plugins": hcm_plugins,
-                  "hcm_fault": hcm_fault}
+                  "hcm_fault": hcm_fault,
+                  "fault_index": fault_index,
+                  "cors_index": cors_index}
         for index, vhost in enumerate(seq(route_config.get("virtual_hosts"))):
             if isinstance(vhost, dict):
                 self._vhost(vhost, index, ref, listen_port, tls, cors_enabled, filter_refusal, buffer_limit, shared)
@@ -556,7 +606,14 @@ class _Envoy:
         if effective_fault is not None:
             spec.plugins.append(PluginSpec(effective_fault.name, effective_fault.config, effective_fault.ref))
         self._headers(spec, raw, vhost, shared, ref)
-        self._cors(spec, raw, vhost, shared, cors_enabled, hcm_filter_kinds, ref)
+        cors_active = self._cors(spec, raw, vhost, shared, cors_enabled, hcm_filter_kinds, ref)
+        if effective_fault is not None and cors_active:
+            f_idx = shared.get("fault_index")
+            c_idx = shared.get("cors_index")
+            if f_idx is not None and c_idx is not None and f_idx < c_idx:
+                spec.refuse("fault filter precedes cors in Envoy http_filters (aborting preflights before CORS), "
+                            "whereas Ferrum cors answers preflights in on_request_received before fault_injection "
+                            "runs in before_proxy")
         return spec
 
     def _direct_response(self, spec: RouteSpec, response: dict) -> None:
@@ -732,7 +789,7 @@ class _Envoy:
         return builder(op, key, translated)
 
     def _cors(self, spec: RouteSpec, raw: dict, vhost: dict, shared: dict, enabled: bool,
-              hcm_filter_kinds: dict[str, str], ref: str) -> None:
+              hcm_filter_kinds: dict[str, str], ref: str) -> bool:
         # Match Envoy cors_filter.cc initializeCorsPolicies precedence:
         # 1) Walk route -> vhost -> route_config typed_per_filter_config for cors-kind entries. If the most
         #    specific cors entry is FilterConfig{disabled: true}, the filter is disabled (legacy route.cors/vhost.cors
@@ -758,7 +815,7 @@ class _Envoy:
                     if override.get("disabled") is True and (not omsg or is_fc):
                         self.report.info("envoy-cors-inactive", ref,
                                          "CORS filter disabled via typed_per_filter_config; omitted.")
-                        return
+                        return False
                 if not is_fc:
                     typed_policies.append(override)
                 break
@@ -769,11 +826,11 @@ class _Envoy:
             legacy_route = route_action.get("cors") if route_action.get("cors") is not None else raw.get("cors")
             policies = [p for p in (legacy_route, vhost.get("cors")) if isinstance(p, dict)]
         if not policies:
-            return
+            return False
         if not enabled and not typed_policies:
             self.report.info("envoy-cors-inactive", ref, "CORS policy present without the cors HTTP filter; ignored "
                              "(it had no effect in Envoy).")
-            return
+            return False
         # Check Envoy enablement/shadow controls on the most specific policy so 0% / shadow-only CORS never activates.
         top_policy = policies[0]
         raw_legacy_enabled = top_policy.get("enabled")
@@ -781,27 +838,27 @@ class _Envoy:
             legacy_bool = _proto_bool(raw_legacy_enabled)
             if legacy_bool is False:
                 self.report.info("envoy-cors-inactive", ref, "CORS policy has enabled: false; omitted.")
-                return
+                return False
             if legacy_bool is None:
                 spec.refuse("CORS policy has an invalid enabled value")
-                return
+                return False
         raw_fe = top_policy.get("filter_enabled")
         if raw_fe is not None:
             if not isinstance(raw_fe, dict) or raw_fe.get("runtime_key"):
                 spec.refuse("CORS policy uses dynamic or malformed filter_enabled that cannot be preserved statically")
-                return
+                return False
             dv = raw_fe.get("default_value")
             fe_pct = 0.0 if dv is None else _envoy_fractional_percent(dv)
             if fe_pct is None or fe_pct not in (0.0, 100.0):
                 spec.refuse("CORS policy uses fractional or invalid filter_enabled that cannot be preserved statically")
-                return
+                return False
             if fe_pct == 0.0:
                 self.report.info("envoy-cors-inactive", ref,
                                  "CORS policy has filter_enabled 0% (inactive or shadow-only); omitted.")
-                return
+                return False
         elif top_policy.get("shadow_enabled") is not None:
             spec.refuse("CORS policy sets shadow_enabled without an explicit filter_enabled; review manually")
-            return
+            return False
         # Merge CORS fields most-specific-first matching Envoy's cors_filter.cc field fallback across policy layers.
         merged_origins = next((p["allow_origin_string_match"] for p in policies
                                if seq(p.get("allow_origin_string_match"))), None)
@@ -833,7 +890,7 @@ class _Envoy:
                 self.report.warning("envoy-cors", ref,
                                     "CORS omitted (allow_credentials has an invalid non-boolean value); browsers block "
                                     "cross-origin calls.")
-                return
+                return False
         raw_fnmp = next((p["forward_not_matching_preflights"] for p in policies
                          if p.get("forward_not_matching_preflights") is not None), None)
         unmatched_mode = "forward"
@@ -841,7 +898,7 @@ class _Envoy:
             fnmp_bool = _proto_bool(raw_fnmp)
             if fnmp_bool is None:
                 spec.refuse("CORS policy has an invalid forward_not_matching_preflights value")
-                return
+                return False
             unmatched_mode = "forward" if fnmp_bool else "ignore"
         parsed_methods = split_csv(merged_methods) or None
         parsed_headers = split_csv(merged_headers) or None
@@ -850,7 +907,7 @@ class _Envoy:
             spec.refuse("CORS policy combines allow_credentials=true with wildcard '*' in "
                         "allow_methods/allow_headers/expose_headers, which Ferrum returns literally; specify "
                         "explicit method and header lists")
-            return
+            return False
         if creds is not True and isinstance(merged_headers, str) and merged_headers.strip() == "*":
             # For standalone allow_headers: "*" without credentials, emit ["*", "authorization"] so Fetch
             # preflights for bearer-token requests succeed (Fetch does not cover Authorization with bare '*').
@@ -863,10 +920,12 @@ class _Envoy:
                                      unmatched_preflights=unmatched_mode)
         if built:
             spec.plugins.append(PluginSpec("cors", built, ref))
-        elif creds is True:
+            return True
+        if creds is True:
             spec.refuse(f"CORS policy with allow_credentials cannot be admitted by Ferrum ({problem})")
         else:
             self.report.warning("envoy-cors", ref, f"CORS omitted ({problem}); browsers block cross-origin calls.")
+        return False
 
     # ---------------------------------------------------------------- clusters
 
@@ -1115,10 +1174,14 @@ class _Envoy:
 def _envoy_fractional_percent(value: Any) -> float | None:
     if not isinstance(value, dict):
         return None
-    numerator = util.as_int(value.get("numerator"))
+    if "numerator" not in value or value.get("numerator") is None:
+        numerator = 0
+    else:
+        numerator = util.as_int(value.get("numerator"))
     if numerator is None or numerator < 0:
         return None
-    denom = str(value.get("denominator", "HUNDRED")).upper()
+    raw_denom = value.get("denominator")
+    denom = "HUNDRED" if raw_denom is None else str(raw_denom).upper()
     scale = {"HUNDRED": 1.0, "TEN_THOUSAND": 100.0, "MILLION": 10_000.0}.get(denom)
     if scale is None:
         return None
@@ -1170,9 +1233,14 @@ def _parse_envoy_compressor(typed: dict) -> tuple[str, Any]:
             return "refuse", "response_direction_config.common_config.enabled.default_value is invalid"
         if default_enabled is False:
             return "omit", None
-    min_len = util.as_int(common.get("min_content_length")) if common.get("min_content_length") is not None else None
-    if common.get("min_content_length") is not None and min_len is None:
-        return "refuse", "response_direction_config.common_config.min_content_length is invalid"
+    raw_min = common.get("min_content_length")
+    if raw_min is None:
+        # Envoy CommonDirectionConfig defaults min_content_length to 30 bytes (Ferrum defaults to 256).
+        min_len: int | None = 30
+    else:
+        min_len = _proto_uint32(raw_min)
+        if min_len is None:
+            return "refuse", "response_direction_config.common_config.min_content_length is invalid"
     raw_types = common.get("content_type")
     content_types = str_list(raw_types) if raw_types is not None else None
     if raw_types is not None and not content_types:
@@ -1188,7 +1256,10 @@ def _parse_envoy_compressor(typed: dict) -> tuple[str, Any]:
                             "range in Ferrum); omitted.")
         content_types = exact_types
     remove_ae = resp.get("remove_accept_encoding_header")
-    if remove_ae is not None and not isinstance(remove_ae, bool):
+    if remove_ae is None:
+        # Envoy ResponseDirectionConfig defaults remove_accept_encoding_header to false (Ferrum defaults to true).
+        remove_ae = False
+    elif not isinstance(remove_ae, bool):
         return "refuse", "remove_accept_encoding_header must be a boolean"
     cfg, err = compression_config([algo], min_content_length=min_len, content_types=content_types,
                                   allow_ranges=False, remove_accept_encoding=remove_ae)
@@ -1226,10 +1297,16 @@ def _parse_envoy_fault(typed: dict, *, has_runtime: bool = False) -> tuple[str, 
         unknown_a = [str(k) for k in raw_abort if k not in ("http_status", "grpc_status", "percentage")]
         if unknown_a:
             return "refuse", f"unsupported fault abort field(s): {', '.join(sorted(unknown_a)[:4])}"
-        http_status = util.as_int(raw_abort.get("http_status"))
-        grpc_status = util.as_int(raw_abort.get("grpc_status")) if raw_abort.get("grpc_status") is not None else None
-        if raw_abort.get("grpc_status") is not None and grpc_status is None:
+        http_raw = raw_abort.get("http_status")
+        grpc_raw = raw_abort.get("grpc_status")
+        if http_raw is not None and grpc_raw is not None:
+            return "refuse", "abort cannot set both http_status and grpc_status"
+        http_status = util.as_int(http_raw) if http_raw is not None else None
+        grpc_status = util.as_int(grpc_raw) if grpc_raw is not None else None
+        if grpc_raw is not None and grpc_status is None:
             return "refuse", "abort.grpc_status is invalid"
+        if http_raw is not None and http_status is None:
+            return "refuse", "abort.http_status is invalid"
         if http_status is None and grpc_status is not None:
             http_status = 503
         if http_status is None:
@@ -1269,4 +1346,4 @@ def translate(text: str, fmt: str, ctx: SourceContext) -> Plan:
     documents = load_structured(text, fmt, ctx.limits, allow_multi=False)
     if not documents or not isinstance(documents[0], dict):
         raise InputError("Envoy bootstrap must be a mapping at the top level")
-    return _Envoy(documents[0], ctx).run()
+    return _Envoy(_normalize_envoy_proto(documents[0]), ctx).run()

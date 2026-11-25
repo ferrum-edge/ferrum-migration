@@ -787,7 +787,8 @@ class NginxFrontendScopeTest(unittest.TestCase):
             self.assertNotIn("compression", [pl["plugin_name"] for pl in plugins_of(dp_res.config, dp_p)])
             self.assertIn("nginx-gzip", codes(dp_rep, "warning"))
 
-        # Explicit gzip_proxied any + gzip_http_version 1.0 without gzip_types compresses ONLY text/html.
+        # Explicit gzip_proxied any + gzip_http_version 1.0 without gzip_types compresses ONLY text/html
+        # and emits NGINX's explicit defaults (min_content_length: 20, gzip_level: 1).
         html_only_conf = """
         server {
             listen 80;
@@ -801,7 +802,7 @@ class NginxFrontendScopeTest(unittest.TestCase):
         def_res, _def_rep, _ = nginx(html_only_conf)
         html_p = one_proxy(self, def_res.config, "/html", "def.example.test")
         self.assertEqual(plugin(self, def_res.config, html_p, "compression")["config"], {
-            "algorithms": ["gzip"], "content_types": ["text/html"],
+            "algorithms": ["gzip"], "min_content_length": 20, "content_types": ["text/html"], "gzip_level": 1,
         })
 
 

@@ -83,18 +83,40 @@ class FerrumSourceSchemaTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.src = ferrum_src()
-        with open(os.path.join(cls.src, "src", "config", "types.rs"), encoding="utf-8") as handle:
-            cls.types = handle.read()
+        cls.pinned_commit = None
+        git = shutil.which("git")
+        if git and os.path.exists(os.path.join(cls.src, ".git")):
+            check = subprocess.run(
+                [git, "-C", cls.src, "rev-parse", "--verify", f"{FERRUM_EDGE_REFERENCE_COMMIT}^{{commit}}"],
+                capture_output=True, text=True, check=False,
+            )
+            if check.returncode == 0 and check.stdout.strip() == FERRUM_EDGE_REFERENCE_COMMIT:
+                cls.pinned_commit = FERRUM_EDGE_REFERENCE_COMMIT
+        cls.types = cls.read_source("src/config/types.rs")
+
+    @classmethod
+    def read_source(cls, relpath: str) -> str:
+        if cls.pinned_commit:
+            completed = subprocess.run(
+                ["git", "-C", cls.src, "show", f"{cls.pinned_commit}:{relpath}"],
+                capture_output=True, text=True, check=True,
+            )
+            return completed.stdout
+        with open(os.path.join(cls.src, *relpath.split("/")), encoding="utf-8") as handle:
+            return handle.read()
 
     def fields(self, name):
         return struct_fields(self.types, name)
 
     def test_reference_commit(self):
-        head = os.path.join(self.src, ".git", "refs", "heads", "main")
-        if not os.path.isfile(head):
-            self.skipTest("checkout has no refs/heads/main")
-        with open(head, encoding="utf-8") as handle:
-            self.assertEqual(handle.read().strip(), FERRUM_EDGE_REFERENCE_COMMIT)
+        if self.pinned_commit == FERRUM_EDGE_REFERENCE_COMMIT:
+            return
+        git = shutil.which("git")
+        if not git or not os.path.exists(os.path.join(self.src, ".git")):
+            self.skipTest("source directory is not a git checkout")
+        head = subprocess.run([git, "-C", self.src, "rev-parse", "HEAD"], capture_output=True, text=True, check=False)
+        self.assertEqual(head.returncode, 0, head.stderr)
+        self.assertEqual(head.stdout.strip(), FERRUM_EDGE_REFERENCE_COMMIT)
 
     def test_emitted_keys_are_accepted_struct_fields(self):
         top = self.fields("GatewayConfig") | {"resource_counts"}
@@ -130,8 +152,7 @@ class FerrumSourceSchemaTest(unittest.TestCase):
             for item in result.config["plugin_configs"]:
                 name = item["plugin_name"]
                 if name not in cache:
-                    with open(os.path.join(self.src, "src", "plugins", f"{name}.rs"), encoding="utf-8") as handle:
-                        cache[name] = set(re.findall(r'"([a-z][a-z0-9_]*)"', handle.read()))
+                    cache[name] = set(re.findall(r'"([a-z][a-z0-9_]*)"', self.read_source(f"src/plugins/{name}.rs")))
                 keys = set(item["config"])
                 for rule in item["config"].get("rules", []):
                     keys |= set(rule) | {rule["operation"], rule["target"]}
@@ -142,8 +163,7 @@ class FerrumSourceSchemaTest(unittest.TestCase):
                     self.assertLessEqual(keys, cache[name] | {"header"})
 
     def test_settings_are_in_public_inventory(self):
-        with open(os.path.join(self.src, "src", "config", "public_env_inventory.rs"), encoding="utf-8") as handle:
-            inventory = set(re.findall(r'"(FERRUM_[A-Z0-9_]+)"', handle.read()))
+        inventory = set(re.findall(r'"(FERRUM_[A-Z0-9_]+)"', self.read_source("src/config/public_env_inventory.rs")))
         self.assertLessEqual(KNOWN_SETTINGS, inventory)
         for platform, _parts, result, plan in outputs():
             for mode in ("file", "database", "cp", "dp"):
@@ -415,8 +435,12 @@ class FerrumBinaryValidateTest(unittest.TestCase):
         )
         traefik_text = yaml.safe_dump({
             "http": {
-                "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "mirrored",
-                                  "middlewares": ["comp", "buf"]}},
+                "routers": {
+                    "r": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "mirrored",
+                          "middlewares": ["comp"]},
+                    "r_buf": {"rule": "Host(`a.example.test`) && PathPrefix(`/buf/`)", "service": "main",
+                              "middlewares": ["buf"]},
+                },
                 "middlewares": {
                     "comp": {"compress": {"encodings": ["br", "gzip"], "minResponseBodyBytes": 1024,
                                           "includedContentTypes": ["application/json", "text/plain"]}},
@@ -526,21 +550,22 @@ class FerrumBinaryValidateTest(unittest.TestCase):
             "      fault:\n        delay: {fixedDelay: 250ms, percentage: {value: 15}}\n"
             "        abort: {httpStatus: 503, percentage: {value: 5}}\n"
         )
-        for label, platform, text, kw, expected_plugins in (
-            ("kong-extended", "kong", kong_text, {}, {"correlation_id"}),
-            ("nginx-extended", "nginx", nginx_text, {"fmt": "nginx"}, {"compression"}),
-            ("traefik-extended", "traefik", traefik_text, {"traefik_controls_asserted": True},
+        for label, platform, text, kw, expected_migrated, expected_plugins in (
+            ("kong-extended", "kong", kong_text, {}, 1, {"correlation_id"}),
+            ("nginx-extended", "nginx", nginx_text, {"fmt": "nginx"}, 1, {"compression"}),
+            ("traefik-extended", "traefik", traefik_text, {"traefik_controls_asserted": True}, 2,
              {"compression", "response_size_limiting", "request_mirror"}),
-            ("envoy-extended", "envoy", envoy_text, {}, {"cors", "grpc_web", "compression", "fault_injection"}),
-            ("istio-extended", "istio", istio_text, {}, {"fault_injection"}),
+            ("envoy-extended", "envoy", envoy_text, {}, 1, {"cors", "grpc_web", "compression", "fault_injection"}),
+            ("istio-extended", "istio", istio_text, {}, 1, {"fault_injection"}),
         ):
             result, _report, _plan = migrate(platform, text, **kw)
             with self.subTest(case=label), tempfile.TemporaryDirectory() as directory:
                 migrated = [p for p in result.config["proxies"]
                             if p["labels"].get("ferrum-migration/status") == "migrated"]
-                self.assertEqual(len(migrated), 1, f"{label} expected 1 migrated proxy, got {len(migrated)}")
+                self.assertEqual(len(migrated), expected_migrated,
+                                 f"{label} expected {expected_migrated} migrated proxies, got {len(migrated)}")
                 by_id = {pc["id"]: pc["plugin_name"] for pc in result.config["plugin_configs"]}
-                attached = {by_id[ref["plugin_config_id"]] for ref in migrated[0].get("plugins", [])}
+                attached = {by_id[ref["plugin_config_id"]] for p in migrated for ref in p.get("plugins", [])}
                 self.assertLessEqual(expected_plugins, attached,
                                      f"{label} missing expected attached plugins: {expected_plugins - attached}")
                 completed = self.validate(binary, directory, result.config, result.basic_auth_used)
