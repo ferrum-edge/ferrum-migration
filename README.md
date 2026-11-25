@@ -1,4 +1,18 @@
-# ferrum-migration
+<p align="center">
+  <img src="docs/ferrum_migration.png" alt="Ferrum Migration" width="400" />
+</p>
+
+<h1 align="center">Ferrum Migration</h1>
+
+<p align="center"><b>Translate your config. Move to the Edge.</b></p>
+
+<p align="center">
+  <a href="https://github.com/ferrum-edge/ferrum-migration/actions/workflows/ci.yml"><img src="https://github.com/ferrum-edge/ferrum-migration/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI" /></a>
+  <a href="https://github.com/ferrum-edge/ferrum-migration/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-PolyForm%20Noncommercial-blue" alt="License" /></a>
+  <img src="https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13-blue?logo=python&logoColor=white" alt="Python 3.11, 3.12, 3.13" />
+  <img src="https://img.shields.io/badge/migrates%20from-Kong%20%7C%20NGINX%20%7C%20Traefik%20%7C%20Envoy%20%7C%20Istio-orange" alt="Migrates from Kong, NGINX, Traefik, Envoy, Istio" />
+  <a href="https://github.com/ferrum-edge/ferrum-edge/releases/tag/v0.9.21"><img src="https://img.shields.io/badge/Ferrum%20Edge-v0.9.21-brightgreen" alt="Mappings verified against Ferrum Edge v0.9.21" /></a>
+</p>
 
 Offline, best-effort, **fail-closed** migration of existing gateway, reverse-proxy and
 service-mesh configuration into [Ferrum Edge](https://github.com/ferrum-edge/ferrum-edge)
