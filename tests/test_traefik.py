@@ -1268,6 +1268,42 @@ class TraefikHardeningTest(unittest.TestCase):
             ct_p = one_proxy(self, ct_res.config, "/api", "a.example.test")
             self.assertEqual(plugins_of(ct_res.config, ct_p), [], bad_ct)
             self.assertIn("traefik-compress", codes(ct_rep, "warning"))
+        # Mirror on a path-rewriting route (stripPrefix) or HTTPS mirror with insecureSkipVerify: true is dropped.
+        for label, extra_doc in (
+            ("strip-prefix-mirror", {
+                "http": {
+                    "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "m",
+                                      "middlewares": ["sp"]}},
+                    "middlewares": {"sp": {"stripPrefix": {"prefixes": ["/api"]}}},
+                    "services": {
+                        "m": {"mirroring": {"service": "main", "mirrorBody": False,
+                                            "mirrors": [{"name": "shadow", "percent": 20}]}},
+                        "main": {"loadBalancer": {"servers": [{"url": "http://main.internal:8080"}]}},
+                        "shadow": {"loadBalancer": {"passHostHeader": False,
+                                                    "servers": [{"url": "http://shadow.internal:9090"}]}},
+                    },
+                }
+            }),
+            ("insecure-skip-verify-mirror", {
+                "http": {
+                    "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "m"}},
+                    "services": {
+                        "m": {"mirroring": {"service": "main", "mirrorBody": False,
+                                            "mirrors": [{"name": "shadow", "percent": 20}]}},
+                        "main": {"loadBalancer": {"servers": [{"url": "http://main.internal:8080"}]}},
+                        "shadow": {"loadBalancer": {"passHostHeader": False, "serversTransport": "insec",
+                                                    "servers": [{"url": "https://shadow.internal:9443"}]}},
+                    },
+                    "serversTransports": {"insec": {"insecureSkipVerify": True}},
+                }
+            }),
+        ):
+            with self.subTest(case=label):
+                mr_res, mr_rep, _ = asserted(yaml.safe_dump(extra_doc))
+                mr_p = one_proxy(self, mr_res.config, "/api", "a.example.test")
+                self.assertEqual(mr_p["labels"]["ferrum-migration/status"], "migrated")
+                self.assertNotIn("request_mirror", [p["plugin_name"] for p in plugins_of(mr_res.config, mr_p)])
+                self.assertIn("traefik-mirroring", codes(mr_rep, "warning"))
         # Canonical schema gate checks newly supported compress/grpcWeb/mirror fields.
         bad = yaml.safe_dump({"http": {"middlewares": {"c": {"compress": {"Encodings": ["gzip"]}}}}})
         with self.assertRaises(InputError):

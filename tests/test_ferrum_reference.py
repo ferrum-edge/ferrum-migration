@@ -455,15 +455,38 @@ class FerrumBinaryValidateTest(unittest.TestCase):
                         "name": "envoy.filters.network.http_connection_manager",
                         "typed_config": {
                             "@type": "type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager",
-                            "route_config": {"virtual_hosts": [{
-                                "name": "v", "domains": ["api.example.test"],
-                                "routes": [{
-                                    "name": "r",
-                                    "match": {"path_separated_prefix": "/api"},
-                                    "route": {"cluster": "app"},
+                            "route_config": {
+                                "typed_per_filter_config": {
+                                    "envoy.filters.http.cors": {
+                                        "@type": "type.googleapis.com/envoy.extensions.filters.http.cors.v3.CorsPolicy",
+                                        "allow_origin_string_match": [{"exact": "https://app.example.test"}],
+                                        "allow_credentials": {"value": True},
+                                    }
+                                },
+                                "virtual_hosts": [{
+                                    "name": "v", "domains": ["api.example.test"],
+                                    "routes": [
+                                        {
+                                            "name": "r",
+                                            "match": {"path_separated_prefix": "/api"},
+                                            "route": {"cluster": "app"},
+                                        },
+                                        {
+                                            "name": "r_bad_cors_prefix",
+                                            "match": {"path_separated_prefix": "/preview"},
+                                            "route": {"cluster": "app"},
+                                            "typed_per_filter_config": {
+                                                "envoy.filters.http.cors": {
+                                                    "@type": "type.googleapis.com/envoy.extensions.filters.http.cors.v3.CorsPolicy",
+                                                    "allow_origin_string_match": [{"prefix": "https://preview.example.test"}],
+                                                }
+                                            },
+                                        },
+                                    ],
                                 }],
-                            }]},
+                            },
                             "http_filters": [
+                                {"name": "envoy.filters.http.cors"},
                                 {"name": "envoy.filters.http.grpc_web",
                                  "typed_config": {"@type": "type.googleapis.com/envoy.extensions.filters.http.grpc_web.v3.GrpcWeb"}},
                                 {"name": "envoy.filters.http.compressor",
@@ -544,7 +567,7 @@ class FerrumBinaryValidateTest(unittest.TestCase):
             ("nginx-extended", "nginx", nginx_text, {"fmt": "nginx"}, {"compression"}),
             ("traefik-extended", "traefik", traefik_text, {"traefik_controls_asserted": True},
              {"compression", "response_size_limiting", "request_mirror"}),
-            ("envoy-extended", "envoy", envoy_text, {}, {"grpc_web", "compression", "fault_injection", "jwks_auth"}),
+            ("envoy-extended", "envoy", envoy_text, {}, {"cors", "grpc_web", "compression", "fault_injection", "jwks_auth"}),
             ("istio-extended", "istio", istio_text, {}, {"jwks_auth", "fault_injection"}),
         ):
             result, _report, _plan = migrate(platform, text, **kw)

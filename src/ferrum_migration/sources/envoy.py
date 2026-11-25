@@ -409,7 +409,7 @@ class _Envoy:
             if buffer_limit and buffer_limit > 0 and not spec.termination:
                 spec.plugins.append(PluginSpec("request_size_limiting", {"max_bytes": buffer_limit}, ref))
             if shared.get("hcm_jwt") is not None:
-                if spec.termination is not None:
+                if spec.termination is not None or getattr(spec, "https_redirect", False):
                     spec.refuse("jwt_authn runs before direct_response/redirect in Envoy, whereas Ferrum "
                                 "request_termination answers before authentication")
                 else:
@@ -419,7 +419,7 @@ class _Envoy:
                 for hp in shared.get("hcm_plugins", []):
                     spec.plugins.append(PluginSpec(hp.name, hp.config, hp.ref))
             routes.append(spec)
-        if not tls and routes and all(getattr(r, "https_redirect", False) for r in routes):
+        if not tls and routes and all(getattr(r, "https_redirect", False) and not r.refusals for r in routes):
             self.plan.settings.https_redirect_seen = True
             self.report.info("envoy-https-redirect", ref, "HTTP-to-HTTPS redirect virtual host: not emitted.")
             return
@@ -428,7 +428,8 @@ class _Envoy:
                 # Keep it as a fail-closed placeholder so its traffic cannot fall through.
                 route.skip = False
                 route.skip_reason = ""
-                route.refuse("https_redirect on a route mixed with forwarding routes")
+                if not route.refusals:
+                    route.refuse("https_redirect on a route mixed with forwarding routes")
         apply_first_match_order(routes, self.report)
         self.plan.routes.extend(routes)
         if hosts:
@@ -541,9 +542,15 @@ class _Envoy:
                             "filter for this route, which is not migrated")
         if raw.get("direct_response") is not None:
             self._direct_response(spec, mapping(raw.get("direct_response")))
+            if effective_fault is not None:
+                spec.refuse("fault filter runs before direct_response in Envoy, whereas Ferrum request_termination "
+                            "answers before fault_injection")
             return spec
         if raw.get("redirect") is not None:
             self._redirect(spec, mapping(raw.get("redirect")), tls)
+            if effective_fault is not None:
+                spec.refuse("fault filter runs before redirect in Envoy, whereas Ferrum request_termination "
+                            "answers before fault_injection")
             return spec
         action = raw.get("route")
         if not isinstance(action, dict):
@@ -831,12 +838,26 @@ class _Envoy:
                                     "CORS omitted (allow_credentials has an invalid non-boolean value); browsers block "
                                     "cross-origin calls.")
                 return
+        raw_fnmp = next((p["forward_not_matching_preflights"] for p in policies
+                         if p.get("forward_not_matching_preflights") is not None), None)
+        unmatched_mode = "forward"
+        if raw_fnmp is not None:
+            fnmp_bool = _proto_bool(raw_fnmp)
+            if fnmp_bool is None:
+                spec.refuse("CORS policy has an invalid forward_not_matching_preflights value")
+                return
+            unmatched_mode = "forward" if fnmp_bool else "ignore"
+        # Use Ferrum's unmatched_preflights mode so omitted allow_methods/allow_headers stay empty and omitted
+        # max_age stays absent (matching Envoy cors_filter.cc instead of inheriting Ferrum's permissive defaults).
         built, problem = cors_config(origins, split_csv(merged_methods) or None,
                                      split_csv(merged_headers) or None,
                                      split_csv(merged_expose) or None,
-                                     creds, util.as_int(merged_max_age) if merged_max_age else None)
+                                     creds, util.as_int(merged_max_age) if merged_max_age else None,
+                                     unmatched_preflights=unmatched_mode)
         if built:
             spec.plugins.append(PluginSpec("cors", built, ref))
+        elif creds is True:
+            spec.refuse(f"CORS policy with allow_credentials cannot be admitted by Ferrum ({problem})")
         else:
             self.report.warning("envoy-cors", ref, f"CORS omitted ({problem}); browsers block cross-origin calls.")
 
@@ -1211,11 +1232,20 @@ class _Envoy:
                     return None, cluster_err
                 if cache_secs is not None:
                     prov_cfg["jwks_max_stale_seconds"] = cache_secs
-            if praw.get("clock_skew_seconds") is not None:
-                skew = util.as_int(praw.get("clock_skew_seconds"))
+            # Envoy defaults require_expiration to false (Ferrum defaults require_exp to true) and treats omitted
+            # or explicit 0 clock_skew_seconds (proto3 uint32 default) as 60 seconds (Ferrum defaults to 0).
+            raw_req_exp = praw.get("require_expiration", False)
+            if not isinstance(raw_req_exp, bool):
+                return None, "require_expiration must be a boolean"
+            prov_cfg["require_exp"] = raw_req_exp
+            raw_skew = praw.get("clock_skew_seconds")
+            if raw_skew is None:
+                prov_cfg["clock_skew_seconds"] = 60
+            else:
+                skew = util.as_int(raw_skew)
                 if skew is None or not 0 <= skew <= 300:
                     return None, "clock_skew_seconds must be 0-300"
-                prov_cfg["clock_skew_seconds"] = skew
+                prov_cfg["clock_skew_seconds"] = 60 if skew == 0 else skew
             parsed_providers[pname] = prov_cfg
             all_claim_dests[pname] = {fold(entry["header"]) for entry in prov_cfg.get("output_claim_headers", [])}
         raw_rules = typed.get("rules")
@@ -1420,7 +1450,7 @@ def _parse_envoy_fault(typed: dict, *, has_runtime: bool = False) -> tuple[str, 
 
 _ENVOY_JWT_PROVIDER_KEYS = frozenset({
     "issuer", "audiences", "remote_jwks", "local_jwks", "from_headers", "from_params",
-    "forward", "claim_to_headers", "jwt_cache_config", "clock_skew_seconds",
+    "forward", "claim_to_headers", "jwt_cache_config", "clock_skew_seconds", "require_expiration",
 })
 _ENVOY_JWT_ROOT_KEYS = frozenset({"@type", "providers", "rules"})
 

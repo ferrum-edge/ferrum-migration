@@ -1071,6 +1071,10 @@ def _translate_request_auth(spec: dict) -> tuple[list[dict[str, Any]] | None, st
         )
         if provider is None:
             return None, problem
+        # Istio generates Envoy jwt_authn with require_expiration=false and default 60s clock skew (whereas Ferrum
+        # defaults require_exp to true and clock_skew_seconds to 0).
+        provider["require_exp"] = False
+        provider["clock_skew_seconds"] = 60
         providers.append(provider)
     return providers, None
 

@@ -818,9 +818,9 @@ class KongExtendedPluginsAndConsumersTest(unittest.TestCase):
         assert_structurally_valid(self, result.config)
 
         # Free-form consumer tags are withheld by default (value-free warning) so UUID/credential-like tags can never
-        # leak into labels; unsupported creds produce actionable errors without echoing secrets.
+        # leak into labels; only migration provenance labels remain. Unsupported creds produce actionable errors.
         alice = result.config["consumers"][0]
-        self.assertNotIn("labels", alice)
+        self.assertEqual(set(alice["labels"]), {"ferrum-migration/source", "ferrum-migration/ref"})
         dumped = json.dumps(result.config) + json.dumps([c.to_dict() for c in report.caveats])
         self.assertNotIn("test-only-hmac-secret", dumped)
         self.assertNotIn("test-only-secret", dumped)

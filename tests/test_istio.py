@@ -1010,7 +1010,7 @@ class IstioCaseAndNamesTest(unittest.TestCase):
         assert_structurally_valid(self, result.config)
         api = one_proxy(self, result.config, "=/api", "api.example.test")
         self.assertEqual(api["labels"]["ferrum-migration/status"], "migrated")
-        # Omitted forwardOriginalToken explicitly emits forward_original_token: False (matching Istio default).
+        # Omitted forwardOriginalToken -> False; Istio defaults require_exp=False and clock_skew_seconds=60.
         self.assertEqual(plugin(self, result.config, api, "jwks_auth")["config"], {
             "providers": [{
                 "jwks_uri": "https://idp.example.test/.well-known/jwks.json",
@@ -1019,6 +1019,8 @@ class IstioCaseAndNamesTest(unittest.TestCase):
                 "from_headers": [{"name": "x-jwt-assertion"}],
                 "forward_original_token": False,
                 "output_claim_headers": [{"claim": "sub", "header": "x-jwt-sub"}],
+                "require_exp": False,
+                "clock_skew_seconds": 60,
             }],
             "allow_missing_token": True,
         })

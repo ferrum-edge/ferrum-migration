@@ -215,9 +215,51 @@ def response_header_rule(op: str, key: Any, value: Any = None, new_key: Any = No
 
 # ----------------------------------------------------------------- CORS
 
+_CORS_UNIVERSALITY_PROBE_GROUPS = (
+    ("https://a.invalid", "https://b.example", "https://z.test"),
+    ("http://a.invalid", "http://b.example", "http://z.test"),
+    ("chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "chrome-extension://bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+    ("moz-extension://00000000-0000-4000-8000-000000000000", "moz-extension://11111111-1111-4111-8111-111111111111"),
+)
+
+
+def _cors_prefix_is_effectively_universal(prefix: str) -> bool:
+    if "://" not in prefix:
+        return True
+    scheme, authority = prefix.split("://", 1)
+    if not scheme or not authority.endswith(":"):
+        return True
+    host = authority[:-1]
+    return not host or any(c in "/?#@:" or c.isspace() for c in host)
+
+
+def _cors_origin_effectively_universal(origin: Any) -> bool:
+    if isinstance(origin, str):
+        if origin == "null":
+            return True
+        if origin.startswith("*.") and origin[2:].count(".") < 1:
+            return True
+        return False
+    if isinstance(origin, dict) and len(origin) == 1:
+        kind, value = next(iter(origin.items()))
+        if kind == "exact":
+            return value == "null"
+        if kind == "prefix":
+            return _cors_prefix_is_effectively_universal(value)
+        if kind == "regex":
+            try:
+                compiled = re.compile(value)
+            except re.error:
+                return True
+            if compiled.fullmatch("null"):
+                return True
+            return any(all(compiled.fullmatch(p) for p in group) for group in _CORS_UNIVERSALITY_PROBE_GROUPS)
+    return False
+
+
 def cors_config(origins: Any, methods: Any = None, headers: Any = None, exposed: Any = None,
                 credentials: Any = None, max_age: Any = None, preflight_continue: Any = None,
-                private_network: Any = None) -> tuple[dict | None, str | None]:
+                private_network: Any = None, unmatched_preflights: str | None = None) -> tuple[dict | None, str | None]:
     if not isinstance(origins, list) or not origins:
         return None, "no allowed origins"
     if len(origins) > 64:
@@ -252,7 +294,11 @@ def cors_config(origins: Any, methods: Any = None, headers: Any = None, exposed:
         if items:
             config[field_name] = items
     if credentials is not None:
-        config["allow_credentials"] = bool(credentials)
+        creds_bool = bool(credentials)
+        if creds_bool and any(_cors_origin_effectively_universal(item) for item in clean):
+            return None, ("allow_credentials=true cannot be combined with an effectively universal origin matcher "
+                          "(such as exact 'null', a prefix without a scheme://host: boundary, or a broad regex)")
+        config["allow_credentials"] = creds_bool
     if max_age is not None:
         age = util.as_int(max_age)
         if age is None or age < 0:
@@ -262,6 +308,12 @@ def cors_config(origins: Any, methods: Any = None, headers: Any = None, exposed:
         config["preflight_continue"] = bool(preflight_continue)
     if private_network is not None:
         config["allow_private_network"] = bool(private_network)
+    if unmatched_preflights is not None:
+        if unmatched_preflights not in ("forward", "ignore"):
+            return None, "unmatched_preflights must be 'forward' or 'ignore'"
+        if preflight_continue is not None:
+            return None, "preflight_continue cannot be combined with unmatched_preflights"
+        config["unmatched_preflights"] = unmatched_preflights
     return config, None
 
 

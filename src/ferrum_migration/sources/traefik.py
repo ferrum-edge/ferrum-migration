@@ -765,6 +765,13 @@ class _Traefik:
                 spec.plugins.append(PluginSpec(extra_plugin.name, extra_plugin.config, extra_plugin.ref,
                                                extra_plugin.shared_key))
             self._apply_paths(spec, acc)
+            if (spec.strip_listen_path or spec.backend_path) \
+                    and any(p.name == "request_mirror" for p in spec.plugins):
+                spec.plugins = [p for p in spec.plugins if p.name != "request_mirror"]
+                self.report.warning("traefik-mirroring", ref,
+                                    "Mirror target(s) dropped on path-rewriting route (stripPrefix/addPrefix): "
+                                    "Traefik mirrors the rewritten path, whereas Ferrum file-mode request_mirror "
+                                    "mirrors the original request path.")
             self.priority[id(spec)] = (priority, name)
             self.plan.routes.append(spec)
 
@@ -1343,7 +1350,8 @@ class _Traefik:
             scheme, targets, problems = self._servers(lb, ref)
             tls, _timeouts, transport_problems = self._transport(lb.get("serversTransport"), ref)
             if problems or transport_problems or scheme is None or len(targets) != 1 \
-                    or (scheme == "https" and (tls.ca_path or tls.client_cert_path or tls.sni or tls.san_allow_list)):
+                    or (scheme == "https" and (not tls.verify or tls.ca_path or tls.client_cert_path
+                                               or tls.sni or tls.san_allow_list)):
                 dropped += 1
                 continue
             built, problem = request_mirror_config(

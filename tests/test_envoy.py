@@ -627,8 +627,8 @@ class EnvoyHardeningTest(unittest.TestCase):
             "delay": {"duration_ms": 500, "percentage": 10.0},
             "abort": {"status_code": 503, "percentage": 5.0},
         })
-        # Omitted `forward` explicitly emits forward_original_token: False (matching Envoy strip default)
-        # and omitted remote_jwks.cache_duration bounds Ferrum staleness/refresh to Envoy's 600s default.
+        # Omitted `forward` -> False, omitted `require_expiration` -> False, omitted `clock_skew_seconds` -> 60,
+        # and omitted remote_jwks.cache_duration -> 600s staleness/refresh.
         self.assertEqual(plugin(self, result.config, api, "jwks_auth")["config"], {
             "providers": [{
                 "jwks_uri": "https://idp.example.test/.well-known/jwks.json",
@@ -638,9 +638,22 @@ class EnvoyHardeningTest(unittest.TestCase):
                 "forward_original_token": False,
                 "output_claim_headers": [{"claim": "sub", "header": "x-jwt-sub"}],
                 "jwks_max_stale_seconds": 600,
+                "require_exp": False,
+                "clock_skew_seconds": 60,
             }],
             "jwks_refresh_interval_secs": 600,
         })
+        # Explicit clock_skew_seconds: 0 (proto3 default) also maps to Envoy's 60s default, and require_expiration:
+        # true emits require_exp: True.
+        jwt_opts = copy.deepcopy(doc)
+        jwt_opts["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"][
+            "http_filters"][3]["typed_config"]["providers"]["idp"].update(
+                {"clock_skew_seconds": 0, "require_expiration": True})
+        jo_res, _jo_rep, _ = migrate("envoy", yaml.safe_dump(jwt_opts))
+        jo_prov = plugin(self, jo_res.config, one_proxy(self, jo_res.config, "/api"), "jwks_auth")["config"][
+            "providers"][0]
+        self.assertEqual(jo_prov["clock_skew_seconds"], 60)
+        self.assertTrue(jo_prov["require_exp"])
         # Active Envoy mirrors are dropped with warning (Envoy -shadow authority vs Ferrum file-mode Host strip).
         self.assertNotIn("request_mirror", [p["plugin_name"] for p in result.config["plugin_configs"]])
         self.assertIn("envoy-mirror", codes(report, "warning"))
@@ -861,6 +874,9 @@ class EnvoyHardeningTest(unittest.TestCase):
         tol_cors = plugin(self, tol_res.config, one_proxy(self, tol_res.config, "/api"), "cors")["config"]
         self.assertEqual(tol_cors["allowed_origins"], [{"exact": "https://app.example.com"}])
         self.assertEqual(tol_cors["allowed_methods"], ["GET"])
+        self.assertEqual(tol_cors["unmatched_preflights"], "forward")
+        self.assertNotIn("allowed_headers", tol_cors)
+        self.assertNotIn("max_age", tol_cors)
         self.assertFalse(tol_cors.get("allow_credentials", False))
 
         typed_inherit = copy.deepcopy(typed_over_legacy)
@@ -875,6 +891,42 @@ class EnvoyHardeningTest(unittest.TestCase):
         ti_cors = plugin(self, ti_res.config, one_proxy(self, ti_res.config, "/api"), "cors")["config"]
         self.assertEqual(ti_cors["allowed_origins"], [{"exact": "https://route.example.com"}])
         self.assertEqual(ti_cors["allowed_methods"], ["GET"])
+        self.assertEqual(ti_cors["unmatched_preflights"], "forward")
+
+        # (D) Inherited allow_credentials: true combined with a route prefix origin lacking a scheme://host: boundary
+        #     refuses the route before emitting an un-admissible CORS plugin.
+        cred_prefix = copy.deepcopy(typed_inherit)
+        ch = cred_prefix["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"]
+        ch["route_config"]["typed_per_filter_config"]["envoy.filters.http.cors"]["allow_credentials"] = {"value": True}
+        ch["route_config"]["virtual_hosts"][0]["routes"][0]["typed_per_filter_config"]["envoy.filters.http.cors"][
+            "allow_origin_string_match"] = [{"prefix": "https://preview.example.test"}]
+        cp_res, _cp_rep, _ = migrate("envoy", yaml.safe_dump(cred_prefix))
+        self.assertEqual(one_proxy(self, cp_res.config, "/api")["labels"]["ferrum-migration/status"], "refused")
+
+        # (E) Active HCM fault filter on direct_response or HTTP-to-HTTPS redirect refuses (never folded away).
+        fault_term = minimal_bootstrap({"path": "/healthz"})
+        fhcm = fault_term["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"]
+        fhcm["http_filters"] = [
+            {"name": "envoy.filters.http.fault",
+             "typed_config": {
+                 "@type": "type.googleapis.com/envoy.extensions.filters.http.fault.v3.HTTPFault",
+                 "abort": {"http_status": 503, "percentage": {"numerator": 100, "denominator": "HUNDRED"}},
+             }},
+            {"name": "envoy.filters.http.router"},
+        ]
+        fhcm["route_config"]["virtual_hosts"][0]["routes"] = [
+            {"name": "dr", "match": {"path": "/healthz"}, "direct_response": {"status": 200}},
+            {"name": "redir", "match": {"prefix": "/"}, "redirect": {"https_redirect": True}},
+        ]
+        ft_res, _ft_rep, _ = migrate("envoy", yaml.safe_dump(fault_term))
+        self.assertEqual(one_proxy(self, ft_res.config, "=/healthz")["labels"]["ferrum-migration/status"], "refused")
+        self.assertEqual(one_proxy(self, ft_res.config, "/")["labels"]["ferrum-migration/status"], "refused")
+        # Pure HTTP-to-HTTPS redirect vhost under an active fault is refused rather than silently folded away.
+        fhcm["route_config"]["virtual_hosts"][0]["routes"] = [
+            {"name": "redir", "match": {"prefix": "/"}, "redirect": {"https_redirect": True}},
+        ]
+        fr_res, _fr_rep, _ = migrate("envoy", yaml.safe_dump(fault_term))
+        self.assertEqual(one_proxy(self, fr_res.config, "/")["labels"]["ferrum-migration/status"], "refused")
 
 
 if __name__ == "__main__":
