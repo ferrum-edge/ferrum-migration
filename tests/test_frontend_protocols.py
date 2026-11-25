@@ -191,9 +191,12 @@ class HttpOnlyOutputTest(unittest.TestCase):
         self.assertEqual(result.frontend_protocols, "http")
         self.assertIn("frontend-https-disabled", codes(report, "error"))
         self.assertNotIn("nginx-frontend-scope-conflict", codes(report))
-        # The plaintext server stays live; the HTTPS-only server becomes a fail-closed placeholder.
+        # The plaintext server and default /healthz stay live; the HTTPS-only server is refused and its
+        # off-protocol placeholder is omitted so it cannot shadow the active plaintext catch-all =/healthz.
         self.assertEqual(status(one_proxy(self, result.config, "/", host="app.example.com")), "migrated")
-        self.assertEqual(status(one_proxy(self, result.config, "/", host="secure.example.com")), "refused")
+        self.assertEqual(status(one_proxy(self, result.config, "=/healthz")), "terminated")
+        self.assertEqual(proxies(result.config, "/", host="secure.example.com"), [])
+        self.assertIn("route-refused", codes(report, "error"))
         values = conf_values(profile_of(plan, result))
         self.assertEqual(values["FERRUM_PROXY_HTTP_PORT"], "80")
         self.assertEqual(values["FERRUM_PROXY_HTTPS_PORT"], "0")

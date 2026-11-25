@@ -868,7 +868,7 @@ def _drop_off_protocol_slot_conflicts(plan: Plan, candidates: list[_Cand], mode:
     O(N log N) time.
     """
     opened = FRONTEND_MODES[mode]
-    live_by_path: dict[str | None, _PortHostIndex] = {}
+    on_protocol_by_path: dict[str | None, _PortHostIndex] = {}
     live_prefix_by_path: dict[str, _PortHostIndex] = {}
     live_string_prefix_by_path: dict[str, _PortHostIndex] = {}
     live_literal_by_path: dict[str, _PortHostIndex] = {}
@@ -879,12 +879,16 @@ def _drop_off_protocol_slot_conflicts(plan: Plan, candidates: list[_Cand], mode:
     live_catchall_paths_set: dict[int | None, set[str]] = {}
     live_wild_paths_set: dict[int | None, dict[str, set[str]]] = {}
     on_protocol_scope_idx = _PortHostIndex()
-    has_any_live = False
+    has_any_on_protocol = False
     for cand in candidates:
+        protos = _effective_protocols(cand.route)
+        is_on_protocol = (not cand.placeholder) or (protos is None) or bool(opened & protos)
+        if not is_on_protocol:
+            continue
+        has_any_on_protocol = True
+        on_protocol_by_path.setdefault(cand.listen_path, _PortHostIndex()).add(cand)
         if cand.placeholder:
             continue
-        has_any_live = True
-        live_by_path.setdefault(cand.listen_path, _PortHostIndex()).add(cand)
         live_any_idx.add(cand)
         if cand.hosts:
             on_protocol_scope_idx.add(cand)
@@ -909,7 +913,7 @@ def _drop_off_protocol_slot_conflicts(plan: Plan, candidates: list[_Cand], mode:
                 for h in cand.hosts:
                     if h.startswith("*."):
                         wmap.setdefault(h[1:], set()).add(p)
-    if not has_any_live:
+    if not has_any_on_protocol:
         return candidates
     for scope in plan.host_scopes:
         sh = _scope_hosts(scope)
@@ -925,6 +929,13 @@ def _drop_off_protocol_slot_conflicts(plan: Plan, candidates: list[_Cand], mode:
         port: {suf: sorted(paths) for suf, paths in smap.items()}
         for port, smap in live_wild_paths_set.items()
     }
+
+    def _host_has_own_scope(port: int | None, host: str) -> bool:
+        if host.startswith("*."):
+            wmap = on_protocol_scope_idx.wild.get(port)
+            return bool(wmap and host[1:] in wmap)
+        emap = on_protocol_scope_idx.exact.get(port)
+        return bool(emap and host in emap)
 
     def _shadows_same_tier(cand: _Cand) -> bool:
         port = cand.listen_port
@@ -951,9 +962,7 @@ def _drop_off_protocol_slot_conflicts(plan: Plan, candidates: list[_Cand], mode:
             )
         return False
 
-    def _has_lower_descendant(cand: _Cand, p: str) -> bool:
-        port = cand.listen_port
-        r = cand.route
+    def _has_lower_descendant(port: int | None, hosts: list[str], r: RouteSpec, p: str) -> bool:
         seg_only = r.prefix_semantics == "segment" or r.trailing_slash
         seg_prefix = p + "/"
 
@@ -969,8 +978,16 @@ def _drop_off_protocol_slot_conflicts(plan: Plan, candidates: list[_Cand], mode:
             return True
         wmap = sorted_wild_paths.get(port)
         if wmap:
-            for h in cand.hosts:
-                if not h.startswith("*."):
+            for h in hosts:
+                if h.startswith("*."):
+                    suffix = h[1:]
+                    dot = suffix.find(".", 1)
+                    while dot != -1:
+                        wpaths = wmap.get(suffix[dot:])
+                        if wpaths and _matches_list(wpaths):
+                            return True
+                        dot = suffix.find(".", dot + 1)
+                else:
                     dot = h.find(".")
                     while dot != -1:
                         wpaths = wmap.get(h[dot:])
@@ -983,14 +1000,17 @@ def _drop_off_protocol_slot_conflicts(plan: Plan, candidates: list[_Cand], mode:
         if not cand.hosts:
             return False
         port = cand.listen_port
-        if on_protocol_scope_idx.has_conflict(port, cand.hosts, path_slot=True):
+        # Evaluate per host: a placeholder with multiple aliases (e.g. [a.example.test, b.example.test]) shadows a
+        # lower-tier route if ANY alias lacks its own on-protocol scope and matches that lower-tier route.
+        unscoped_hosts = [h for h in cand.hosts if not _host_has_own_scope(port, h)]
+        if not unscoped_hosts:
             return False
         r = cand.route
         if r.kind in ("hostonly", "regex") or r.case_insensitive or (r.kind == "prefix" and (r.path or "/") == "/"):
-            return live_any_idx.has_lower_tier_overlap(port, cand.hosts)
-        if live_hostonly_idx.has_lower_tier_overlap(port, cand.hosts) \
-                or live_regex_idx.has_lower_tier_overlap(port, cand.hosts) \
-                or live_ci_idx.has_lower_tier_overlap(port, cand.hosts):
+            return live_any_idx.has_lower_tier_overlap(port, unscoped_hosts)
+        if live_hostonly_idx.has_lower_tier_overlap(port, unscoped_hosts) \
+                or live_regex_idx.has_lower_tier_overlap(port, unscoped_hosts) \
+                or live_ci_idx.has_lower_tier_overlap(port, unscoped_hosts):
             return True
         p = r.path or "/"
         for k in range(1, len(p) + 1):
@@ -998,12 +1018,12 @@ def _drop_off_protocol_slot_conflicts(plan: Plan, candidates: list[_Cand], mode:
             boundary = (anc == "/" or k == len(p) or p[k] == "/")
             table = live_prefix_by_path if boundary else live_string_prefix_by_path
             idx = table.get(anc)
-            if idx is not None and idx.has_lower_tier_overlap(port, cand.hosts):
+            if idx is not None and idx.has_lower_tier_overlap(port, unscoped_hosts):
                 return True
         if r.kind == "exact":
             lit_idx = live_literal_by_path.get(p)
-            return lit_idx is not None and lit_idx.has_lower_tier_overlap(port, cand.hosts)
-        return _has_lower_descendant(cand, p)
+            return lit_idx is not None and lit_idx.has_lower_tier_overlap(port, unscoped_hosts)
+        return _has_lower_descendant(port, unscoped_hosts, r, p)
 
     kept: list[_Cand] = []
     dropped_routes: list[RouteSpec] = []
@@ -1011,7 +1031,7 @@ def _drop_off_protocol_slot_conflicts(plan: Plan, candidates: list[_Cand], mode:
         if cand.placeholder:
             protos = _effective_protocols(cand.route)
             if protos is not None and not (opened & protos):
-                idx = live_by_path.get(cand.listen_path)
+                idx = on_protocol_by_path.get(cand.listen_path)
                 same_slot = idx is not None and idx.has_conflict(
                     cand.listen_port, cand.hosts, path_slot=cand.listen_path is not None
                 )
@@ -1126,14 +1146,23 @@ def _resolve_conflicts(candidates: list[_Cand], report: Report) -> list[_Cand]:
         all_idx = _PortHostIndex()
         prefix_by_path: dict[str, _PortHostIndex] = {}
         literal_by_path: dict[str, _PortHostIndex] = {}
+        regex_by_literal_prefix: dict[str, _PortHostIndex] = {}
         special_idx = _PortHostIndex()
         for item in candidates:
             if item.placeholder or not item.hosts:
                 continue
             all_idx.add(item)
             r = item.route
-            if r.kind in ("hostonly", "regex") or r.case_insensitive:
+            if r.kind == "hostonly" or r.case_insensitive:
                 special_idx.add(item)
+            elif r.kind == "regex":
+                lit = util.regex_literal_prefix(r.path or "") if (
+                    r.path and not util.regex_alternation_unproven(r.path)
+                ) else ""
+                if len(lit) >= 2 and lit.startswith("/"):
+                    regex_by_literal_prefix.setdefault(lit, _PortHostIndex()).add(item)
+                else:
+                    special_idx.add(item)
             else:
                 p = r.path or "/"
                 literal_by_path.setdefault(p, _PortHostIndex()).add(item)
@@ -1144,6 +1173,8 @@ def _resolve_conflicts(candidates: list[_Cand], report: Report) -> list[_Cand]:
             "prefix_by_path": prefix_by_path,
             "literal_by_path": literal_by_path,
             "sorted_literal_paths": sorted(literal_by_path),
+            "regex_by_literal_prefix": regex_by_literal_prefix,
+            "sorted_regex_prefixes": sorted(regex_by_literal_prefix),
             "special": special_idx,
         }
 
@@ -1190,6 +1221,8 @@ def _resolve_conflicts(candidates: list[_Cand], report: Report) -> list[_Cand]:
             prefix_by_path: dict[str, _PortHostIndex] = outrank_indices["prefix_by_path"]
             literal_by_path: dict[str, _PortHostIndex] = outrank_indices["literal_by_path"]
             sorted_literal_paths: list[str] = outrank_indices["sorted_literal_paths"]
+            regex_by_literal_prefix: dict[str, _PortHostIndex] = outrank_indices["regex_by_literal_prefix"]
+            sorted_regex_prefixes: list[str] = outrank_indices["sorted_regex_prefixes"]
             seen_idx_ids: set[int] = set()
 
             def _add_idx(idx: _PortHostIndex | None) -> None:
@@ -1200,13 +1233,20 @@ def _resolve_conflicts(candidates: list[_Cand], report: Report) -> list[_Cand]:
             _add_idx(outrank_indices["special"])
             for path_str in literal_paths:
                 for k in range(1, len(path_str) + 1):
-                    _add_idx(prefix_by_path.get(path_str[:k]))
+                    sub = path_str[:k]
+                    _add_idx(prefix_by_path.get(sub))
+                    if k >= 2:
+                        _add_idx(regex_by_literal_prefix.get(sub))
                 _add_idx(literal_by_path.get(path_str))
                 if has_prefix:
                     lo = bisect.bisect_left(sorted_literal_paths, path_str)
                     while lo < len(sorted_literal_paths) and sorted_literal_paths[lo].startswith(path_str):
                         _add_idx(literal_by_path[sorted_literal_paths[lo]])
                         lo += 1
+                    rlo = bisect.bisect_left(sorted_regex_prefixes, path_str)
+                    while rlo < len(sorted_regex_prefixes) and sorted_regex_prefixes[rlo].startswith(path_str):
+                        _add_idx(regex_by_literal_prefix[sorted_regex_prefixes[rlo]])
+                        rlo += 1
         refused_outrank = 0
         seen_other: set[int] = set()
         for target_idx in target_indices:
@@ -1572,7 +1612,7 @@ class _PortHostIndex:
         return False
 
     def has_lower_tier_overlap(self, port: int | None, scope_hosts: list[str]) -> bool:
-        """Whether an indexed candidate in a lower host tier (catch-all or covering wildcard) overlaps ``scope_hosts``."""
+        """Whether an indexed candidate in a lower host tier (catch-all or strictly broader wildcard) overlaps."""
         if not scope_hosts:
             return False
         if self.catchall.get(port):
@@ -1580,7 +1620,14 @@ class _PortHostIndex:
         wi_map = self.wild.get(port)
         if wi_map:
             for h in scope_hosts:
-                if not h.startswith("*."):
+                if h.startswith("*."):
+                    suffix = h[1:]
+                    dot = suffix.find(".", 1)
+                    while dot != -1:
+                        if suffix[dot:] in wi_map:
+                            return True
+                        dot = suffix.find(".", dot + 1)
+                else:
                     dot = h.find(".")
                     while dot != -1:
                         if h[dot:] in wi_map:

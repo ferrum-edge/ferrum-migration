@@ -13,6 +13,7 @@ from decimal import Decimal, DecimalException
 import ipaddress
 import math
 import re
+import warnings
 from urllib.parse import urlsplit
 
 VALID_HTTP_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "TRACE", "CONNECT")
@@ -428,6 +429,10 @@ def _rust_regex_syntax_problem(pattern: str) -> str | None:
         if err:
             return err
         i += 1
+    if in_class:
+        return "regex has an unclosed character class"
+    if len(flag_stack) > 1:
+        return "regex has an unclosed group"
     return None
 
 
@@ -445,7 +450,9 @@ def regex_problem(pattern: object, *, max_bytes: int = MAX_REGEX_LENGTH) -> str 
     if syntax_err is not None:
         return syntax_err
     try:
-        re.compile(pattern)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", FutureWarning)
+            re.compile(pattern)
     except (re.error, OverflowError, RecursionError):
         return "regex does not compile"
     return None
@@ -627,10 +634,21 @@ def has_top_level_alternation(pattern: str) -> bool:
             index += 2
             continue
         if in_class:
-            if char == "]":
+            if char == "[":
+                pm = _POSIX_CLASS_RE.match(pattern, index)
+                if pm is not None:
+                    index = pm.end()
+                    continue
+            elif char == "]":
                 in_class = False
         elif char == "[":
             in_class = True
+            index += 1
+            if index < len(pattern) and pattern[index] == "^":
+                index += 1
+            if index < len(pattern) and pattern[index] == "]":
+                index += 1
+            continue
         elif char == "(":
             depth += 1
         elif char == ")":

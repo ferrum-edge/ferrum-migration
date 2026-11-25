@@ -260,7 +260,9 @@ class MatchingTest(unittest.TestCase):
         self.assertIsNotNone(util.regex_problem(r"^/item/[^a&&b]$"))
         self.assertIsNotNone(util.regex_problem(r"^/item/[a--b]$"))
         self.assertIsNotNone(util.regex_problem(r"^/item/[a~~b]$"))
+        self.assertIsNotNone(util.regex_problem(r"^/item/[[:digit:]$"))
         self.assertIsNone(util.regex_problem(r"^/item/[[:digit:]]+$"))
+        self.assertTrue(util.has_top_level_alternation(r"^/x[[:digit:](]|/y[[:digit:])]$"))
         self.assertIsNone(util.regex_problem(r"^/api/a}b$"))
         self.assertIsNone(util.regex_problem(r"^/api[\\0]$"))
         self.assertIsNone(util.regex_problem(r"(?x)^/api$ # (?xx:[ab])"))
@@ -776,6 +778,45 @@ class MatchingTest(unittest.TestCase):
         self.assertEqual(root_p["labels"]["ferrum-migration/status"], "refused")
         pub_p = next(p for p in result.config["proxies"] if p.get("listen_path") == "/public")
         self.assertEqual(pub_p["labels"]["ferrum-migration/status"], "migrated")
+
+    def test_off_protocol_narrower_wildcard_multi_alias_and_refused_slot_isolation(self):
+        from ferrum_migration.model import HostScope
+        # 1. Plaintext narrower wildcard '/' must not shadow live HTTPS broader wildcard '/api'.
+        r_plain = route("plain", "/", hosts=["*.sub.example.test"], protocols=PLAINTEXT)
+        r_https = route("https", "/api", hosts=["*.example.test"], requires_tls=True, protocols=HTTPS)
+        res1, _ = run([r_plain, r_https], tls_only=True)
+        assert_structurally_valid(self, res1.config)
+        self.assertEqual([p.get("listen_path") for p in res1.config["proxies"]], ["/api"])
+
+        # 2. Plaintext multi-alias =/extra [a, b] where only 'a' has an HTTPS scope must still be dropped so 'b'
+        # reaches the live HTTPS catch-all '/'.
+        plan2 = Plan(
+            platform="envoy",
+            routes=[
+                route("p-extra", "/extra", kind="exact", hosts=["a.example.test", "b.example.test"],
+                      protocols=PLAINTEXT),
+                route("h-a", "/app", hosts=["a.example.test"], requires_tls=True, protocols=HTTPS),
+                route("h-ca", "/", hosts=[], requires_tls=True, protocols=HTTPS),
+            ],
+            host_scopes=[HostScope("a-https", ["a.example.test"], None, protocols=HTTPS)],
+        )
+        res2 = emit(plan2, EmitOptions(tls_only=True), Report("envoy", "synthetic"))
+        assert_structurally_valid(self, res2.config)
+        self.assertFalse(any(p.get("listen_path") == "=/extra" for p in res2.config["proxies"]))
+
+        # 3. Plaintext catch-all =/admin must not merge with an already-refused HTTPS named =/admin and take down
+        # the live HTTPS named '/' route.
+        p_ca = route("p-ca", "/admin", kind="exact", hosts=[], protocols=PLAINTEXT)
+        h_ref = route("h-ref", "/admin", kind="exact", hosts=["app.example.test"], requires_tls=True,
+                      protocols=HTTPS, refusals=["unsupported policy"])
+        h_live = route("h-live", "/", hosts=["app.example.test"], requires_tls=True, protocols=HTTPS)
+        res3, _ = run([p_ca, h_ref, h_live], tls_only=True)
+        assert_structurally_valid(self, res3.config)
+        root3 = next(p for p in res3.config["proxies"] if p.get("listen_path") == "/")
+        self.assertEqual(root3["labels"]["ferrum-migration/status"], "migrated")
+        admin3 = next(p for p in res3.config["proxies"] if p.get("listen_path") == "=/admin")
+        self.assertEqual(admin3["hosts"], ["app.example.test"])
+        self.assertEqual(admin3["labels"]["ferrum-migration/status"], "refused")
 
 
 if __name__ == "__main__":
