@@ -47,24 +47,30 @@ def _proto_snake(key: str) -> str:
     return _CAMEL_BOUNDARY_RE.sub(r"\1_\2", key).lower()
 
 
-def _normalize_envoy_proto(obj: Any, *, preserve_map_keys: bool = False) -> Any:
+def _normalize_envoy_proto(obj: Any, *, preserve_map_keys: bool = False, parent_key: str | None = None) -> Any:
     """Normalize protobuf JSON camelCase field aliases to snake_case, rejecting duplicate spellings."""
     if isinstance(obj, list):
-        return [_normalize_envoy_proto(item, preserve_map_keys=False) for item in obj]
+        return [_normalize_envoy_proto(item, preserve_map_keys=False, parent_key=parent_key) for item in obj]
     if not isinstance(obj, dict):
         return obj
     out: dict[Any, Any] = {}
     for raw_key, raw_val in obj.items():
         if preserve_map_keys or not isinstance(raw_key, str):
-            out[raw_key] = _normalize_envoy_proto(raw_val, preserve_map_keys=False)
+            out[raw_key] = _normalize_envoy_proto(raw_val, preserve_map_keys=False, parent_key=None)
             continue
         norm_key = _proto_snake(raw_key)
         if norm_key in out:
             raise InputError(f"Envoy config contains duplicate protobuf field spelling for '{safe_label(norm_key, 60)}'")
-        if norm_key in _ENVOY_OPAQUE_FIELDS:
+        # Node.metadata is a protobuf Struct (opaque user JSON), whereas cluster/listener/route metadata is
+        # envoy.config.core.v3.Metadata (whose filter_metadata field is opaque).
+        if norm_key in _ENVOY_OPAQUE_FIELDS or (parent_key == "node" and norm_key == "metadata"):
             out[norm_key] = raw_val
         else:
-            out[norm_key] = _normalize_envoy_proto(raw_val, preserve_map_keys=norm_key in _ENVOY_TYPED_MAP_FIELDS)
+            out[norm_key] = _normalize_envoy_proto(
+                raw_val,
+                preserve_map_keys=norm_key in _ENVOY_TYPED_MAP_FIELDS,
+                parent_key=norm_key,
+            )
     return out
 
 
@@ -879,17 +885,27 @@ class _Envoy:
                                if p.get("max_age") is not None and p.get("max_age") != ""), None)
         raw_creds = next((p["allow_credentials"] for p in policies if p.get("allow_credentials") is not None), None)
         origins = []
+        matcher_problem: str | None = None
         for matcher in seq(merged_origins):
             matcher = mapping(matcher)
-            if "exact" in matcher:
-                origins.append({"exact": matcher["exact"]})
-            elif "prefix" in matcher:
-                origins.append({"prefix": matcher["prefix"]})
-            elif "safe_regex" in matcher:
-                origins.append({"regex": mapping(matcher["safe_regex"]).get("regex")})
-            else:
+            extra_keys = set(matcher) - {"exact", "prefix", "safe_regex", "ignore_case"}
+            raw_ignore = matcher.get("ignore_case")
+            if extra_keys or (raw_ignore is not None and raw_ignore is not False):
                 origins = []
+                matcher_problem = "origin matcher uses ignore_case or unsupported StringMatcher options"
                 break
+            present = [k for k in ("exact", "prefix", "safe_regex") if k in matcher]
+            if len(present) != 1:
+                origins = []
+                matcher_problem = "origin matcher is invalid or ambiguous"
+                break
+            kind = present[0]
+            if kind == "exact":
+                origins.append({"exact": matcher["exact"]})
+            elif kind == "prefix":
+                origins.append({"prefix": matcher["prefix"]})
+            else:
+                origins.append({"regex": mapping(matcher["safe_regex"]).get("regex")})
         creds: bool | None = None
         if raw_creds is not None:
             creds = _proto_bool(raw_creds)
@@ -898,6 +914,13 @@ class _Envoy:
                                     "CORS omitted (allow_credentials has an invalid non-boolean value); browsers block "
                                     "cross-origin calls.")
                 return False
+        if matcher_problem:
+            if creds is True:
+                spec.refuse(f"CORS policy with allow_credentials cannot be migrated ({matcher_problem})")
+            else:
+                self.report.warning("envoy-cors", ref,
+                                    f"CORS omitted ({matcher_problem}); browsers block cross-origin calls.")
+            return False
         raw_fnmp = next((p["forward_not_matching_preflights"] for p in policies
                          if p.get("forward_not_matching_preflights") is not None), None)
         unmatched_mode = "forward"
@@ -910,6 +933,10 @@ class _Envoy:
         parsed_methods = split_csv(merged_methods) or None
         parsed_headers = split_csv(merged_headers) or None
         parsed_expose = split_csv(merged_expose) or None
+        if creds is True and any(o == "*" or o == {"exact": "*"} for o in origins):
+            spec.refuse("CORS policy combines allow_credentials=true with wildcard '*' origin, which Ferrum "
+                        "downgrades by disabling credentials")
+            return False
         if creds is True and any("*" in (lst or []) for lst in (parsed_methods, parsed_headers, parsed_expose)):
             spec.refuse("CORS policy combines allow_credentials=true with wildcard '*' in "
                         "allow_methods/allow_headers/expose_headers, which Ferrum returns literally; specify "

@@ -157,7 +157,10 @@ def as_int(value: object) -> int | None:
         stripped = value.strip()
         body = stripped[1:] if stripped.startswith("-") else stripped
         if body and body.isascii() and body.isdigit():
-            return int(stripped)
+            try:
+                return int(stripped)
+            except ValueError:
+                return None
     return None
 
 
@@ -211,7 +214,7 @@ def regex_problem(pattern: object) -> str | None:
         return "regex uses lookaround, backreferences or other features the Rust regex engine lacks"
     try:
         re.compile(pattern)
-    except re.error:
+    except (re.error, OverflowError):
         return "regex does not compile"
     return None
 

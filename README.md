@@ -26,8 +26,8 @@ It writes, into a private output directory:
 * `migration-report.md` and `migration-report.json`: every caveat, refusal and safe omission,
   plus next steps. These never contain credential values.
 
-Mappings were verified against Ferrum Edge `main` at
-`c1d73c35ef2e61a2c58c7a62a08ea70e35fff924` (config structs, plugin validators, and the settings
+Mappings were verified against Ferrum Edge `v0.9.21` at
+`f9915358c8032214f4034a17c28cdf72d14006c3` (config structs, plugin validators, and the settings
 inventory). See [docs/mappings.md](docs/mappings.md).
 
 ## Install

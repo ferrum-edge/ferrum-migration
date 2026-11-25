@@ -1079,6 +1079,9 @@ class _Traefik:
                 else:
                     acc.plugins.append(PluginSpec("response_size_limiting",
                                                   {"max_bytes": resp_size, "require_buffered_check": True}, ref))
+                    self.report.warning("traefik-buffering", ref,
+                                        "buffering.maxResponseBodyBytes returns HTTP 500 on oversized upstream "
+                                        "responses in Traefik, whereas Ferrum response_size_limiting returns HTTP 502.")
                 acc.resp_size_limited = True
             if any(config.get(k) for k in ("memRequestBodyBytes", "memResponseBodyBytes", "retryExpression")) \
                     or not ((req_size and req_size > 0) or (resp_size and resp_size > 0)):
@@ -1158,6 +1161,12 @@ class _Traefik:
         if built is None:
             self.report.warning("traefik-compress", ref, f"compress omitted ({problem}).")
             return
+        if raw_inc is None:
+            self.report.warning("traefik-compress", ref,
+                                "compress has no includedContentTypes (Traefik compresses any non-excluded media "
+                                "type), whereas Ferrum applies its fixed default MIME allow-list (skipping types "
+                                "such as text/csv); specify explicit content_types in Ferrum if other media types "
+                                "must be compressed.")
         if config.get("defaultEncoding"):
             self.report.warning("traefik-compress", ref,
                                 "compress.defaultEncoding is not migrated; Ferrum negotiates via Accept-Encoding.")
@@ -1364,6 +1373,11 @@ class _Traefik:
                 # file-mode request_mirror strips Host to the mirror target's authority. Only mirror when
                 # passHostHeader is explicitly false so the virtual-host boundary matches.
                 dropped += 1
+                continue
+            if lb.get("healthCheck") is not None:
+                self.report.warning("traefik-mirroring", ref,
+                                    "Mirror target configures loadBalancer.healthCheck, which Ferrum static "
+                                    "request_mirror endpoints do not evaluate; mirror dropped.")
                 continue
             if any(isinstance(srv, dict) and isinstance(srv.get("url"), str)
                    and srv["url"].strip().lower().startswith("h2c://") for srv in seq(lb.get("servers"))):

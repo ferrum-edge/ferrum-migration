@@ -800,12 +800,13 @@ class NginxFrontendScopeTest(unittest.TestCase):
             location /html/ { proxy_pass http://html.internal:8080; }
         }
         """
-        def_res, _def_rep, _ = nginx(html_only_conf)
+        def_res, def_rep, _ = nginx(html_only_conf)
         html_p = one_proxy(self, def_res.config, "/html", "def.example.test")
         self.assertEqual(plugin(self, def_res.config, html_p, "compression")["config"], {
             "algorithms": ["gzip"], "min_content_length": 20, "content_types": ["text/html"],
             "gzip_level": 1, "remove_accept_encoding": False,
         })
+        self.assertIn("nginx-gzip", codes(def_rep, "warning"))
 
 
 if __name__ == "__main__":

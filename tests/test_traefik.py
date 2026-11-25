@@ -1237,6 +1237,7 @@ class TraefikHardeningTest(unittest.TestCase):
         self.assertEqual(buf_proxy["labels"]["ferrum-migration/status"], "migrated")
         self.assertEqual(plugin(self, result.config, buf_proxy, "response_size_limiting")["config"],
                          {"max_bytes": 4194304, "require_buffered_check": True})
+        self.assertIn("traefik-buffering", codes(report, "warning"))
         self.assertEqual(plugin(self, result.config, proxy, "request_mirror")["config"], {
             "mirror_host": "shadow.internal",
             "mirror_port": 9090,
@@ -1264,11 +1265,12 @@ class TraefikHardeningTest(unittest.TestCase):
                 "services": {"main": {"loadBalancer": {"servers": [{"url": "http://main.internal:8080"}]}}},
             }
         })
-        defenc_res = asserted(defenc_doc)[0]
+        defenc_res, defenc_rep, _ = asserted(defenc_doc)
         self.assertEqual(plugin(self, defenc_res.config, one_proxy(self, defenc_res.config, "/v3", "a.example.test"),
                                 "compression")["config"], {
             "algorithms": ["zstd", "br", "gzip"], "min_content_length": 1024, "remove_accept_encoding": False,
         })
+        self.assertIn("traefik-compress", codes(defenc_rep, "warning"))
         self.assertNotIn("request_mirror", [p["plugin_name"] for p in plugins_of(result.config, defmin)])
         # excludedContentTypes omits compression; body-enabled mirror (mirrorBody: true) is dropped so Ferrum's
         # body-mirroring ceiling never returns 413 on chunked uploads that Traefik forwarded unmirrored.
@@ -1329,6 +1331,19 @@ class TraefikHardeningTest(unittest.TestCase):
                         "main": {"loadBalancer": {"servers": [{"url": "http://main.internal:8080"}]}},
                         "shadow": {"loadBalancer": {"passHostHeader": False,
                                                     "servers": [{"url": "h2c://shadow.internal:9090"}]}},
+                    },
+                }
+            }),
+            ("healthcheck-mirror", {
+                "http": {
+                    "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "m"}},
+                    "services": {
+                        "m": {"mirroring": {"service": "main", "mirrorBody": False,
+                                            "mirrors": [{"name": "shadow", "percent": 20}]}},
+                        "main": {"loadBalancer": {"servers": [{"url": "http://main.internal:8080"}]}},
+                        "shadow": {"loadBalancer": {"passHostHeader": False,
+                                                    "healthCheck": {"path": "/ready"},
+                                                    "servers": [{"url": "http://shadow.internal:9090"}]}},
                     },
                 }
             }),

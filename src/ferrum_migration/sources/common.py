@@ -294,6 +294,10 @@ def _cors_regex_problem(pattern: str) -> str | None:
             nxt = pattern[i + 1]
             if nxt in "01234567uUN":
                 return "an allowed origin regex uses an escape not portable to Rust regex"
+            if nxt in "<>":
+                return "an allowed origin regex uses an escape not portable to Rust regex"
+            if class_depth > 0 and nxt in "bBAz":
+                return "an allowed origin regex uses an assertion escape inside a character class"
             if nxt == "x":
                 if i + 3 >= n or pattern[i + 2] not in _CORS_HEX_DIGITS or pattern[i + 3] not in _CORS_HEX_DIGITS:
                     return "an allowed origin regex has an invalid hex escape"
@@ -387,9 +391,14 @@ def _cors_regex_problem(pattern: str) -> str | None:
             group_depth += 1
             if 4 + 4 * group_depth > 24:
                 return "an allowed origin regex exceeds Ferrum nesting limits"
+            # Charge capture start/end state overhead for capturing groups (step == 1) and minimal
+            # wrapper overhead for non-capturing groups so repeated empty groups cannot exceed 64 KiB.
+            group_overhead = 4 if step == 1 else 1
             group_mult_stack.append(1)
             group_unicode_stack.append(False)
-            group_cost_stack.append(0)
+            group_cost_stack.append(group_overhead)
+            if sum(group_cost_stack) > _CORS_MAX_COMPILED_COST:
+                return "an allowed origin regex exceeds safe Ferrum compiled-size limits"
             last_atom_mult = 1
             last_atom_unicode = False
             last_atom_cost = 0

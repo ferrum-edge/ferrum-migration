@@ -699,20 +699,74 @@ class _Istio:
             spec.refuse("CORS policy has an invalid allowCredentials value")
             return
         creds = raw_creds if isinstance(raw_creds, bool) else None
+        raw_unmatched = policy.get("unmatchedPreflights")
+        unmatched_mode = "forward"
+        if raw_unmatched is not None:
+            if isinstance(raw_unmatched, str) and raw_unmatched.upper() in ("UNSPECIFIED", "FORWARD"):
+                unmatched_mode = "forward"
+            elif isinstance(raw_unmatched, str) and raw_unmatched.upper() == "IGNORE":
+                unmatched_mode = "ignore"
+            elif raw_unmatched in (0, 1):
+                unmatched_mode = "forward"
+            elif raw_unmatched == 2:
+                unmatched_mode = "ignore"
+            else:
+                if creds is True:
+                    spec.refuse("CORS policy has an unsupported unmatchedPreflights value")
+                else:
+                    self.report.warning("istio-cors", spec.ref,
+                                        "CORS omitted (unsupported unmatchedPreflights value); browsers block "
+                                        "cross-origin calls.")
+                return
+        # Istio prefers allowOrigins when present and ignores deprecated allowOrigin.
         origins = []
-        for matcher in seq(policy.get("allowOrigins")):
-            matcher = mapping(matcher)
-            key = next((k for k in ("exact", "prefix", "regex") if k in matcher), None)
-            if key is None:
-                origins = []
-                break
-            origins.append({key: matcher[key]})
-        for origin in seq(policy.get("allowOrigin")):
-            origins.append({"exact": origin})
-        max_age = util.parse_go_duration_ms(policy.get("maxAge")) if policy.get("maxAge") else None
+        matcher_problem: str | None = None
+        modern_origins = seq(policy.get("allowOrigins"))
+        if modern_origins:
+            for raw_m in modern_origins:
+                matcher = mapping(raw_m)
+                extra_keys = set(matcher) - {"exact", "prefix", "regex"}
+                present = [k for k in ("exact", "prefix", "regex") if k in matcher]
+                if extra_keys or len(present) != 1:
+                    origins = []
+                    matcher_problem = "allowOrigins entry uses unsupported or ambiguous matcher fields"
+                    break
+                key = present[0]
+                origins.append({key: matcher[key]})
+        else:
+            for origin in seq(policy.get("allowOrigin")):
+                origins.append({"exact": origin})
+        if matcher_problem:
+            if creds is True:
+                spec.refuse(f"CORS policy with allowCredentials=true cannot be safely migrated ({matcher_problem})")
+            else:
+                self.report.warning("istio-cors", spec.ref,
+                                    f"CORS omitted ({matcher_problem}); browsers block cross-origin calls.")
+            return
+        if creds is True and any(o == "*" or o == {"exact": "*"} for o in origins):
+            spec.refuse("CORS policy combines allowCredentials=true with wildcard '*' origin, which Ferrum "
+                        "downgrades by disabling credentials")
+            return
+        if creds is True and any("*" in (str_list(policy.get(k)) or [])
+                                 for k in ("allowMethods", "allowHeaders", "exposeHeaders")):
+            spec.refuse("CORS policy combines allowCredentials=true with wildcard '*' in "
+                        "allowMethods/allowHeaders/exposeHeaders, which Ferrum returns literally; specify explicit lists")
+            return
+        raw_max_age = policy.get("maxAge")
+        max_age = util.parse_go_duration_ms(raw_max_age) if raw_max_age is not None else None
+        if raw_max_age is not None and max_age is None:
+            if creds is True:
+                spec.refuse("CORS policy with allowCredentials=true has an invalid maxAge")
+            else:
+                self.report.warning("istio-cors", spec.ref,
+                                    "CORS omitted (invalid maxAge); browsers block cross-origin calls.")
+            return
+        # Pass unmatched_preflights explicitly so Ferrum preserves omitted allowMethods/allowHeaders/maxAge
+        # rather than supplying permissive defaults that could broaden credentialed CORS.
         built, problem = cors_config(origins, policy.get("allowMethods"), policy.get("allowHeaders"),
                                      policy.get("exposeHeaders"), creds,
-                                     max_age // 1000 if max_age is not None else None)
+                                     max_age // 1000 if max_age is not None else None,
+                                     unmatched_preflights=unmatched_mode)
         if built:
             spec.plugins.append(PluginSpec("cors", built, spec.ref))
         elif creds is True:
@@ -1072,9 +1126,12 @@ def _target_ref_may_apply(ref: dict, policy_ns: str, gw_ns: str, gw_name: str, g
     ref_name = raw_name.strip()
     ref_ns = raw_ns.strip() if isinstance(raw_ns, str) else policy_ns
     ref_group = (raw_group or "").strip()
+    # Istio targetRef attachment is strictly same-namespace; cross-namespace targetRefs are invalid and fail closed.
+    if ref_ns != policy_ns:
+        return True
     if (ref_kind == "Service" and ref_group == "") or (ref_kind == "ServiceEntry" and ref_group == "networking.istio.io"):
         return False
-    if ref_kind == "Gateway" and ref_group in ("", "gateway.networking.k8s.io", "networking.istio.io"):
+    if ref_kind == "Gateway" and ref_group == "gateway.networking.k8s.io":
         if ref_name == gw_name and ref_ns == gw_ns:
             return True
         return not (

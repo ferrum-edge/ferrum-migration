@@ -1101,6 +1101,10 @@ class _Nginx:
                 )
                 if comp_cfg is not None:
                     route.plugins.append(PluginSpec("compression", comp_cfg, ref))
+                    self.report.warning("nginx-gzip", ref,
+                                        "Ferrum compression returns HTTP 406 when a client's Accept-Encoding excludes "
+                                        "both gzip and identity (e.g. 'br, identity;q=0'), whereas NGINX skips gzip "
+                                        "and forwards the unencoded backend response.")
                 else:
                     self.report.warning("nginx-gzip", ref, f"gzip omitted ({comp_problem}).")
         size = scope.body_size if scope.body_size is not None else 1024 * 1024

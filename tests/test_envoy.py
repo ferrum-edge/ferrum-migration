@@ -624,16 +624,18 @@ class EnvoyHardeningTest(unittest.TestCase):
         self.assertEqual(plugin(self, cd_res.config, one_proxy(self, cd_res.config, "/api"), "compression")["config"], {
             "algorithms": ["gzip"], "min_content_length": 30, "remove_accept_encoding": False,
         })
-        comp_bad_min = copy.deepcopy(comp_def)
-        comp_bad_min["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"][
-            "http_filters"][0]["typed_config"]["response_direction_config"] = {
-            "common_config": {"min_content_length": {"value": "--1"}},
-        }
-        self.assertEqual(one_proxy(self, migrate("envoy", yaml.safe_dump(comp_bad_min))[0].config, "/api")[
-            "labels"]["ferrum-migration/status"], "refused")
+        for bad_min_val in ("--1", "9" * 4301):
+            comp_bad_min = copy.deepcopy(comp_def)
+            comp_bad_min["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"][
+                "http_filters"][0]["typed_config"]["response_direction_config"] = {
+                "common_config": {"min_content_length": {"value": bad_min_val}},
+            }
+            self.assertEqual(one_proxy(self, migrate("envoy", yaml.safe_dump(comp_bad_min))[0].config, "/api")[
+                "labels"]["ferrum-migration/status"], "refused", len(bad_min_val))
 
-        # Opaque protobuf Structs (metadata.filterMetadata) keep arbitrary keys untouched without collision.
+        # Opaque protobuf Structs (metadata.filterMetadata and node.metadata) keep arbitrary keys untouched.
         opaque_meta = minimal_bootstrap({"path_separated_prefix": "/api"})
+        opaque_meta["node"] = {"id": "edge-1", "metadata": {"tenantId": "a", "tenant_id": "b"}}
         opaque_meta["static_resources"]["clusters"][0]["metadata"] = {
             "filterMetadata": {"envoy.lb": {"tenantId": "a", "tenant_id": "b"}},
         }
@@ -897,11 +899,16 @@ class EnvoyHardeningTest(unittest.TestCase):
             r"x|a(?:x|a(?:x|a(?:x|a(?:x|a(?:x|ab+)+)+)+)+)+",
             r"^https://(?:[a])" + "(?:" * 26 + "pp" + ")" * 26 + r"\.example\.test$",
             "https://portal(?:" + "[ab]01" * 70 + "){0,64}[.]example[.]test",
+            "https://(?:a|" + "()" * 200 + r"b){64}\.example\.test",
             r"^https://{tenant}\.example\.test$",
             r"^https://a{,3}\.example\.test$",
             r"^https://.{64}.{64}\.example\.test$",
             r"^https://a{5000}\.example\.test$",
+            r"^https://a{5000000000}\.example\.test$",
             r"^https://[a[]\.example\.test$",
+            r"^https://[\<]app\.example\.test$",
+            r"^https://\<app\.example\.test$",
+            r"^https://[\b]app\.example\.test$",
         ):
             with self.subTest(regex=bad_rx):
                 nc_hcm["route_config"]["typed_per_filter_config"]["envoy.filters.http.cors"][
@@ -909,6 +916,23 @@ class EnvoyHardeningTest(unittest.TestCase):
                 nest_res, nest_rep, _ = migrate("envoy", yaml.safe_dump(non_cred_star))
                 self.assertEqual(nest_res.config["plugin_configs"], [])
                 self.assertIn("envoy-cors", codes(nest_rep, "warning"))
+        # ignoreCase origin matcher omits uncredentialed CORS and refuses credentialed CORS; credentialed exact '*' refuses.
+        nc_hcm["route_config"]["typed_per_filter_config"]["envoy.filters.http.cors"][
+            "allow_origin_string_match"] = [{"exact": "https://APP.example.test", "ignoreCase": True}]
+        ic_res, ic_rep, _ = migrate("envoy", yaml.safe_dump(non_cred_star))
+        self.assertEqual(ic_res.config["plugin_configs"], [])
+        self.assertIn("envoy-cors", codes(ic_rep, "warning"))
+        for cred_bad_matcher in (
+            {"exact": "https://APP.example.test", "ignoreCase": True},
+            {"exact": "*"},
+        ):
+            cred_ic = copy.deepcopy(non_cred_star)
+            ci_cors = cred_ic["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"][
+                "route_config"]["typed_per_filter_config"]["envoy.filters.http.cors"]
+            ci_cors["allow_credentials"] = {"value": True}
+            ci_cors["allow_origin_string_match"] = [cred_bad_matcher]
+            self.assertEqual(one_proxy(self, migrate("envoy", yaml.safe_dump(cred_ic))[0].config, "/api")[
+                "labels"]["ferrum-migration/status"], "refused")
         nc_hcm["route_config"]["typed_per_filter_config"]["envoy.filters.http.cors"][
             "allow_origin_string_match"] = [{"safe_regex": {"regex": r"^https://([a-z0-9-]+\.)?example\.test$"}}]
         ok_rx_res, _ok_rx_rep, _ = migrate("envoy", yaml.safe_dump(non_cred_star))

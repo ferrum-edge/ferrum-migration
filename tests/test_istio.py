@@ -1092,6 +1092,8 @@ class IstioCaseAndNamesTest(unittest.TestCase):
         for bad_ref_label, bad_ref_yaml in (
             ("numeric-namespace", "{group: gateway.networking.k8s.io, kind: Gateway, name: gw, namespace: 42}"),
             ("gateway-class", "{group: gateway.networking.k8s.io, kind: GatewayClass, name: istio}"),
+            ("wrong-gateway-group", "{group: networking.istio.io, kind: Gateway, name: edge-api}"),
+            ("cross-ns-service", "{group: '', kind: Service, name: api, namespace: other}"),
         ):
             with self.subTest(target_ref=bad_ref_label):
                 br_doc = pinned_text + textwrap.dedent(f"""
@@ -1106,9 +1108,10 @@ class IstioCaseAndNamesTest(unittest.TestCase):
                 self.assertEqual(one_proxy(self, br_res.config, "=/api", "api.example.test")["labels"][
                     "ferrum-migration/status"], "refused")
 
-        # Credentialed Istio CORS with a regex origin cannot be translated and MUST refuse the route fail-closed
-        # (never omit CORS and leave the route open to backend-emitted credentialed CORS headers).
-        cred_cors_doc = textwrap.dedent("""
+        # Credentialed Istio CORS preserves omitted allowMethods/allowHeaders via unmatched_preflights,
+        # ignores deprecated allowOrigin when allowOrigins is set, and refuses untranslatable credentialed
+        # origins (regex or wildcard '*').
+        cred_cors_base = textwrap.dedent("""
             apiVersion: networking.istio.io/v1
             kind: Gateway
             metadata: {name: gw, namespace: edge}
@@ -1130,12 +1133,29 @@ class IstioCaseAndNamesTest(unittest.TestCase):
                   route: [{destination: {host: svc.edge.svc.cluster.local, port: {number: 8080}}}]
                   corsPolicy:
                     allowOrigins:
-                      - regex: '^https://(?:portal|admin)\\.example\\.com$'
+                      - exact: https://app.example.test
+                    allowOrigin:
+                      - https://legacy.example.test
                     allowCredentials: true
+                    unmatchedPreflights: IGNORE
         """)
-        cc_res = migrate("istio", cred_cors_doc)[0]
-        self.assertEqual(one_proxy(self, cc_res.config, "=/api", "api.example.test")["labels"][
-            "ferrum-migration/status"], "refused")
+        cc_ok = migrate("istio", cred_cors_base)[0]
+        cc_proxy = one_proxy(self, cc_ok.config, "=/api", "api.example.test")
+        self.assertEqual(cc_proxy["labels"]["ferrum-migration/status"], "migrated")
+        self.assertEqual(plugin(self, cc_ok.config, cc_proxy, "cors")["config"], {
+            "allowed_origins": [{"exact": "https://app.example.test"}],
+            "allow_credentials": True,
+            "unmatched_preflights": "ignore",
+        })
+        for bad_origin in (
+            "regex: '^https://(?:portal|admin)\\.example\\.com$'",
+            "exact: '*'",
+        ):
+            with self.subTest(bad_origin=bad_origin):
+                bad_cc = cred_cors_base.replace("exact: https://app.example.test", bad_origin)
+                cc_res = migrate("istio", bad_cc)[0]
+                self.assertEqual(one_proxy(self, cc_res.config, "=/api", "api.example.test")["labels"][
+                    "ferrum-migration/status"], "refused")
 
 
 if __name__ == "__main__":

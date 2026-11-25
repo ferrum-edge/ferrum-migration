@@ -42,10 +42,12 @@ CASES = [("kong", ("kong", "kong.yaml"), "yaml"), ("nginx", ("nginx", "nginx.con
 
 
 def ferrum_src():
-    candidates = [os.environ.get("FERRUM_EDGE_SRC"), os.path.join(ROOT, "..", "refs", "ferrum-edge")]
-    for candidate in candidates:
-        if candidate and os.path.isfile(os.path.join(candidate, "src", "config", "types.rs")):
-            return os.path.abspath(candidate)
+    explicit = os.environ.get("FERRUM_EDGE_SRC")
+    if explicit:
+        return os.path.abspath(explicit)
+    default = os.path.join(ROOT, "..", "refs", "ferrum-edge")
+    if os.path.exists(os.path.join(default, ".git")):
+        return os.path.abspath(default)
     return None
 
 
@@ -525,6 +527,22 @@ class FerrumBinaryValidateTest(unittest.TestCase):
                                                 }
                                             },
                                         },
+                                        {
+                                            "name": "r_capture_cors_regex",
+                                            "match": {"path_separated_prefix": "/capture-rx"},
+                                            "route": {"cluster": "app"},
+                                            "typed_per_filter_config": {
+                                                "envoy.filters.http.cors": {
+                                                    "@type": "type.googleapis.com/envoy.extensions.filters.http.cors.v3.CorsPolicy",
+                                                    "allow_credentials": {"value": False},
+                                                    "allow_origin_string_match": [{
+                                                        "safe_regex": {
+                                                            "regex": "https://(?:a|" + "()" * 200 + r"b){64}\.example\.test"
+                                                        }
+                                                    }],
+                                                }
+                                            },
+                                        },
                                     ],
                                 }],
                             },
@@ -574,7 +592,7 @@ class FerrumBinaryValidateTest(unittest.TestCase):
             ("nginx-extended", "nginx", nginx_text, {"fmt": "nginx"}, 1, {"compression"}),
             ("traefik-extended", "traefik", traefik_text, {"traefik_controls_asserted": True}, 2,
              {"compression", "response_size_limiting", "request_mirror"}),
-            ("envoy-extended", "envoy", envoy_text, {}, 2, {"cors", "grpc_web", "compression", "fault_injection"}),
+            ("envoy-extended", "envoy", envoy_text, {}, 3, {"cors", "grpc_web", "compression", "fault_injection"}),
             ("istio-extended", "istio", istio_text, {}, 1, {"fault_injection"}),
         ):
             result, _report, _plan = migrate(platform, text, **kw)
