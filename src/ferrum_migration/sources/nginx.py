@@ -286,8 +286,7 @@ class _Nginx:
                     child.gzip_comp_level = gzip_level
             elif name == "gzip_min_length" and args:
                 length = util.parse_nginx_size(args[0])
-                if length is not None and length >= 0:
-                    child.gzip_min_length = length
+                child.gzip_min_length = length if (length is not None and length >= 0) else -1
             elif name == "gzip_types" and args:
                 child.gzip_types = list(args)
             elif name == "gzip_proxied" and args:

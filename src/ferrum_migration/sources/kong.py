@@ -19,9 +19,9 @@ from ..errors import InputError
 from ..model import BackendRef, ConsumerSpec, Plan, PluginSpec, RouteSpec, Target, TlsSpec, UpstreamSpec
 from ..redact import contains_secret_reference, safe_label
 from ..safe_load import load_structured
-from .common import (SourceContext, check_route_budget, correlation_id_header_ok, cors_config, header_name_ok,
-                     header_value_ok, is_canonical_http_origin, mapping, query_rule, request_header_rule,
-                     response_header_rule, seq, str_list)
+from .common import (SourceContext, check_route_budget, correlation_id_header_ok, cors_config,
+                     has_explicit_default_origin_port, header_name_ok, header_value_ok, is_canonical_http_origin,
+                     mapping, query_rule, request_header_rule, response_header_rule, seq, str_list)
 
 PLATFORM = "kong"
 HTTP_PROTOCOLS = {"http", "https", "grpc", "grpcs", "ws", "wss"}
@@ -1242,42 +1242,57 @@ def _kong_rate_limiting(self: _Kong, config: dict, ref: str) -> tuple:
     return ("plugin", PluginSpec("rate_limiting", plugin_config, ref))
 
 
+_KONG_DEFAULT_CORS_METHODS = ["GET", "HEAD", "PUT", "PATCH", "POST", "DELETE", "OPTIONS", "TRACE", "CONNECT"]
+_FERRUM_DEFAULT_CORS_HEADERS = ["Content-Type", "Authorization", "X-Requested-With", "Accept", "Origin"]
+
+
 def _kong_cors(self: _Kong, config: dict, ref: str) -> tuple:
-    local_preflight = config.get("preflight_continue") is not True
+    raw_preflight_continue = config.get("preflight_continue")
+    if raw_preflight_continue is not None and not isinstance(raw_preflight_continue, bool):
+        return ("refuse", "CORS preflight_continue must be a boolean")
+    if raw_preflight_continue is True:
+        return ("refuse", "preflight_continue: true lets the upstream control OPTIONS CORS headers in Kong, "
+                          "whereas Ferrum replaces them with gateway-generated headers")
     raw_origins = config.get("origins")
     origins = str_list(raw_origins)
     if raw_origins is not None and origins is None:
-        if local_preflight:
-            return ("refuse", "CORS plugin answers preflights locally but origins has unexpected types "
-                              "(omitting would forward preflights to the backend)")
-        self.report.warning("kong-cors", ref, "CORS omitted (origins has unexpected types); browsers block "
-                            "cross-origin calls.")
-        return ("omit",)
+        return ("refuse", "CORS origins has unexpected types")
     origins = origins or ["*"]
+    ferrum_origins: list[Any] = []
     for origin in origins:
-        if origin != "*" and _REGEX_HINT.search(origin.replace(".", "")):
-            if local_preflight:
-                return ("refuse", "CORS plugin answers preflights locally with regex origins that cannot be "
-                                  "migrated (omitting would forward preflights to the backend)")
-            self.report.warning("kong-cors-regex", ref, "Regex CORS origins are not translated; CORS omitted, so "
-                                "browsers block cross-origin calls (fail closed).")
-            return ("omit",)
+        if origin == "*":
+            ferrum_origins.append("*")
+            continue
+        if _REGEX_HINT.search(origin.replace(".", "")):
+            return ("refuse", "CORS plugin uses regex origins that cannot be migrated (omitting would forward "
+                              "preflights to the backend)")
+        if origin == "null":
+            ferrum_origins.append({"exact": "null"})
+            continue
+        if not is_canonical_http_origin(origin):
+            return ("refuse", "CORS origin is not a canonical http(s)://host[:port] URL or 'null'; Kong's loose "
+                              "host/URL origin matching cannot be proven equivalent in Ferrum")
+        # Plain-string Ferrum origins canonicalize default ports (:80/:443) and case, whereas Kong compares
+        # single-origin literals verbatim; wrap explicit default-port or non-lowercase origins as {'exact': ...}.
+        if has_explicit_default_origin_port(origin) or origin != origin.lower():
+            ferrum_origins.append({"exact": origin})
+        else:
+            ferrum_origins.append(origin)
+    methods = _KONG_DEFAULT_CORS_METHODS if config.get("methods") is None else config.get("methods")
     if config.get("headers") is None:
         self.report.warning("kong-cors-headers", ref, "Kong reflected requested headers; Ferrum allows its default "
                             "header list (stricter).")
-    # Ferrum plain-string allowed_origins only accept '*' or canonical http(s)://host[:port] URLs (and treat
-    # '*.host' as a subdomain wildcard); wrap literal non-URL origins such as 'null' in {'exact': origin}.
-    ferrum_origins: list[Any] = [
-        o if (o == "*" or is_canonical_http_origin(o)) else {"exact": o} for o in origins
-    ]
-    built, problem = cors_config(ferrum_origins, config.get("methods"), config.get("headers"),
+        headers: Any = _FERRUM_DEFAULT_CORS_HEADERS
+    else:
+        headers = config.get("headers")
+    # Use unmatched_preflights='ignore' so unmatched normal requests forward without 403 (matching Kong),
+    # unmatched preflights are answered locally without CORS headers, and explicit empty lists (methods: [])
+    # stay empty instead of inheriting Ferrum's native defaults.
+    built, problem = cors_config(ferrum_origins, methods, headers,
                                  config.get("exposed_headers"), config.get("credentials"), config.get("max_age"),
-                                 config.get("preflight_continue"), config.get("private_network"))
+                                 None, config.get("private_network"), unmatched_preflights="ignore")
     if built is None:
-        if local_preflight:
-            return ("refuse", f"CORS plugin answers preflights locally and cannot be migrated ({problem})")
-        self.report.warning("kong-cors", ref, f"CORS omitted ({problem}); browsers block cross-origin calls.")
-        return ("omit",)
+        return ("refuse", f"CORS plugin cannot be migrated ({problem})")
     if origins == ["*"] and config.get("credentials"):
         self.report.warning("kong-cors-credentials", ref, "Wildcard origins with credentials: Ferrum drops credentials "
                             "instead of reflecting every origin (stricter).")

@@ -1771,6 +1771,47 @@ class TraefikHardeningTest(unittest.TestCase):
                     "serversTransports": {"t": {"forwardingTimeouts": {"dialTimeout": "750us"}}},
                 }
             }),
+            ("headers-cors-cred-star-origin", {
+                "http": {
+                    "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "main",
+                                      "middlewares": ["h"]}},
+                    "middlewares": {"h": {"headers": {"accessControlAllowOriginList": ["*"],
+                                                      "accessControlAllowCredentials": True}}},
+                    "services": {"main": {"loadBalancer": {"servers": [{"url": "http://main.internal:8080"}]}}},
+                }
+            }),
+            ("headers-cors-cred-star-headers", {
+                "http": {
+                    "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "main",
+                                      "middlewares": ["h"]}},
+                    "middlewares": {"h": {"headers": {"accessControlAllowOriginList": ["https://app.example.test"],
+                                                      "accessControlAllowHeaders": ["*"],
+                                                      "accessControlAllowCredentials": True}}},
+                    "services": {"main": {"loadBalancer": {"servers": [{"url": "http://main.internal:8080"}]}}},
+                }
+            }),
+            ("headers-cors-valid-with-https-redirect", {
+                "http": {
+                    "routers": {
+                        "r": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "main",
+                              "priority": 100, "middlewares": ["h", "redir"]},
+                        "fallback": {"rule": "Host(`a.example.test`)", "service": "main", "priority": 10},
+                    },
+                    "middlewares": {
+                        "h": {"headers": {"accessControlAllowOriginList": ["https://app.example.test"]}},
+                        "redir": {"redirectScheme": {"scheme": "https"}},
+                    },
+                    "services": {"main": {"loadBalancer": {"servers": [{"url": "http://main.internal:8080"}]}}},
+                }
+            }),
+            ("transport-subms-999999-9ns-timeout", {
+                "http": {
+                    "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "main"}},
+                    "services": {"main": {"loadBalancer": {"serversTransport": "t",
+                                                           "servers": [{"url": "http://main.internal:8080"}]}}},
+                    "serversTransports": {"t": {"forwardingTimeouts": {"dialTimeout": "999999.9ns"}}},
+                }
+            }),
             ("transport-unitless-float-timeout", {
                 "http": {
                     "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "main"}},
@@ -1806,21 +1847,27 @@ class TraefikHardeningTest(unittest.TestCase):
         })
         self.assertIn("traefik-buffering-retry", codes(cl_rep, "warning"))
         # Health-check interval and timeout clamp to Ferrum bounds (3600s and MAX_TIMEOUT_MS), status carries over,
-        # and non-GET method omits the health check with a warning.
+        # HTTPS backend inherits use_tls=True, empty method "" is accepted as GET, and lowercase "get"/HEAD omit.
         hc_doc = yaml.safe_dump({
             "http": {
                 "routers": {
                     "r": {"rule": "Host(`a.example.test`) && PathPrefix(`/hc/`)", "service": "main"},
                     "r_head": {"rule": "Host(`a.example.test`) && PathPrefix(`/head/`)", "service": "head_svc"},
+                    "r_lower": {"rule": "Host(`a.example.test`) && PathPrefix(`/lower/`)", "service": "lower_svc"},
                 },
                 "services": {
                     "main": {"loadBalancer": {
-                        "healthCheck": {"path": "/healthz", "interval": "2h", "timeout": "48h", "status": 204},
-                        "servers": [{"url": "http://main.internal:8080"}],
+                        "healthCheck": {"path": "/healthz", "method": "", "interval": "2h", "timeout": "48h",
+                                        "status": 204},
+                        "servers": [{"url": "https://main.internal:8443"}],
                     }},
                     "head_svc": {"loadBalancer": {
                         "healthCheck": {"path": "/healthz", "method": "HEAD", "status": 204},
                         "servers": [{"url": "http://head.internal:8080"}],
+                    }},
+                    "lower_svc": {"loadBalancer": {
+                        "healthCheck": {"path": "/healthz", "method": "get"},
+                        "servers": [{"url": "http://lower.internal:8080"}],
                     }},
                 },
             }
@@ -1830,6 +1877,7 @@ class TraefikHardeningTest(unittest.TestCase):
         self.assertEqual(hc_active["interval_seconds"], 3600)
         self.assertEqual(hc_active["timeout_ms"], 86_400_000)
         self.assertEqual(hc_active["healthy_status_codes"], [204])
+        self.assertIs(hc_active["use_tls"], True)
         self.assertEqual(len(hc_res.config["upstreams"]), 1)
         self.assertIn("traefik-health", codes(hc_rep, "warning"))
         # compress.minResponseBodyBytes above u64::MAX omits compression cleanly instead of emitting invalid config.

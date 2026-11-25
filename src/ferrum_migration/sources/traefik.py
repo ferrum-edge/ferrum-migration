@@ -449,6 +449,8 @@ class _Traefik:
         self.middlewares = mapping(http.get("middlewares"))
         self.transports = mapping(http.get("serversTransports"))
         self.priority: dict[int, tuple[int, str]] = {}
+        self.https_redirects: set[int] = set()
+        self.redirect_router_refs: dict[int, str] = {}
         self.builtin_default_tls_used = False
         # Per route spec (by id): the sorted entryPoint names its router lists, or None when it lists none (Traefik
         # then attaches it to its default entryPoints, which only the static configuration defines).
@@ -475,6 +477,7 @@ class _Traefik:
         handshake_scope_problems = self._handshake_scope()
         for name, router in self.routers.items():
             self._router(str(name), router)
+        self._resolve_https_redirects()
         self._https_handshake_policy(handshake_scope_problems)
         if self.builtin_default_tls_used:
             self.report.info("traefik-tls-default-options", "traefik tls options",
@@ -728,11 +731,7 @@ class _Traefik:
         if not groups:
             self.report.warning("traefik-rule-unsatisfiable", ref, "Rule can never match; not emitted.")
             return
-        if acc.https_redirect and not requires_tls and not acc.refusals:
-            self.plan.settings.https_redirect_seen = True
-            self.report.info("traefik-https-redirect", ref, "HTTP-to-HTTPS redirect router: not emitted; Ferrum's "
-                             "TLS-only profile disables the plaintext listener instead.")
-            return
+        is_plain_https_redirect = acc.https_redirect and not requires_tls
         for number, ((kind, path, methods, extra), group) in enumerate(groups.items()):
             spec = RouteSpec(ref=ref if len(groups) == 1 else f"{ref} alternative #{number + 1}",
                              name=name if number == 0 else f"{name}-{number + 1}")
@@ -757,8 +756,9 @@ class _Traefik:
                 spec.refuse("headers.allowedHosts restricts hosts beyond the router rule")
             for refusal in acc.refusals:
                 spec.refuse(refusal)
-            for problem in backend_info["problems"]:
-                spec.refuse(problem)
+            if not is_plain_https_redirect:
+                for problem in backend_info["problems"]:
+                    spec.refuse(problem)
             spec.backend = backend_info.get("backend")
             spec.preserve_host = backend_info.get("preserve_host", True)
             spec.connect_timeout_ms = backend_info.get("connect")
@@ -776,8 +776,43 @@ class _Traefik:
                                     "Mirror target(s) dropped on path-rewriting route (stripPrefix/addPrefix): "
                                     "Traefik mirrors the rewritten path, whereas Ferrum file-mode request_mirror "
                                     "mirrors the original request path.")
+            if is_plain_https_redirect:
+                self.https_redirects.add(id(spec))
+                self.redirect_router_refs[id(spec)] = ref
             self.priority[id(spec)] = (priority, name)
             self.plan.routes.append(spec)
+
+    def _resolve_https_redirects(self) -> None:
+        """Fold plaintext ``redirectScheme: https`` routers away only when no other plaintext traffic exists.
+
+        If another plaintext router keeps Ferrum's HTTP listener open, or a redirect router carries refusals or
+        local-answering plugins (such as CORS), keep it as a fail-closed refused placeholder so precedence analysis
+        runs and lower-priority plaintext routers cannot receive traffic Traefik redirected or answered locally.
+        """
+        if not self.https_redirects:
+            return
+        plaintext = [spec for spec in self.plan.routes if not spec.requires_tls and not spec.skip]
+        if plaintext and all(
+            id(spec) in self.https_redirects and not spec.refusals and not spec.plugins
+            for spec in plaintext
+        ):
+            self.plan.settings.https_redirect_seen = True
+            seen_refs: set[str] = set()
+            for spec in plaintext:
+                rref = self.redirect_router_refs.get(id(spec), spec.ref)
+                if rref not in seen_refs:
+                    seen_refs.add(rref)
+                    self.report.info("traefik-https-redirect", rref,
+                                     "HTTP-to-HTTPS redirect router: not emitted; Ferrum's TLS-only profile "
+                                     "disables the plaintext listener instead.")
+                self.priority.pop(id(spec), None)
+                self.entrypoints_of.pop(id(spec), None)
+            self.plan.routes = [spec for spec in self.plan.routes if id(spec) not in self.https_redirects]
+            return
+        for spec in self.plan.routes:
+            if id(spec) in self.https_redirects:
+                spec.refuse("plaintext redirectScheme: https router cannot be folded away alongside other plaintext "
+                            "routes or local-answering middlewares")
 
     def _apply_paths(self, spec: RouteSpec, acc: _Acc) -> None:
         if len(acc.strip_prefixes) > 1:
@@ -1302,6 +1337,15 @@ class _Traefik:
                     origins_raw = str_list(raw_origins) if raw_origins is not None else []
                     if raw_origins is not None and origins_raw is None:
                         acc.refusals.append("headers.accessControlAllowOriginList has unexpected types")
+                    elif raw_creds is True and (
+                        "*" in (origins_raw or [])
+                        or "*" in (str_list(config.get("accessControlAllowMethods")) or [])
+                        or "*" in (str_list(config.get("accessControlAllowHeaders")) or [])
+                        or "*" in (str_list(config.get("accessControlExposeHeaders")) or [])
+                    ):
+                        acc.refusals.append("headers CORS policy combines accessControlAllowCredentials: true with "
+                                            "wildcard '*' in origins/methods/headers, which Ferrum downgrades or "
+                                            "returns literally; specify explicit lists")
                     else:
                         # Traefik matches origins literally (so '*.example.test' is literal, not a subdomain wildcard,
                         # and 'null' is a literal origin); wrap non-'*' entries as {'exact': origin} and set
@@ -1610,7 +1654,7 @@ class _Traefik:
         result.update(timeouts)
         if problems or scheme is None:
             return result
-        health = self._health(mapping(lb.get("healthCheck")), ref)
+        health = self._health(mapping(lb.get("healthCheck")), scheme, ref)
         sticky = mapping(mapping(lb.get("sticky")).get("cookie"))
         if len(targets) == 1 and not health and not sticky and not (scheme == "https" and (tls.sni or tls.san_allow_list)):
             result["backend"] = BackendRef(scheme=scheme, host=targets[0].host, port=targets[0].port, tls=tls)
@@ -1638,8 +1682,13 @@ class _Traefik:
         result["backend"] = BackendRef(scheme=scheme, upstream_key=key)
         return result
 
-    def _health(self, health: dict, ref: str) -> dict | None:
+    def _health(self, health: dict, backend_scheme: str, ref: str) -> dict | None:
         if not health or not isinstance(health.get("path"), str):
+            return None
+        raw_mode = health.get("mode")
+        if raw_mode is not None and (not isinstance(raw_mode, str) or raw_mode.lower() != "http"):
+            self.report.warning("traefik-health", ref,
+                                "Active health check uses non-HTTP mode (such as grpc); omitted.")
             return None
         http_path = health["path"]
         if not http_path.startswith("/") or len(http_path.encode("utf-8")) > util.MAX_BACKEND_PATH_LENGTH \
@@ -1650,7 +1699,7 @@ class _Traefik:
                                 "active health check omitted.")
             return None
         raw_method = health.get("method")
-        if raw_method is not None and (not isinstance(raw_method, str) or raw_method.strip().upper() != "GET"):
+        if raw_method is not None and (not isinstance(raw_method, str) or raw_method not in ("", "GET")):
             self.report.warning("traefik-health", ref,
                                 "Active health check uses a non-GET HTTP method; Ferrum active HTTP probes only "
                                 "send GET, so the health check was omitted.")
@@ -1679,8 +1728,13 @@ class _Traefik:
                                 "Active health check omits status (Traefik accepts HTTP 200-399), whereas Ferrum "
                                 "uses its default healthy_status_codes; configure healthy_status_codes explicitly "
                                 "if other 2xx/3xx responses must count as healthy.")
-        if health.get("scheme") == "https":
+        probe_scheme = str(health.get("scheme") or backend_scheme).lower()
+        if probe_scheme == "https":
             entry["use_tls"] = True
+        if health.get("followRedirects") is not False:
+            self.report.warning("traefik-health", ref,
+                                "Traefik active health checks follow HTTP redirects by default, whereas Ferrum "
+                                "active probes do not follow redirects.")
         if health.get("port") or health.get("hostname") or health.get("headers"):
             self.report.warning("traefik-health", ref, "Health-check port/hostname/headers are not migrated.")
         return {"active": entry}

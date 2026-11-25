@@ -829,12 +829,34 @@ def is_canonical_http_origin(origin: str) -> bool:
         return False
     if not authority or any(ch in authority for ch in "/\\?#@%"):
         return False
+    # Reject unbracketed IPv6 literals (multiple colons without '[...]') because Url::parse rejects them.
+    if not authority.startswith("[") and authority.count(":") > 1:
+        return False
     parsed = util.split_host_port(authority, 80)
     if parsed is None:
         return False
     host, _port = parsed
     norm_host = util.normalize_backend_host(host)
     return norm_host is not None and _is_valid_mirror_host(norm_host)
+
+
+def has_explicit_default_origin_port(origin: str) -> bool:
+    """Whether an ``http(s)://`` origin explicitly specifies its scheme's default port (``:80`` / ``:443``)."""
+    lower = origin.lower()
+    if lower.startswith("http://"):
+        authority, default_port = origin[7:], 80
+    elif lower.startswith("https://"):
+        authority, default_port = origin[8:], 443
+    else:
+        return False
+    if authority.startswith("["):
+        end = authority.find("]")
+        rest = authority[end + 1:] if end >= 0 else ""
+        return rest.startswith(":") and util.parse_port(rest[1:]) == default_port
+    if authority.count(":") == 1:
+        _, _, port_text = authority.partition(":")
+        return util.parse_port(port_text) == default_port
+    return False
 
 
 def cors_config(origins: Any, methods: Any = None, headers: Any = None, exposed: Any = None,

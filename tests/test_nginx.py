@@ -809,21 +809,22 @@ class NginxFrontendScopeTest(unittest.TestCase):
         })
         self.assertIn("nginx-gzip", codes(def_rep, "warning"))
 
-        # gzip_min_length exceeding u64::MAX omits compression cleanly instead of emitting out-of-range config.
-        huge_min_conf = """
-        server {
-            listen 80;
-            server_name def.example.test;
-            gzip on;
-            gzip_proxied any;
-            gzip_http_version 1.0;
-            gzip_min_length 18446744073709551616;
-            location /html/ { proxy_pass http://html.internal:8080; }
-        }
-        """
-        hm_res, hm_rep, _ = nginx(huge_min_conf)
-        self.assertEqual(plugins_of(hm_res.config, one_proxy(self, hm_res.config, "/html", "def.example.test")), [])
-        self.assertIn("nginx-gzip", codes(hm_rep, "warning"))
+        # gzip_min_length exceeding u64::MAX or Python's int digit limit omits compression cleanly without crashing.
+        for huge_min in ("18446744073709551616", "9" * 4400):
+            huge_min_conf = f"""
+            server {{
+                listen 80;
+                server_name def.example.test;
+                gzip on;
+                gzip_proxied any;
+                gzip_http_version 1.0;
+                gzip_min_length {huge_min};
+                location /html/ {{ proxy_pass http://html.internal:8080; }}
+            }}
+            """
+            hm_res, hm_rep, _ = nginx(huge_min_conf)
+            self.assertEqual(plugins_of(hm_res.config, one_proxy(self, hm_res.config, "/html", "def.example.test")), [])
+            self.assertIn("nginx-gzip", codes(hm_rep, "warning"))
 
 
 if __name__ == "__main__":

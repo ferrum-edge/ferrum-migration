@@ -141,7 +141,7 @@ def parse_port(value: object) -> int | None:
         return None
     if isinstance(value, int):
         port = value
-    elif isinstance(value, str) and value.isdigit() and len(value) <= 5:
+    elif isinstance(value, str) and value.isascii() and value.isdigit() and len(value) <= 5:
         port = int(value)
     else:
         return None
@@ -426,10 +426,14 @@ _GO_UNIT_NS = {
     "h": Decimal(3_600_000_000_000),
 }
 _MAX_DURATION_NS = (1 << 63) - 1
+_MAX_DURATION_MS = (1 << 63) - 1
 
 
 def parse_go_duration_ns(value: object, *, allow_unitless_float: bool = True) -> int | None:
-    """Parse a non-negative Go/Traefik/Istio duration into exact integer nanoseconds (or ``None`` if invalid)."""
+    """Parse a non-negative Go/Traefik/Istio duration into exact integer nanoseconds (or ``None`` if invalid).
+
+    Matches Go ``time.ParseDuration`` truncation toward zero for fractional nanoseconds.
+    """
     if isinstance(value, bool):
         return None
     if isinstance(value, int):
@@ -440,10 +444,12 @@ def parse_go_duration_ns(value: object, *, allow_unitless_float: bool = True) ->
         if not allow_unitless_float or not math.isfinite(value) or value < 0.0:
             return None
         try:
-            ns = int((Decimal(str(value)) * Decimal(1_000_000_000)).to_integral_value())
+            dec_f = Decimal(str(value)) * Decimal(1_000_000_000)
         except (InvalidOperation, ValueError, OverflowError):
             return None
-        return ns if 0 <= ns <= _MAX_DURATION_NS else None
+        if dec_f < 0 or dec_f > _MAX_DURATION_NS:
+            return None
+        return int(dec_f)
     if not isinstance(value, str):
         return None
     text = value.strip()
@@ -471,7 +477,7 @@ def parse_go_duration_ns(value: object, *, allow_unitless_float: bool = True) ->
             return 0
         if neg or dec < 0 or dec > _MAX_DURATION_NS:
             return None
-        return max(1, int(dec.to_integral_value()))
+        return int(dec)
     if not _GO_DURATION.match(text):
         return None
     total = Decimal(0)
@@ -492,7 +498,7 @@ def parse_go_duration_ns(value: object, *, allow_unitless_float: bool = True) ->
         return 0
     if neg:
         return None
-    return max(1, int(total.to_integral_value()))
+    return int(total)
 
 
 def classify_go_duration(value: object, *, allow_unitless_float: bool = True) -> str:
@@ -558,11 +564,14 @@ def parse_nginx_time_ms(value: object) -> int | None:
 def parse_nginx_size(value: object) -> int | None:
     if not isinstance(value, str):
         return None
-    match = re.fullmatch(r"(\d+)([kKmMgG]?)", value.strip())
+    match = re.fullmatch(r"(\d+)([kKmMgG]?)", value.strip(), re.ASCII)
     if not match:
         return None
     factor = {"": 1, "k": 1024, "m": 1024 ** 2, "g": 1024 ** 3}[match.group(2).lower()]
-    return int(match.group(1)) * factor
+    try:
+        return int(match.group(1)) * factor
+    except ValueError:
+        return None
 
 
 # ----------------------------------------------------------------------- URLs

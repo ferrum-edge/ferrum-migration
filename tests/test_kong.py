@@ -515,9 +515,9 @@ class KongHardeningTest(unittest.TestCase):
         alt_res, _alt_rep, _ = migrate("kong", alt_text)
         assert_structurally_valid(self, alt_res.config)
         self.assertEqual(one_proxy(self, alt_res.config, "~/a|/b")["labels"]["ferrum-migration/status"], "refused")
-        # Untranslatable CORS refuses fail-closed when Kong answered preflights locally (default preflight_continue:
-        # false), so preflights are not newly forwarded to the backend; with preflight_continue: true it omits AND
-        # suppresses any global CORS plugin on that route. Plain 'null' origin is wrapped as {'exact': 'null'}.
+        # Untranslatable CORS (malformed origins, regex origins, preflight_continue: true, host-only/bare-IPv6
+        # origins) refuses fail-closed; 'null' and explicit default-port origins ('https://app.example.test:443')
+        # wrap as {'exact': ...}; explicit methods: [] stays empty under unmatched_preflights: ignore.
         cors_text = textwrap.dedent("""
             _format_version: "3.0"
             plugins:
@@ -536,30 +536,42 @@ class KongHardeningTest(unittest.TestCase):
                     paths: [/cp/]
                     plugins:
                       - name: cors
-                        config: {origins: ['^https://.*\\.example$'], preflight_continue: true}
-                  - name: null-origin
-                    paths: [/null/]
+                        config: {origins: ["https://ok.example.test"], preflight_continue: true}
+                  - name: bad-cors-host-only
+                    paths: [/host/]
                     plugins:
                       - name: cors
-                        config: {origins: ["null"], credentials: false}
+                        config: {origins: ["example.com"]}
+                  - name: bad-cors-bare-v6
+                    paths: [/v6/]
+                    plugins:
+                      - name: cors
+                        config: {origins: ["http://::1"]}
+                  - name: null-and-default-port
+                    paths: [/exact/]
+                    plugins:
+                      - name: cors
+                        config: {origins: ["null", "https://app.example.test:443"], methods: [], credentials: false}
                   - name: inherits-global
                     paths: [/g/]
         """)
-        cors_res, cors_rep, _ = migrate("kong", cors_text)
+        cors_res, _cors_rep, _ = migrate("kong", cors_text)
         assert_structurally_valid(self, cors_res.config)
-        self.assertEqual(one_proxy(self, cors_res.config, "/c")["labels"]["ferrum-migration/status"], "refused")
-        cp_proxy = one_proxy(self, cors_res.config, "/cp")
-        self.assertEqual(cp_proxy["labels"]["ferrum-migration/status"], "migrated")
-        self.assertEqual(plugins_of(cors_res.config, cp_proxy), [])
+        for refused_path in ("/c", "/cp", "/host", "/v6"):
+            self.assertEqual(one_proxy(self, cors_res.config, refused_path)["labels"]["ferrum-migration/status"],
+                             "refused", refused_path)
         self.assertFalse(any(p["plugin_name"] == "cors" and p["scope"] == "global"
                              for p in cors_res.config["plugin_configs"]))
-        self.assertIn("kong-cors-regex", codes(cors_rep, "warning"))
-        null_p = one_proxy(self, cors_res.config, "/null")
-        self.assertEqual(plugin(self, cors_res.config, null_p, "cors")["config"]["allowed_origins"],
-                         [{"exact": "null"}])
+        exact_p = one_proxy(self, cors_res.config, "/exact")
+        exact_cors = plugin(self, cors_res.config, exact_p, "cors")["config"]
+        self.assertEqual(exact_cors["allowed_origins"],
+                         [{"exact": "null"}, {"exact": "https://app.example.test:443"}])
+        self.assertEqual(exact_cors["unmatched_preflights"], "ignore")
+        self.assertNotIn("allowed_methods", exact_cors)
         g_p = one_proxy(self, cors_res.config, "/g")
-        self.assertEqual(plugin(self, cors_res.config, g_p, "cors")["config"]["allowed_origins"],
-                         ["https://global.example.test"])
+        g_cors = plugin(self, cors_res.config, g_p, "cors")["config"]
+        self.assertEqual(g_cors["allowed_origins"], ["https://global.example.test"])
+        self.assertEqual(g_cors["unmatched_preflights"], "ignore")
 
     def test_top_level_consumer_group_plugin_quarantines_group_members(self):
         text = textwrap.dedent("""
