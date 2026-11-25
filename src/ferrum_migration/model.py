@@ -60,6 +60,7 @@ class PluginSpec:
     config: dict
     ref: str = ""
     shared_key: str | None = None
+    trigger: dict | None = None
 
 
 @dataclass

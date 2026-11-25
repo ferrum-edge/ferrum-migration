@@ -1183,29 +1183,49 @@ class IstioCaseAndNamesTest(unittest.TestCase):
                 self.assertEqual(one_proxy(self, ep_res.config, "=/api", "api.example.test")["labels"][
                     "ferrum-migration/status"], "refused")
 
-        # Uncredentialed allowHeaders: ["*"] expands to ["*", "authorization"]; regex matching literal "*"
-        # normalizes to ["*"] (uncredentialed) and refuses (credentialed); overflowing maxAge refuses cleanly.
-        uncred_star = cred_cors_base.replace(
-            "        allowCredentials: true\n        unmatchedPreflights: IGNORE",
-            "        allowHeaders: ['*']\n        allowCredentials: false",
+        # Uncredentialed allowHeaders: ["*"] expands to ["*", "authorization"]; RE2 regexes matching literal "*"
+        # (\*, \x{2a}, \Q*\E) normalize to ["*"] (uncredentialed) and refuse (credentialed); divergent syntax,
+        # ambiguous repetitions, and overflowing maxAge refuse cleanly; [\\x{2a}] never becomes ["*"].
+        for star_pat in (r"\*", r"\x{2a}", r"\Q*\E"):
+            with self.subTest(star_pat=star_pat):
+                uncred_star = cred_cors_base.replace(
+                    "        allowCredentials: true\n        unmatchedPreflights: IGNORE",
+                    "        allowHeaders: ['*']\n        allowCredentials: false",
+                ).replace(
+                    "exact: https://app.example.test",
+                    f"regex: '{star_pat}'",
+                )
+                self.assertIn("allowHeaders: ['*']", uncred_star)
+                us_res = migrate("istio", uncred_star)[0]
+                us_proxy = one_proxy(self, us_res.config, "=/api", "api.example.test")
+                self.assertEqual(plugin(self, us_res.config, us_proxy, "cors")["config"], {
+                    "allowed_origins": ["*"],
+                    "allowed_headers": ["*", "authorization"],
+                    "allow_credentials": False,
+                    "unmatched_preflights": "forward",
+                })
+                cred_star_rx = cred_cors_base.replace("exact: https://app.example.test", f"regex: '{star_pat}'")
+                self.assertNotEqual(cred_star_rx, cred_cors_base)
+                self.assertEqual(one_proxy(self, migrate("istio", cred_star_rx)[0].config, "=/api", "api.example.test")[
+                    "labels"]["ferrum-migration/status"], "refused")
+        for bad_probe_pat in (r".{,64}", r"(?=\*)\*", r"(?:a?|b?){100}x"):
+            with self.subTest(bad_probe=bad_probe_pat):
+                bp_doc = cred_cors_base.replace(
+                    "allowCredentials: true", "allowCredentials: false"
+                ).replace(
+                    "exact: https://app.example.test", f"regex: '{bad_probe_pat}'"
+                )
+                self.assertEqual(one_proxy(self, migrate("istio", bp_doc)[0].config, "=/api", "api.example.test")[
+                    "labels"]["ferrum-migration/status"], "refused")
+        esc_bs_istio = cred_cors_base.replace(
+            "allowCredentials: true", "allowCredentials: false"
         ).replace(
-            "exact: https://app.example.test",
-            r"regex: '\*'",
+            "exact: https://app.example.test", r"regex: '[\\x{2a}]'"
         )
-        self.assertIn("allowHeaders: ['*']", uncred_star)
-        self.assertIn(r"regex: '\*'", uncred_star)
-        us_res = migrate("istio", uncred_star)[0]
-        us_proxy = one_proxy(self, us_res.config, "=/api", "api.example.test")
-        self.assertEqual(plugin(self, us_res.config, us_proxy, "cors")["config"], {
-            "allowed_origins": ["*"],
-            "allowed_headers": ["*", "authorization"],
-            "allow_credentials": False,
-            "unmatched_preflights": "forward",
-        })
-        cred_star_rx = cred_cors_base.replace("exact: https://app.example.test", r"regex: '\*'")
-        self.assertNotEqual(cred_star_rx, cred_cors_base)
-        self.assertEqual(one_proxy(self, migrate("istio", cred_star_rx)[0].config, "=/api", "api.example.test")[
-            "labels"]["ferrum-migration/status"], "refused")
+        ebi_res = migrate("istio", esc_bs_istio)[0]
+        ebi_cors = [p for p in ebi_res.config["plugin_configs"] if p["plugin_name"] == "cors"]
+        if ebi_cors:
+            self.assertNotEqual(ebi_cors[0]["config"]["allowed_origins"], ["*"])
         huge_age_doc = cred_cors_base + f"        maxAge: {'1' + '0' * 310}s\n"
         self.assertEqual(one_proxy(self, migrate("istio", huge_age_doc)[0].config, "=/api", "api.example.test")[
             "labels"]["ferrum-migration/status"], "refused")

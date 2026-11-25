@@ -1395,7 +1395,14 @@ class _Traefik:
             if transport_name:
                 tbase, _, tprov = str(transport_name).partition("@")
                 if tprov in ("", "file"):
-                    raw_ft = mapping(mapping(self.transports.get(tbase)).get("forwardingTimeouts"))
+                    tdoc = mapping(self.transports.get(tbase))
+                    if tdoc.get("disableHTTP2") not in (None, False):
+                        self.report.warning("traefik-mirroring", ref,
+                                            "Mirror target configures serversTransport.disableHTTP2, which Ferrum's "
+                                            "shared request_mirror client cannot enforce (it may negotiate HTTP/2 or "
+                                            "use HTTP/2 for native gRPC); mirror dropped.")
+                        continue
+                    raw_ft = mapping(tdoc.get("forwardingTimeouts"))
                     if any(util.classify_go_duration(raw_ft.get(k)) != "zero"
                            for k in ("dialTimeout", "responseHeaderTimeout")):
                         self.report.warning("traefik-mirroring", ref,

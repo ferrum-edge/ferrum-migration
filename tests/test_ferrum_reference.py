@@ -453,6 +453,7 @@ class FerrumBinaryValidateTest(unittest.TestCase):
                           "middlewares": ["comp"]},
                     "r_buf": {"rule": "Host(`a.example.test`) && PathPrefix(`/buf/`)", "service": "main",
                               "middlewares": ["buf"]},
+                    "r_abbr": {"rule": "Host(`a.example.test`) && PathPrefix(`/abbr/`)", "service": "mirrored_abbr"},
                 },
                 "middlewares": {
                     "comp": {"compress": {"encodings": ["br", "gzip"], "minResponseBodyBytes": 1024,
@@ -462,9 +463,13 @@ class FerrumBinaryValidateTest(unittest.TestCase):
                 "services": {
                     "mirrored": {"mirroring": {"service": "main", "mirrorBody": False,
                                                "mirrors": [{"name": "shadow", "percent": 20}]}},
+                    "mirrored_abbr": {"mirroring": {"service": "main", "mirrorBody": False,
+                                                    "mirrors": [{"name": "shadow_abbr", "percent": 20}]}},
                     "main": {"loadBalancer": {"servers": [{"url": "http://main.internal:8080"}]}},
                     "shadow": {"loadBalancer": {"passHostHeader": False,
                                                 "servers": [{"url": "http://shadow.internal:9090"}]}},
+                    "shadow_abbr": {"loadBalancer": {"passHostHeader": False,
+                                                     "servers": [{"url": "http://127.1:9090"}]}},
                 },
             }
         })
@@ -598,7 +603,7 @@ class FerrumBinaryValidateTest(unittest.TestCase):
         for label, platform, text, kw, expected_migrated, expected_plugins in (
             ("kong-extended", "kong", kong_text, {}, 1, {"correlation_id"}),
             ("nginx-extended", "nginx", nginx_text, {"fmt": "nginx"}, 1, {"compression"}),
-            ("traefik-extended", "traefik", traefik_text, {"traefik_controls_asserted": True}, 2,
+            ("traefik-extended", "traefik", traefik_text, {"traefik_controls_asserted": True}, 3,
              {"compression", "response_size_limiting", "request_mirror"}),
             ("envoy-extended", "envoy", envoy_text, {}, 1, {"cors", "grpc_web", "compression", "fault_injection"}),
             ("istio-extended", "istio", istio_text, {}, 1, {"fault_injection"}),

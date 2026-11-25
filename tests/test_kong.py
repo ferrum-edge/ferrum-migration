@@ -910,9 +910,13 @@ class KongExtendedPluginsAndConsumersTest(unittest.TestCase):
         tls_res = migrate("kong", proto_cid, tls_only=True)[0]
         tls_p = one_proxy(self, tls_res.config, "/tls")
         self.assertEqual(tls_p["labels"]["ferrum-migration/status"], "migrated")
-        self.assertEqual(plugin(self, tls_res.config, tls_p, "correlation_id")["config"]["header_name"], "x-tls-id")
+        tls_cid = plugin(self, tls_res.config, tls_p, "correlation_id")
+        self.assertEqual(tls_cid["config"]["header_name"], "x-tls-id")
+        self.assertEqual(tls_cid["trigger"], {"when": {"not": {"match": {"protocol": ["grpc", "websocket"]}}}})
 
-        # Distinct Kong protocols on the same plaintext listener (http vs grpc) are compared without collapsing.
+        # Distinct Kong protocols on the same plaintext listener (http vs grpc) are compared without collapsing,
+        # and Ferrum trigger.when enforces the wire flavor at runtime (excluding gRPC/WS on http-only, matching
+        # gRPC on grpc-only, and omitting when flavors disagree across HTTP and HTTPS listeners).
         grpc_cid = textwrap.dedent("""
             _format_version: "3.0"
             plugins:
@@ -926,18 +930,35 @@ class KongExtendedPluginsAndConsumersTest(unittest.TestCase):
                   - name: grpc-only
                     protocols: [grpc]
                     paths: [/grpc/]
+                    plugins:
+                      - name: correlation-id
+                        protocols: [grpc]
+                        config: {header_name: X-Grpc-Only, echo_downstream: false, generator: uuid}
                   - name: http-and-grpc
                     protocols: [http, grpc]
                     paths: [/mixed/]
                   - name: http-only
                     protocols: [http]
                     paths: [/http/]
+                  - name: cross-flavor
+                    protocols: [http, grpcs]
+                    paths: [/cross/]
+                    plugins:
+                      - name: correlation-id
+                        protocols: [http, grpcs]
+                        config: {header_name: X-Cross, echo_downstream: false, generator: uuid}
         """)
         gc_res, gc_rep, _ = migrate("kong", grpc_cid)
-        self.assertEqual(plugins_of(gc_res.config, one_proxy(self, gc_res.config, "/grpc")), [])
+        grpc_pl = plugin(self, gc_res.config, one_proxy(self, gc_res.config, "/grpc"), "correlation_id")
+        self.assertEqual(grpc_pl["config"]["header_name"], "x-grpc-only")
+        self.assertEqual(grpc_pl["trigger"], {"when": {"match": {"protocol": ["grpc"]}}})
         self.assertEqual(plugins_of(gc_res.config, one_proxy(self, gc_res.config, "/mixed")), [])
-        self.assertEqual(plugin(self, gc_res.config, one_proxy(self, gc_res.config, "/http"), "correlation_id")[
-            "config"]["header_name"], "x-http-only")
+        http_pl = plugin(self, gc_res.config, one_proxy(self, gc_res.config, "/http"), "correlation_id")
+        self.assertEqual(http_pl["config"]["header_name"], "x-http-only")
+        self.assertEqual(http_pl["trigger"], {"when": {"not": {"match": {"protocol": ["grpc", "websocket"]}}}})
+        cross_p = one_proxy(self, gc_res.config, "/cross")
+        self.assertEqual(cross_p["labels"]["ferrum-migration/status"], "migrated")
+        self.assertEqual(plugins_of(gc_res.config, cross_p), [])
         self.assertIn("kong-correlation-id", codes(gc_rep, "warning"))
 
 

@@ -1398,6 +1398,31 @@ class TraefikHardeningTest(unittest.TestCase):
                     },
                 }
             }),
+            ("abbreviated-ipv4-mirror", {
+                "http": {
+                    "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "m"}},
+                    "services": {
+                        "m": {"mirroring": {"service": "main", "mirrorBody": False,
+                                            "mirrors": [{"name": "shadow", "percent": 20}]}},
+                        "main": {"loadBalancer": {"servers": [{"url": "http://main.internal:8080"}]}},
+                        "shadow": {"loadBalancer": {"passHostHeader": False,
+                                                    "servers": [{"url": "http://127.1:9090"}]}},
+                    },
+                }
+            }),
+            ("disable-http2-mirror", {
+                "http": {
+                    "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "m"}},
+                    "services": {
+                        "m": {"mirroring": {"service": "main", "mirrorBody": False,
+                                            "mirrors": [{"name": "shadow", "percent": 20}]}},
+                        "main": {"loadBalancer": {"servers": [{"url": "http://main.internal:8080"}]}},
+                        "shadow": {"loadBalancer": {"passHostHeader": False, "serversTransport": "no_h2",
+                                                    "servers": [{"url": "https://shadow.internal:9443"}]}},
+                    },
+                    "serversTransports": {"no_h2": {"disableHTTP2": True}},
+                }
+            }),
             ("huge-percent-mirror", {
                 "http": {
                     "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "m"}},
@@ -1420,6 +1445,9 @@ class TraefikHardeningTest(unittest.TestCase):
                 if label in ("subms-timeout-mirror", "overflow-timeout-mirror"):
                     msgs = [c.message for c in mr_rep.caveats if c.code == "traefik-mirroring"]
                     self.assertTrue(any("forwardingTimeouts" in m for m in msgs), msgs)
+                if label == "disable-http2-mirror":
+                    msgs = [c.message for c in mr_rep.caveats if c.code == "traefik-mirroring"]
+                    self.assertTrue(any("disableHTTP2" in m for m in msgs), msgs)
         # Equivalent zero duration (0m) on shadow serversTransport does NOT drop an eligible mirror.
         zero_tm_doc = yaml.safe_dump({
             "http": {

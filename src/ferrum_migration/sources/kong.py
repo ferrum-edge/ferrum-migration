@@ -706,6 +706,7 @@ class _Kong:
         cid_suppressed = False
         for name, (plugin, level) in by_name.items():
             ref = f"kong {level} plugin {safe_label(name, 40)}"
+            cid_trigger: dict | None = None
             if name == "correlation-id":
                 p_protos = _plugin_protocols(plugin.raw)
                 if p_protos is not None and p_protos.isdisjoint(route_protocols):
@@ -716,9 +717,15 @@ class _Kong:
                                         "correlation-id omitted: plugin protocols do not cover every protocol of this "
                                         "route (Ferrum cannot restrict correlation_id to a subset of protocols).")
                     continue
+                cid_trigger, trig_err = _correlation_id_trigger(route_protocols)
+                if trig_err is not None:
+                    self.report.warning("kong-correlation-id", ref, f"correlation-id omitted: {trig_err}.")
+                    continue
             outcome = self._translate_plugin(plugin, ref)
             if outcome[0] == "plugin":
                 spec = outcome[1]
+                if name == "correlation-id":
+                    spec.trigger = cid_trigger
                 if level == "service":
                     spec.shared_key = f"service-{service_key}"
                 plugins.append(spec)
@@ -737,8 +744,13 @@ class _Kong:
                                     "protocol of this route (Ferrum cannot restrict correlation_id to a subset of "
                                     "protocols).")
             else:
-                plugins.append(PluginSpec(gspec.name, dict(gspec.config), gspec.ref,
-                                          shared_key="global-correlation-id"))
+                g_trigger, trig_err = _correlation_id_trigger(route_protocols)
+                if trig_err is not None:
+                    self.report.warning("kong-correlation-id", gspec.ref,
+                                        f"global correlation-id omitted on route: {trig_err}.")
+                else:
+                    plugins.append(PluginSpec(gspec.name, dict(gspec.config), gspec.ref,
+                                              shared_key="global-correlation-id", trigger=g_trigger))
         return plugins, termination, refusals
 
     def _auth_composition(self, plugins: list[PluginSpec], ref: str) -> str | None:
@@ -1060,7 +1072,7 @@ class _Kong:
                 spec.read_timeout_ms = backend_info.get("read")
                 spec.write_timeout_ms = backend_info.get("write")
                 spec.retry = backend_info.get("retry")
-                spec.plugins = [PluginSpec(p.name, p.config, p.ref, p.shared_key) for p in plugins]
+                spec.plugins = [PluginSpec(p.name, p.config, p.ref, p.shared_key, p.trigger) for p in plugins]
             self.plan.routes.append(spec)
 
     def _check_regex_overlaps(self) -> None:
@@ -1427,6 +1439,35 @@ def _plugin_protocols(raw_plugin: dict) -> frozenset[str] | None:
     if protos is None or not protos:
         return None
     return frozenset(p for p in protos if p in HTTP_PROTOCOLS)
+
+
+def _correlation_id_trigger(route_protocols: frozenset[str]) -> tuple[dict | None, str | None]:
+    """Build Ferrum ``PluginTrigger`` restricting ``correlation_id`` to the route's Kong wire flavors.
+
+    Ferrum dispatches HTTP, native gRPC, and WebSocket traffic through the same proxy on a listener.
+    When a Kong route serves only a subset of those flavors (e.g. ``[https]`` without ``grpcs``/``wss``),
+    attach ``trigger.when`` to exclude the unselected flavors. If plaintext and TLS listeners disagree on
+    flavors (e.g. ``[http, grpcs]``), omit with an explanation because one trigger cannot split listeners.
+    """
+    plain = route_protocols & {"http", "grpc", "ws"}
+    tls = route_protocols & {"https", "grpcs", "wss"}
+    flavors_per_listener = []
+    if plain:
+        flavors_per_listener.append(("http" in plain, "grpc" in plain, "ws" in plain))
+    if tls:
+        flavors_per_listener.append(("https" in tls, "grpcs" in tls, "wss" in tls))
+    if not flavors_per_listener:
+        return None, "route has no HTTP/gRPC/WebSocket protocols"
+    if len(set(flavors_per_listener)) > 1:
+        return None, "route mixes different protocol flavors across HTTP and HTTPS listeners"
+    wants_http, wants_grpc, wants_ws = flavors_per_listener[0]
+    if wants_http and wants_grpc and wants_ws:
+        return None, None
+    if wants_http:
+        excluded = [proto for flag, proto in ((wants_grpc, "grpc"), (wants_ws, "websocket")) if not flag]
+        return {"when": {"not": {"match": {"protocol": excluded}}}}, None
+    included = [proto for flag, proto in ((wants_grpc, "grpc"), (wants_ws, "websocket")) if flag]
+    return {"when": {"match": {"protocol": included}}}, None
 
 
 def _kong_correlation_id(self: _Kong, config: dict, ref: str) -> tuple:

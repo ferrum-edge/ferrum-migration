@@ -520,42 +520,283 @@ def _cors_regex_problem(pattern: str) -> str | None:
     return None
 
 
-_RE2_HEX_ESCAPE_RE = re.compile(r"((?:\\\\)*)\\x\{([0-9A-Fa-f]{1,6})\}")
+def _re2_to_python_probe(pattern: str) -> str | None:
+    """Translate RE2 literal quotes (``\\Q...\\E``) and ``\\x{...}`` escapes for probing literal ``*``.
+
+    Walks escapes left-to-right so escaped backslashes (e.g. ``[\\\\x{2a}]``) are never misread as
+    RE2 escapes. Returns ``None`` on malformed RE2 ``\\Q``/``\\x{...}`` syntax.
+    """
+    out: list[str] = []
+    in_class = False
+    class_state = 0
+    i = 0
+    n = len(pattern)
+    while i < n:
+        ch = pattern[i]
+        if ch == "\\":
+            if i + 1 >= n:
+                return None
+            nxt = pattern[i + 1]
+            if not in_class and nxt == "Q":
+                end = pattern.find(r"\E", i + 2)
+                if end < 0:
+                    return None
+                out.append(re.escape(pattern[i + 2:end]))
+                i = end + 2
+                continue
+            if nxt == "x" and i + 2 < n and pattern[i + 2] == "{":
+                close = pattern.find("}", i + 3)
+                if close < 0 or not (1 <= close - (i + 3) <= 6):
+                    return None
+                hex_digits = pattern[i + 3:close]
+                if not all(c in _CORS_HEX_DIGITS for c in hex_digits):
+                    return None
+                code = int(hex_digits, 16)
+                if code > 0x10FFFF:
+                    return None
+                out.append(re.escape(chr(code)))
+                i = close + 1
+                class_state = 0
+                continue
+            out.append(pattern[i:i + 2])
+            i += 2
+            class_state = 0
+            continue
+        if in_class:
+            if class_state == 2 and ch == "^":
+                class_state = 1
+            elif ch == "]" and class_state == 0:
+                in_class = False
+            else:
+                class_state = 0
+            out.append(ch)
+            i += 1
+            continue
+        if ch == "[":
+            in_class = True
+            class_state = 2
+        out.append(ch)
+        i += 1
+    return "".join(out)
 
 
-def _re2_to_python_probe(pattern: str) -> str:
-    """Translate RE2 ``\\x{...}`` escapes to escaped literals for probing literal ``*``."""
-    def _sub(match: re.Match) -> str:
-        prefix, hex_digits = match.group(1), match.group(2)
-        code = int(hex_digits, 16)
-        if code > 0x10FFFF:
-            return match.group(0)
-        return prefix + re.escape(chr(code))
-    return _RE2_HEX_ESCAPE_RE.sub(_sub, pattern)
+def _star_concat(a: tuple[bool, bool, bool], b: tuple[bool, bool, bool]) -> tuple[bool, bool, bool]:
+    return (a[0] and b[0], (a[0] and b[1]) or (a[1] and b[2]), a[2] and b[2])
 
 
-def cors_origin_matches_star(origin: Any) -> bool:
-    """Whether an Envoy/Istio CORS origin matcher matches the literal ``"*"`` (treated as allow-all by Envoy)."""
+def _star_or(a: tuple[bool, bool, bool], b: tuple[bool, bool, bool]) -> tuple[bool, bool, bool]:
+    return (a[0] or b[0], a[1] or b[1], a[2] or b[2])
+
+
+def _star_repeat(e: tuple[bool, bool, bool], lo: int, hi: int | None) -> tuple[bool, bool, bool]:
+    """Boolean 2x2 transition-matrix power union over the 1-character string ``"*"`` (stabilizes at k=2)."""
+    res = (False, False, False)
+    if lo == 0:
+        res = _star_or(res, (True, False, True))
+    if lo <= 1 and (hi is None or hi >= 1):
+        res = _star_or(res, e)
+    if hi is None or hi >= 2:
+        res = _star_or(res, (e[0], e[1] and (e[0] or e[2]), e[2]))
+    return res
+
+
+def _regex_matches_star_linear(pattern: str) -> bool | None:
+    """Decide in O(len(pattern)) time (no backtracking) whether ``pattern`` full-matches ``"*"``.
+
+    Assumes ``pattern`` already passed ``_cors_regex_problem`` (balanced groups/classes, no backrefs
+    or lookarounds, only ``(``, ``(?:``, ``(?i:``, ``(?i)`` groups, and valid ``{lo[,hi]}`` bounds).
+    Each subexpression is tracked as a 3-bit reachability matrix ``(m00, m01, m11)`` over positions
+    ``0`` (before ``*``) and ``1`` (after ``*``). Returns ``None`` if any unexpected token is seen.
+    """
+    empty = (True, False, True)
+    none_val = (False, False, False)
+    alt_stack: list[tuple[bool, bool, bool]] = [none_val]
+    seq_stack: list[tuple[bool, bool, bool]] = [empty]
+    last: tuple[bool, bool, bool] | None = None
+    i = 0
+    n = len(pattern)
+    while i < n:
+        ch = pattern[i]
+        if ch == "\\":
+            if i + 1 >= n:
+                return None
+            if last is not None:
+                seq_stack[-1] = _star_concat(seq_stack[-1], last)
+                last = None
+            nxt = pattern[i + 1]
+            if nxt == "A":
+                seq_stack[-1] = _star_concat(seq_stack[-1], (True, False, False))
+                i += 2
+                continue
+            if nxt in ("z", "Z"):
+                seq_stack[-1] = _star_concat(seq_stack[-1], (False, False, True))
+                i += 2
+                continue
+            if nxt == "b":
+                seq_stack[-1] = _star_concat(seq_stack[-1], none_val)
+                i += 2
+                continue
+            if nxt == "B":
+                seq_stack[-1] = _star_concat(seq_stack[-1], empty)
+                i += 2
+                continue
+            if nxt == "x":
+                if i + 3 >= n:
+                    return None
+                tok = pattern[i:i + 4]
+                i += 4
+            else:
+                tok = pattern[i:i + 2]
+                i += 2
+            try:
+                matched = bool(re.fullmatch(tok, "*"))
+            except re.error:
+                return None
+            last = (False, matched, False)
+            continue
+        if ch == "[":
+            if last is not None:
+                seq_stack[-1] = _star_concat(seq_stack[-1], last)
+                last = None
+            start = i
+            i += 1
+            state = 2
+            closed = False
+            while i < n:
+                c = pattern[i]
+                if c == "\\":
+                    i += 2
+                    state = 0
+                    continue
+                if state == 2 and c == "^":
+                    state = 1
+                    i += 1
+                    continue
+                if c == "]" and state == 0:
+                    i += 1
+                    closed = True
+                    break
+                state = 0
+                i += 1
+            if not closed:
+                return None
+            try:
+                matched = bool(re.fullmatch(pattern[start:i], "*"))
+            except re.error:
+                return None
+            last = (False, matched, False)
+            continue
+        if ch == "(":
+            if last is not None:
+                seq_stack[-1] = _star_concat(seq_stack[-1], last)
+                last = None
+            if pattern.startswith("(?i)", i):
+                i += 4
+                continue
+            if pattern.startswith("(?:", i):
+                step = 3
+            elif pattern.startswith("(?i:", i):
+                step = 4
+            elif i + 1 < n and pattern[i + 1] == "?":
+                return None
+            else:
+                step = 1
+            alt_stack.append(none_val)
+            seq_stack.append(empty)
+            i += step
+            continue
+        if ch == ")":
+            if last is not None:
+                seq_stack[-1] = _star_concat(seq_stack[-1], last)
+                last = None
+            if len(seq_stack) <= 1:
+                return None
+            last = _star_or(alt_stack.pop(), seq_stack.pop())
+            i += 1
+            continue
+        if ch == "|":
+            if last is not None:
+                seq_stack[-1] = _star_concat(seq_stack[-1], last)
+                last = None
+            alt_stack[-1] = _star_or(alt_stack[-1], seq_stack[-1])
+            seq_stack[-1] = empty
+            i += 1
+            continue
+        if ch in "^$":
+            if last is not None:
+                seq_stack[-1] = _star_concat(seq_stack[-1], last)
+                last = None
+            anchor = (True, False, False) if ch == "^" else (False, False, True)
+            seq_stack[-1] = _star_concat(seq_stack[-1], anchor)
+            i += 1
+            continue
+        if ch in "*+?":
+            if last is None:
+                return None
+            lo, hi = (0, 1) if ch == "?" else ((0, None) if ch == "*" else (1, None))
+            seq_stack[-1] = _star_concat(seq_stack[-1], _star_repeat(last, lo, hi))
+            last = None
+            i += 1
+            if i < n and pattern[i] == "?":
+                i += 1
+            continue
+        if ch == "{":
+            if last is None:
+                return None
+            close = pattern.find("}", i + 1)
+            if close <= i + 1:
+                return None
+            parts = pattern[i + 1:close].split(",")
+            if len(parts) not in (1, 2) or not (parts[0].isascii() and parts[0].isdigit()) \
+                    or (len(parts) == 2 and parts[1] != "" and not (parts[1].isascii() and parts[1].isdigit())):
+                return None
+            lo = int(parts[0])
+            hi = lo if len(parts) == 1 else (None if parts[1] == "" else int(parts[1]))
+            seq_stack[-1] = _star_concat(seq_stack[-1], _star_repeat(last, lo, hi))
+            last = None
+            i = close + 1
+            if i < n and pattern[i] == "?":
+                i += 1
+            continue
+        if last is not None:
+            seq_stack[-1] = _star_concat(seq_stack[-1], last)
+        last = (False, ch in (".", "*"), False)
+        i += 1
+    if last is not None:
+        seq_stack[-1] = _star_concat(seq_stack[-1], last)
+    if len(seq_stack) != 1:
+        return None
+    return _star_or(alt_stack[0], seq_stack[0])[1]
+
+
+def cors_origin_star_probe(origin: Any) -> str:
+    """Classify an Envoy/Istio CORS origin matcher against literal ``"*"``.
+
+    Returns ``"star"`` (Envoy treats the matcher as allow-all), ``"no_match"`` (confirmed not
+    allow-all), or ``"error"`` (regex syntax diverges from RE2/Rust or exceeds safe probe bounds,
+    so the caller must fail closed).
+    """
     if origin == "*":
-        return True
+        return "star"
     if isinstance(origin, dict) and len(origin) == 1:
         kind, value = next(iter(origin.items()))
         if not isinstance(value, str):
-            return False
+            return "error"
         if kind == "exact":
-            return value == "*"
+            return "star" if value == "*" else "no_match"
         if kind == "prefix":
-            return value in ("", "*")
+            return "star" if value in ("", "*") else "no_match"
         if kind == "regex":
-            if not value or len(value.encode("utf-8")) > 2048:
-                return False
-            # Probe with RE2-compatible \x{...} expansion before applying Ferrum's regex limits so
-            # valid RE2 wildcard matchers such as \x{2a} normalize cleanly to ["*"] (or refuse if credentialed).
-            try:
-                return bool(re.fullmatch(_re2_to_python_probe(value), "*"))
-            except (re.error, OverflowError):
-                return False
-    return False
+            if not value or len(value.encode("utf-8")) > 512:
+                return "error"
+            translated = _re2_to_python_probe(value)
+            if translated is None or _cors_regex_problem(translated) is not None:
+                return "error"
+            matched = _regex_matches_star_linear(translated)
+            if matched is None:
+                return "error"
+            return "star" if matched else "no_match"
+    return "error"
 
 
 def cors_config(origins: Any, methods: Any = None, headers: Any = None, exposed: Any = None,
@@ -812,6 +1053,33 @@ def fault_injection_config(
     return config, None
 
 
+def _is_valid_mirror_host(norm_host: str) -> bool:
+    """Mirror Ferrum v0.9.21 ``request_mirror::parse_mirror_host`` host rules.
+
+    Accepts canonical IPv4/IPv6 literals (without IPv6 ``%`` zone identifiers) and DNS domain names
+    whose final label does not trigger WHATWG URL IPv4 parsing (such as ``127.1`` or ``foo.0x1``).
+    """
+    if "%" in norm_host:
+        return False
+    bare = norm_host[1:-1] if norm_host.startswith("[") and norm_host.endswith("]") else norm_host
+    try:
+        ipaddress.ip_address(bare)
+        return True
+    except ValueError:
+        pass
+    trimmed = norm_host.rstrip(".")
+    if not trimmed:
+        return False
+    last = trimmed.rsplit(".", 1)[-1]
+    if not last:
+        return False
+    if last.isascii() and last.isdigit():
+        return False
+    if last.lower().startswith("0x") and all(ch in _CORS_HEX_DIGITS for ch in last[2:]):
+        return False
+    return True
+
+
 def request_mirror_config(
     host: Any,
     port: Any,
@@ -824,7 +1092,7 @@ def request_mirror_config(
 ) -> tuple[dict | None, str | None]:
     """Build a Ferrum v0.9.21 ``request_mirror`` config."""
     norm_host = util.normalize_backend_host(host)
-    if norm_host is None or "%" in norm_host:
+    if norm_host is None or not _is_valid_mirror_host(norm_host):
         return None, "mirror_host is not a valid hostname or IP address"
     parsed_port = util.parse_port(port)
     if parsed_port is None:

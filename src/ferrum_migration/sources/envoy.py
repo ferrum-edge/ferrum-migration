@@ -20,7 +20,7 @@ from ..model import BackendRef, HostScope, Plan, PluginSpec, RouteSpec, Target, 
 from ..redact import safe_label
 from ..safe_load import load_structured
 from .common import (SourceContext, apply_first_match_order, check_route_budget, choose_main_port, compression_config,
-                     cors_config, cors_origin_matches_star, fault_injection_config, header_value_ok, literal_value,
+                     cors_config, cors_origin_star_probe, fault_injection_config, header_value_ok, literal_value,
                      mapping, merge_weighted_targets, request_header_rule, response_header_rule, retry_from_policy, seq,
                      split_csv, str_list)
 
@@ -352,6 +352,7 @@ class _Envoy:
         filter_refusal = None
         buffer_limit = None
         hcm_plugins: list[PluginSpec] = []
+        hcm_compressors: list[tuple[str, dict[str, Any], bool]] = []
         hcm_fault: PluginSpec | None = None
         hcm_fault_error: str | None = None
         hcm_filter_kinds: dict[str, str] = {}
@@ -402,12 +403,12 @@ class _Envoy:
             elif kind == "compressor":
                 comp_status, comp_val = _parse_envoy_compressor(typed)
                 if comp_status == "plugin":
-                    comp_cfg, dropped_wild = comp_val
+                    comp_cfg, dropped_wild, choose_first = comp_val
                     if dropped_wild:
                         self.report.warning("envoy-compressor", ref,
                                             "Envoy compressor content_type wildcard entries ('*' or 'type/*') were "
                                             "dropped (Envoy matches literally whereas Ferrum treats 'type/*' as a range).")
-                    hcm_plugins.append(PluginSpec("compression", comp_cfg, ref))
+                    hcm_compressors.append((comp_cfg["algorithms"][0], comp_cfg, choose_first))
                 elif comp_status == "omit":
                     if comp_val:
                         self.report.warning("envoy-compressor", ref, comp_val)
@@ -432,6 +433,22 @@ class _Envoy:
                                   "confirming IdP token format")
             else:
                 filter_refusal = f"HTTP filter {safe_label(kind, 80)} has no safe Ferrum equivalent"
+        if len(hcm_compressors) == 1:
+            hcm_plugins.append(PluginSpec("compression", hcm_compressors[0][1], ref))
+        elif len(hcm_compressors) > 1:
+            algos = [item[0] for item in hcm_compressors]
+            base_settings = {k: v for k, v in hcm_compressors[0][1].items() if k != "algorithms"}
+            same_settings = all(
+                {k: v for k, v in cfg.items() if k != "algorithms"} == base_settings
+                for _, cfg, _ in hcm_compressors[1:]
+            )
+            any_choose_first = any(cf for _, _, cf in hcm_compressors)
+            if len(set(algos)) == len(algos) and same_settings and not any_choose_first:
+                merged_cfg = {"algorithms": algos, **base_settings}
+                hcm_plugins.append(PluginSpec("compression", merged_cfg, ref))
+            else:
+                filter_refusal = ("multiple compressor HTTP filters with incompatible settings, duplicate codecs, "
+                                  "or choose_first: true cannot be merged into one Ferrum compression plugin")
         route_config = mapping(config.get("route_config"))
         shared = {"request_add": seq(route_config.get("request_headers_to_add")),
                   "request_remove": seq(route_config.get("request_headers_to_remove")),
@@ -987,7 +1004,11 @@ class _Envoy:
         parsed_headers = split_csv(merged_headers) or None
         parsed_expose = split_csv(merged_expose) or None
         # Envoy treats any origin matcher matching literal "*" (exact, prefix, or safe_regex) as allow-all.
-        if any(cors_origin_matches_star(o) for o in origins):
+        star_probes = [cors_origin_star_probe(o) for o in origins]
+        if "error" in star_probes:
+            spec.refuse("active CORS policy contains an origin regex that cannot be safely verified or admitted")
+            return False
+        if "star" in star_probes:
             if creds is True:
                 spec.refuse("CORS policy combines allow_credentials=true with a wildcard '*' origin matcher, "
                             "which Ferrum downgrades by disabling credentials")
@@ -1391,9 +1412,13 @@ def _parse_envoy_compressor(typed: dict) -> tuple[str, Any]:
         remove_ae = False
     elif not isinstance(remove_ae, bool):
         return "refuse", "remove_accept_encoding_header must be a boolean"
+    raw_choose_first = typed.get("choose_first")
+    if raw_choose_first is not None and not isinstance(raw_choose_first, bool):
+        return "refuse", "choose_first must be a boolean"
+    choose_first = bool(raw_choose_first)
     cfg, err = compression_config([algo], min_content_length=min_len, content_types=content_types,
                                   allow_ranges=False, remove_accept_encoding=remove_ae)
-    return ("plugin", (cfg, dropped_wild)) if cfg is not None else ("refuse", err)
+    return ("plugin", (cfg, dropped_wild, choose_first)) if cfg is not None else ("refuse", err)
 
 
 def _parse_envoy_fault(typed: dict, *, has_runtime: bool = False) -> tuple[str, Any]:

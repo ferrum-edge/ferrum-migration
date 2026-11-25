@@ -23,7 +23,7 @@ from ..model import BackendRef, HostScope, Plan, PluginSpec, RouteSpec, Target, 
 from ..redact import safe_label
 from ..safe_load import load_structured
 from .common import (SourceContext, apply_first_match_order, check_route_budget, choose_main_port, cors_config,
-                     cors_origin_matches_star, fault_injection_config, header_value_ok, literal_value, mapping,
+                     cors_origin_star_probe, fault_injection_config, header_value_ok, literal_value, mapping,
                      merge_weighted_targets, parse_percentage, request_header_rule, response_header_rule,
                      retry_from_policy, seq, str_list)
 
@@ -739,7 +739,11 @@ class _Istio:
             spec.refuse(f"active CORS policy cannot be safely migrated ({matcher_problem})")
             return
         # Istio/Envoy treats any origin matcher matching literal "*" (exact, prefix, or regex) as allow-all.
-        if any(cors_origin_matches_star(o) for o in origins):
+        star_probes = [cors_origin_star_probe(o) for o in origins]
+        if "error" in star_probes:
+            spec.refuse("active CORS policy contains an origin regex that cannot be safely verified or admitted")
+            return
+        if "star" in star_probes:
             if creds is True:
                 spec.refuse("CORS policy combines allowCredentials=true with a wildcard '*' origin matcher, "
                             "which Ferrum downgrades by disabling credentials")
