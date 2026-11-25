@@ -995,6 +995,14 @@ class NginxFrontendScopeTest(unittest.TestCase):
         self.assertEqual(ro_res.frontend_protocols, "http")
         self.assertEqual(one_proxy(self, ro_res.config, None, "secure.example.test")["labels"][
             "ferrum-migration/status"], "scope-default")
+        # Same even when the dual-listener redirect server has no location blocks at all.
+        ro_noloc_res, _ro_noloc_rep, _ = nginx(
+            redirect_owner_conf.replace("location = /secure { proxy_pass http://secure.internal:8080; }", "")
+        )
+        assert_structurally_valid(self, ro_noloc_res.config)
+        self.assertEqual(ro_noloc_res.frontend_protocols, "http")
+        self.assertEqual(one_proxy(self, ro_noloc_res.config, None, "secure.example.test")["labels"][
+            "ferrum-migration/status"], "scope-default")
 
 
 if __name__ == "__main__":

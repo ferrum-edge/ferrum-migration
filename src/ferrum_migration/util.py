@@ -227,8 +227,10 @@ def _rust_regex_syntax_problem(pattern: str) -> tuple[str | None, str]:
     n = len(pattern)
     i = 0
     in_class = False
-    class_start_item = False
-    class_prev_dash = False
+    # 0 = start of class / after a completed range or class atom (next '-' is literal),
+    # 1 = after a single literal atom (next '-' starts a range),
+    # 2 = immediately after '<literal>-' (expecting range RHS; POSIX class here diverges from Rust).
+    class_state = 0
     class_cost = 0
     flag_stack: list[tuple[bool, bool]] = [(False, True)]  # (verbose_x, unicode_u)
     cost_stack: list[list[int]] = [[0, 0]]  # [group_total_cost, last_atom_cost]
@@ -267,8 +269,12 @@ def _rust_regex_syntax_problem(pattern: str) -> tuple[str | None, str]:
             esc_cost = (100 if u_on else 4) if nxt in _UNICODE_CLASS_ESCAPES else 1
             if in_class:
                 class_cost += esc_cost
-                class_start_item = False
-                class_prev_dash = False
+                if nxt in _UNICODE_CLASS_ESCAPES:
+                    if class_state == 2:
+                        return "regex uses a character class escape as the end of a range", ""
+                    class_state = 0
+                else:
+                    class_state = 0 if class_state == 2 else 1
             else:
                 err = _charge(esc_cost)
                 if err:
@@ -280,34 +286,33 @@ def _rust_regex_syntax_problem(pattern: str) -> tuple[str | None, str]:
             if ch == "[":
                 pm = _POSIX_CLASS_RE.match(pattern, i)
                 if pm is not None:
-                    if class_prev_dash:
-                        return "regex uses a POSIX class as the end of a character range (rejected by Rust regex)", ""
-                    end_pos = pm.end()
-                    if end_pos < n and pattern[end_pos] == "-" and (end_pos + 1 >= n or pattern[end_pos + 1] != "]"):
-                        return "regex uses a POSIX class as the start of a character range (rejected by Rust regex)", ""
+                    if class_state == 2:
+                        return "regex uses a POSIX class as the end of a character range (diverges in Rust regex)", ""
                     class_cost += 4
-                    class_start_item = False
-                    class_prev_dash = False
-                    py_parts.append("0")
-                    i = end_pos
+                    class_state = 0
+                    py_parts.append(r"\d")
+                    i = pm.end()
                     continue
                 return "regex uses unescaped '[' inside a character class (nested class syntax differs in Rust regex)", ""
             if i + 1 < n and pattern[i:i + 2] in ("&&", "--", "~~"):
                 return ("regex uses '&&', '--', or '~~' inside a character class, which Rust regex parses as a "
                         "character-class set operator rather than literal characters"), ""
-            if x_on and (ch == "#" or ch.isspace()):
+            if x_on and (ch == "#" or ch.isspace() or ch in ("\u200e", "\u200f")):
                 return ("regex uses unescaped '#' or whitespace inside a character class under verbose (?x) mode, "
                         "which Rust regex parses differently from PCRE/Python"), ""
             if ch == "]":
                 in_class = False
-                class_start_item = False
-                class_prev_dash = False
+                class_state = 0
                 err = _charge(max(2, class_cost))
                 if err:
                     return err, ""
             else:
-                class_prev_dash = (ch == "-" and not class_start_item)
-                class_start_item = False
+                if ch == "-" and class_state == 1:
+                    class_state = 2
+                elif class_state == 2:
+                    class_state = 0
+                else:
+                    class_state = 0 if ch == "-" else 1
                 class_cost += 1
             py_parts.append(ch)
             i += 1
@@ -320,14 +325,16 @@ def _rust_regex_syntax_problem(pattern: str) -> tuple[str | None, str]:
             py_parts.append(pattern[i:nl + 1])
             i = nl + 1
             continue
+        if x_on and ((not ch.isascii() and ch.isspace()) or ch in ("\u200e", "\u200f")):
+            return ("regex uses non-ASCII Unicode whitespace under verbose (?x) mode, which Rust regex ignores "
+                    "while PCRE/Python match literally"), ""
         if x_on and ch.isspace():
             py_parts.append(ch)
             i += 1
             continue
         if ch == "[":
             in_class = True
-            class_start_item = True
-            class_prev_dash = False
+            class_state = 0
             class_cost = 0
             start_i = i
             i += 1
@@ -335,7 +342,7 @@ def _rust_regex_syntax_problem(pattern: str) -> tuple[str | None, str]:
                 i += 1
             if i < n and pattern[i] == "]":
                 class_cost += 1
-                class_start_item = False
+                class_state = 1
                 i += 1
             py_parts.append(pattern[start_i:i])
             continue

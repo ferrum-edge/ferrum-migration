@@ -1143,6 +1143,48 @@ def _resolve_conflicts(candidates: list[_Cand], report: Report) -> list[_Cand]:
         groups.setdefault((cand.listen_port, cand.listen_path), []).append(cand)
     replacement: dict[int, list[_Cand]] = {}
     outrank_indices: dict[str, Any] | None = None
+    fully_closed_ports: set[int | None] = set()
+    fully_closed_exact: dict[int | None, set[str]] = {}
+    fully_closed_wild: dict[int | None, set[str]] = {}
+
+    def _is_host_fully_closed(p: int | None, h: str) -> bool:
+        if p in fully_closed_ports:
+            return True
+        wset = fully_closed_wild.get(p)
+        if h.startswith("*."):
+            if not wset:
+                return False
+            suffix = h[1:]
+            if suffix in wset:
+                return True
+            dot = suffix.find(".", 1)
+            while dot != -1:
+                if suffix[dot:] in wset:
+                    return True
+                dot = suffix.find(".", dot + 1)
+            return False
+        eset = fully_closed_exact.get(p)
+        if eset and h in eset:
+            return True
+        if wset:
+            dot = h.find(".")
+            while dot != -1:
+                if h[dot:] in wset:
+                    return True
+                dot = h.find(".", dot + 1)
+        return False
+
+    def _mark_fully_closed(p: int | None, hosts: list[str]) -> None:
+        if not hosts:
+            fully_closed_ports.add(p)
+            return
+        eset = fully_closed_exact.setdefault(p, set())
+        wset = fully_closed_wild.setdefault(p, set())
+        for h in hosts:
+            if h.startswith("*."):
+                wset.add(h[1:])
+            else:
+                eset.add(h)
 
     def _build_outrank_indices() -> dict[str, Any]:
         all_idx = _PortHostIndex()
@@ -1258,11 +1300,23 @@ def _resolve_conflicts(candidates: list[_Cand], report: Report) -> list[_Cand]:
                     while rlo < len(sorted_regex_prefixes) and sorted_regex_prefixes[rlo].startswith(path_str):
                         _add_idx(regex_by_literal_prefix[sorted_regex_prefixes[rlo]])
                         rlo += 1
+        covers_all_paths = any(
+            matching.path_space(probe.kind, probe.path) in (None, ("/", False), ("", False))
+            for probe in probes
+        )
         refused_outrank = 0
         seen_other: set[int] = set()
-        for target_idx in target_indices:
-            for p in ports:
-                for other in target_idx.query(p, named_hosts, path_slot=False):
+        for p in ports:
+            if p in fully_closed_ports:
+                continue
+            if named_hosts:
+                active_hosts = [h for h in named_hosts if not _is_host_fully_closed(p, h)]
+                if not active_hosts:
+                    continue
+            else:
+                active_hosts = []
+            for target_idx in target_indices:
+                for other in target_idx.query(p, active_hosts, path_slot=False):
                     oid = id(other)
                     if oid in seen_other or oid in excluded_ids or oid in replacement or other.placeholder:
                         continue
@@ -1270,6 +1324,9 @@ def _resolve_conflicts(candidates: list[_Cand], report: Report) -> list[_Cand]:
                     if any(matching.route_overlaps(probe, other.route) for probe in probes):
                         _fail_close(other, reason)
                         refused_outrank += 1
+            if covers_all_paths:
+                _mark_fully_closed(p, active_hosts)
+                all_idx.prune_placeholders(p, active_hosts)
         return refused_outrank
 
     for (port, path), members in list(groups.items()):
@@ -1681,6 +1738,43 @@ class _PortHostIndex:
                             return True
                         dot = h.find(".", dot + 1)
         return False
+
+    def prune_placeholders(self, port: int | None, scope_hosts: list[str]) -> None:
+        """Drop already-failed-closed candidates from touched buckets so later scans never revisit them."""
+        def _prune(bucket: list[_Cand] | None) -> None:
+            if bucket:
+                bucket[:] = [c for c in bucket if not c.placeholder]
+
+        if not scope_hosts:
+            _prune(self.all_by_port.get(port))
+            _prune(self.catchall.get(port))
+            for m in (self.exact.get(port), self.wild.get(port),
+                      self.exact_by_suffix.get(port), self.wild_by_parent.get(port)):
+                if m:
+                    for b in m.values():
+                        _prune(b)
+            return
+        _prune(self.catchall.get(port))
+        ex_map = self.exact.get(port, {})
+        wi_map = self.wild.get(port, {})
+        ex_suf = self.exact_by_suffix.get(port, {})
+        wi_par = self.wild_by_parent.get(port, {})
+        for h in scope_hosts:
+            if h.startswith("*."):
+                suffix = h[1:]
+                _prune(wi_map.get(suffix))
+                _prune(ex_suf.get(suffix))
+                _prune(wi_par.get(suffix))
+                dot = suffix.find(".", 1)
+                while dot != -1:
+                    _prune(wi_map.get(suffix[dot:]))
+                    dot = suffix.find(".", dot + 1)
+            else:
+                _prune(ex_map.get(h))
+                dot = h.find(".")
+                while dot != -1:
+                    _prune(wi_map.get(h[dot:]))
+                    dot = h.find(".", dot + 1)
 
     def query(self, port: int | None, scope_hosts: list[str], *, path_slot: bool = False) -> list[_Cand]:
         if not scope_hosts:

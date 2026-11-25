@@ -604,6 +604,10 @@ class _Nginx:
             return
         locations = [d for d in server.block or [] if d.name == "location"]
         if not locations:
+            if base["hosts"]:
+                self.plan.host_scopes.append(
+                    HostScope(ref, list(base["hosts"]), listen_port, protocols=self._base_scope_protocols(base))
+                )
             self.report.warning("nginx-no-locations", ref, "Server has no locations (static files); skipped.")
             return
         routes = []
