@@ -412,16 +412,18 @@ def has_top_level_alternation(pattern: str) -> bool:
 
 # ------------------------------------------------------------ durations/sizes
 
-_GO_DURATION = re.compile(r"^(?:\d+(?:\.\d+)?(?:ns|us|µs|ms|s|m|h))+$")
-_GO_PART = re.compile(r"(\d+(?:\.\d+)?)(ns|us|µs|ms|s|m|h)")
-_GO_UNIT_MS = {"ns": 1e-6, "us": 1e-3, "µs": 1e-3, "ms": 1.0, "s": 1000.0, "m": 60_000.0, "h": 3_600_000.0}
+_GO_DURATION = re.compile(r"^[+-]?(?:(?:\d+(?:\.\d*)?|\.\d+)(?:ns|us|µs|μs|ms|s|m|h))+$")
+_GO_PART = re.compile(r"(\d+(?:\.\d*)?|\.\d+)(ns|us|µs|μs|ms|s|m|h)")
+_GO_UNIT_MS = {
+    "ns": 1e-6, "us": 1e-3, "µs": 1e-3, "μs": 1e-3, "ms": 1.0, "s": 1000.0, "m": 60_000.0, "h": 3_600_000.0,
+}
 _MAX_DURATION_MS = (1 << 63) - 1
 
 
 def classify_go_duration(value: object) -> str:
     """Classify a Go/Traefik/Istio duration without rounding sub-ms values to 0 or overflowing.
 
-    Returns ``"zero"`` (unset, empty, or valid zero duration such as ``"0m"`` / ``"0.0s"``),
+    Returns ``"zero"`` (unset, empty, or valid zero duration such as ``"0m"``, ``"+0s"``, ``"0μs"``),
     ``"nonzero"`` (valid positive duration, including sub-ms like ``"100us"``), or ``"invalid"``.
     """
     if value is None:
@@ -441,20 +443,24 @@ def classify_go_duration(value: object) -> str:
     text = value.strip()
     if not text:
         return "zero"
-    num_body = text.replace(".", "", 1)
-    if num_body.isascii() and num_body.isdigit():
+    neg = text.startswith("-")
+    unsigned = text[1:] if text[0] in "+-" else text
+    num_body = unsigned.replace(".", "", 1)
+    if num_body and num_body.isascii() and num_body.isdigit():
         try:
-            secs = float(text)
+            secs = float(unsigned)
         except ValueError:
             return "invalid"
         if not math.isfinite(secs) or secs < 0.0 or secs > _MAX_DURATION_MS / 1000.0:
             return "invalid"
-        return "zero" if secs == 0.0 else "nonzero"
+        if secs == 0.0:
+            return "zero"
+        return "invalid" if neg else "nonzero"
     if not _GO_DURATION.match(text):
         return "invalid"
     total = 0.0
     any_nonzero = False
-    for number, unit in _GO_PART.findall(text):
+    for number, unit in _GO_PART.findall(unsigned):
         if any(ch != "0" and ch != "." for ch in number):
             any_nonzero = True
         try:
@@ -466,7 +472,9 @@ def classify_go_duration(value: object) -> str:
         total += part
         if not math.isfinite(total) or total > _MAX_DURATION_MS:
             return "invalid"
-    return "nonzero" if any_nonzero else "zero"
+    if not any_nonzero:
+        return "zero"
+    return "invalid" if neg else "nonzero"
 
 
 def parse_go_duration_ms(value: object) -> int | None:
@@ -484,19 +492,28 @@ def parse_go_duration_ms(value: object) -> int | None:
     if not isinstance(value, str):
         return None
     text = value.strip()
-    num_body = text.replace(".", "", 1)
+    if not text:
+        return None
+    neg = text.startswith("-")
+    unsigned = text[1:] if text[0] in "+-" else text
+    num_body = unsigned.replace(".", "", 1)
     if num_body and num_body.isascii() and num_body.isdigit():
         try:
-            secs = float(text)
+            secs = float(unsigned)
         except ValueError:
             return None
         if not math.isfinite(secs) or secs < 0.0 or secs > _MAX_DURATION_MS / 1000.0:
             return None
-        return int(round(secs * 1000.0))
+        if secs == 0.0:
+            return 0
+        return None if neg else int(round(secs * 1000.0))
     if not _GO_DURATION.match(text):
         return None
     total = 0.0
-    for number, unit in _GO_PART.findall(text):
+    any_nonzero = False
+    for number, unit in _GO_PART.findall(unsigned):
+        if any(ch != "0" and ch != "." for ch in number):
+            any_nonzero = True
         try:
             part = float(number) * _GO_UNIT_MS[unit]
         except (ValueError, OverflowError):
@@ -506,7 +523,9 @@ def parse_go_duration_ms(value: object) -> int | None:
         total += part
         if not math.isfinite(total) or total > _MAX_DURATION_MS:
             return None
-    return int(round(total))
+    if not any_nonzero:
+        return 0
+    return None if neg else int(round(total))
 
 
 def proto_duration_ms(value: object) -> int | None:

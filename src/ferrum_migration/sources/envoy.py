@@ -418,10 +418,6 @@ class _Envoy:
                                             "Envoy compressor content_type wildcard entries ('*' or 'type/*') were "
                                             "dropped (Envoy matches literally whereas Ferrum treats 'type/*' as a range).")
                     hcm_compressors.append(comp_cfg)
-                elif comp_status == "omit_active":
-                    active_compressor_count += 1
-                    if comp_val:
-                        self.report.warning("envoy-compressor", ref, comp_val)
                 else:
                     active_compressor_count += 1
                     filter_refusal = f"HTTP filter compressor cannot be migrated ({comp_val})"
@@ -459,7 +455,8 @@ class _Envoy:
                   "hcm_fault_error": hcm_fault_error,
                   "fault_index": fault_index,
                   "cors_index": cors_index,
-                  "grpc_web_index": grpc_web_index}
+                  "grpc_web_index": grpc_web_index,
+                  "has_local_reply": bool(config.get("local_reply_config"))}
         for index, vhost in enumerate(seq(route_config.get("virtual_hosts"))):
             if isinstance(vhost, dict):
                 self._vhost(vhost, index, ref, listen_port, tls, cors_enabled, filter_refusal, buffer_limit, shared)
@@ -684,6 +681,9 @@ class _Envoy:
             return spec
         self._action(spec, action, vhost, ref)
         if effective_fault is not None:
+            if shared.get("has_local_reply") and effective_fault.config.get("abort") is not None:
+                spec.refuse("fault abort under HCM local_reply_config cannot be proven equivalent "
+                            "(local_reply_config can rewrite abort status, body, or content type)")
             gw_idx = shared.get("grpc_web_index")
             f_idx = shared.get("fault_index")
             if gw_idx is not None and f_idx is not None and gw_idx < f_idx \
@@ -1455,8 +1455,8 @@ def _parse_envoy_compressor(typed: dict) -> tuple[str, Any]:
         exact_types = [ct for ct in content_types if "*" not in ct]
         dropped_wild = len(exact_types) != len(content_types)
         if not exact_types:
-            return "omit_active", ("Envoy compressor content_type contains only wildcard entries (literal in Envoy, "
-                                   "range in Ferrum); omitted.")
+            return "refuse", ("content_type contains only wildcard entries (literal in Envoy, which still compresses "
+                              "responses without Content-Type and can strip Accept-Encoding)")
         content_types = exact_types
     remove_ae = resp.get("remove_accept_encoding_header")
     if remove_ae is None:

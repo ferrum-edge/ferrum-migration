@@ -349,6 +349,15 @@ class CliTest(unittest.TestCase):
                 self.assertNotIn("client\nca.pem", err)
         self.assertFalse(os.path.exists(self.out_dir()))
 
+    def test_resources_file_over_ferrum_limit_writes_nothing(self):
+        from unittest import mock
+        out = self.out_dir()
+        with mock.patch("ferrum_migration.cli.MAX_FERRUM_RESOURCES_BYTES", 64):
+            code, _out, err = run_cli("convert", fixture_path("nginx", "nginx.conf"), "--from", "nginx", "--out", out)
+        self.assertEqual(code, 5)
+        self.assertIn("64-byte limit", err)
+        self.assertFalse(os.path.exists(out))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -845,15 +845,6 @@ class EnvoyHardeningTest(unittest.TestCase):
         shadow_cors = minimal_bootstrap({"path_separated_prefix": "/api"})
         shcm = shadow_cors["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"]
         shcm["http_filters"].insert(0, {"name": "envoy.filters.http.cors"})
-        shcm["http_filters"].insert(0, {
-            "name": "envoy.filters.http.compressor",
-            "typed_config": {
-                "@type": "type.googleapis.com/envoy.extensions.filters.http.compressor.v3.Compressor",
-                "compressor_library": {"name": "gzip", "typed_config": {
-                    "@type": "type.googleapis.com/envoy.extensions.compression.gzip.compressor.v3.Gzip"}},
-                "response_direction_config": {"common_config": {"content_type": ["text/*"]}},
-            },
-        })
         shcm["route_config"]["virtual_hosts"][0]["cors"] = {
             "allow_origin_string_match": [{"exact": "https://app.example.test"}],
             "allow_credentials": {"value": True},
@@ -867,7 +858,24 @@ class EnvoyHardeningTest(unittest.TestCase):
         sc_res, sc_rep, _ = migrate("envoy", yaml.safe_dump(shadow_cors))
         self.assertEqual(sc_res.config["plugin_configs"], [])
         self.assertIn("envoy-cors-inactive", codes(sc_rep, "info"))
-        self.assertIn("envoy-compressor", codes(sc_rep, "warning"))
+        # A single wildcard-only Envoy compressor refuses fail-closed (Envoy still compresses responses without
+        # Content-Type and can strip Accept-Encoding via remove_accept_encoding_header: true).
+        wild_comp = minimal_bootstrap({"path_separated_prefix": "/api"})
+        wild_comp["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"][
+            "http_filters"].insert(0, {
+                "name": "envoy.filters.http.compressor",
+                "typed_config": {
+                    "@type": "type.googleapis.com/envoy.extensions.filters.http.compressor.v3.Compressor",
+                    "compressor_library": {"name": "gzip", "typed_config": {
+                        "@type": "type.googleapis.com/envoy.extensions.compression.gzip.compressor.v3.Gzip"}},
+                    "response_direction_config": {
+                        "common_config": {"content_type": ["text/*"]},
+                        "remove_accept_encoding_header": True,
+                    },
+                },
+            })
+        self.assertEqual(one_proxy(self, migrate("envoy", yaml.safe_dump(wild_comp))[0].config, "/api")[
+            "labels"]["ferrum-migration/status"], "refused")
         # 7) Envoy cors_filter.cc precedence regressions:
         #    (A) vhost FilterConfig{disabled: true} disables CORS even when a stale legacy route.cors exists.
         #    (B) route_config typed CorsPolicy overrides stale legacy route.cors.
@@ -1182,6 +1190,12 @@ class EnvoyHardeningTest(unittest.TestCase):
         self.assertEqual(plugin(self, gf_res.config, one_proxy(self, gf_res.config, "/api"), "fault_injection")[
             "config"], {"abort": {"status_code": 200, "grpc_status": 7, "percentage": 100.0,
                                   "body": "fault filter abort"}})
+        # HCM local_reply_config refuses routes with active fault aborts (local_reply_config can rewrite them).
+        lr_fault = copy.deepcopy(grpc_fault)
+        lr_fault["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"][
+            "local_reply_config"] = {"body_format": {"text_format": "custom"}}
+        self.assertEqual(one_proxy(self, migrate("envoy", yaml.safe_dump(lr_fault))[0].config, "/api")[
+            "labels"]["ferrum-migration/status"], "refused")
 
         for star_pattern in (r"\*", r"\x{2a}", r"\Q*\E", r"(?:a?|\*?){30}"):
             with self.subTest(star_pattern=star_pattern):

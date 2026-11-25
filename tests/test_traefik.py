@@ -1250,9 +1250,9 @@ class TraefikHardeningTest(unittest.TestCase):
         for refused_path in ("/grpc", "/upload"):
             self.assertEqual(one_proxy(self, result.config, refused_path, "a.example.test")["labels"][
                 "ferrum-migration/status"], "refused", refused_path)
-        # Omitted minResponseBodyBytes defaults explicitly to Traefik's 1024 bytes, remove_accept_encoding is false,
-        # and omitted encodings defaults to Traefik v3's ["zstd", "br", "gzip"]; mirror with default passHostHeader
-        # (true) is dropped so Host is never silently changed.
+        # Omitted or 0 minResponseBodyBytes defaults explicitly to Traefik's 1024 bytes, remove_accept_encoding is
+        # false, and omitted encodings defaults to Traefik v3.8's ["gzip", "br", "zstd"]; mirror with default
+        # passHostHeader (true) is dropped so Host is never silently changed.
         defmin = one_proxy(self, result.config, "/defmin", "a.example.test")
         self.assertEqual(plugin(self, result.config, defmin, "compression")["config"], {
             "algorithms": ["gzip"], "min_content_length": 1024, "remove_accept_encoding": False,
@@ -1261,14 +1261,14 @@ class TraefikHardeningTest(unittest.TestCase):
             "http": {
                 "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/v3/`)", "service": "main",
                                   "middlewares": ["c"]}},
-                "middlewares": {"c": {"compress": {}}},
+                "middlewares": {"c": {"compress": {"minResponseBodyBytes": 0}}},
                 "services": {"main": {"loadBalancer": {"servers": [{"url": "http://main.internal:8080"}]}}},
             }
         })
         defenc_res, defenc_rep, _ = asserted(defenc_doc)
         self.assertEqual(plugin(self, defenc_res.config, one_proxy(self, defenc_res.config, "/v3", "a.example.test"),
                                 "compression")["config"], {
-            "algorithms": ["zstd", "br", "gzip"], "min_content_length": 1024, "remove_accept_encoding": False,
+            "algorithms": ["gzip", "br", "zstd"], "min_content_length": 1024, "remove_accept_encoding": False,
         })
         self.assertIn("traefik-compress", codes(defenc_rep, "warning"))
         self.assertNotIn("request_mirror", [p["plugin_name"] for p in plugins_of(result.config, defmin)])
@@ -1552,23 +1552,36 @@ class TraefikHardeningTest(unittest.TestCase):
                 if label == "disable-http2-mirror":
                     msgs = [c.message for c in mr_rep.caveats if c.code == "traefik-mirroring"]
                     self.assertTrue(any("disableHTTP2" in m for m in msgs), msgs)
-        # Equivalent zero duration (0m) on shadow serversTransport does NOT drop an eligible mirror.
-        zero_tm_doc = yaml.safe_dump({
-            "http": {
-                "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "m"}},
-                "services": {
-                    "m": {"mirroring": {"service": "main", "mirrorBody": False,
-                                        "mirrors": [{"name": "shadow", "percent": 20}]}},
-                    "main": {"loadBalancer": {"servers": [{"url": "http://main.internal:8080"}]}},
-                    "shadow": {"loadBalancer": {"passHostHeader": False, "serversTransport": "zero",
-                                                "servers": [{"url": "http://shadow.internal:9090"}]}},
-                },
-                "serversTransports": {"zero": {"forwardingTimeouts": {"responseHeaderTimeout": "0m"}}},
-            }
-        })
-        zt_res = asserted(zero_tm_doc)[0]
-        self.assertEqual(plugin(self, zt_res.config, one_proxy(self, zt_res.config, "/api", "a.example.test"),
-                                "request_mirror")["config"]["mirror_host"], "shadow.internal")
+        # Equivalent zero durations (0m, +0s, 0μs) on zero-default fields do NOT refuse primary routes or drop
+        # eligible mirrors; disableRequestBuffer/disableResponseBuffer: true keep buffering limits inactive.
+        for zero_dur in ("0m", "+0s", "0\u03bcs"):
+            zero_tm_doc = yaml.safe_dump({
+                "http": {
+                    "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "m",
+                                      "middlewares": ["disbuf"]}},
+                    "middlewares": {"disbuf": {"buffering": {
+                        "maxRequestBodyBytes": 1048576, "disableRequestBuffer": True,
+                        "maxResponseBodyBytes": 1048576, "disableResponseBuffer": True,
+                    }}},
+                    "services": {
+                        "m": {"mirroring": {"service": "main", "mirrorBody": False,
+                                            "mirrors": [{"name": "shadow", "percent": 20}]}},
+                        "main": {"loadBalancer": {"serversTransport": "zero",
+                                                  "servers": [{"url": "http://main.internal:8080"}]}},
+                        "shadow": {"loadBalancer": {"passHostHeader": False, "serversTransport": "zero",
+                                                    "servers": [{"url": "http://shadow.internal:9090"}]}},
+                    },
+                    "serversTransports": {"zero": {"forwardingTimeouts": {
+                        "responseHeaderTimeout": zero_dur, "readTimeout": zero_dur,
+                    }}},
+                }
+            })
+            zt_res = asserted(zero_tm_doc)[0]
+            zt_p = one_proxy(self, zt_res.config, "/api", "a.example.test")
+            self.assertEqual(zt_p["labels"]["ferrum-migration/status"], "migrated", zero_dur)
+            self.assertEqual([p["plugin_name"] for p in plugins_of(zt_res.config, zt_p)], ["request_mirror"])
+            self.assertEqual(plugin(self, zt_res.config, zt_p, "request_mirror")["config"]["mirror_host"],
+                             "shadow.internal")
         # Buffering > 10 MiB warns about SSE rejection and raising FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES.
         big_buf = yaml.safe_dump({
             "http": {

@@ -178,7 +178,8 @@ _TYPED_FIELDS: dict[str, dict[str, Any]] = {
                   "redis": None},
     "sourceCriterion": {"ipStrategy": "ipStrategy", "requestHeaderName": None, "requestHost": None},
     "buffering": {"maxRequestBodyBytes": None, "memRequestBodyBytes": None, "maxResponseBodyBytes": None,
-                  "memResponseBodyBytes": None, "retryExpression": None},
+                  "memResponseBodyBytes": None, "retryExpression": None, "disableRequestBuffer": None,
+                  "disableResponseBuffer": None},
     "redirectScheme": {"scheme": None, "port": None, "permanent": None},
     "retry": {"attempts": None, "initialInterval": None},
 }
@@ -1066,12 +1067,18 @@ class _Traefik:
         elif mw_type == "rateLimit":
             self._rate_limit(config, acc, ref)
         elif mw_type == "buffering":
-            req_size = util.as_int(config.get("maxRequestBodyBytes"))
+            disable_req = config.get("disableRequestBuffer")
+            disable_resp = config.get("disableResponseBuffer")
+            if (disable_req is not None and not isinstance(disable_req, bool)) \
+                    or (disable_resp is not None and not isinstance(disable_resp, bool)):
+                acc.refusals.append("buffering disableRequestBuffer/disableResponseBuffer must be a boolean")
+                return
+            req_size = None if disable_req is True else util.as_int(config.get("maxRequestBodyBytes"))
             if req_size and req_size > 0:
                 acc.refusals.append("buffering.maxRequestBodyBytes buffers and rejects oversized chunked uploads "
                                     "before contacting the backend, whereas Ferrum request_size_limiting streams "
                                     "chunked bodies up to max_bytes")
-            resp_size = util.as_int(config.get("maxResponseBodyBytes"))
+            resp_size = None if disable_resp is True else util.as_int(config.get("maxResponseBodyBytes"))
             if resp_size and resp_size > 0:
                 if resp_size > (1 << 64) - 1:
                     acc.refusals.append("buffering.maxResponseBodyBytes exceeds Ferrum's u64::MAX limit")
@@ -1094,7 +1101,7 @@ class _Traefik:
             if any(config.get(k) for k in ("memRequestBodyBytes", "memResponseBodyBytes", "retryExpression")) \
                     or not ((req_size and req_size > 0) or (resp_size and resp_size > 0)):
                 self.report.info("traefik-buffering", ref,
-                                 "Only maxResponseBodyBytes is migrated from buffering.")
+                                 "Only active maxResponseBodyBytes is migrated from buffering.")
         elif mw_type == "compress":
             acc.has_compress = True
             if acc.resp_size_limited:
@@ -1132,20 +1139,20 @@ class _Traefik:
                                 "allow-list and cannot exclude specific response media types).")
             return
         raw_enc = config.get("encodings")
-        # Traefik v3 compress defaults encodings to ["zstd", "br", "gzip"] (in preference order).
-        encodings = str_list(raw_enc) if raw_enc is not None else ["zstd", "br", "gzip"]
+        # Traefik v3.8 compress defaults encodings to ["gzip", "br", "zstd"] (in preference order).
+        encodings = str_list(raw_enc) if raw_enc is not None else ["gzip", "br", "zstd"]
         if raw_enc is not None and (encodings is None or not encodings):
             self.report.warning("traefik-compress", ref, "compress omitted: encodings has unexpected types.")
             return
         raw_min = config.get("minResponseBodyBytes")
-        # Traefik compress defaults minResponseBodyBytes to 1024 (whereas Ferrum defaults to 256).
+        # Traefik compress uses 1024 bytes whenever minResponseBodyBytes is omitted or <= 0 (compress.go).
         min_len: int = 1024
         if raw_min is not None:
             parsed_min = util.as_int(raw_min)
             if parsed_min is None or parsed_min < 0:
                 self.report.warning("traefik-compress", ref, "compress omitted: invalid minResponseBodyBytes.")
                 return
-            min_len = parsed_min
+            min_len = 1024 if parsed_min == 0 else parsed_min
         raw_inc = config.get("includedContentTypes")
         inc: list[str] | None = None
         if raw_inc is not None:
