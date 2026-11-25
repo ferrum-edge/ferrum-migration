@@ -765,6 +765,7 @@ class NginxFrontendScopeTest(unittest.TestCase):
             "min_content_length": 1024,
             "content_types": ["text/html", "application/json", "text/plain"],
             "gzip_level": 6,
+            "remove_accept_encoding": False,
         })
         for path in ("/nogzip", "/wild", "/typewild", "/disabled-ua"):
             p = one_proxy(self, result.config, path, "app.example.test")
@@ -802,7 +803,8 @@ class NginxFrontendScopeTest(unittest.TestCase):
         def_res, _def_rep, _ = nginx(html_only_conf)
         html_p = one_proxy(self, def_res.config, "/html", "def.example.test")
         self.assertEqual(plugin(self, def_res.config, html_p, "compression")["config"], {
-            "algorithms": ["gzip"], "min_content_length": 20, "content_types": ["text/html"], "gzip_level": 1,
+            "algorithms": ["gzip"], "min_content_length": 20, "content_types": ["text/html"],
+            "gzip_level": 1, "remove_accept_encoding": False,
         })
 
 

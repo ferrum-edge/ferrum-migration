@@ -29,9 +29,13 @@ _REDIRECT_CODES = {"MOVED_PERMANENTLY": 301, "FOUND": 302, "SEE_OTHER": 303, "TE
                    "PERMANENT_REDIRECT": 308}
 
 
-_ENVOY_MAP_FIELDS = frozenset({
-    "typed_per_filter_config", "per_filter_config", "filter_metadata", "typed_filter_metadata", "dynamic_metadata",
-    "metadata", "static_layer", "labels", "providers", "requirement_map",
+# Map fields whose direct keys are user-chosen identifiers while their values are protobuf messages.
+_ENVOY_TYPED_MAP_FIELDS = frozenset({
+    "typed_per_filter_config", "per_filter_config", "typed_filter_metadata", "providers", "requirement_map",
+})
+# Fields whose values are opaque protobuf Structs or arbitrary label maps (left untouched recursively).
+_ENVOY_OPAQUE_FIELDS = frozenset({
+    "filter_metadata", "static_layer", "dynamic_metadata", "labels",
 })
 _CAMEL_BOUNDARY_RE = re.compile(r"([a-z0-9])([A-Z])")
 
@@ -57,7 +61,10 @@ def _normalize_envoy_proto(obj: Any, *, preserve_map_keys: bool = False) -> Any:
         norm_key = _proto_snake(raw_key)
         if norm_key in out:
             raise InputError(f"Envoy config contains duplicate protobuf field spelling for '{safe_label(norm_key, 60)}'")
-        out[norm_key] = _normalize_envoy_proto(raw_val, preserve_map_keys=norm_key in _ENVOY_MAP_FIELDS)
+        if norm_key in _ENVOY_OPAQUE_FIELDS:
+            out[norm_key] = raw_val
+        else:
+            out[norm_key] = _normalize_envoy_proto(raw_val, preserve_map_keys=norm_key in _ENVOY_TYPED_MAP_FIELDS)
     return out
 
 

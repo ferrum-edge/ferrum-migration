@@ -1084,6 +1084,59 @@ class IstioCaseAndNamesTest(unittest.TestCase):
                 self.assertEqual(one_proxy(self, k8s_res.config, "=/api", "api.example.test")["labels"][
                     "ferrum-migration/status"], "refused")
 
+        # Malformed targetRef (numeric namespace) and GatewayClass refuse even when both gateway-name labels are pinned.
+        pinned_text = text.replace(
+            "selector: {istio: ingressgateway}",
+            "selector: {gateway.networking.k8s.io/gateway-name: other, istio.io/gateway-name: other}",
+        )
+        for bad_ref_label, bad_ref_yaml in (
+            ("numeric-namespace", "{group: gateway.networking.k8s.io, kind: Gateway, name: gw, namespace: 42}"),
+            ("gateway-class", "{group: gateway.networking.k8s.io, kind: GatewayClass, name: istio}"),
+        ):
+            with self.subTest(target_ref=bad_ref_label):
+                br_doc = pinned_text + textwrap.dedent(f"""
+                    ---
+                    apiVersion: security.istio.io/v1
+                    kind: AuthorizationPolicy
+                    metadata: {{name: bad-ref, namespace: edge}}
+                    spec:
+                      targetRef: {bad_ref_yaml}
+                """)
+                br_res = migrate("istio", br_doc)[0]
+                self.assertEqual(one_proxy(self, br_res.config, "=/api", "api.example.test")["labels"][
+                    "ferrum-migration/status"], "refused")
+
+        # Credentialed Istio CORS with a regex origin cannot be translated and MUST refuse the route fail-closed
+        # (never omit CORS and leave the route open to backend-emitted credentialed CORS headers).
+        cred_cors_doc = textwrap.dedent("""
+            apiVersion: networking.istio.io/v1
+            kind: Gateway
+            metadata: {name: gw, namespace: edge}
+            spec:
+              selector: {istio: ingressgateway}
+              servers:
+                - port: {number: 80, name: http, protocol: HTTP}
+                  hosts: [api.example.test]
+            ---
+            apiVersion: networking.istio.io/v1
+            kind: VirtualService
+            metadata: {name: vs, namespace: edge}
+            spec:
+              hosts: [api.example.test]
+              gateways: [gw]
+              http:
+                - name: api
+                  match: [{uri: {exact: /api}}]
+                  route: [{destination: {host: svc.edge.svc.cluster.local, port: {number: 8080}}}]
+                  corsPolicy:
+                    allowOrigins:
+                      - regex: '^https://(?:portal|admin)\\.example\\.com$'
+                    allowCredentials: true
+        """)
+        cc_res = migrate("istio", cred_cors_doc)[0]
+        self.assertEqual(one_proxy(self, cc_res.config, "=/api", "api.example.test")["labels"][
+            "ferrum-migration/status"], "refused")
+
 
 if __name__ == "__main__":
     unittest.main()

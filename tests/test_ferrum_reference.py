@@ -83,40 +83,43 @@ class FerrumSourceSchemaTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.src = ferrum_src()
-        cls.pinned_commit = None
         git = shutil.which("git")
-        if git and os.path.exists(os.path.join(cls.src, ".git")):
-            check = subprocess.run(
-                [git, "-C", cls.src, "rev-parse", "--verify", f"{FERRUM_EDGE_REFERENCE_COMMIT}^{{commit}}"],
-                capture_output=True, text=True, check=False,
+        if not git or not os.path.exists(os.path.join(cls.src, ".git")):
+            raise AssertionError(
+                f"FERRUM_EDGE_SRC ({cls.src}) must be a git checkout containing pinned commit "
+                f"{FERRUM_EDGE_REFERENCE_COMMIT}; unpacked or non-git trees are rejected"
             )
-            if check.returncode == 0 and check.stdout.strip() == FERRUM_EDGE_REFERENCE_COMMIT:
-                cls.pinned_commit = FERRUM_EDGE_REFERENCE_COMMIT
+        check = subprocess.run(
+            [git, "-C", cls.src, "rev-parse", "--verify", f"{FERRUM_EDGE_REFERENCE_COMMIT}^{{commit}}"],
+            capture_output=True, text=True, check=False,
+        )
+        if check.returncode != 0 or check.stdout.strip() != FERRUM_EDGE_REFERENCE_COMMIT:
+            raise AssertionError(
+                f"FERRUM_EDGE_SRC ({cls.src}) does not contain pinned commit {FERRUM_EDGE_REFERENCE_COMMIT}"
+            )
+        cls.git = git
+        cls.pinned_commit = FERRUM_EDGE_REFERENCE_COMMIT
         cls.types = cls.read_source("src/config/types.rs")
 
     @classmethod
     def read_source(cls, relpath: str) -> str:
-        if cls.pinned_commit:
-            completed = subprocess.run(
-                ["git", "-C", cls.src, "show", f"{cls.pinned_commit}:{relpath}"],
-                capture_output=True, text=True, check=True,
-            )
-            return completed.stdout
-        with open(os.path.join(cls.src, *relpath.split("/")), encoding="utf-8") as handle:
-            return handle.read()
+        completed = subprocess.run(
+            [cls.git, "-C", cls.src, "show", f"{cls.pinned_commit}:{relpath}"],
+            capture_output=True, text=True, check=True,
+        )
+        return completed.stdout
 
     def fields(self, name):
         return struct_fields(self.types, name)
 
     def test_reference_commit(self):
-        if self.pinned_commit == FERRUM_EDGE_REFERENCE_COMMIT:
-            return
-        git = shutil.which("git")
-        if not git or not os.path.exists(os.path.join(self.src, ".git")):
-            self.skipTest("source directory is not a git checkout")
-        head = subprocess.run([git, "-C", self.src, "rev-parse", "HEAD"], capture_output=True, text=True, check=False)
-        self.assertEqual(head.returncode, 0, head.stderr)
-        self.assertEqual(head.stdout.strip(), FERRUM_EDGE_REFERENCE_COMMIT)
+        obj_type = subprocess.run(
+            [self.git, "-C", self.src, "cat-file", "-t", FERRUM_EDGE_REFERENCE_COMMIT],
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(obj_type.returncode, 0, obj_type.stderr)
+        self.assertEqual(obj_type.stdout.strip(), "commit")
+        self.assertEqual(self.pinned_commit, FERRUM_EDGE_REFERENCE_COMMIT)
 
     def test_emitted_keys_are_accepted_struct_fields(self):
         top = self.fields("GatewayConfig") | {"resource_counts"}
@@ -506,6 +509,22 @@ class FerrumBinaryValidateTest(unittest.TestCase):
                                                 }
                                             },
                                         },
+                                        {
+                                            "name": "r_huge_cors_regex",
+                                            "match": {"path_separated_prefix": "/huge-rx"},
+                                            "route": {"cluster": "app"},
+                                            "typed_per_filter_config": {
+                                                "envoy.filters.http.cors": {
+                                                    "@type": "type.googleapis.com/envoy.extensions.filters.http.cors.v3.CorsPolicy",
+                                                    "allow_credentials": {"value": False},
+                                                    "allow_origin_string_match": [{
+                                                        "safe_regex": {
+                                                            "regex": "https://portal(?:" + "[ab]01" * 70 + "){0,64}[.]example[.]test"
+                                                        }
+                                                    }],
+                                                }
+                                            },
+                                        },
                                     ],
                                 }],
                             },
@@ -555,7 +574,7 @@ class FerrumBinaryValidateTest(unittest.TestCase):
             ("nginx-extended", "nginx", nginx_text, {"fmt": "nginx"}, 1, {"compression"}),
             ("traefik-extended", "traefik", traefik_text, {"traefik_controls_asserted": True}, 2,
              {"compression", "response_size_limiting", "request_mirror"}),
-            ("envoy-extended", "envoy", envoy_text, {}, 1, {"cors", "grpc_web", "compression", "fault_injection"}),
+            ("envoy-extended", "envoy", envoy_text, {}, 2, {"cors", "grpc_web", "compression", "fault_injection"}),
             ("istio-extended", "istio", istio_text, {}, 1, {"fault_injection"}),
         ):
             result, _report, _plan = migrate(platform, text, **kw)

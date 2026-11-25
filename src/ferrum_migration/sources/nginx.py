@@ -1090,13 +1090,14 @@ class _Nginx:
                                             f"gzip omitted: gzip_types could not be represented ({problem}).")
                         omit_gzip = True
             if not omit_gzip:
-                # NGINX defaults gzip_min_length to 20 bytes and gzip_comp_level to 1
-                # (whereas Ferrum compression defaults to 256 bytes and level 6).
+                # NGINX defaults gzip_min_length to 20 bytes, gzip_comp_level to 1, and leaves inbound
+                # Accept-Encoding intact for proxy_pass upstreams (Ferrum defaults 256, 6, and remove=true).
                 comp_cfg, comp_problem = compression_config(
                     ["gzip"],
                     min_content_length=scope.gzip_min_length if scope.gzip_min_length is not None else 20,
                     content_types=content_types,
                     gzip_level=scope.gzip_comp_level if scope.gzip_comp_level is not None else 1,
+                    remove_accept_encoding=False,
                 )
                 if comp_cfg is not None:
                     route.plugins.append(PluginSpec("compression", comp_cfg, ref))

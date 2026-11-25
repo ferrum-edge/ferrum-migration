@@ -120,6 +120,18 @@ jobs:
           ./"$FERRUM_EDGE_ASSET" version --json
           echo "FERRUM_EDGE_BIN=$dir/$FERRUM_EDGE_ASSET" >> "$GITHUB_ENV"
 
+      - name: Fetch pinned ferrum-edge v0.9.21 source for schema checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          src_dir="$RUNNER_TEMP/ferrum-edge-src"
+          mkdir -p "$src_dir"
+          git -C "$src_dir" init -q
+          git -C "$src_dir" fetch --depth 1 https://github.com/ferrum-edge/ferrum-edge.git f9915358c8032214f4034a17c28cdf72d14006c3
+          git -C "$src_dir" checkout -q --detach FETCH_HEAD
+          test "$(git -C "$src_dir" rev-parse HEAD)" = "f9915358c8032214f4034a17c28cdf72d14006c3"
+          echo "FERRUM_EDGE_SRC=$src_dir" >> "$GITHUB_ENV"
+
       - name: Converter output passes ferrum-edge validate (synthetic CA for operator-CA fixtures)
         run: python -m unittest discover -s tests -p 'test_ferrum_reference.py' -v
 
@@ -137,4 +149,4 @@ jobs:
 
       - name: Remove work dirs (may hold per-run synthetic credentials)
         if: always()
-        run: rm -rf "$RUNNER_TEMP/acceptance-smoke" "$RUNNER_TEMP/acceptance-full" "$RUNNER_TEMP/ferrum-edge"
+        run: rm -rf "$RUNNER_TEMP/acceptance-smoke" "$RUNNER_TEMP/acceptance-full" "$RUNNER_TEMP/ferrum-edge" "$RUNNER_TEMP/ferrum-edge-src"

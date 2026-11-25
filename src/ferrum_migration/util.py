@@ -153,8 +153,11 @@ def as_int(value: object) -> int | None:
         return value
     if isinstance(value, float) and value.is_integer():
         return int(value)
-    if isinstance(value, str) and value.strip().lstrip("-").isdigit():
-        return int(value.strip())
+    if isinstance(value, str):
+        stripped = value.strip()
+        body = stripped[1:] if stripped.startswith("-") else stripped
+        if body and body.isascii() and body.isdigit():
+            return int(stripped)
     return None
 
 

@@ -607,7 +607,8 @@ class EnvoyHardeningTest(unittest.TestCase):
         self.assertNotIn("envoy-mirror", codes(im_rep))
 
         # Omitted Envoy compressor remove_accept_encoding_header and min_content_length emit Envoy defaults
-        # (false and 30 bytes) rather than inheriting Ferrum's defaults (true and 256 bytes).
+        # (false and 30 bytes) rather than inheriting Ferrum's defaults (true and 256 bytes); malformed UInt32Value
+        # like "--1" refuses cleanly rather than crashing.
         comp_def = minimal_bootstrap({"path_separated_prefix": "/api"})
         comp_def["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"][
             "http_filters"] = [
@@ -623,6 +624,21 @@ class EnvoyHardeningTest(unittest.TestCase):
         self.assertEqual(plugin(self, cd_res.config, one_proxy(self, cd_res.config, "/api"), "compression")["config"], {
             "algorithms": ["gzip"], "min_content_length": 30, "remove_accept_encoding": False,
         })
+        comp_bad_min = copy.deepcopy(comp_def)
+        comp_bad_min["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"][
+            "http_filters"][0]["typed_config"]["response_direction_config"] = {
+            "common_config": {"min_content_length": {"value": "--1"}},
+        }
+        self.assertEqual(one_proxy(self, migrate("envoy", yaml.safe_dump(comp_bad_min))[0].config, "/api")[
+            "labels"]["ferrum-migration/status"], "refused")
+
+        # Opaque protobuf Structs (metadata.filterMetadata) keep arbitrary keys untouched without collision.
+        opaque_meta = minimal_bootstrap({"path_separated_prefix": "/api"})
+        opaque_meta["static_resources"]["clusters"][0]["metadata"] = {
+            "filterMetadata": {"envoy.lb": {"tenantId": "a", "tenant_id": "b"}},
+        }
+        self.assertEqual(one_proxy(self, migrate("envoy", yaml.safe_dump(opaque_meta))[0].config, "/api")[
+            "labels"]["ferrum-migration/status"], "migrated")
 
         # Fail-closed regressions:
         # 1) Misnamed ext_authz, dynamic config_discovery, and jwt_authn (including camelCase protobuf JSON
@@ -728,18 +744,19 @@ class EnvoyHardeningTest(unittest.TestCase):
             self.assertEqual(one_proxy(self, zf_res.config, "/api")["labels"]["ferrum-migration/status"], "migrated")
             self.assertEqual(zf_res.config["plugin_configs"], [])
             self.assertIn("envoy-fault-noop", codes(zf_rep, "info"))
-        bad_num_fault = minimal_bootstrap({"path_separated_prefix": "/api"})
-        bad_num_fault["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"][
-            "http_filters"] = [
-            {"name": "envoy.filters.http.fault",
-             "typed_config": {
-                 "@type": "type.googleapis.com/envoy.extensions.filters.http.fault.v3.HTTPFault",
-                 "abort": {"http_status": 503, "percentage": {"numerator": "bad", "denominator": "HUNDRED"}},
-             }},
-            {"name": "envoy.filters.http.router"},
-        ]
-        self.assertEqual(one_proxy(self, migrate("envoy", yaml.safe_dump(bad_num_fault))[0].config, "/api")[
-            "labels"]["ferrum-migration/status"], "refused")
+        for bad_num in ("bad", "--1"):
+            bad_num_fault = minimal_bootstrap({"path_separated_prefix": "/api"})
+            bad_num_fault["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"][
+                "http_filters"] = [
+                {"name": "envoy.filters.http.fault",
+                 "typed_config": {
+                     "@type": "type.googleapis.com/envoy.extensions.filters.http.fault.v3.HTTPFault",
+                     "abort": {"http_status": 503, "percentage": {"numerator": bad_num, "denominator": "HUNDRED"}},
+                 }},
+                {"name": "envoy.filters.http.router"},
+            ]
+            self.assertEqual(one_proxy(self, migrate("envoy", yaml.safe_dump(bad_num_fault))[0].config, "/api")[
+                "labels"]["ferrum-migration/status"], "refused", bad_num)
         for rt_fault in (
             {"@type": "type.googleapis.com/envoy.extensions.filters.http.fault.v3.HTTPFault",
              "abort": {"http_status": 503, "percentage": {"numerator": 0, "denominator": "HUNDRED"}}},
@@ -877,7 +894,12 @@ class EnvoyHardeningTest(unittest.TestCase):
         self.assertEqual(mix_cors["allowed_headers"], ["*", "X-Trace"])
         for bad_rx in (
             r"https://(a(b(c(d(e(f(g(h(i(j(app\.example\.test)))))))))))",
+            r"x|a(?:x|a(?:x|a(?:x|a(?:x|a(?:x|ab+)+)+)+)+)+",
             r"^https://(?:[a])" + "(?:" * 26 + "pp" + ")" * 26 + r"\.example\.test$",
+            "https://portal(?:" + "[ab]01" * 70 + "){0,64}[.]example[.]test",
+            r"^https://{tenant}\.example\.test$",
+            r"^https://a{,3}\.example\.test$",
+            r"^https://.{64}.{64}\.example\.test$",
             r"^https://a{5000}\.example\.test$",
             r"^https://[a[]\.example\.test$",
         ):

@@ -245,6 +245,7 @@ _CORS_UNICODE_SHORTHANDS = frozenset("wWdDsS")
 _CORS_MAX_REPEAT = 64
 _CORS_MAX_TOTAL_REPEATS = 128
 _CORS_MAX_UNICODE_SHORTHANDS = 4
+_CORS_MAX_COMPILED_COST = 512
 
 
 def _cors_regex_problem(pattern: str) -> str | None:
@@ -252,10 +253,16 @@ def _cors_regex_problem(pattern: str) -> str | None:
 
     Ferrum wraps each origin regex as ``^(?:<pattern>)$`` and compiles it with
     ``nest_limit(24)``, ``size_limit(64 KiB)``, and ``dfa_size_limit(64 KiB)``.
-    We check printable ASCII, reject constructs whose syntax diverges between Python
-    ``re`` and Rust ``regex-syntax``, bound AST nesting conservatively (``3 + 4*group
-    + 2*class + quant <= 24``), and cap bounded repetitions and Unicode shorthands so
-    compiled NFA/DFA size cannot approach 64 KiB.
+    In ``regex-syntax``, the wrapper itself costs up to 4 levels (outer Concat,
+    wrapper Group, Alternation, branch Concat), each nested group adds up to 4
+    levels (Repetition, Group, Alternation, Concat), a quantifier adds 1, and a
+    character class adds up to 3 (Repetition, ClassBracketed, ClassSetUnion).
+    We enforce printable ASCII, reject syntax that differs between Python ``re``
+    and Rust ``regex-syntax`` (including literal ``{``), bound AST nesting
+    (group ``4 + 4*g <= 24``, quantifier ``5 + 4*g <= 24``, class ``7 + 4*g <= 24``),
+    and charge the expanded operand cost of bounded repetitions (including classes,
+    ``.``, negated classes, and Unicode shorthands) so compiled NFA/DFA size stays
+    well under 64 KiB.
     """
     problem = util.regex_problem(pattern)
     if problem:
@@ -266,12 +273,17 @@ def _cors_regex_problem(pattern: str) -> str | None:
     class_depth = 0
     class_state = 0  # 2: right after '[', 1: right after '[^', 0: normal inside class
     class_has_unicode = False
+    class_negated = False
+    class_atom_count = 0
     unicode_shorthands = 0
     total_bounded_repeats = 0
     group_mult_stack = [1]
     group_unicode_stack = [False]
+    group_cost_stack = [0]
     last_atom_mult = 1
     last_atom_unicode = False
+    last_atom_cost = 0
+    has_atom = False
     i = 0
     n = len(pattern)
     while i < n:
@@ -286,9 +298,17 @@ def _cors_regex_problem(pattern: str) -> str | None:
                 if i + 3 >= n or pattern[i + 2] not in _CORS_HEX_DIGITS or pattern[i + 3] not in _CORS_HEX_DIGITS:
                     return "an allowed origin regex has an invalid hex escape"
                 i += 4
-                last_atom_mult = 1
-                last_atom_unicode = False
-                class_state = 0
+                if class_depth > 0:
+                    class_atom_count += 1
+                    class_state = 0
+                else:
+                    group_cost_stack[-1] += 1
+                    last_atom_cost = 1
+                    last_atom_mult = 1
+                    last_atom_unicode = False
+                    has_atom = True
+                if sum(group_cost_stack) > _CORS_MAX_COMPILED_COST:
+                    return "an allowed origin regex exceeds safe Ferrum compiled-size limits"
                 continue
             if nxt in _CORS_UNICODE_SHORTHANDS:
                 unicode_shorthands += 1
@@ -297,25 +317,47 @@ def _cors_regex_problem(pattern: str) -> str | None:
                 group_unicode_stack[-1] = True
                 if class_depth > 0:
                     class_has_unicode = True
-                    last_atom_unicode = False
+                    class_atom_count += 1
+                    class_state = 0
                 else:
+                    group_cost_stack[-1] += 128
+                    last_atom_cost = 128
+                    last_atom_mult = 1
                     last_atom_unicode = True
+                    has_atom = True
             else:
-                last_atom_unicode = False
-            last_atom_mult = 1
-            class_state = 0
+                if class_depth > 0:
+                    class_atom_count += 1
+                    class_state = 0
+                else:
+                    group_cost_stack[-1] += 1
+                    last_atom_cost = 1
+                    last_atom_mult = 1
+                    last_atom_unicode = False
+                    has_atom = nxt not in "bBAz"
+            if sum(group_cost_stack) > _CORS_MAX_COMPILED_COST:
+                return "an allowed origin regex exceeds safe Ferrum compiled-size limits"
             i += 2
             continue
         if class_depth > 0:
             if class_state == 2 and ch == "^":
                 class_state = 1
+                class_negated = True
                 i += 1
                 continue
             if ch == "]" and class_state == 0:
                 class_depth = 0
+                atom_cost = 128 if class_has_unicode else (64 if class_negated else max(4, class_atom_count))
+                group_cost_stack[-1] += atom_cost
+                if sum(group_cost_stack) > _CORS_MAX_COMPILED_COST:
+                    return "an allowed origin regex exceeds safe Ferrum compiled-size limits"
+                last_atom_cost = atom_cost
                 last_atom_mult = 1
                 last_atom_unicode = class_has_unicode
                 class_has_unicode = False
+                class_negated = False
+                class_atom_count = 0
+                has_atom = True
                 i += 1
                 continue
             class_state = 0
@@ -323,6 +365,7 @@ def _cors_regex_problem(pattern: str) -> str | None:
                 return "an allowed origin regex contains an unescaped '[' inside a character class"
             if i + 1 < n and pattern[i:i + 2] in ("--", "&&", "~~"):
                 return "an allowed origin regex contains Rust character-class set operators"
+            class_atom_count += 1
             i += 1
             continue
         if ch == "(":
@@ -336,16 +379,21 @@ def _cors_regex_problem(pattern: str) -> str | None:
                     i += 4
                     last_atom_mult = 1
                     last_atom_unicode = False
+                    last_atom_cost = 0
+                    has_atom = False
                     continue
                 else:
                     return "an allowed origin regex uses a group construct not supported for CORS migration"
             group_depth += 1
-            if 3 + 4 * group_depth > 24:
+            if 4 + 4 * group_depth > 24:
                 return "an allowed origin regex exceeds Ferrum nesting limits"
             group_mult_stack.append(1)
             group_unicode_stack.append(False)
+            group_cost_stack.append(0)
             last_atom_mult = 1
             last_atom_unicode = False
+            last_atom_cost = 0
+            has_atom = False
             i += step
             continue
         if ch == ")":
@@ -353,70 +401,112 @@ def _cors_regex_problem(pattern: str) -> str | None:
                 group_depth -= 1
                 child_mult = group_mult_stack.pop()
                 child_unicode = group_unicode_stack.pop()
+                child_cost = group_cost_stack.pop()
                 group_mult_stack[-1] = max(group_mult_stack[-1], child_mult)
                 group_unicode_stack[-1] = group_unicode_stack[-1] or child_unicode
+                group_cost_stack[-1] += child_cost
                 last_atom_mult = child_mult
                 last_atom_unicode = child_unicode
+                last_atom_cost = max(1, child_cost)
+                has_atom = True
             else:
                 last_atom_mult = 1
                 last_atom_unicode = False
+                last_atom_cost = 0
+                has_atom = False
             i += 1
             continue
         if ch == "[":
             class_depth = 1
             class_state = 2
             class_has_unicode = False
-            if 3 + 4 * group_depth + 2 * class_depth > 24:
+            class_negated = False
+            class_atom_count = 0
+            if 7 + 4 * group_depth > 24:
                 return "an allowed origin regex exceeds Ferrum nesting limits"
             last_atom_mult = 1
             last_atom_unicode = False
+            last_atom_cost = 0
+            has_atom = False
             i += 1
             continue
         if ch in "*+?":
-            if 3 + 4 * group_depth + 1 > 24:
+            if not has_atom:
+                return "an allowed origin regex has an invalid quantifier placement"
+            if 5 + 4 * group_depth > 24:
                 return "an allowed origin regex exceeds Ferrum nesting limits"
+            group_cost_stack[-1] += 2
+            if sum(group_cost_stack) > _CORS_MAX_COMPILED_COST:
+                return "an allowed origin regex exceeds safe Ferrum compiled-size limits"
             i += 1
             if i < n and pattern[i] == "?":
                 i += 1
             last_atom_mult = 1
             last_atom_unicode = False
+            last_atom_cost = 0
+            has_atom = False
             continue
         if ch == "{":
             close = pattern.find("}", i + 1)
-            if close > i + 1:
-                body = pattern[i + 1:close]
-                parts = body.split(",")
-                if len(parts) in (1, 2) and parts[0].isdigit() and (len(parts) == 1 or parts[1] == "" or parts[1].isdigit()):
-                    if 3 + 4 * group_depth + 1 > 24:
-                        return "an allowed origin regex exceeds Ferrum nesting limits"
-                    lo = int(parts[0])
-                    hi = int(parts[1]) if len(parts) == 2 and parts[1] else lo
-                    factor = max(lo, hi)
-                    if factor > _CORS_MAX_REPEAT:
-                        return "an allowed origin regex repetition bound exceeds safe Ferrum size limits"
-                    effective = last_atom_mult * max(1, factor)
-                    if effective > _CORS_MAX_REPEAT:
-                        return "an allowed origin regex nested repetition exceeds safe Ferrum size limits"
-                    total_bounded_repeats += effective
-                    if total_bounded_repeats > _CORS_MAX_TOTAL_REPEATS:
-                        return "an allowed origin regex total repetition budget exceeds safe Ferrum size limits"
-                    if last_atom_unicode and factor > 1:
-                        unicode_shorthands += factor - 1
-                        if unicode_shorthands > _CORS_MAX_UNICODE_SHORTHANDS:
-                            return "an allowed origin regex exceeds safe Rust regex size bounds"
-                    group_mult_stack[-1] = max(group_mult_stack[-1], effective)
-                    i = close + 1
-                    if i < n and pattern[i] == "?":
-                        i += 1
-                    last_atom_mult = 1
-                    last_atom_unicode = False
-                    continue
+            body = pattern[i + 1:close] if close > i + 1 else ""
+            parts = body.split(",") if body else []
+            valid_rep = (
+                has_atom
+                and close > i + 1
+                and len(parts) in (1, 2)
+                and parts[0].isascii()
+                and parts[0].isdigit()
+                and (len(parts) == 1 or parts[1] == "" or (parts[1].isascii() and parts[1].isdigit()))
+            )
+            if not valid_rep:
+                return "an allowed origin regex contains an unescaped '{' that Rust regex rejects (escape it as \\{)"
+            lo = int(parts[0])
+            hi = int(parts[1]) if len(parts) == 2 and parts[1] else lo
+            if len(parts) == 2 and parts[1] and hi < lo:
+                return "an allowed origin regex has an inverted repetition range"
+            if 5 + 4 * group_depth > 24:
+                return "an allowed origin regex exceeds Ferrum nesting limits"
+            factor = max(lo, hi)
+            if factor > _CORS_MAX_REPEAT:
+                return "an allowed origin regex repetition bound exceeds safe Ferrum size limits"
+            effective = last_atom_mult * max(1, factor)
+            if effective > _CORS_MAX_REPEAT:
+                return "an allowed origin regex nested repetition exceeds safe Ferrum size limits"
+            total_bounded_repeats += effective
+            if total_bounded_repeats > _CORS_MAX_TOTAL_REPEATS:
+                return "an allowed origin regex total repetition budget exceeds safe Ferrum size limits"
+            if last_atom_unicode and factor > 1:
+                unicode_shorthands += factor - 1
+                if unicode_shorthands > _CORS_MAX_UNICODE_SHORTHANDS:
+                    return "an allowed origin regex exceeds safe Rust regex size bounds"
+            extra_cost = last_atom_cost * max(0, factor - 1)
+            group_cost_stack[-1] += extra_cost
+            if sum(group_cost_stack) > _CORS_MAX_COMPILED_COST:
+                return "an allowed origin regex exceeds safe Ferrum compiled-size limits"
+            group_mult_stack[-1] = max(group_mult_stack[-1], effective)
+            i = close + 1
+            if i < n and pattern[i] == "?":
+                i += 1
             last_atom_mult = 1
             last_atom_unicode = False
+            last_atom_cost = 0
+            has_atom = False
+            continue
+        if ch in "|^$":
+            last_atom_mult = 1
+            last_atom_unicode = False
+            last_atom_cost = 0
+            has_atom = False
             i += 1
             continue
+        atom_cost = 64 if ch == "." else 1
+        group_cost_stack[-1] += atom_cost
+        if sum(group_cost_stack) > _CORS_MAX_COMPILED_COST:
+            return "an allowed origin regex exceeds safe Ferrum compiled-size limits"
+        last_atom_cost = atom_cost
         last_atom_mult = 1
         last_atom_unicode = False
+        has_atom = True
         i += 1
     return None
 

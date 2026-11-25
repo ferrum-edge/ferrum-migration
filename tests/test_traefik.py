@@ -1231,6 +1231,7 @@ class TraefikHardeningTest(unittest.TestCase):
             "algorithms": ["br", "gzip"],
             "min_content_length": 2048,
             "content_types": ["application/json", "text/plain"],
+            "remove_accept_encoding": False,
         })
         buf_proxy = one_proxy(self, result.config, "/buf", "a.example.test")
         self.assertEqual(buf_proxy["labels"]["ferrum-migration/status"], "migrated")
@@ -1248,11 +1249,25 @@ class TraefikHardeningTest(unittest.TestCase):
         for refused_path in ("/grpc", "/upload"):
             self.assertEqual(one_proxy(self, result.config, refused_path, "a.example.test")["labels"][
                 "ferrum-migration/status"], "refused", refused_path)
-        # Omitted minResponseBodyBytes defaults explicitly to Traefik's 1024 bytes; mirror with default
-        # passHostHeader (true) is dropped so Host is never silently changed.
+        # Omitted minResponseBodyBytes defaults explicitly to Traefik's 1024 bytes, remove_accept_encoding is false,
+        # and omitted encodings defaults to Traefik v3's ["zstd", "br", "gzip"]; mirror with default passHostHeader
+        # (true) is dropped so Host is never silently changed.
         defmin = one_proxy(self, result.config, "/defmin", "a.example.test")
         self.assertEqual(plugin(self, result.config, defmin, "compression")["config"], {
-            "algorithms": ["gzip"], "min_content_length": 1024,
+            "algorithms": ["gzip"], "min_content_length": 1024, "remove_accept_encoding": False,
+        })
+        defenc_doc = yaml.safe_dump({
+            "http": {
+                "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/v3/`)", "service": "main",
+                                  "middlewares": ["c"]}},
+                "middlewares": {"c": {"compress": {}}},
+                "services": {"main": {"loadBalancer": {"servers": [{"url": "http://main.internal:8080"}]}}},
+            }
+        })
+        defenc_res = asserted(defenc_doc)[0]
+        self.assertEqual(plugin(self, defenc_res.config, one_proxy(self, defenc_res.config, "/v3", "a.example.test"),
+                                "compression")["config"], {
+            "algorithms": ["zstd", "br", "gzip"], "min_content_length": 1024, "remove_accept_encoding": False,
         })
         self.assertNotIn("request_mirror", [p["plugin_name"] for p in plugins_of(result.config, defmin)])
         # excludedContentTypes omits compression; body-enabled mirror (mirrorBody: true) is dropped so Ferrum's
@@ -1303,6 +1318,18 @@ class TraefikHardeningTest(unittest.TestCase):
                                                     "servers": [{"url": "https://shadow.internal:9443"}]}},
                     },
                     "serversTransports": {"insec": {"insecureSkipVerify": True}},
+                }
+            }),
+            ("h2c-mirror", {
+                "http": {
+                    "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "m"}},
+                    "services": {
+                        "m": {"mirroring": {"service": "main", "mirrorBody": False,
+                                            "mirrors": [{"name": "shadow", "percent": 20}]}},
+                        "main": {"loadBalancer": {"servers": [{"url": "http://main.internal:8080"}]}},
+                        "shadow": {"loadBalancer": {"passHostHeader": False,
+                                                    "servers": [{"url": "h2c://shadow.internal:9090"}]}},
+                    },
                 }
             }),
         ):

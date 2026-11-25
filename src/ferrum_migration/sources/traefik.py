@@ -1121,7 +1121,8 @@ class _Traefik:
                                 "allow-list and cannot exclude specific response media types).")
             return
         raw_enc = config.get("encodings")
-        encodings = str_list(raw_enc) if raw_enc is not None else ["gzip", "br"]
+        # Traefik v3 compress defaults encodings to ["zstd", "br", "gzip"] (in preference order).
+        encodings = str_list(raw_enc) if raw_enc is not None else ["zstd", "br", "gzip"]
         if raw_enc is not None and (encodings is None or not encodings):
             self.report.warning("traefik-compress", ref, "compress omitted: encodings has unexpected types.")
             return
@@ -1151,7 +1152,9 @@ class _Traefik:
             if not exact_inc:
                 return
             inc = exact_inc
-        built, problem = compression_config(encodings, min_content_length=min_len, content_types=inc, allow_ranges=False)
+        # Traefik compress leaves inbound Accept-Encoding intact for backends (Ferrum defaults remove_accept_encoding to true).
+        built, problem = compression_config(encodings, min_content_length=min_len, content_types=inc,
+                                            allow_ranges=False, remove_accept_encoding=False)
         if built is None:
             self.report.warning("traefik-compress", ref, f"compress omitted ({problem}).")
             return
@@ -1361,6 +1364,13 @@ class _Traefik:
                 # file-mode request_mirror strips Host to the mirror target's authority. Only mirror when
                 # passHostHeader is explicitly false so the virtual-host boundary matches.
                 dropped += 1
+                continue
+            if any(isinstance(srv, dict) and isinstance(srv.get("url"), str)
+                   and srv["url"].strip().lower().startswith("h2c://") for srv in seq(lb.get("servers"))):
+                self.report.warning("traefik-mirroring", ref,
+                                    "Mirror target uses h2c:// (cleartext HTTP/2 prior knowledge); Ferrum "
+                                    "request_mirror only uses prior-knowledge HTTP/2 for native gRPC requests, so "
+                                    "the h2c mirror was dropped.")
                 continue
             scheme, targets, problems = self._servers(lb, ref)
             tls, _timeouts, transport_problems = self._transport(lb.get("serversTransport"), ref)

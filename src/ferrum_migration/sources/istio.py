@@ -694,6 +694,11 @@ class _Istio:
     def _cors(self, spec: RouteSpec, policy: dict) -> None:
         if not policy:
             return
+        raw_creds = policy.get("allowCredentials")
+        if raw_creds is not None and not isinstance(raw_creds, bool):
+            spec.refuse("CORS policy has an invalid allowCredentials value")
+            return
+        creds = raw_creds if isinstance(raw_creds, bool) else None
         origins = []
         for matcher in seq(policy.get("allowOrigins")):
             matcher = mapping(matcher)
@@ -706,10 +711,12 @@ class _Istio:
             origins.append({"exact": origin})
         max_age = util.parse_go_duration_ms(policy.get("maxAge")) if policy.get("maxAge") else None
         built, problem = cors_config(origins, policy.get("allowMethods"), policy.get("allowHeaders"),
-                                     policy.get("exposeHeaders"), policy.get("allowCredentials"),
+                                     policy.get("exposeHeaders"), creds,
                                      max_age // 1000 if max_age is not None else None)
         if built:
             spec.plugins.append(PluginSpec("cors", built, spec.ref))
+        elif creds is True:
+            spec.refuse(f"CORS policy with allowCredentials=true cannot be safely migrated ({problem})")
         else:
             self.report.warning("istio-cors", spec.ref, f"CORS omitted ({problem}); browsers block cross-origin calls.")
 
@@ -1047,25 +1054,34 @@ def _target_ref_may_apply(ref: dict, policy_ns: str, gw_ns: str, gw_name: str, g
     A Kubernetes Gateway API ``targetRef`` (``kind: Gateway``) attaches to gateway pods carrying either
     ``gateway.networking.k8s.io/gateway-name: <name>`` or legacy ``istio.io/gateway-name: <name>``. Under the
     same disjointness invariant as workload selectors, a ``kind: Gateway`` targetRef is provably unrelated only
-    when it does not name this Gateway AND ``gateway_selector`` pins BOTH gateway-name label keys to values
-    different from the referenced Gateway name. ``kind: GatewayClass`` and malformed refs always apply.
+    when it is well-formed, does not name this Gateway, AND ``gateway_selector`` pins BOTH gateway-name label
+    keys to values different from the referenced Gateway name. Malformed refs (non-string namespace/group),
+    ``kind: GatewayClass``, and unrecognized kind/group combinations always apply.
     """
     raw_kind = ref.get("kind")
     raw_name = ref.get("name")
+    raw_ns = ref.get("namespace")
+    raw_group = ref.get("group")
     if not (isinstance(raw_kind, str) and raw_kind.strip() and isinstance(raw_name, str) and raw_name.strip()):
+        return True
+    if raw_ns is not None and (not isinstance(raw_ns, str) or not raw_ns.strip()):
+        return True
+    if raw_group is not None and not isinstance(raw_group, str):
         return True
     ref_kind = raw_kind.strip()
     ref_name = raw_name.strip()
-    if ref_kind == "GatewayClass":
-        return True
-    if ref_kind != "Gateway":
+    ref_ns = raw_ns.strip() if isinstance(raw_ns, str) else policy_ns
+    ref_group = (raw_group or "").strip()
+    if (ref_kind == "Service" and ref_group == "") or (ref_kind == "ServiceEntry" and ref_group == "networking.istio.io"):
         return False
-    if ref_name == gw_name and (ref.get("namespace") or policy_ns) == gw_ns:
-        return True
-    return not (
-        _selectors_disjoint(gateway_selector, {"gateway.networking.k8s.io/gateway-name": ref_name})
-        and _selectors_disjoint(gateway_selector, {"istio.io/gateway-name": ref_name})
-    )
+    if ref_kind == "Gateway" and ref_group in ("", "gateway.networking.k8s.io", "networking.istio.io"):
+        if ref_name == gw_name and ref_ns == gw_ns:
+            return True
+        return not (
+            _selectors_disjoint(gateway_selector, {"gateway.networking.k8s.io/gateway-name": ref_name})
+            and _selectors_disjoint(gateway_selector, {"istio.io/gateway-name": ref_name})
+        )
+    return True
 
 
 def _is_ip_literal(value: str) -> bool:
