@@ -512,8 +512,12 @@ class _Envoy:
                                vhost, shared)
             if filter_refusal:
                 spec.refuse(filter_refusal)
-            if buffer_limit and buffer_limit > 0 and not spec.termination:
-                spec.plugins.append(PluginSpec("request_size_limiting", {"max_bytes": buffer_limit}, ref))
+            if buffer_limit and buffer_limit > 0:
+                if spec.termination is not None:
+                    spec.refuse("active Envoy buffer filter can return HTTP 413 before a direct_response or static "
+                                "redirect runs, which Ferrum request_termination cannot reproduce")
+                else:
+                    spec.plugins.append(PluginSpec("request_size_limiting", {"max_bytes": buffer_limit}, ref))
             if not spec.termination and not getattr(spec, "https_redirect", False):
                 for hp in shared.get("hcm_plugins", []):
                     spec.plugins.append(PluginSpec(hp.name, hp.config, hp.ref))

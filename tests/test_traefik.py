@@ -1883,6 +1883,17 @@ class TraefikHardeningTest(unittest.TestCase):
                     "services": {"main": {"loadBalancer": {"servers": [{"url": "http://main.internal:8080"}]}}},
                 }
             }),
+            ("headers-multiple-active-cors", {
+                "http": {
+                    "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "main",
+                                      "middlewares": ["cors1", "cors2"]}},
+                    "middlewares": {
+                        "cors1": {"headers": {"accessControlAllowOriginList": ["https://a.example.test"]}},
+                        "cors2": {"headers": {"accessControlAllowOriginList": ["https://b.example.test"]}},
+                    },
+                    "services": {"main": {"loadBalancer": {"servers": [{"url": "http://main.internal:8080"}]}}},
+                }
+            }),
             ("headers-strip-origin-after-cors", {
                 "http": {
                     "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "main",
@@ -2037,6 +2048,26 @@ class TraefikHardeningTest(unittest.TestCase):
         unasserted_res, unasserted_rep, _ = migrate("traefik", redir_443_doc)
         self.assertNotIn("traefik-https-redirect", codes(unasserted_rep, "info"))
         self.assertEqual(live_routes(unasserted_res.config), [])
+        # When colliding HTTPS routes collapse to a 503 placeholder in _resolve_conflicts, a deferred redirect
+        # with an uncanonical path (/legacy;v=1) is NOT folded and is validated cleanly so output stays valid.
+        conflict_https_doc = yaml.safe_dump({
+            "http": {
+                "routers": {
+                    "plain_redir": {"rule": "Host(`a.example.test`) && Path(`/legacy;v=1`)", "service": "main",
+                                    "middlewares": ["r443"]},
+                    "tls_get": {"rule": "Host(`a.example.test`) && Path(`/api`) && Method(`GET`)", "service": "main",
+                                "tls": {}},
+                    "tls_post": {"rule": "Host(`a.example.test`) && Path(`/api`) && Method(`POST`)", "service": "main",
+                                 "tls": {}},
+                },
+                "middlewares": {"r443": {"redirectScheme": {"scheme": "https"}}},
+                "services": {"main": {"loadBalancer": {"servers": [{"url": "http://main.internal:8080"}]}}},
+            }
+        })
+        ch_res, ch_rep, _ = asserted(conflict_https_doc)
+        assert_structurally_valid(self, ch_res.config)
+        self.assertNotIn("traefik-https-redirect", codes(ch_rep, "info"))
+        self.assertEqual(live_routes(ch_res.config), [])
         # Canonical schema gate checks newly supported compress/grpcWeb/mirror/v3.8 fields.
         for bad_case in (
             {"http": {"middlewares": {"c": {"compress": {"Encodings": ["gzip"]}}}}},

@@ -1404,6 +1404,22 @@ class EnvoyHardeningTest(unittest.TestCase):
         self.assertNotIn("envoy-https-redirect", codes(br_rep, "info"))
         self.assertEqual(one_proxy(self, br_res.config, "/", "app.example.test")["labels"][
             "ferrum-migration/status"], "refused")
+        # Active buffer filter also refuses static redirects and direct_response routes.
+        buf_static = minimal_bootstrap({"path": "/old"})
+        bshcm = buf_static["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"]
+        bshcm["http_filters"] = [
+            {"name": "envoy.filters.http.buffer",
+             "typed_config": {"@type": "type.googleapis.com/envoy.extensions.filters.http.buffer.v3.Buffer",
+                              "max_request_bytes": 1024}},
+            {"name": "envoy.filters.http.router"},
+        ]
+        bshcm["route_config"]["virtual_hosts"][0]["routes"] = [
+            {"name": "static_redir", "match": {"path": "/old"},
+             "redirect": {"scheme_redirect": "https", "host_redirect": "new.example.test",
+                          "path_redirect": "/new", "strip_query": True}},
+        ]
+        bs_res = migrate("envoy", yaml.safe_dump(buf_static))[0]
+        self.assertEqual(one_proxy(self, bs_res.config, "=/old")["labels"]["ferrum-migration/status"], "refused")
 
 
 if __name__ == "__main__":

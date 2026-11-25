@@ -1346,6 +1346,10 @@ class _Traefik:
                 ))
             )
             if has_cors:
+                if acc.has_cors:
+                    acc.refusals.append("router chains multiple active CORS headers middlewares; Traefik answers "
+                                        "preflights from the first active middleware, whereas Ferrum combines "
+                                        "multiple cors plugins")
                 acc.has_cors = True
                 if acc.mutates_origin_header or mutates_origin_now:
                     acc.refusals.append("headers middleware removes or rewrites the Origin request header on a CORS "

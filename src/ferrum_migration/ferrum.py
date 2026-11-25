@@ -163,9 +163,9 @@ def emit(plan: Plan, options: EmitOptions, report: Report) -> EmitResult:
     _poison(routes)
     _poison_case_variants(plan, routes)
     _resolve_frontend_client_ca(plan, routes, report, mode)
-    _finalize_https_redirects(plan, routes, mode, report)
     candidates = _build_candidates(routes)
     candidates = _resolve_conflicts(candidates, report)
+    candidates = _finalize_https_redirects(plan, routes, candidates, mode, options, report)
     _add_scope_closures(plan, candidates, report)
     _add_trailing_slash_placeholders(candidates, report)
     _add_divergence_guards(plan, candidates, report)
@@ -185,25 +185,26 @@ def emit(plan: Plan, options: EmitOptions, report: Report) -> EmitResult:
                       frontend_protocols=mode)
 
 
-def _finalize_https_redirects(plan: Plan, routes: list[RouteSpec], mode: str, report: Report) -> None:
-    """Confirm deferred plaintext HTTP-to-HTTPS redirect folds only after final listener & TLS validation.
+def _finalize_https_redirects(plan: Plan, routes: list[RouteSpec], candidates: list[_Cand], mode: str,
+                              options: EmitOptions, report: Report) -> list[_Cand]:
+    """Confirm deferred plaintext HTTP-to-HTTPS redirect folds only after final candidate resolution.
 
     A redirect candidate folds away (and emits its ``*-https-redirect`` info diagnostic) only if the final
-    profile disables plaintext (``mode == "https"``) AND at least one live (unrefused) HTTPS route survived
-    validation, precedence, poisoning, and client-CA scope checks. Otherwise, un-skip and refuse the redirect
-    candidates as fail-closed placeholders.
+    profile disables plaintext (``mode == "https"``) AND at least one live (non-placeholder) HTTPS candidate
+    survived validation, precedence, poisoning, client-CA scope, and slot conflict resolution. Otherwise,
+    un-skip, refuse, validate, poison, and resolve the restored redirect candidates through the same pipeline.
     """
-    candidates = [route for route in routes if route.https_redirect_fold is not None]
-    if not candidates:
-        return
+    deferred = [route for route in routes if route.https_redirect_fold is not None]
+    if not deferred:
+        return candidates
     has_surviving_https = mode == "https" and any(
-        not route.skip and not route.refusals and "https" in (_effective_protocols(route) or ())
-        for route in routes
+        not cand.placeholder and "https" in (_effective_protocols(cand.route) or ())
+        for cand in candidates
     )
     if has_surviving_https:
         plan.settings.https_redirect_seen = True
         seen: set[tuple[str, str]] = set()
-        for route in candidates:
+        for route in deferred:
             assert route.https_redirect_fold is not None
             code, ref = route.https_redirect_fold
             if (code, ref) not in seen:
@@ -211,12 +212,16 @@ def _finalize_https_redirects(plan: Plan, routes: list[RouteSpec], mode: str, re
                 report.info(code, ref,
                             "HTTP-to-HTTPS redirect: not emitted; Ferrum's TLS-only profile disables the plaintext "
                             "listener instead.")
-        return
-    for route in candidates:
+        return candidates
+    for route in deferred:
         route.skip = False
         route.skip_reason = ""
         route.https_redirect_fold = None
         route.refuse("HTTP-to-HTTPS redirect cannot be folded away because no live HTTPS route survived validation")
+        _validate_route(route, plan, options, report)
+    _poison(routes)
+    _poison_case_variants(plan, routes)
+    return _resolve_conflicts(_build_candidates(routes), report)
 
 
 def _assert_frontend_protocols(candidates: list[_Cand], mode: str) -> None:
@@ -831,9 +836,13 @@ def _resolve_conflicts(candidates: list[_Cand], report: Report) -> list[_Cand]:
             if len(component) < 2:
                 continue
             refs = [m.route.ref for m in component]
+            capped_refs = [(ref, safe_label(ref)) for ref in refs[:8]]
+            extra_count = len(refs) - len(capped_refs)
             for member in component:
-                others = ", ".join(safe_label(ref) for ref in refs if ref != member.route.ref)[:400]
-                member.route.refuse(f"Ferrum requires one route per host/path/port and it conflicts with {others}")
+                others = ", ".join(lbl for raw_ref, lbl in capped_refs if raw_ref != member.route.ref)
+                if extra_count > 0:
+                    others = f"{others}, +{extra_count} more" if others else f"+{extra_count} more"
+                member.route.refuse(f"Ferrum requires one route per host/path/port and it conflicts with {others[:400]}")
                 member.route.placeholder_emitted = True
             hosts: list[str] = []
             if not any(not m.hosts for m in component):

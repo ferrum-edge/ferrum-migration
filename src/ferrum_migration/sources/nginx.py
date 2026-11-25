@@ -500,6 +500,7 @@ class _Nginx:
         ownership = {self.default_server.get((listen["port"], listen["ssl"])) == info["index"] for listen in selected}
         is_default = ownership == {True}
         hosts, host_problem = _server_hosts(info["names"])
+        declared_hosts = [] if host_problem else list(hosts)
         if ownership == {True, False}:
             # Ferrum serves the same port-agnostic routes on every selected listener, so a catch-all would also take
             # unknown host names from the listener where another server is the default.
@@ -547,7 +548,8 @@ class _Nginx:
                               "Keep SNI handshake rejection on a front proxy, or review whether accepting handshakes "
                               "for unknown SNIs is acceptable before migrating.")
             scope.problems.append("ssl_reject_handshake cannot be reproduced by Ferrum's HTTPS listener")
-        base = {"hosts": None if host_problem else hosts, "listen_port": listen_port, "requires_tls": requires_tls,
+        base = {"hosts": None if host_problem else hosts, "declared_hosts": declared_hosts,
+                "listen_port": listen_port, "requires_tls": requires_tls,
                 "server_label": info["label"], "server_ref": ref, "extra": bool(host_problem),
                 "client_cas": client_cas, "client_ca_problem": client_ca_problem,
                 "on_plain": on_plain, "on_tls": on_tls}
@@ -561,7 +563,7 @@ class _Nginx:
                     continue
             scope.problems.append("an 'if' block is not supported")
         if server_return is not None:
-            if _is_https_redirect(server_return.args) and not tls_ports:
+            if _is_https_redirect(server_return.args, base["declared_hosts"]) and not tls_ports:
                 route = self._new_route(base, "/", "prefix", ref + " return")
                 route.https_redirect = True  # type: ignore[attr-defined]
                 for problem in scope.problems:
@@ -836,11 +838,8 @@ class _Nginx:
         if access_problem:
             route.refuse(access_problem)
         if returns:
-            if allow_https_redirect and _is_https_redirect(returns[0].args):
+            if allow_https_redirect and _is_https_redirect(returns[0].args, base["declared_hosts"]):
                 route.https_redirect = True  # type: ignore[attr-defined]
-                target_url = returns[0].args[-1]
-                if "$" not in target_url:
-                    self._apply_return(route, returns[0].args)
                 return route
             self._apply_return(route, returns[0].args)
             return route
@@ -1002,8 +1001,13 @@ class _Nginx:
                             passive = {"unhealthy_threshold": min(fails, 1000)}
                     elif flag.startswith("fail_timeout=") and passive is not None:
                         seconds = (util.parse_nginx_time_ms(flag[13:], allow_ms=False) or 10_000) // 1000
-                        passive["unhealthy_window_seconds"] = max(1, seconds)
-                        passive["healthy_after_seconds"] = max(1, seconds)
+                        clamped = min(max(1, seconds), 86_400)
+                        if seconds > 86_400:
+                            self.report.warning("nginx-passive-health", ref,
+                                                "fail_timeout exceeds Ferrum's 86400s passive health-check ceiling "
+                                                "and was clamped to 86400s.")
+                        passive["unhealthy_window_seconds"] = clamped
+                        passive["healthy_after_seconds"] = clamped
                 spec.targets.append(Target(parsed[0], parsed[1], weight))
             elif directive.name == "least_conn":
                 spec.algorithm = "least_connections"
@@ -1247,10 +1251,32 @@ def _server_hosts(names: list[str]) -> tuple[list[str], str | None]:
     return hosts, None
 
 
-def _is_https_redirect(args: list[str]) -> bool:
+def _is_https_redirect(args: list[str], server_hosts: list[str] | None = None) -> bool:
+    """Whether an NGINX ``return`` is an HTTP-to-HTTPS scheme upgrade (preserving the request URI).
+
+    Static redirects to fixed destinations (such as ``return 301 https://auth.example.test/login;``) or
+    custom-port HTTPS redirects are NOT listener-level scheme upgrades and stay as termination routes.
+    """
     if len(args) == 1:
-        return args[0].startswith("https://")
-    return len(args) == 2 and args[0] in ("301", "302", "303", "307", "308") and args[1].startswith("https://")
+        url = args[0]
+    elif len(args) == 2 and args[0] in ("301", "302", "303", "307", "308"):
+        url = args[1]
+    else:
+        return False
+    if not url.startswith("https://"):
+        return False
+    target = url[len("https://"):]
+    if target in ("$host$request_uri", "$server_name$request_uri", "$http_host$request_uri",
+                  "$host$uri", "$server_name$uri"):
+        return True
+    if target.endswith("$request_uri"):
+        host_part = target[:-len("$request_uri")]
+        if host_part and "/" not in host_part and ":" not in host_part and "$" not in host_part:
+            if server_hosts is None:
+                return True
+            if server_hosts and host_part.lower() in {h.lower() for h in server_hosts}:
+                return True
+    return False
 
 
 def _is_https_redirect_termination(termination: dict) -> bool:

@@ -883,6 +883,29 @@ class NginxFrontendScopeTest(unittest.TestCase):
         """)
         self.assertTrue(one_arg_res.tls_only)
         self.assertIn("nginx-https-redirect", codes(one_arg_rep, "info"))
+        # Plaintext server returning a static fixed HTTPS destination (not a $request_uri scheme upgrade) stays a
+        # static 301 termination route even alongside an unrelated HTTPS server; fail_timeout > 86400s clamps cleanly.
+        fixed_dest_res, fixed_dest_rep, _ = nginx("""
+            upstream slow {
+                server 10.0.0.1:8080 max_fails=2 fail_timeout=2d;
+            }
+            server {
+                listen 80;
+                server_name legacy.example.test;
+                return 301 https://auth.example.test/login;
+            }
+            server {
+                listen 80 default_server;
+                location /api/ { proxy_pass http://slow; }
+            }
+        """)
+        legacy_p = one_proxy(self, fixed_dest_res.config, "/", "legacy.example.test")
+        self.assertEqual(legacy_p["labels"]["ferrum-migration/status"], "terminated")
+        self.assertEqual(plugin(self, fixed_dest_res.config, legacy_p, "request_termination")["config"]["headers"][
+            "location"], "https://auth.example.test/login")
+        self.assertEqual(fixed_dest_res.config["upstreams"][0]["health_checks"]["passive"][
+            "unhealthy_window_seconds"], 86_400)
+        self.assertIn("nginx-passive-health", codes(fixed_dest_rep, "warning"))
 
         # Redirect-only plaintext server alongside a wildcard/default plaintext server stays as a refused placeholder
         # so the broader plaintext server cannot absorb the redirected host's traffic.

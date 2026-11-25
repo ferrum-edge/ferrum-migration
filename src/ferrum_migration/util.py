@@ -584,12 +584,14 @@ def parse_nginx_time_ms(value: object, *, allow_ms: bool = True) -> int | None:
             return None
         if not allow_ms and unit == "ms":
             return None
-        if unit is None and match.end() != len(text):
-            return None
-        rank = _NGINX_TIME_RANK[unit]
-        if rank >= prev_rank:
-            return None
-        prev_rank = rank
+        if unit is None:
+            if match.end() != len(text):
+                return None
+        else:
+            rank = _NGINX_TIME_RANK[unit]
+            if rank >= prev_rank:
+                return None
+            prev_rank = rank
         try:
             total += int(match.group(1)) * _NGINX_TIME_MS[unit]
         except ValueError:

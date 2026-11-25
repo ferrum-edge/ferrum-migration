@@ -260,6 +260,7 @@ class MatchingTest(unittest.TestCase):
         self.assertEqual(util.parse_nginx_time_ms("60s"), 60_000)
         self.assertEqual(util.parse_nginx_time_ms("5"), 5_000)
         self.assertEqual(util.parse_nginx_time_ms("1m 500ms"), 60_500)
+        self.assertEqual(util.parse_nginx_time_ms("1s2"), 3_000)
         self.assertIsNone(util.parse_nginx_time_ms("1m\t500ms"))
         self.assertIsNone(util.parse_nginx_time_ms("500ms 1m"))
         self.assertIsNone(util.parse_nginx_time_ms("1y", allow_ms=True))

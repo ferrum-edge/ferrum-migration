@@ -384,21 +384,32 @@ class _Istio:
                 stripped: list[str] = []
                 any_host = False
                 for entry in server["hosts"]:
-                    _, _, host = entry.rpartition("/")
-                    host = host.lower().strip()
+                    _, _, raw_host = entry.rpartition("/")
+                    host = raw_host.lower().strip()
                     if host == "*":
-                        any_host = True
-                    elif host and host not in seen_hosts:
-                        seen_hosts.add(host)
-                        stripped.append(host)
-                        total_hosts += 1
-                        if total_hosts > max_hosts:
-                            raise InputError(f"more than {max_hosts} hosts across Istio httpsRedirect servers")
+                        if not any_host:
+                            any_host = True
+                            total_hosts += 1
+                            if total_hosts > max_hosts:
+                                raise InputError(f"more than {max_hosts} hosts across Istio httpsRedirect servers")
+                    elif host:
+                        norm_host = util.normalize_host(host) or host.rstrip(".")
+                        if norm_host and norm_host not in seen_hosts:
+                            seen_hosts.add(norm_host)
+                            stripped.append(norm_host)
+                            total_hosts += 1
+                            if total_hosts > max_hosts:
+                                raise InputError(f"more than {max_hosts} hosts across Istio httpsRedirect servers")
                 if not any_host and not stripped:
                     continue
                 bucket = main_redirects if server["port"] == settings.main_http_port else extra_redirects
                 bucket.append(((gw_ns, gw_name), srv_idx, server, [] if any_host else stripped))
+        seen_extra_scopes: set[tuple[int | None, tuple[str, ...]]] = set()
         for (gw_ns, gw_name), srv_idx, server, hosts in extra_redirects:
+            scope_key = (server["port"], tuple(hosts))
+            if scope_key in seen_extra_scopes:
+                continue
+            seen_extra_scopes.add(scope_key)
             route = RouteSpec(
                 ref=server["ref"],
                 name=f"{gw_ns}-{gw_name}-https-redirect-{srv_idx}",
@@ -418,8 +429,13 @@ class _Istio:
         has_live_https = any(not r.skip and not r.refusals and "https" in (r.protocols or ())
                              for r in self.plan.routes)
         has_other_plain = any(not r.skip and not r.requires_tls and r.listen_port is None for r in self.plan.routes)
+        seen_main_scopes: set[tuple[str, ...]] = set()
         if has_live_https and not has_other_plain:
             for (gw_ns, gw_name), srv_idx, server, hosts in main_redirects:
+                scope_key_m = tuple(hosts)
+                if scope_key_m in seen_main_scopes:
+                    continue
+                seen_main_scopes.add(scope_key_m)
                 route = RouteSpec(
                     ref=server["ref"],
                     name=f"{gw_ns}-{gw_name}-https-redirect-{srv_idx}",
@@ -439,6 +455,10 @@ class _Istio:
         exact_redir: dict[str, str] = {}
         wild_redir: dict[str, str] = {}
         for (gw_ns, gw_name), srv_idx, server, hosts in main_redirects:
+            scope_key_m = tuple(hosts)
+            if scope_key_m in seen_main_scopes:
+                continue
+            seen_main_scopes.add(scope_key_m)
             route = RouteSpec(
                 ref=server["ref"],
                 name=f"{gw_ns}-{gw_name}-https-redirect-{srv_idx}",
@@ -468,7 +488,8 @@ class _Istio:
                 continue
             matched_ref: str | None = any_redir_ref
             if matched_ref is None and proj["hosts"]:
-                for host in proj["hosts"]:
+                for raw_host in proj["hosts"]:
+                    host = util.normalize_host(raw_host) or raw_host.strip().lower().rstrip(".")
                     if host.startswith("*."):
                         # A wildcard plaintext host ties with an identical wildcard redirect or is covered by a
                         # broader wildcard redirect.
