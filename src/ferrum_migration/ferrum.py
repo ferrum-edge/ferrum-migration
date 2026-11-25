@@ -900,7 +900,7 @@ def _resolve_conflicts(candidates: list[_Cand], report: Report) -> list[_Cand]:
         if len(members) < 2:
             continue
         collapsed_group = False
-        for component in _components(members):
+        for component in _components(members, host_only=path is None):
             if len(component) < 2:
                 continue
             refs = [m.route.ref for m in component]
@@ -1002,7 +1002,7 @@ def _resolve_conflicts(candidates: list[_Cand], report: Report) -> list[_Cand]:
     return result
 
 
-def _components(members: list[_Cand]) -> list[list[_Cand]]:
+def _components(members: list[_Cand], *, host_only: bool = True) -> list[list[_Cand]]:
     n = len(members)
     parent = list(range(n))
 
@@ -1041,13 +1041,16 @@ def _components(members: list[_Cand]) -> list[list[_Cand]]:
                     else:
                         union(i, prev)
         if wild_owner:
-            for host, owner in exact_owner.items():
-                dot = host.find(".")
-                while dot != -1:
-                    w = wild_owner.get(host[dot:])
-                    if w is not None:
-                        union(owner, w)
-                    dot = host.find(".", dot + 1)
+            # On path slots Ferrum keeps exact-host and wildcard-host proxies in separate tiers (exact beats wildcard);
+            # exact-to-wildcard overlap conflicts only in the host-only slot.
+            if host_only:
+                for host, owner in exact_owner.items():
+                    dot = host.find(".")
+                    while dot != -1:
+                        w = wild_owner.get(host[dot:])
+                        if w is not None:
+                            union(owner, w)
+                        dot = host.find(".", dot + 1)
             for suffix, owner in wild_owner.items():
                 dot = suffix.find(".", 1)
                 while dot != -1:
@@ -1087,36 +1090,52 @@ def _refuse_nested_wildcard_scopes(plan: Plan, candidates: list[_Cand], report: 
     host for a path the narrower scope does not route more specifically. No closure can prevent that, so
     every route carrying the broader pattern becomes a fail-closed placeholder.
     """
-    # Index only wildcard-bearing scopes by suffix (exact-host scopes cannot participate in wildcard nesting).
-    wild_by_suffix: dict[str, list[tuple[int | None, str, str]]] = {}
-    wild_scopes: list[tuple[Any, list[str], set[str]]] = []
+    wild_scopes: list[tuple[Any, set[str]]] = []
+    # Map (inner_port, parent_suffix) -> up to 2 distinct witness (inner_ref, inner_wilds_set) entries so each
+    # broader scope is evaluated in O(1) per pattern without quadratic outer x inner pair allocation.
+    witnesses_by_port: dict[int | None, dict[str, list[tuple[str, set[str]]]]] = {}
+    witnesses_any: dict[str, list[tuple[str, set[str]]]] = {}
     for scope in plan.host_scopes:
-        wilds = [h for h in _scope_hosts(scope) if h.startswith("*.")]
+        wilds = {h for h in _scope_hosts(scope) if h.startswith("*.")}
         if not wilds:
             continue
-        wset = set(wilds)
-        wild_scopes.append((scope, wilds, wset))
-        for pattern in wset:
-            wild_by_suffix.setdefault(pattern[1:], []).append((scope.listen_port, scope.ref, pattern))
-    if not wild_scopes:
-        return
-    leaky: list[tuple[str, int | None, str, str]] = []
-    seen_leaky: set[tuple[str, int | None, str, str]] = set()
-    for inner, inner_wilds, inner_set in wild_scopes:
-        for other in inner_wilds:
+        wild_scopes.append((scope, wilds))
+        port_map = witnesses_by_port.setdefault(scope.listen_port, {})
+        for other in wilds:
             suffix = other[1:]
             dot = suffix.find(".", 1)
             while dot != -1:
                 parent = suffix[dot:]
-                for outer_port, outer_ref, pattern in wild_by_suffix.get(parent, ()):
-                    if outer_ref == inner.ref or pattern in inner_set \
-                            or not matching.ports_compatible(outer_port, inner.listen_port):
-                        continue
-                    entry = (pattern, outer_port, outer_ref, inner.ref)
-                    if entry not in seen_leaky:
-                        seen_leaky.add(entry)
-                        leaky.append(entry)
+                if ("*" + parent) not in wilds:
+                    # Record at most 2 distinct scope refs per (port, parent_suffix) and globally for port-None queries.
+                    plist = port_map.setdefault(parent, [])
+                    if len(plist) < 2 and all(r != scope.ref for r, _ in plist):
+                        plist.append((scope.ref, wilds))
+                    alist = witnesses_any.setdefault(parent, [])
+                    if len(alist) < 2 and all(r != scope.ref for r, _ in alist):
+                        alist.append((scope.ref, wilds))
                 dot = suffix.find(".", dot + 1)
+    if not wild_scopes:
+        return
+    leaky: list[tuple[str, int | None, str, str]] = []
+    seen_outer: set[tuple[str, int | None, str]] = set()
+    for outer, outer_wilds in wild_scopes:
+        for pattern in outer_wilds:
+            key = (pattern, outer.listen_port, outer.ref)
+            if key in seen_outer:
+                continue
+            suffix = pattern[1:]
+            cand_witnesses: list[tuple[str, set[str]]] = []
+            if outer.listen_port is None:
+                cand_witnesses.extend(witnesses_any.get(suffix, ()))
+            else:
+                cand_witnesses.extend(witnesses_by_port.get(outer.listen_port, {}).get(suffix, ()))
+                cand_witnesses.extend(witnesses_by_port.get(None, {}).get(suffix, ()))
+            for inner_ref, inner_wilds in cand_witnesses:
+                if inner_ref != outer.ref and pattern not in inner_wilds:
+                    seen_outer.add(key)
+                    leaky.append((pattern, outer.listen_port, outer.ref, inner_ref))
+                    break
     if not leaky:
         return
     leaky_by_pattern: dict[str, list[tuple[int | None, str, str]]] = {}
@@ -1151,7 +1170,79 @@ def _refuse_nested_wildcard_scopes(plan: Plan, candidates: list[_Cand], report: 
                      "wildcard with explicit host names, then convert again.")
 
 
-def _add_regex_closure(scope, hosts: list[str], candidates: list[_Cand], report: Report) -> bool:
+class _PortHostIndex:
+    """Per-port hash index for O(|hosts| * labels) host-overlap queries on a single route slot."""
+
+    def __init__(self) -> None:
+        self.catchall: dict[int | None, list[_Cand]] = {}
+        self.exact: dict[int | None, dict[str, list[_Cand]]] = {}
+        self.wild: dict[int | None, dict[str, list[_Cand]]] = {}
+        self.exact_by_suffix: dict[int | None, dict[str, list[_Cand]]] = {}
+        self.wild_by_parent: dict[int | None, dict[str, list[_Cand]]] = {}
+
+    def add(self, cand: _Cand) -> None:
+        port = cand.listen_port
+        if not cand.hosts:
+            self.catchall.setdefault(port, []).append(cand)
+            return
+        ex_map = self.exact.setdefault(port, {})
+        wi_map = self.wild.setdefault(port, {})
+        ex_suf = self.exact_by_suffix.setdefault(port, {})
+        wi_par = self.wild_by_parent.setdefault(port, {})
+        for h in cand.hosts:
+            if h.startswith("*."):
+                suffix = h[1:]
+                wi_map.setdefault(suffix, []).append(cand)
+                dot = suffix.find(".", 1)
+                while dot != -1:
+                    wi_par.setdefault(suffix[dot:], []).append(cand)
+                    dot = suffix.find(".", dot + 1)
+            else:
+                ex_map.setdefault(h, []).append(cand)
+                dot = h.find(".")
+                while dot != -1:
+                    ex_suf.setdefault(h[dot:], []).append(cand)
+                    dot = h.find(".", dot + 1)
+
+    def query(self, port: int | None, scope_hosts: list[str]) -> list[_Cand]:
+        found: list[_Cand] = []
+        seen_ids: set[int] = set()
+
+        def _add_all(items: list[_Cand] | None) -> None:
+            if not items:
+                return
+            for item in items:
+                iid = id(item)
+                if iid not in seen_ids:
+                    seen_ids.add(iid)
+                    found.append(item)
+
+        _add_all(self.catchall.get(port))
+        ex_map = self.exact.get(port, {})
+        wi_map = self.wild.get(port, {})
+        ex_suf = self.exact_by_suffix.get(port, {})
+        wi_par = self.wild_by_parent.get(port, {})
+        for h in scope_hosts:
+            if h.startswith("*."):
+                suffix = h[1:]
+                _add_all(wi_map.get(suffix))
+                _add_all(ex_suf.get(suffix))
+                _add_all(wi_par.get(suffix))
+                dot = suffix.find(".", 1)
+                while dot != -1:
+                    _add_all(wi_map.get(suffix[dot:]))
+                    dot = suffix.find(".", dot + 1)
+            else:
+                _add_all(ex_map.get(h))
+                dot = h.find(".")
+                while dot != -1:
+                    _add_all(wi_map.get(h[dot:]))
+                    dot = h.find(".", dot + 1)
+        return found
+
+
+def _add_regex_closure(scope, hosts: list[str], candidates: list[_Cand], regex_idx: _PortHostIndex,
+                       report: Report) -> bool:
     """Close a scope whose host-only closure would overlap another host-only route with a catch-any regex 404.
 
     Within a host tier Ferrum tries exact, prefix and regex routes (regex in config order) before host-only
@@ -1162,16 +1253,16 @@ def _add_regex_closure(scope, hosts: list[str], candidates: list[_Cand], report:
     chunks = _chunk_hosts_no_prune(hosts, host_only=False)
     if chunks is None:
         return False
-    for cand in candidates:
-        if cand.listen_port == scope.listen_port and cand.listen_path == REGEX_CLOSURE_PATH \
-                and matching.hosts_overlap(cand.hosts, hosts):
-            return False
+    if regex_idx.query(scope.listen_port, hosts):
+        return False
     for index, chunk in enumerate(chunks):
         suffix = f"-default-{index + 1}" if len(chunks) > 1 else "-default"
         synthetic = RouteSpec(ref=scope.ref, name=f"{scope.ref}{suffix}", hosts=chunk, kind="regex",
                               path=REGEX_CLOSURE_PATH[1:])
-        candidates.append(_Cand(synthetic, True, chunk, REGEX_CLOSURE_PATH, scope.listen_port,
-                                termination=NOT_FOUND_TERMINATION, kind_label="scope-default"))
+        closure = _Cand(synthetic, True, chunk, REGEX_CLOSURE_PATH, scope.listen_port,
+                        termination=NOT_FOUND_TERMINATION, kind_label="scope-default")
+        candidates.append(closure)
+        regex_idx.add(closure)
     report.info("scope-closure-regex", scope.ref,
                 "A host-only 404 route for this scope would overlap another host-only route, so a regex route "
                 "matching every path (answering 404, tried after the scope's own routes) closes it instead.")
@@ -1196,79 +1287,16 @@ def _refuse_fallthrough_targets(scope, hosts: list[str], candidates: list[_Cand]
 def _add_scope_closures(plan: Plan, candidates: list[_Cand], report: Report) -> None:
     _refuse_nested_wildcard_scopes(plan, candidates, report)
     scopes = sorted(plan.host_scopes, key=lambda s: matching.host_tier(s.hosts))
-    # Per-port hash index of host-only candidates so overlap lookups stay O(|hosts| * labels) instead of O(S^2).
-    ho_catchall: dict[int | None, list[_Cand]] = {}
-    ho_exact: dict[int | None, dict[str, list[_Cand]]] = {}
-    ho_wild: dict[int | None, dict[str, list[_Cand]]] = {}
-    ho_exact_by_suffix: dict[int | None, dict[str, list[_Cand]]] = {}
-    ho_wild_by_parent: dict[int | None, dict[str, list[_Cand]]] = {}
+    host_only_idx = _PortHostIndex()
+    regex_idx = _PortHostIndex()
     root_hosts: dict[int | None, set[str]] = {}
-
-    def _index_host_only(cand: _Cand) -> None:
-        port = cand.listen_port
-        if not cand.hosts:
-            ho_catchall.setdefault(port, []).append(cand)
-            return
-        ex_map = ho_exact.setdefault(port, {})
-        wi_map = ho_wild.setdefault(port, {})
-        ex_suf = ho_exact_by_suffix.setdefault(port, {})
-        wi_par = ho_wild_by_parent.setdefault(port, {})
-        for h in cand.hosts:
-            if h.startswith("*."):
-                suffix = h[1:]
-                wi_map.setdefault(suffix, []).append(cand)
-                dot = suffix.find(".", 1)
-                while dot != -1:
-                    wi_par.setdefault(suffix[dot:], []).append(cand)
-                    dot = suffix.find(".", dot + 1)
-            else:
-                ex_map.setdefault(h, []).append(cand)
-                dot = h.find(".")
-                while dot != -1:
-                    ex_suf.setdefault(h[dot:], []).append(cand)
-                    dot = h.find(".", dot + 1)
-
-    def _query_host_only(port: int | None, scope_hosts: list[str]) -> list[_Cand]:
-        found: list[_Cand] = []
-        seen_ids: set[int] = set()
-
-        def _add_all(items: list[_Cand] | None) -> None:
-            if not items:
-                return
-            for item in items:
-                iid = id(item)
-                if iid not in seen_ids:
-                    seen_ids.add(iid)
-                    found.append(item)
-
-        _add_all(ho_catchall.get(port))
-        ex_map = ho_exact.get(port, {})
-        wi_map = ho_wild.get(port, {})
-        ex_suf = ho_exact_by_suffix.get(port, {})
-        wi_par = ho_wild_by_parent.get(port, {})
-        for h in scope_hosts:
-            if h.startswith("*."):
-                suffix = h[1:]
-                _add_all(wi_map.get(suffix))
-                _add_all(ex_suf.get(suffix))
-                _add_all(wi_par.get(suffix))
-                dot = suffix.find(".", 1)
-                while dot != -1:
-                    _add_all(wi_map.get(suffix[dot:]))
-                    dot = suffix.find(".", dot + 1)
-            else:
-                _add_all(ex_map.get(h))
-                dot = h.find(".")
-                while dot != -1:
-                    _add_all(wi_map.get(h[dot:]))
-                    dot = h.find(".", dot + 1)
-        return found
-
     for cand in candidates:
         if cand.listen_path is None:
-            _index_host_only(cand)
+            host_only_idx.add(cand)
         elif cand.listen_path == "/":
             root_hosts.setdefault(cand.listen_port, set()).update(cand.hosts)
+        elif cand.listen_path == REGEX_CLOSURE_PATH:
+            regex_idx.add(cand)
     for scope in scopes:
         hosts = list(dict.fromkeys(h for h in (util.normalize_host(x) for x in scope.hosts) if h))
         if not hosts:
@@ -1276,7 +1304,7 @@ def _add_scope_closures(plan: Plan, candidates: list[_Cand], report: Report) -> 
         # A prefix route for "/" on exactly these host names already catches every unmatched path in their tier.
         if all(host in root_hosts.get(scope.listen_port, set()) for host in hosts):
             continue
-        overlapping = _query_host_only(scope.listen_port, hosts)
+        overlapping = host_only_idx.query(scope.listen_port, hosts)
         # Only a closure for the very same host names closes this scope. A covering wildcard closure does not:
         # Ferrum tries every path route of every matching wildcard pattern (and of the exact tier) before any
         # wildcard host-only route, so another scope's routes would still receive these hosts' unmatched paths.
@@ -1285,7 +1313,7 @@ def _add_scope_closures(plan: Plan, candidates: list[_Cand], report: Report) -> 
             continue
         chunks = None if overlapping else _chunk_hosts_no_prune(hosts, host_only=True)
         if overlapping or chunks is None:
-            if _add_regex_closure(scope, hosts, candidates, report):
+            if _add_regex_closure(scope, hosts, candidates, regex_idx, report):
                 continue
             refused = _refuse_fallthrough_targets(scope, hosts, candidates)
             report.error("scope-closure-skipped", scope.ref,
@@ -1303,7 +1331,7 @@ def _add_scope_closures(plan: Plan, candidates: list[_Cand], report: Report) -> 
             closure = _Cand(synthetic, True, chunk, None, scope.listen_port,
                             termination=NOT_FOUND_TERMINATION, kind_label="scope-default")
             candidates.append(closure)
-            _index_host_only(closure)
+            host_only_idx.add(closure)
         report.info("scope-closure", scope.ref,
                     "Added a host-only route answering 404 for paths this scope does not route, because the "
                     "source never falls through to other hosts' routes but Ferrum does.")

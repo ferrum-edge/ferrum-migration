@@ -249,7 +249,12 @@ class MatchingTest(unittest.TestCase):
         self.assertEqual(util.regex_literal_prefix("/files?/x"), "/file")
         self.assertIsNotNone(util.regex_problem("/(?=x)y"))
         self.assertIsNotNone(util.regex_problem(r"\057api"))
+        self.assertIsNotNone(util.regex_problem(r"^/api(?xx:[ab])$"))
+        self.assertIsNone(util.regex_problem(r"^/api[\\0]$"))
         self.assertIsNone(util.regex_problem("/users/(?P<id>[0-9]+)"))
+        self.assertIsNone(util.normalize_host("api.-team.example.test"))
+        self.assertIsNone(util.normalize_host("a" * 64 + ".example.test"))
+        self.assertEqual(util.normalize_host("Api.Example.Test."), "api.example.test")
 
     def test_durations_and_sizes(self):
         self.assertEqual(util.parse_go_duration_ms("1m30s"), 90_000)

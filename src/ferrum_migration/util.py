@@ -79,17 +79,25 @@ class IdAllocator:
 # ---------------------------------------------------------------------- hosts
 
 def normalize_host(raw: object) -> str | None:
-    """Ferrum proxy ``hosts`` entry: lowercase DNS name or ``*.suffix`` wildcard."""
+    """Ferrum proxy ``hosts`` entry: lowercase DNS name or ``*.suffix`` wildcard (RFC 1123 labels)."""
     if not isinstance(raw, str):
         return None
     host = raw.strip().lower()
     if host.endswith(".") and not host.endswith(".."):
         host = host[:-1]
-    if not host or len(host) > 253 or ".." in host:
+    if not host or len(host) > 253 or ".." in host or not host.isascii():
         return None
-    if _WILDCARD_RE.match(host) or _HOST_RE.match(host):
-        return host
-    return None
+    body = host[2:] if host.startswith("*.") else host
+    if not body:
+        return None
+    for label in body.split("."):
+        if not 1 <= len(label) <= 63:
+            return None
+        if not (label[0].isalnum() and label[-1].isalnum()):
+            return None
+        if any(not (ch.isalnum() or ch == "-") for ch in label):
+            return None
+    return host
 
 
 def normalize_backend_host(raw: object) -> str | None:
@@ -195,10 +203,77 @@ def canonical_path_problem(path: object) -> str | None:
 
 # --------------------------------------------------------------------- regex
 
-_REGEX_UNSUPPORTED = ("(?=", "(?!", "(?<=", "(?<!", "(?>", "(?#", "(?|", "(?R", "(?&", "(?P=",
-                      "\\G", "\\K", "\\Z", "\\k<", "\\k{", "\\g")
-_BACKREF = re.compile(r"\\[0-9]")
-_POSSESSIVE = re.compile(r"(?<!\\)[*+?}]\+")
+_RUST_REGEX_FLAGS = frozenset("imsURux")
+
+
+def _rust_regex_syntax_problem(pattern: str) -> str | None:
+    """Scan escapes and inline flag groups linearly to catch Python-accepted syntax rejected by Rust regex."""
+    n = len(pattern)
+    i = 0
+    in_class = False
+    while i < n:
+        ch = pattern[i]
+        if ch == "\\":
+            if i + 1 >= n:
+                return "regex ends with a trailing backslash"
+            nxt = pattern[i + 1]
+            if "0" <= nxt <= "9":
+                return "regex uses backreferences or octal escapes unsupported by the Rust regex engine"
+            if nxt in ("G", "K", "Z", "g") or (nxt == "k" and i + 2 < n and pattern[i + 2] in ("<", "{")):
+                return "regex uses escapes unsupported by the Rust regex engine"
+            i += 2
+            continue
+        if in_class:
+            if ch == "]":
+                in_class = False
+            i += 1
+            continue
+        if ch == "[":
+            in_class = True
+            i += 1
+            if i < n and pattern[i] == "^":
+                i += 1
+            if i < n and pattern[i] == "]":
+                i += 1
+            continue
+        if ch in "*+?}" and i + 1 < n and pattern[i + 1] == "+":
+            return "regex uses possessive quantifiers unsupported by the Rust regex engine"
+        if ch == "(" and i + 1 < n and pattern[i + 1] == "?":
+            if i + 2 >= n:
+                return "regex has an incomplete group"
+            c2 = pattern[i + 2]
+            if c2 in ("=", "!", ">", "#", "|", "R", "&"):
+                return "regex uses lookaround or group features unsupported by the Rust regex engine"
+            if c2 == "<":
+                if i + 3 < n and pattern[i + 3] in ("=", "!"):
+                    return "regex uses lookbehind unsupported by the Rust regex engine"
+            elif c2 == "P":
+                if i + 3 < n and pattern[i + 3] == "=":
+                    return "regex uses backreferences unsupported by the Rust regex engine"
+            elif c2 != ":":
+                # Inline flag group (?flags) or (?flags:...): Rust regex rejects duplicate flags and non-Rust flags.
+                j = i + 2
+                seen_flags: set[str] = set()
+                seen_dash = False
+                while j < n and pattern[j] not in (":", ")"):
+                    flag = pattern[j]
+                    if flag == "-":
+                        if seen_dash:
+                            return "regex inline flag group repeats '-'"
+                        seen_dash = True
+                    elif flag in _RUST_REGEX_FLAGS:
+                        if flag in seen_flags:
+                            return "regex inline flag group repeats a flag (rejected by Rust regex)"
+                        seen_flags.add(flag)
+                    else:
+                        return "regex uses inline flags unsupported by the Rust regex engine"
+                    j += 1
+                if j >= n:
+                    return "regex has an unclosed inline flag group"
+                i = j + 1
+                continue
+        i += 1
+    return None
 
 
 def regex_problem(pattern: object, *, max_bytes: int = MAX_REGEX_LENGTH) -> str | None:
@@ -211,9 +286,9 @@ def regex_problem(pattern: object, *, max_bytes: int = MAX_REGEX_LENGTH) -> str 
         return "regex contains control characters"
     if "%" in pattern:
         return "regex contains percent-escapes, which never match canonical request paths"
-    if any(token in pattern for token in _REGEX_UNSUPPORTED) or _BACKREF.search(pattern) \
-            or _POSSESSIVE.search(pattern):
-        return "regex uses lookaround, backreferences or other features the Rust regex engine lacks"
+    syntax_err = _rust_regex_syntax_problem(pattern)
+    if syntax_err is not None:
+        return syntax_err
     try:
         re.compile(pattern)
     except (re.error, OverflowError, RecursionError):

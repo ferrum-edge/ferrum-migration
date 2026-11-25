@@ -715,7 +715,28 @@ class _Nginx:
 
         Ferrum serves port-agnostic routes on both listeners, so each server's catch-all routes would also answer
         unknown host names on the listener where the other server is the default. Neither envelope is kept.
+        When no live plaintext route exists (so Ferrum disables the plaintext listener in TLS-only mode), a
+        refused plaintext-only catch-all route (such as a rejected literal-host redirect) is skipped rather than
+        taking down the valid HTTPS default server.
         """
+        has_live_plain = any(
+            not r.skip and not r.refusals and not r.requires_tls and r.listen_port is None
+            for r in self.plan.routes
+        )
+        has_live_https = any(
+            not r.skip and not r.refusals and "https" in (r.protocols or ())
+            for r in self.plan.routes
+        )
+        if has_live_https and not has_live_plain:
+            for idx, routes in list(self.catch_all_routes.items()):
+                if all(r.refusals and not r.requires_tls and r.protocols == frozenset({"http"}) for r in routes):
+                    for r in routes:
+                        r.skip = True
+                        r.skip_reason = "refused plaintext catch-all omitted in TLS-only mode"
+                        self.report.error("nginx-redirect-refused", r.ref,
+                                          f"Plaintext default route could not be migrated ({'; '.join(r.refusals)}); "
+                                          "omitted because Ferrum's TLS-only profile disables the plaintext listener.")
+                    del self.catch_all_routes[idx]
         if len(self.catch_all_routes) < 2:
             return
         for routes in self.catch_all_routes.values():
