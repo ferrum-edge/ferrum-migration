@@ -1221,15 +1221,22 @@ def _kong_rate_limiting(self: _Kong, config: dict, ref: str) -> tuple:
 
 
 def _kong_cors(self: _Kong, config: dict, ref: str) -> tuple:
+    local_preflight = config.get("preflight_continue") is not True
     raw_origins = config.get("origins")
     origins = str_list(raw_origins)
     if raw_origins is not None and origins is None:
+        if local_preflight:
+            return ("refuse", "CORS plugin answers preflights locally but origins has unexpected types "
+                              "(omitting would forward preflights to the backend)")
         self.report.warning("kong-cors", ref, "CORS omitted (origins has unexpected types); browsers block "
                             "cross-origin calls.")
         return ("omit",)
     origins = origins or ["*"]
     for origin in origins:
         if origin != "*" and _REGEX_HINT.search(origin.replace(".", "")):
+            if local_preflight:
+                return ("refuse", "CORS plugin answers preflights locally with regex origins that cannot be "
+                                  "migrated (omitting would forward preflights to the backend)")
             self.report.warning("kong-cors-regex", ref, "Regex CORS origins are not translated; CORS omitted, so "
                                 "browsers block cross-origin calls (fail closed).")
             return ("omit",)
@@ -1240,6 +1247,8 @@ def _kong_cors(self: _Kong, config: dict, ref: str) -> tuple:
                                  config.get("credentials"), config.get("max_age"), config.get("preflight_continue"),
                                  config.get("private_network"))
     if built is None:
+        if local_preflight:
+            return ("refuse", f"CORS plugin answers preflights locally and cannot be migrated ({problem})")
         self.report.warning("kong-cors", ref, f"CORS omitted ({problem}); browsers block cross-origin calls.")
         return ("omit",)
     if origins == ["*"] and config.get("credentials"):

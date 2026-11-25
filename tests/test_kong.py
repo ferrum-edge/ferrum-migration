@@ -515,24 +515,31 @@ class KongHardeningTest(unittest.TestCase):
         alt_res, _alt_rep, _ = migrate("kong", alt_text)
         assert_structurally_valid(self, alt_res.config)
         self.assertEqual(one_proxy(self, alt_res.config, "~/a|/b")["labels"]["ferrum-migration/status"], "refused")
-        # Malformed CORS origins omits CORS (fail closed in browsers) rather than defaulting to ["*"].
+        # Untranslatable CORS refuses fail-closed when Kong answered preflights locally (default preflight_continue:
+        # false), so preflights are not newly forwarded to the backend; with preflight_continue: true it omits.
         cors_text = textwrap.dedent("""
             _format_version: "3.0"
             services:
               - name: s
                 url: http://s.internal:8080
                 routes:
-                  - name: bad-cors
+                  - name: bad-cors-local
                     paths: [/c/]
                     plugins:
                       - name: cors
                         config: {origins: [123]}
+                  - name: bad-cors-passthrough
+                    paths: [/cp/]
+                    plugins:
+                      - name: cors
+                        config: {origins: [123], preflight_continue: true}
         """)
         cors_res, cors_rep, _ = migrate("kong", cors_text)
         assert_structurally_valid(self, cors_res.config)
-        cors_proxy = one_proxy(self, cors_res.config, "/c")
-        self.assertEqual(cors_proxy["labels"]["ferrum-migration/status"], "migrated")
-        self.assertEqual(cors_proxy["plugins"], [])
+        self.assertEqual(one_proxy(self, cors_res.config, "/c")["labels"]["ferrum-migration/status"], "refused")
+        cp_proxy = one_proxy(self, cors_res.config, "/cp")
+        self.assertEqual(cp_proxy["labels"]["ferrum-migration/status"], "migrated")
+        self.assertEqual(cp_proxy["plugins"], [])
         self.assertIn("kong-cors", codes(cors_rep, "warning"))
 
     def test_top_level_consumer_group_plugin_quarantines_group_members(self):

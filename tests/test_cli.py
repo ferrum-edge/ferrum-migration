@@ -357,6 +357,13 @@ class CliTest(unittest.TestCase):
         self.assertEqual(code, 5)
         self.assertIn("64-byte limit", err)
         self.assertFalse(os.path.exists(out))
+        out_ev = self.out_dir("yaml-events")
+        with mock.patch("ferrum_migration.cli.MAX_FERRUM_YAML_EVENTS", 10):
+            code, _out, err = run_cli("convert", fixture_path("nginx", "nginx.conf"), "--from", "nginx", "--out", out_ev)
+        self.assertEqual(code, 5)
+        self.assertIn("10-event YAML limit", err)
+        self.assertIn("--resources-format json", err)
+        self.assertFalse(os.path.exists(out_ev))
 
 
 if __name__ == "__main__":

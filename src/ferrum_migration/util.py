@@ -412,8 +412,8 @@ def has_top_level_alternation(pattern: str) -> bool:
 
 # ------------------------------------------------------------ durations/sizes
 
-_GO_DURATION = re.compile(r"^[+-]?(?:(?:\d+(?:\.\d*)?|\.\d+)(?:ns|us|µs|μs|ms|s|m|h))+$")
-_GO_PART = re.compile(r"(\d+(?:\.\d*)?|\.\d+)(ns|us|µs|μs|ms|s|m|h)")
+_GO_DURATION = re.compile(r"^[+-]?(?:(?:\d+(?:\.\d*)?|\.\d+)(?:ns|us|µs|μs|ms|s|m|h))+$", re.ASCII)
+_GO_PART = re.compile(r"(\d+(?:\.\d*)?|\.\d+)(ns|us|µs|μs|ms|s|m|h)", re.ASCII)
 _GO_UNIT_MS = {
     "ns": 1e-6, "us": 1e-3, "µs": 1e-3, "μs": 1e-3, "ms": 1.0, "s": 1000.0, "m": 60_000.0, "h": 3_600_000.0,
 }

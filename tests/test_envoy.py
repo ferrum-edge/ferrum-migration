@@ -620,7 +620,7 @@ class EnvoyHardeningTest(unittest.TestCase):
              }},
             {"name": "envoy.filters.http.router"},
         ]
-        cd_res, _cd_rep, _ = migrate("envoy", yaml.safe_dump(comp_def))
+        cd_res, cd_rep, _ = migrate("envoy", yaml.safe_dump(comp_def))
         cd_cfg = plugin(self, cd_res.config, one_proxy(self, cd_res.config, "/api"), "compression")["config"]
         self.assertEqual(cd_cfg["algorithms"], ["gzip"])
         self.assertEqual(cd_cfg["min_content_length"], 30)
@@ -628,6 +628,22 @@ class EnvoyHardeningTest(unittest.TestCase):
         self.assertIn("application/xml", cd_cfg["content_types"])
         self.assertIn("application/grpc-web+proto", cd_cfg["content_types"])
         self.assertEqual(len(cd_cfg["content_types"]), 20)
+        self.assertIn("envoy-compressor", codes(cd_rep, "warning"))
+        # Explicit min_content_length: 0 also normalizes to Envoy's 30-byte default.
+        comp_zero = copy.deepcopy(comp_def)
+        comp_zero["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"][
+            "http_filters"][0]["typed_config"]["response_direction_config"] = {
+            "common_config": {"min_content_length": 0},
+        }
+        cz_res = migrate("envoy", yaml.safe_dump(comp_zero))[0]
+        self.assertEqual(plugin(self, cz_res.config, one_proxy(self, cz_res.config, "/api"), "compression")[
+            "config"]["min_content_length"], 30)
+        # Inherited vhost / route_config request_mirror_policies emit envoy-mirror warnings.
+        inh_mirror = minimal_bootstrap({"path_separated_prefix": "/api"})
+        inh_mirror["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"][
+            "route_config"]["virtual_hosts"][0]["request_mirror_policies"] = [{"cluster": "shadow"}]
+        _ihm_res, ihm_rep, _ = migrate("envoy", yaml.safe_dump(inh_mirror))
+        self.assertIn("envoy-mirror", codes(ihm_rep, "warning"))
         # Multiple compressor HTTP filters in one HCM (whether both active or one active + one disabled via
         # common_config.enabled.default_value: false) refuse fail-closed because Envoy's client-order
         # Accept-Encoding tie-breaking, inter-filter header removal, and disabled-compressor registry
@@ -1190,12 +1206,22 @@ class EnvoyHardeningTest(unittest.TestCase):
         self.assertEqual(plugin(self, gf_res.config, one_proxy(self, gf_res.config, "/api"), "fault_injection")[
             "config"], {"abort": {"status_code": 200, "grpc_status": 7, "percentage": 100.0,
                                   "body": "fault filter abort"}})
-        # HCM local_reply_config refuses routes with active fault aborts (local_reply_config can rewrite them).
+        # HCM local_reply_config refuses routes with active fault aborts, direct_response, or redirects.
         lr_fault = copy.deepcopy(grpc_fault)
         lr_fault["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"][
             "local_reply_config"] = {"body_format": {"text_format": "custom"}}
         self.assertEqual(one_proxy(self, migrate("envoy", yaml.safe_dump(lr_fault))[0].config, "/api")[
             "labels"]["ferrum-migration/status"], "refused")
+        lr_local = minimal_bootstrap({"path": "/healthz"})
+        llhcm = lr_local["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"]
+        llhcm["local_reply_config"] = {"body_format": {"json_format": {"msg": "%LOCAL_REPLY_BODY%"}}}
+        llhcm["route_config"]["virtual_hosts"][0]["routes"] = [
+            {"name": "dr", "match": {"path": "/healthz"}, "direct_response": {"status": 200}},
+            {"name": "redir", "match": {"prefix": "/"}, "redirect": {"https_redirect": True}},
+        ]
+        ll_res = migrate("envoy", yaml.safe_dump(lr_local))[0]
+        self.assertEqual(one_proxy(self, ll_res.config, "=/healthz")["labels"]["ferrum-migration/status"], "refused")
+        self.assertEqual(one_proxy(self, ll_res.config, "/")["labels"]["ferrum-migration/status"], "refused")
 
         for star_pattern in (r"\*", r"\x{2a}", r"\Q*\E", r"(?:a?|\*?){30}"):
             with self.subTest(star_pattern=star_pattern):

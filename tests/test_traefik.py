@@ -1261,7 +1261,8 @@ class TraefikHardeningTest(unittest.TestCase):
             "http": {
                 "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/v3/`)", "service": "main",
                                   "middlewares": ["c"]}},
-                "middlewares": {"c": {"compress": {"minResponseBodyBytes": 0}}},
+                "middlewares": {"c": {"compress": {"minResponseBodyBytes": -10, "includedContentTypes": [],
+                                                   "encodings": []}}},
                 "services": {"main": {"loadBalancer": {"servers": [{"url": "http://main.internal:8080"}]}}},
             }
         })
@@ -1685,11 +1686,67 @@ class TraefikHardeningTest(unittest.TestCase):
                     "services": {"main": {"loadBalancer": {"servers": [{"url": "http://main.internal:8080"}]}}},
                 }
             }),
+            ("buffering-retry-with-disable", {
+                "http": {
+                    "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "main",
+                                      "middlewares": ["b"]}},
+                    "middlewares": {"b": {"buffering": {"retryExpression": "IsNetworkError()",
+                                                        "disableResponseBuffer": True}}},
+                    "services": {"main": {"loadBalancer": {"servers": [{"url": "http://main.internal:8080"}]}}},
+                }
+            }),
+            ("compress-include-and-exclude", {
+                "http": {
+                    "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "main",
+                                      "middlewares": ["c"]}},
+                    "middlewares": {"c": {"compress": {"includedContentTypes": ["text/plain"],
+                                                       "excludedContentTypes": ["text/html"]}}},
+                    "services": {"main": {"loadBalancer": {"servers": [{"url": "http://main.internal:8080"}]}}},
+                }
+            }),
+            ("compress-bad-default-encoding", {
+                "http": {
+                    "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "main",
+                                      "middlewares": ["c"]}},
+                    "middlewares": {"c": {"compress": {"encodings": ["gzip"], "defaultEncoding": "zstd"}}},
+                    "services": {"main": {"loadBalancer": {"servers": [{"url": "http://main.internal:8080"}]}}},
+                }
+            }),
+            ("headers-cors-regex-refused", {
+                "http": {
+                    "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "main",
+                                      "middlewares": ["h"]}},
+                    "middlewares": {"h": {"headers": {"accessControlAllowOriginListRegex": ["^https://.*\\.example$"]}}},
+                    "services": {"main": {"loadBalancer": {"servers": [{"url": "http://main.internal:8080"}]}}},
+                }
+            }),
+            ("transport-subms-header-timeout", {
+                "http": {
+                    "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "main"}},
+                    "services": {"main": {"loadBalancer": {"serversTransport": "t",
+                                                           "servers": [{"url": "http://main.internal:8080"}]}}},
+                    "serversTransports": {"t": {"forwardingTimeouts": {"responseHeaderTimeout": "100\u03bcs"}}},
+                }
+            }),
         ):
             with self.subTest(case=label):
                 res_bad, _rep_bad, _ = asserted(yaml.safe_dump(bad_doc))
                 self.assertEqual(one_proxy(self, res_bad.config, "/api", "a.example.test")["labels"][
                     "ferrum-migration/status"], "refused")
+        # Health-check interval and timeout clamp to Ferrum bounds (3600s and MAX_TIMEOUT_MS).
+        hc_doc = yaml.safe_dump({
+            "http": {
+                "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/hc/`)", "service": "main"}},
+                "services": {"main": {"loadBalancer": {
+                    "healthCheck": {"path": "/healthz", "interval": "2h", "timeout": "48h"},
+                    "servers": [{"url": "http://main.internal:8080"}],
+                }}},
+            }
+        })
+        hc_res = asserted(hc_doc)[0]
+        hc_active = hc_res.config["upstreams"][0]["health_checks"]["active"]
+        self.assertEqual(hc_active["interval_seconds"], 3600)
+        self.assertEqual(hc_active["timeout_ms"], 86_400_000)
         # compress.minResponseBodyBytes above u64::MAX omits compression cleanly instead of emitting invalid config.
         over_comp_doc = yaml.safe_dump({
             "http": {

@@ -443,12 +443,17 @@ class _Envoy:
                               "compression plugin")
         elif len(hcm_compressors) == 1 and compressor_filter_count == 1:
             hcm_plugins.append(PluginSpec("compression", hcm_compressors[0], ref))
+            self.report.warning("envoy-compressor", ref,
+                                "Envoy compresses responses without a Content-Type header and strips strong ETag "
+                                "validators when compressing, whereas Ferrum v0.9.21 requires a matching Content-Type "
+                                "and skips strong-ETag responses by default.")
         route_config = mapping(config.get("route_config"))
         shared = {"request_add": seq(route_config.get("request_headers_to_add")),
                   "request_remove": seq(route_config.get("request_headers_to_remove")),
                   "response_add": seq(route_config.get("response_headers_to_add")),
                   "response_remove": seq(route_config.get("response_headers_to_remove")),
                   "typed_per_filter_config": mapping(route_config.get("typed_per_filter_config")),
+                  "request_mirror_policies": seq(route_config.get("request_mirror_policies")),
                   "hcm_filter_kinds": hcm_filter_kinds,
                   "hcm_plugins": hcm_plugins,
                   "hcm_fault": hcm_fault,
@@ -665,12 +670,18 @@ class _Envoy:
                         "can enable or change a filter for this route, which is not migrated")
         if raw.get("direct_response") is not None:
             self._direct_response(spec, mapping(raw.get("direct_response")))
+            if shared.get("has_local_reply"):
+                spec.refuse("direct_response under HCM local_reply_config cannot be proven equivalent "
+                            "(local_reply_config can rewrite status, body, or content type)")
             if effective_fault is not None:
                 spec.refuse("fault filter runs before direct_response in Envoy, whereas Ferrum request_termination "
                             "answers before fault_injection")
             return spec
         if raw.get("redirect") is not None:
             self._redirect(spec, mapping(raw.get("redirect")), tls)
+            if shared.get("has_local_reply"):
+                spec.refuse("redirect under HCM local_reply_config cannot be proven equivalent "
+                            "(local_reply_config can rewrite status, body, or content type)")
             if effective_fault is not None:
                 spec.refuse("fault filter runs before redirect in Envoy, whereas Ferrum request_termination "
                             "answers before fault_injection")
@@ -679,7 +690,7 @@ class _Envoy:
         if not isinstance(action, dict):
             spec.refuse("route action is not a forwarding route")
             return spec
-        self._action(spec, action, vhost, ref)
+        self._action(spec, action, vhost, shared, ref)
         if effective_fault is not None:
             if shared.get("has_local_reply") and effective_fault.config.get("abort") is not None:
                 spec.refuse("fault abort under HCM local_reply_config cannot be proven equivalent "
@@ -738,7 +749,7 @@ class _Envoy:
             return
         spec.termination = {"status_code": code, "headers": {"location": location}, "body": ""}
 
-    def _action(self, spec: RouteSpec, action: dict, vhost: dict, ref: str) -> None:
+    def _action(self, spec: RouteSpec, action: dict, vhost: dict, shared: dict, ref: str) -> None:
         hash_on = None
         for policy in seq(action.get("hash_policy")):
             policy = mapping(policy)
@@ -793,8 +804,13 @@ class _Envoy:
             spec.retry = config
             for note in notes:
                 self.report.warning("envoy-retry", ref, note)
-        if action.get("request_mirror_policies"):
-            self._mirror_policies(spec, seq(action.get("request_mirror_policies")), ref)
+        # Envoy resolves request_mirror_policies by most-specific non-empty list across route, vhost, route_config.
+        raw_mirrors = (seq(action.get("request_mirror_policies"))
+                       or seq(vhost.get("request_mirror_policies"))
+                       or shared.get("request_mirror_policies")
+                       or [])
+        if raw_mirrors:
+            self._mirror_policies(spec, raw_mirrors, ref)
 
     def _mirror_policies(self, spec: RouteSpec, policies: list, ref: str) -> None:
         # Envoy mirrors rewrite :authority (appending '-shadow' by default, or keeping client :authority when
@@ -1434,12 +1450,14 @@ def _parse_envoy_compressor(typed: dict) -> tuple[str, Any]:
             return "disabled", None
     raw_min = common.get("min_content_length")
     if raw_min is None:
-        # Envoy CommonDirectionConfig defaults min_content_length to 30 bytes (Ferrum defaults to 256).
+        # Envoy CommonDirectionConfig resolves omitted or 0 min_content_length to 30 bytes (Ferrum defaults to 256).
         min_len: int | None = 30
     else:
         min_len = _proto_uint32(raw_min)
         if min_len is None:
             return "refuse", "response_direction_config.common_config.min_content_length is invalid"
+        if min_len == 0:
+            min_len = 30
     raw_types = common.get("content_type")
     content_types = str_list(raw_types) if raw_types is not None else None
     if raw_types is not None and content_types is None:

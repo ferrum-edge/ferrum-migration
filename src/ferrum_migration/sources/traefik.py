@@ -1073,6 +1073,10 @@ class _Traefik:
                     or (disable_resp is not None and not isinstance(disable_resp, bool)):
                 acc.refusals.append("buffering disableRequestBuffer/disableResponseBuffer must be a boolean")
                 return
+            if config.get("retryExpression") and (disable_req is True or disable_resp is True):
+                acc.refusals.append("buffering combines retryExpression with disableRequestBuffer/"
+                                    "disableResponseBuffer, which Traefik v3.8 rejects at middleware construction")
+                return
             req_size = None if disable_req is True else util.as_int(config.get("maxRequestBodyBytes"))
             if req_size and req_size > 0:
                 acc.refusals.append("buffering.maxRequestBodyBytes buffers and rejects oversized chunked uploads "
@@ -1133,37 +1137,60 @@ class _Traefik:
             acc.refusals.append(f"middleware type {safe_label(mw_type, 40)} has no safe Ferrum equivalent")
 
     def _compress(self, config: dict, acc: _Acc, ref: str) -> None:
-        if config.get("excludedContentTypes"):
+        raw_exc = config.get("excludedContentTypes")
+        exc_list = str_list(raw_exc) if raw_exc is not None else []
+        raw_inc = config.get("includedContentTypes")
+        inc_list = str_list(raw_inc) if raw_inc is not None else []
+        if (raw_exc is not None and exc_list is None) or (raw_inc is not None and inc_list is None):
+            acc.refusals.append("compress includedContentTypes/excludedContentTypes has unexpected types")
+            return
+        if exc_list and inc_list:
+            acc.refusals.append("compress sets both includedContentTypes and excludedContentTypes, which Traefik "
+                                "rejects at middleware construction")
+            return
+        raw_enc = config.get("encodings")
+        # Traefik v3.8 compress defaults encodings to ["gzip", "br", "zstd"] when omitted or empty.
+        if raw_enc is not None:
+            encodings = str_list(raw_enc)
+            if encodings is None:
+                acc.refusals.append("compress.encodings has unexpected types")
+                return
+            if not encodings:
+                encodings = ["gzip", "br", "zstd"]
+            elif any(enc.lower() not in ("gzip", "br", "zstd") for enc in encodings):
+                acc.refusals.append("compress.encodings names an encoding rejected by Traefik or unsupported in Ferrum")
+                return
+        else:
+            encodings = ["gzip", "br", "zstd"]
+        default_enc = config.get("defaultEncoding")
+        if default_enc is not None:
+            if not isinstance(default_enc, str):
+                acc.refusals.append("compress.defaultEncoding must be a string")
+                return
+            if default_enc and default_enc.lower() not in {enc.lower() for enc in encodings}:
+                acc.refusals.append("compress.defaultEncoding is not in the configured encodings list, which Traefik "
+                                    "rejects at middleware construction")
+                return
+        if exc_list:
             self.report.warning("traefik-compress", ref,
                                 "compress omitted: excludedContentTypes has no Ferrum equivalent (Ferrum uses an "
                                 "allow-list and cannot exclude specific response media types).")
-            return
-        raw_enc = config.get("encodings")
-        # Traefik v3.8 compress defaults encodings to ["gzip", "br", "zstd"] (in preference order).
-        encodings = str_list(raw_enc) if raw_enc is not None else ["gzip", "br", "zstd"]
-        if raw_enc is not None and (encodings is None or not encodings):
-            self.report.warning("traefik-compress", ref, "compress omitted: encodings has unexpected types.")
             return
         raw_min = config.get("minResponseBodyBytes")
         # Traefik compress uses 1024 bytes whenever minResponseBodyBytes is omitted or <= 0 (compress.go).
         min_len: int = 1024
         if raw_min is not None:
             parsed_min = util.as_int(raw_min)
-            if parsed_min is None or parsed_min < 0:
+            if parsed_min is None:
                 self.report.warning("traefik-compress", ref, "compress omitted: invalid minResponseBodyBytes.")
                 return
-            min_len = 1024 if parsed_min == 0 else parsed_min
-        raw_inc = config.get("includedContentTypes")
+            min_len = 1024 if parsed_min <= 0 else parsed_min
         inc: list[str] | None = None
-        if raw_inc is not None:
-            inc = str_list(raw_inc)
-            if not inc:
-                self.report.warning("traefik-compress", ref, "compress omitted: invalid includedContentTypes.")
-                return
+        if inc_list:
             # Traefik matches media types literally via mime.ParseMediaType; wildcard entries like 'text/*' never match
             # in Traefik but would widen compression as a range in Ferrum. Drop wildcard entries and omit if none stay.
-            exact_inc = [ct for ct in inc if "*" not in ct]
-            if len(exact_inc) != len(inc):
+            exact_inc = [ct for ct in inc_list if "*" not in ct]
+            if len(exact_inc) != len(inc_list):
                 self.report.warning("traefik-compress", ref,
                                     "compress.includedContentTypes wildcard entries ('*' or 'type/*') were dropped "
                                     "(Traefik matches media types literally whereas Ferrum treats 'type/*' as a range).")
@@ -1176,13 +1203,13 @@ class _Traefik:
         if built is None:
             self.report.warning("traefik-compress", ref, f"compress omitted ({problem}).")
             return
-        if raw_inc is None:
+        if not inc_list:
             self.report.warning("traefik-compress", ref,
                                 "compress has no includedContentTypes (Traefik compresses any non-excluded media "
                                 "type), whereas Ferrum applies its fixed default MIME allow-list (skipping types "
                                 "such as text/csv); specify explicit content_types in Ferrum if other media types "
                                 "must be compressed.")
-        if config.get("defaultEncoding"):
+        if default_enc:
             self.report.warning("traefik-compress", ref,
                                 "compress.defaultEncoding is not migrated; Ferrum negotiates via Accept-Encoding.")
         acc.plugins.append(PluginSpec("compression", built, ref))
@@ -1245,19 +1272,25 @@ class _Traefik:
             self.report.warning("traefik-sts", ref, "Traefik only sent HSTS over HTTPS; Ferrum sets it on every response.")
         if any(key.startswith("accessControl") for key in config):
             if config.get("accessControlAllowOriginListRegex"):
-                self.report.warning("traefik-cors-regex", ref, "Regex CORS origins are not translated; CORS omitted "
-                                    "(browsers block cross-origin calls).")
-            else:
-                built, problem = cors_config(str_list(config.get("accessControlAllowOriginList")) or [],
-                                             config.get("accessControlAllowMethods"),
-                                             config.get("accessControlAllowHeaders"),
-                                             config.get("accessControlExposeHeaders"),
-                                             config.get("accessControlAllowCredentials"),
-                                             config.get("accessControlMaxAge"))
-                if built:
-                    acc.plugins.append(PluginSpec("cors", built, ref))
+                acc.refusals.append("headers.accessControlAllowOriginListRegex answers CORS preflights locally and "
+                                    "cannot be migrated (omitting would forward preflights to the backend)")
+            elif any(config.get(key) for key in config if key.startswith("accessControl")):
+                raw_origins = config.get("accessControlAllowOriginList")
+                origins = str_list(raw_origins) if raw_origins is not None else []
+                if raw_origins is not None and origins is None:
+                    acc.refusals.append("headers.accessControlAllowOriginList has unexpected types")
                 else:
-                    self.report.warning("traefik-cors", ref, f"CORS omitted ({problem}).")
+                    built, problem = cors_config(origins or [],
+                                                 config.get("accessControlAllowMethods"),
+                                                 config.get("accessControlAllowHeaders"),
+                                                 config.get("accessControlExposeHeaders"),
+                                                 config.get("accessControlAllowCredentials"),
+                                                 config.get("accessControlMaxAge"))
+                    if built:
+                        acc.plugins.append(PluginSpec("cors", built, ref))
+                    else:
+                        acc.refusals.append(f"headers CORS policy answers preflights locally and cannot be migrated "
+                                            f"({problem})")
         if config.get("allowedHosts"):
             hosts = [host.lower() for host in (str_list(config.get("allowedHosts")) or [])]
             # Every headers middleware in the chain checks its own list, so a request must pass all of them:
@@ -1497,12 +1530,18 @@ class _Traefik:
             if util.classify_go_duration(forwarding.get(rw_key)) != "zero":
                 problems.append(f"serversTransport forwardingTimeouts.{rw_key} (Traefik v3.8+ per-socket deadline) "
                                 "has no Ferrum equivalent")
-        dial = util.parse_go_duration_ms(forwarding.get("dialTimeout"))
-        header = util.parse_go_duration_ms(forwarding.get("responseHeaderTimeout"))
-        if dial:
-            timeouts["connect"] = dial
-        if header:
-            timeouts["read"] = header
+        for src_key, dst_key in (("dialTimeout", "connect"), ("responseHeaderTimeout", "read")):
+            raw_dur = forwarding.get(src_key)
+            dur_cls = util.classify_go_duration(raw_dur)
+            if dur_cls == "invalid":
+                problems.append(f"serversTransport forwardingTimeouts.{src_key} is not a valid duration")
+            elif dur_cls == "nonzero":
+                dur_ms = util.parse_go_duration_ms(raw_dur)
+                if not dur_ms:
+                    problems.append(f"serversTransport forwardingTimeouts.{src_key} is positive but below Ferrum's "
+                                    "1ms timeout resolution")
+                else:
+                    timeouts[dst_key] = dur_ms
         return tls, timeouts, problems
 
     def _servers(self, lb: dict, ref: str) -> tuple[str | None, list[Target], list[str]]:
@@ -1571,13 +1610,20 @@ class _Traefik:
     def _health(self, health: dict, ref: str) -> dict | None:
         if not health or not isinstance(health.get("path"), str):
             return None
-        entry: dict[str, Any] = {"http_path": health["path"]}
+        http_path = health["path"]
+        if not http_path.startswith("/") or len(http_path.encode("utf-8")) > util.MAX_BACKEND_PATH_LENGTH \
+                or any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in http_path):
+            self.report.warning("traefik-health", ref,
+                                "Active health check path is not representable in Ferrum (must start with '/' and "
+                                f"be at most {util.MAX_BACKEND_PATH_LENGTH} bytes); active health check omitted.")
+            return None
+        entry: dict[str, Any] = {"http_path": http_path}
         interval = util.parse_go_duration_ms(health.get("interval", "30s"))
         timeout = util.parse_go_duration_ms(health.get("timeout", "5s"))
         if interval:
-            entry["interval_seconds"] = max(1, interval // 1000)
+            entry["interval_seconds"] = max(1, min(interval // 1000, 3600))
         if timeout:
-            entry["timeout_ms"] = timeout
+            entry["timeout_ms"] = max(1, min(timeout, util.MAX_TIMEOUT_MS))
         if health.get("scheme") == "https":
             entry["use_tls"] = True
         if health.get("port") or health.get("hostname") or health.get("headers"):
