@@ -1243,24 +1243,27 @@ class IstioCaseAndNamesTest(unittest.TestCase):
         self.assertEqual(plugins_of(hp_res.config, hp_api), [])
         self.assertIn("istio-dropped", codes(hp_rep, "warning"))
 
-        # Gateway httpsRedirect server alongside a wildcard plaintext server refuses both the redirect placeholder
-        # AND overlapping plaintext routes (even longer prefixes like /api) so plaintext cannot bypass httpsRedirect;
-        # disjoint plaintext hosts stay live.
+        # Gateway httpsRedirect server alongside plaintext servers: Ferrum's exact-host tier already isolates an
+        # exact redirect placeholder (secure.example.test) from broader wildcard plaintext (*.example.test), while a
+        # wildcard redirect (*.blocked.test) refuses covered exact/wildcard plaintext routes (api.blocked.test /api).
         mixed_redir = textwrap.dedent("""
             apiVersion: networking.istio.io/v1
             kind: Gateway
             metadata: {name: gw, namespace: default}
             spec:
               servers:
-                - port: {number: 80, name: http-redir, protocol: HTTP}
+                - port: {number: 80, name: http-redir-exact, protocol: HTTP}
                   hosts: ["*/secure.example.test"]
                   tls: {httpsRedirect: true}
+                - port: {number: 80, name: http-redir-wild, protocol: HTTP}
+                  hosts: ["*/*.blocked.test"]
+                  tls: {httpsRedirect: true}
                 - port: {number: 80, name: http-pub, protocol: HTTP}
-                  hosts: ["*/*.example.test", "*/public.other.test"]
+                  hosts: ["*/*.example.test", "*/api.blocked.test"]
             ---
             apiVersion: networking.istio.io/v1
             kind: VirtualService
-            metadata: {name: vs-overlap, namespace: default}
+            metadata: {name: vs-broader, namespace: default}
             spec:
               hosts: ["*.example.test"]
               gateways: [gw]
@@ -1270,21 +1273,21 @@ class IstioCaseAndNamesTest(unittest.TestCase):
             ---
             apiVersion: networking.istio.io/v1
             kind: VirtualService
-            metadata: {name: vs-disjoint, namespace: default}
+            metadata: {name: vs-covered, namespace: default}
             spec:
-              hosts: ["public.other.test"]
+              hosts: ["api.blocked.test"]
               gateways: [gw]
               http:
-                - match: [{uri: {prefix: /ok}}]
+                - match: [{uri: {prefix: /api}}]
                   route: [{destination: {host: pub.default.svc.cluster.local, port: {number: 8080}}}]
         """)
         mr_res = migrate("istio", mixed_redir)[0]
         self.assertEqual(one_proxy(self, mr_res.config, "/", "secure.example.test")["labels"][
             "ferrum-migration/status"], "refused")
         self.assertEqual(one_proxy(self, mr_res.config, "/api", "*.example.test")["labels"][
-            "ferrum-migration/status"], "refused")
-        self.assertEqual(one_proxy(self, mr_res.config, "/ok", "public.other.test")["labels"][
             "ferrum-migration/status"], "migrated")
+        self.assertEqual(one_proxy(self, mr_res.config, "/api", "api.blocked.test")["labels"][
+            "ferrum-migration/status"], "refused")
 
 
 if __name__ == "__main__":

@@ -435,6 +435,7 @@ class _Acc:
     allowed_hosts: list[str] | None = None
     resp_size_limited: bool = False
     has_compress: bool = False
+    has_cors: bool = False
     mutates_origin_header: bool = False
     mutates_preflight_header: bool = False
 
@@ -718,6 +719,10 @@ class _Traefik:
         else:
             for mw_name, mw_type, mw_config in self._resolve_middlewares(middleware_names, acc, 0, set()):
                 self._apply_middleware(mw_name, mw_type, mw_config, acc, ref)
+        if acc.has_cors and acc.mutates_origin_header:
+            acc.refusals.append("a headers middleware on this router removes or rewrites the Origin request header "
+                                "while CORS is active; Traefik evaluates response CORS headers against the mutated "
+                                "request, whereas Ferrum captures Origin before request_transformer")
         groups: dict[tuple, dict] = {}
         for term in terms:
             evaluated = evaluate_term(term)
@@ -734,6 +739,9 @@ class _Traefik:
             self.report.warning("traefik-rule-unsatisfiable", ref, "Rule can never match; not emitted.")
             return
         is_plain_https_redirect = acc.https_redirect and not requires_tls
+        if acc.https_redirect and requires_tls:
+            acc.refusals.append("redirectScheme on a TLS router still redirects requests arriving on non-443 "
+                                "authority ports (such as :8443) in Traefik, which Ferrum cannot reproduce")
         for number, ((kind, path, methods, extra), group) in enumerate(groups.items()):
             spec = RouteSpec(ref=ref if len(groups) == 1 else f"{ref} alternative #{number + 1}",
                              name=name if number == 0 else f"{name}-{number + 1}")
@@ -799,18 +807,13 @@ class _Traefik:
             id(spec) in self.https_redirects and not spec.refusals and not spec.plugins
             for spec in plaintext
         ):
-            self.plan.settings.https_redirect_seen = True
-            seen_refs: set[str] = set()
             for spec in plaintext:
                 rref = self.redirect_router_refs.get(id(spec), spec.ref)
-                if rref not in seen_refs:
-                    seen_refs.add(rref)
-                    self.report.info("traefik-https-redirect", rref,
-                                     "HTTP-to-HTTPS redirect router: not emitted; Ferrum's TLS-only profile "
-                                     "disables the plaintext listener instead.")
+                spec.skip = True
+                spec.skip_reason = "HTTPS redirect"
+                spec.https_redirect_fold = ("traefik-https-redirect", rref)
                 self.priority.pop(id(spec), None)
                 self.entrypoints_of.pop(id(spec), None)
-            self.plan.routes = [spec for spec in self.plan.routes if id(spec) not in self.https_redirects]
             return
         for spec in self.plan.routes:
             if id(spec) in self.https_redirects:
@@ -1343,6 +1346,7 @@ class _Traefik:
                 ))
             )
             if has_cors:
+                acc.has_cors = True
                 if acc.mutates_origin_header or mutates_origin_now:
                     acc.refusals.append("headers middleware removes or rewrites the Origin request header on a CORS "
                                         "route, whereas Ferrum evaluates CORS before request_transformer")
@@ -1761,10 +1765,9 @@ class _Traefik:
         if status_code is not None:
             entry["healthy_status_codes"] = [status_code]
         else:
-            self.report.warning("traefik-health", ref,
-                                "Active health check omits status (Traefik accepts HTTP 200-399), whereas Ferrum "
-                                "uses its default healthy_status_codes; configure healthy_status_codes explicitly "
-                                "if other 2xx/3xx responses must count as healthy.")
+            # Traefik considers any HTTP 200-399 response healthy when status is omitted or 0 (healthcheck.go),
+            # whereas Ferrum defaults to [200, 302] when healthy_status_codes is omitted (MAX_STATUS_CODES = 500).
+            entry["healthy_status_codes"] = list(range(200, 400))
         probe_scheme = str(health.get("scheme") or backend_scheme).lower()
         if probe_scheme == "https":
             entry["use_tls"] = True

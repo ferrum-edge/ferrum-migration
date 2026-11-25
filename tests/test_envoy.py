@@ -1384,6 +1384,26 @@ class EnvoyHardeningTest(unittest.TestCase):
         self.assertNotIn("envoy-https-redirect", codes(pr_rep, "info"))
         self.assertEqual(one_proxy(self, pr_res.config, "/", "app.example.test")["labels"][
             "ferrum-migration/status"], "refused")
+        # port_redirect: 0 (proto3 unset) folds cleanly alongside live HTTPS, whereas an active buffer filter
+        # (which can locally return 413 before the redirect) prevents folding.
+        zero_redir = copy.deepcopy(port_redir)
+        zero_redir["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"][
+            "route_config"]["virtual_hosts"][0]["routes"][0]["redirect"]["port_redirect"] = 0
+        zr_res, zr_rep, _ = migrate("envoy", yaml.safe_dump(zero_redir))
+        self.assertTrue(zr_res.tls_only)
+        self.assertIn("envoy-https-redirect", codes(zr_rep, "info"))
+        buf_redir = copy.deepcopy(zero_redir)
+        buf_redir["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"][
+            "http_filters"] = [
+            {"name": "envoy.filters.http.buffer",
+             "typed_config": {"@type": "type.googleapis.com/envoy.extensions.filters.http.buffer.v3.Buffer",
+                              "max_request_bytes": 1024}},
+            {"name": "envoy.filters.http.router"},
+        ]
+        br_res, br_rep, _ = migrate("envoy", yaml.safe_dump(buf_redir))
+        self.assertNotIn("envoy-https-redirect", codes(br_rep, "info"))
+        self.assertEqual(one_proxy(self, br_res.config, "/", "app.example.test")["labels"][
+            "ferrum-migration/status"], "refused")
 
 
 if __name__ == "__main__":

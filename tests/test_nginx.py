@@ -758,7 +758,7 @@ class NginxFrontendScopeTest(unittest.TestCase):
         """
         result, report, _ = nginx(conf)
         assert_structurally_valid(self, result.config)
-        api = one_proxy(self, result.config, "/api", "app.example.test")
+        api = one_proxy(self, result.config, "/api")
         comp = plugin(self, result.config, api, "compression")["config"]
         self.assertEqual(comp, {
             "algorithms": ["gzip"],
@@ -769,7 +769,7 @@ class NginxFrontendScopeTest(unittest.TestCase):
             "weaken_strong_etag": True,
         })
         for path in ("/nogzip", "/wild", "/typewild", "/disabled-ua"):
-            p = one_proxy(self, result.config, path, "app.example.test")
+            p = one_proxy(self, result.config, path)
             self.assertNotIn("compression", [pl["plugin_name"] for pl in plugins_of(result.config, p)], path)
         self.assertIn("nginx-gzip", codes(report, "warning"))
 
@@ -785,7 +785,7 @@ class NginxFrontendScopeTest(unittest.TestCase):
             }}
             """
             dp_res, dp_rep, _ = nginx(default_conf)
-            dp_p = one_proxy(self, dp_res.config, "/html", "def.example.test")
+            dp_p = one_proxy(self, dp_res.config, "/html")
             self.assertNotIn("compression", [pl["plugin_name"] for pl in plugins_of(dp_res.config, dp_p)])
             self.assertIn("nginx-gzip", codes(dp_rep, "warning"))
 
@@ -802,7 +802,7 @@ class NginxFrontendScopeTest(unittest.TestCase):
         }
         """
         def_res, def_rep, _ = nginx(html_only_conf)
-        html_p = one_proxy(self, def_res.config, "/html", "def.example.test")
+        html_p = one_proxy(self, def_res.config, "/html")
         self.assertEqual(plugin(self, def_res.config, html_p, "compression")["config"], {
             "algorithms": ["gzip"], "min_content_length": 20, "content_types": ["text/html"],
             "gzip_level": 1, "remove_accept_encoding": False, "weaken_strong_etag": True,
@@ -824,7 +824,7 @@ class NginxFrontendScopeTest(unittest.TestCase):
             }}
             """
             hm_res, hm_rep, _ = nginx(huge_min_conf)
-            self.assertEqual(plugins_of(hm_res.config, one_proxy(self, hm_res.config, "/html", "def.example.test")), [])
+            self.assertEqual(plugins_of(hm_res.config, one_proxy(self, hm_res.config, "/html")), [])
             self.assertIn("nginx-gzip", codes(hm_rep, "warning"))
 
         # Malformed or huge proxy_read_timeout values do not backtrack catastrophically or crash int() (and warn).
@@ -838,7 +838,7 @@ class NginxFrontendScopeTest(unittest.TestCase):
             }}
             """
             bt_res, bt_rep, _ = nginx(bad_to_conf)
-            self.assertEqual(one_proxy(self, bt_res.config, "/api", "to.example.test")["labels"][
+            self.assertEqual(one_proxy(self, bt_res.config, "/api")["labels"][
                 "ferrum-migration/status"], "migrated")
             self.assertIn("nginx-timeout", codes(bt_rep, "warning"))
         # Valid spaced compound NGINX timeout ("1m 500ms") is parsed accurately.
@@ -850,8 +850,39 @@ class NginxFrontendScopeTest(unittest.TestCase):
                 location /api/ { proxy_pass http://api.internal:8080; }
             }
         """)
-        self.assertEqual(one_proxy(self, spaced_to_res.config, "/api", "to.example.test")["backend_read_timeout_ms"],
+        self.assertEqual(one_proxy(self, spaced_to_res.config, "/api")["backend_read_timeout_ms"],
                          60_500)
+
+        # Static HTTPS redirect location on a mixed plaintext server stays a live 301 termination (not refused);
+        # 1-arg `return https://$host$request_uri;` folds cleanly alongside a live HTTPS server.
+        mixed_static_res, _ms_rep, _ = nginx("""
+            server {
+                listen 80;
+                server_name a.example.test;
+                location / { proxy_pass http://app.internal:8080; }
+                location = /login { return 301 https://auth.example.test/login; }
+            }
+        """)
+        login_p = one_proxy(self, mixed_static_res.config, "=/login")
+        self.assertEqual(login_p["labels"]["ferrum-migration/status"], "terminated")
+        self.assertEqual(plugin(self, mixed_static_res.config, login_p, "request_termination")["config"]["status_code"],
+                         301)
+        one_arg_res, one_arg_rep, _ = nginx("""
+            server {
+                listen 80;
+                server_name a.example.test;
+                return https://$host$request_uri;
+            }
+            server {
+                listen 443 ssl;
+                server_name a.example.test;
+                ssl_certificate /etc/certs/tls.crt;
+                ssl_certificate_key /etc/certs/tls.key;
+                location /api/ { proxy_pass http://app.internal:8080; }
+            }
+        """)
+        self.assertTrue(one_arg_res.tls_only)
+        self.assertIn("nginx-https-redirect", codes(one_arg_rep, "info"))
 
         # Redirect-only plaintext server alongside a wildcard/default plaintext server stays as a refused placeholder
         # so the broader plaintext server cannot absorb the redirected host's traffic.

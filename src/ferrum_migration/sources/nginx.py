@@ -266,8 +266,8 @@ class _Nginx:
                 else:
                     child.body_size = size
             elif name in ("proxy_connect_timeout", "grpc_connect_timeout", "proxy_read_timeout", "grpc_read_timeout",
-                          "proxy_send_timeout", "grpc_send_timeout") and args:
-                value = util.parse_nginx_time_ms(args[0])
+                          "proxy_send_timeout", "grpc_send_timeout"):
+                value = util.parse_nginx_time_ms(args[0], allow_ms=True) if len(args) == 1 else None
                 if value is not None:
                     child.timeouts[name.split("_", 1)[1].replace("_timeout", "")] = value
                 else:
@@ -589,7 +589,10 @@ class _Nginx:
             return
         for route in routes:
             if getattr(route, "https_redirect", False):
-                route.refuse("HTTP-to-HTTPS redirect location mixed with non-redirect locations")
+                if route.termination and not route.refusals:
+                    route.https_redirect = False  # type: ignore[attr-defined]
+                else:
+                    route.refuse("HTTP-to-HTTPS redirect location mixed with non-redirect locations")
         _check_precedence(routes)
         self.plan.routes.extend(routes)
         self._note_catch_all(info, base, routes)
@@ -607,6 +610,7 @@ class _Nginx:
         If another plaintext server keeps Ferrum's HTTP listener open, no live (unrefused) HTTPS route exists in the
         input, or a redirect server carries refusals or local-answering plugins, keep its routes as fail-closed refused
         placeholders so a broader wildcard/default plaintext server cannot absorb the redirected host's traffic.
+        Final fold confirmation happens in the emitter once all validation and client-CA checks complete.
         """
         if not self.redirect_servers:
             return
@@ -625,10 +629,12 @@ class _Nginx:
             )
         )
         if can_fold:
-            self.plan.settings.https_redirect_seen = True
-            for ref, _, _, _ in self.redirect_servers:
-                self.report.info("nginx-https-redirect", ref, "HTTP-to-HTTPS redirect server: not emitted; Ferrum's "
-                                 "TLS-only profile disables the plaintext listener instead.")
+            for ref, _info, _base, routes in self.redirect_servers:
+                for route in routes:
+                    route.skip = True
+                    route.skip_reason = "HTTPS redirect"
+                    route.https_redirect_fold = ("nginx-https-redirect", ref)
+                self.plan.routes.extend(routes)
             return
         for ref, info, base, routes in self.redirect_servers:
             for route in routes:
@@ -832,8 +838,9 @@ class _Nginx:
         if returns:
             if allow_https_redirect and _is_https_redirect(returns[0].args):
                 route.https_redirect = True  # type: ignore[attr-defined]
-                if access_config:
-                    route.plugins.insert(0, PluginSpec("ip_restriction", access_config, ref))
+                target_url = returns[0].args[-1]
+                if "$" not in target_url:
+                    self._apply_return(route, returns[0].args)
                 return route
             self._apply_return(route, returns[0].args)
             return route
@@ -994,7 +1001,7 @@ class _Nginx:
                         if fails > 0:
                             passive = {"unhealthy_threshold": min(fails, 1000)}
                     elif flag.startswith("fail_timeout=") and passive is not None:
-                        seconds = (util.parse_nginx_time_ms(flag[13:]) or 10_000) // 1000
+                        seconds = (util.parse_nginx_time_ms(flag[13:], allow_ms=False) or 10_000) // 1000
                         passive["unhealthy_window_seconds"] = max(1, seconds)
                         passive["healthy_after_seconds"] = max(1, seconds)
                 spec.targets.append(Target(parsed[0], parsed[1], weight))
@@ -1241,12 +1248,14 @@ def _server_hosts(names: list[str]) -> tuple[list[str], str | None]:
 
 
 def _is_https_redirect(args: list[str]) -> bool:
-    return len(args) == 2 and args[0] in ("301", "302", "307", "308") and args[1].startswith("https://")
+    if len(args) == 1:
+        return args[0].startswith("https://")
+    return len(args) == 2 and args[0] in ("301", "302", "303", "307", "308") and args[1].startswith("https://")
 
 
 def _is_https_redirect_termination(termination: dict) -> bool:
     location = mapping_get(termination, "headers", "location")
-    return termination.get("status_code") in (301, 302, 307, 308) and isinstance(location, str) \
+    return termination.get("status_code") in (301, 302, 303, 307, 308) and isinstance(location, str) \
         and location.startswith("https://")
 
 
@@ -1264,8 +1273,7 @@ def _is_https_redirect_if(directive: Directive) -> bool:
                          "($scheme != 'https')"):
         return False
     body = directive.block or []
-    return len(body) == 1 and body[0].name == "return" and len(body[0].args) == 2 \
-        and body[0].args[0] in ("301", "302", "307", "308") and body[0].args[1].startswith("https://")
+    return len(body) == 1 and body[0].name == "return" and _is_https_redirect(body[0].args)
 
 
 def _nginx_regex(pattern: str, case_insensitive: bool) -> str | None:

@@ -163,6 +163,7 @@ def emit(plan: Plan, options: EmitOptions, report: Report) -> EmitResult:
     _poison(routes)
     _poison_case_variants(plan, routes)
     _resolve_frontend_client_ca(plan, routes, report, mode)
+    _finalize_https_redirects(plan, routes, mode, report)
     candidates = _build_candidates(routes)
     candidates = _resolve_conflicts(candidates, report)
     _add_scope_closures(plan, candidates, report)
@@ -182,6 +183,40 @@ def emit(plan: Plan, options: EmitOptions, report: Report) -> EmitResult:
     return EmitResult(config=config, stats=stats, tls_only=tls_only,
                       basic_auth_used=builder.basic_auth_used, secrets_emitted=builder.secrets_emitted,
                       frontend_protocols=mode)
+
+
+def _finalize_https_redirects(plan: Plan, routes: list[RouteSpec], mode: str, report: Report) -> None:
+    """Confirm deferred plaintext HTTP-to-HTTPS redirect folds only after final listener & TLS validation.
+
+    A redirect candidate folds away (and emits its ``*-https-redirect`` info diagnostic) only if the final
+    profile disables plaintext (``mode == "https"``) AND at least one live (unrefused) HTTPS route survived
+    validation, precedence, poisoning, and client-CA scope checks. Otherwise, un-skip and refuse the redirect
+    candidates as fail-closed placeholders.
+    """
+    candidates = [route for route in routes if route.https_redirect_fold is not None]
+    if not candidates:
+        return
+    has_surviving_https = mode == "https" and any(
+        not route.skip and not route.refusals and "https" in (_effective_protocols(route) or ())
+        for route in routes
+    )
+    if has_surviving_https:
+        plan.settings.https_redirect_seen = True
+        seen: set[tuple[str, str]] = set()
+        for route in candidates:
+            assert route.https_redirect_fold is not None
+            code, ref = route.https_redirect_fold
+            if (code, ref) not in seen:
+                seen.add((code, ref))
+                report.info(code, ref,
+                            "HTTP-to-HTTPS redirect: not emitted; Ferrum's TLS-only profile disables the plaintext "
+                            "listener instead.")
+        return
+    for route in candidates:
+        route.skip = False
+        route.skip_reason = ""
+        route.https_redirect_fold = None
+        route.refuse("HTTP-to-HTTPS redirect cannot be folded away because no live HTTPS route survived validation")
 
 
 def _assert_frontend_protocols(candidates: list[_Cand], mode: str) -> None:

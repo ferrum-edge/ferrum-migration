@@ -71,7 +71,8 @@ class TraefikFixtureTest(unittest.TestCase):
         upstream = upstream_of(self.config, proxy)
         self.assertEqual(len(upstream["targets"]), 2)
         self.assertEqual(upstream["health_checks"]["active"],
-                         {"http_path": "/health", "interval_seconds": 10, "timeout_ms": 3000})
+                         {"http_path": "/health", "interval_seconds": 10, "timeout_ms": 3000,
+                          "healthy_status_codes": list(range(200, 400))})
         request_rules = plugin(self, self.config, proxy, "request_transformer")["config"]["rules"]
         self.assertIn({"operation": "update", "target": "header", "key": "x-gateway", "value": "ferrum"}, request_rules)
         self.assertIn({"operation": "remove", "target": "header", "key": "x-debug"}, request_rules)
@@ -1882,6 +1883,25 @@ class TraefikHardeningTest(unittest.TestCase):
                     "services": {"main": {"loadBalancer": {"servers": [{"url": "http://main.internal:8080"}]}}},
                 }
             }),
+            ("headers-strip-origin-after-cors", {
+                "http": {
+                    "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "main",
+                                      "middlewares": ["cors_mw", "strip_origin"]}},
+                    "middlewares": {
+                        "cors_mw": {"headers": {"accessControlAllowOriginList": ["https://app.example.test"]}},
+                        "strip_origin": {"headers": {"customRequestHeaders": {"Origin": ""}}},
+                    },
+                    "services": {"main": {"loadBalancer": {"servers": [{"url": "http://main.internal:8080"}]}}},
+                }
+            }),
+            ("redirect-scheme-default-port-on-tls", {
+                "http": {
+                    "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "main",
+                                      "tls": {}, "middlewares": ["redir"]}},
+                    "middlewares": {"redir": {"redirectScheme": {"scheme": "https", "port": "443"}}},
+                    "services": {"main": {"loadBalancer": {"servers": [{"url": "http://main.internal:8080"}]}}},
+                }
+            }),
             ("redirect-scheme-custom-port-on-tls", {
                 "http": {
                     "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "main",
@@ -1970,37 +1990,40 @@ class TraefikHardeningTest(unittest.TestCase):
         oc_res, oc_rep, _ = asserted(over_comp_doc)
         self.assertEqual(plugins_of(oc_res.config, one_proxy(self, oc_res.config, "/api", "a.example.test")), [])
         self.assertIn("traefik-compress", codes(oc_rep, "warning"))
-        # Pathless gRPC healthCheck emits a traefik-health warning; pathless HTTP healthCheck: {} maps to '/'.
-        grpc_hc_doc = yaml.safe_dump({
+        # Isolated pathless gRPC healthCheck emits a traefik-health warning; pathless HTTP healthCheck: {} maps to
+        # '/' with Traefik's 200-399 healthy status range.
+        grpc_only_res, grpc_only_rep, _ = asserted(yaml.safe_dump({
             "http": {
-                "routers": {
-                    "r": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "main"},
-                    "r2": {"rule": "Host(`a.example.test`) && PathPrefix(`/http/`)", "service": "http_hc"},
-                },
-                "services": {
-                    "main": {"loadBalancer": {
-                        "healthCheck": {"mode": "grpc"},
-                        "servers": [{"url": "http://main.internal:8080"}],
-                    }},
-                    "http_hc": {"loadBalancer": {
-                        "healthCheck": {},
-                        "servers": [{"url": "http://hc.internal:8080"}],
-                    }},
-                },
+                "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "main"}},
+                "services": {"main": {"loadBalancer": {
+                    "healthCheck": {"mode": "grpc"},
+                    "servers": [{"url": "http://main.internal:8080"}],
+                }}},
             }
-        })
-        ghc_res, ghc_rep, _ = asserted(grpc_hc_doc)
-        self.assertEqual(len(ghc_res.config["upstreams"]), 1)
-        self.assertEqual(ghc_res.config["upstreams"][0]["health_checks"]["active"]["http_path"], "/")
-        self.assertIn("traefik-health", codes(ghc_rep, "warning"))
-        # redirectScheme: {scheme: https, port: "443"} folds into TLS-only alongside a live HTTPS router,
-        # and redirectScheme: {scheme: https} without a custom port is a no-op on a TLS router.
+        }))
+        self.assertEqual(grpc_only_res.config["upstreams"], [])
+        self.assertIn("traefik-health", codes(grpc_only_rep, "warning"))
+        http_hc_res, _http_hc_rep, _ = asserted(yaml.safe_dump({
+            "http": {
+                "routers": {"r2": {"rule": "Host(`a.example.test`) && PathPrefix(`/http/`)", "service": "http_hc"}},
+                "services": {"http_hc": {"loadBalancer": {
+                    "healthCheck": {},
+                    "servers": [{"url": "http://hc.internal:8080"}],
+                }}},
+            }
+        }))
+        self.assertEqual(len(http_hc_res.config["upstreams"]), 1)
+        hc_act = http_hc_res.config["upstreams"][0]["health_checks"]["active"]
+        self.assertEqual(hc_act["http_path"], "/")
+        self.assertEqual(hc_act["healthy_status_codes"], list(range(200, 400)))
+        # redirectScheme: {scheme: https, port: "443"} on a plaintext router folds into TLS-only alongside a live
+        # HTTPS router (and does NOT emit traefik-https-redirect when the controls assertion is absent and the HTTPS
+        # router is refused by _outside_controls).
         redir_443_doc = yaml.safe_dump({
             "http": {
                 "routers": {
                     "plain_redir": {"rule": "Host(`a.example.test`)", "service": "main", "middlewares": ["r443"]},
-                    "tls_ok": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "main",
-                               "tls": {}, "middlewares": ["r443"]},
+                    "tls_ok": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "main", "tls": {}},
                 },
                 "middlewares": {"r443": {"redirectScheme": {"scheme": "https", "port": "443"}}},
                 "services": {"main": {"loadBalancer": {"servers": [{"url": "http://main.internal:8080"}]}}},
@@ -2011,6 +2034,9 @@ class TraefikHardeningTest(unittest.TestCase):
         self.assertIn("traefik-https-redirect", codes(r443_rep, "info"))
         self.assertEqual(one_proxy(self, r443_res.config, "/api", "a.example.test")["labels"][
             "ferrum-migration/status"], "migrated")
+        unasserted_res, unasserted_rep, _ = migrate("traefik", redir_443_doc)
+        self.assertNotIn("traefik-https-redirect", codes(unasserted_rep, "info"))
+        self.assertEqual(live_routes(unasserted_res.config), [])
         # Canonical schema gate checks newly supported compress/grpcWeb/mirror/v3.8 fields.
         for bad_case in (
             {"http": {"middlewares": {"c": {"compress": {"Encodings": ["gzip"]}}}}},

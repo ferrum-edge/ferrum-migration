@@ -127,6 +127,7 @@ class RouteSpec:
     protocols: frozenset[str] | None = None
     skip: bool = False
     skip_reason: str = ""
+    https_redirect_fold: tuple[str, str] | None = None
     # Maintained by the emitter.
     path_ok: bool = True
     trailing_slash: bool = False

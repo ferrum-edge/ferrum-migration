@@ -512,7 +512,7 @@ class _Envoy:
                                vhost, shared)
             if filter_refusal:
                 spec.refuse(filter_refusal)
-            if buffer_limit and buffer_limit > 0 and not spec.termination and not getattr(spec, "https_redirect", False):
+            if buffer_limit and buffer_limit > 0 and not spec.termination:
                 spec.plugins.append(PluginSpec("request_size_limiting", {"max_bytes": buffer_limit}, ref))
             if not spec.termination and not getattr(spec, "https_redirect", False):
                 for hp in shared.get("hcm_plugins", []):
@@ -538,7 +538,7 @@ class _Envoy:
         if not self.redirect_vhosts:
             return
         local_plugins = {"cors", "basic_auth", "key_auth", "jwt_auth", "ip_restriction", "rate_limiting",
-                         "request_termination", "fault_injection"}
+                         "request_termination", "fault_injection", "request_size_limiting"}
         has_live_https = any(not r.skip and not r.refusals and "https" in (r.protocols or ())
                              for r in self.plan.routes)
         has_other_plain = any(not r.skip and not r.requires_tls and r.listen_port is None for r in self.plan.routes)
@@ -552,11 +552,12 @@ class _Envoy:
             )
         )
         if can_fold:
-            self.plan.settings.https_redirect_seen = True
-            for ref, _, _, _ in self.redirect_vhosts:
-                self.report.info("envoy-https-redirect", ref,
-                                 "HTTP-to-HTTPS redirect virtual host: not emitted; Ferrum's TLS-only profile "
-                                 "disables the plaintext listener instead.")
+            for ref, _hosts, _listen_port, routes in self.redirect_vhosts:
+                for route in routes:
+                    route.skip = True
+                    route.skip_reason = "HTTPS redirect"
+                    route.https_redirect_fold = ("envoy-https-redirect", ref)
+                self.plan.routes.extend(routes)
             return
         for ref, hosts, listen_port, routes in self.redirect_vhosts:
             for route in routes:
@@ -777,10 +778,10 @@ class _Envoy:
         port_redir: int | None = None
         if raw_port is not None:
             parsed_port = util.as_int(raw_port)
-            if parsed_port is None or not 1 <= parsed_port <= 65535:
+            if parsed_port is None or not 0 <= parsed_port <= 65535:
                 spec.refuse("redirect port_redirect is invalid")
                 return
-            port_redir = parsed_port
+            port_redir = None if parsed_port == 0 else parsed_port
         if (redirect.get("https_redirect") or redirect.get("scheme_redirect") == "https") \
                 and port_redir in (None, 443):
             if not tls and not redirect.get("host_redirect") and not redirect.get("path_redirect"):
@@ -792,9 +793,14 @@ class _Envoy:
         scheme = redirect.get("scheme_redirect") or ("https" if redirect.get("https_redirect") else None)
         host = redirect.get("host_redirect")
         path = redirect.get("path_redirect")
-        if code is None or not (scheme and host and path):
+        if code is None or not (scheme and host and isinstance(path, str) and path):
             spec.refuse("only fully static redirects (scheme, host and path) are migrated")
             return
+        if "?" not in path and redirect.get("strip_query") is not True:
+            spec.refuse("static redirect preserves incoming query strings unless strip_query: true or path_redirect "
+                        "sets a fixed query, which Ferrum request_termination cannot reproduce dynamically")
+            return
+        norm_path = path if path.startswith("/") else "/" + path
         host_str = str(host)
         if port_redir is not None:
             if ":" in host_str and not (host_str.startswith("[") and host_str.endswith("]")):
@@ -803,7 +809,7 @@ class _Envoy:
             authority = f"{host_str}:{port_redir}"
         else:
             authority = host_str
-        location = f"{scheme}://{authority}{path}"
+        location = f"{scheme}://{authority}{norm_path}"
         if not header_value_ok(location, nonempty=True, strict_ws=True):
             spec.refuse("redirect location is not a valid header value")
             return

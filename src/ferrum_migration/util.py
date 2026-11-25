@@ -441,15 +441,16 @@ def parse_go_duration_ns(value: object, *, allow_unitless_float: bool = True) ->
             return value * 1_000_000_000
         return None
     if isinstance(value, float):
-        if not allow_unitless_float or not math.isfinite(value) or value < 0.0:
+        if not allow_unitless_float or not math.isfinite(value):
             return None
         try:
             dec_f = Decimal(str(value)) * Decimal(1_000_000_000)
         except (DecimalException, ValueError, OverflowError):
             return None
-        if dec_f.is_nan() or dec_f.is_infinite() or dec_f < 0 or dec_f >= _MAX_DURATION_NS + 1:
+        if dec_f.is_nan() or dec_f.is_infinite() or dec_f <= -1 or dec_f >= _MAX_DURATION_NS + 1:
             return None
-        return int(dec_f)
+        ns = int(dec_f)
+        return ns if 0 <= ns <= _MAX_DURATION_NS else None
     if not isinstance(value, str):
         return None
     text = value.strip()
@@ -549,25 +550,40 @@ def proto_duration_ms(value: object) -> int | None:
     return None
 
 
-_NGINX_TIME_PART = re.compile(r"\s*(\d+)(ms|s|m|h|d|w|M|y)?", re.ASCII)
+_NGINX_TIME_PART = re.compile(r"(\d+)(ms|s|m|h|d|w|M|y)?", re.ASCII)
 _NGINX_TIME_MS = {"ms": 1, "s": 1000, None: 1000, "m": 60_000, "h": 3_600_000, "d": 86_400_000,
                   "w": 604_800_000, "M": 2_592_000_000, "y": 31_536_000_000}
 _NGINX_TIME_RANK = {"y": 7, "M": 6, "w": 5, "d": 4, "h": 3, "m": 2, "s": 1, None: 1, "ms": 0}
 
 
-def parse_nginx_time_ms(value: object) -> int | None:
+def parse_nginx_time_ms(value: object, *, allow_ms: bool = True) -> int | None:
+    """Parse an NGINX time literal in linear time (ASCII space separators, descending units).
+
+    Matches ``ngx_parse_time``: ``allow_ms=True`` (``is_sec=0``, e.g. ``proxy_*_timeout``) allows ``ms``
+    through ``w`` and rejects ``M``/``y``; ``allow_ms=False`` (``is_sec=1``, e.g. ``fail_timeout``)
+    allows ``s`` through ``y`` and rejects ``ms``.
+    """
     if not isinstance(value, str):
         return None
-    text = value.strip()
+    text = value.strip(" ")
     if not text:
         return None
     total = 0
     pos = 0
     prev_rank = 8
-    for match in _NGINX_TIME_PART.finditer(text):
-        if match.start() != pos:
+    while pos < len(text):
+        while pos < len(text) and text[pos] == " ":
+            pos += 1
+        if pos >= len(text):
+            break
+        match = _NGINX_TIME_PART.match(text, pos)
+        if not match:
             return None
         unit = match.group(2)
+        if allow_ms and unit in ("M", "y"):
+            return None
+        if not allow_ms and unit == "ms":
+            return None
         if unit is None and match.end() != len(text):
             return None
         rank = _NGINX_TIME_RANK[unit]
@@ -581,7 +597,7 @@ def parse_nginx_time_ms(value: object) -> int | None:
         if total > _MAX_DURATION_MS:
             return None
         pos = match.end()
-    return total if pos == len(text) else None
+    return total
 
 
 def parse_nginx_size(value: object) -> int | None:

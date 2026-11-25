@@ -360,16 +360,18 @@ class _Istio:
                 self.plan.host_scopes.append(HostScope(f"{ref} via {safe_label(gateway_ref)}", list(hosts), listen_port))
 
     def _resolve_https_redirects(self) -> None:
-        """Fold Gateway ``httpsRedirect`` servers away only when live HTTPS exists and no other main plain routes do.
+        """Fold main-port Gateway ``httpsRedirect`` servers away only when live HTTPS exists and no other main plain routes do.
 
-        Istio enforces ``httpsRedirect: true`` at the Gateway server level before VirtualService routing. If another
-        plaintext route keeps Ferrum's HTTP listener open or no live (unrefused) HTTPS route exists, emit a fail-closed
-        refused placeholder for each redirect server's host scope and refuse any overlapping main-port projection so a
-        longer-prefix plaintext route (such as ``/api``) cannot outrank the ``/`` redirect placeholder.
+        Extra-port ``httpsRedirect`` servers always emit extra-listener placeholders and never block main-port
+        folding. When main-port redirects cannot fold, emit a fail-closed refused placeholder for each redirect
+        server's host scope and refuse only plaintext main-port projections that can tie with or outrank a
+        redirect placeholder in Ferrum's host-tier order (exact > wildcard > catch-all).
         """
         settings = self.plan.settings
-        redirects: list[tuple[tuple[str, str], int, dict, list[str]]] = []
+        main_redirects: list[tuple[tuple[str, str], int, dict, list[str]]] = []
+        extra_redirects: list[tuple[tuple[str, str], int, dict, list[str]]] = []
         max_hosts = self.ctx.limits.max_precedence_routes
+        total_hosts = 0
         for (gw_ns, gw_name), gateway in self.gateways.items():
             for srv_idx, server in enumerate(self._servers(gateway), start=1):
                 if not server["redirect"]:
@@ -389,60 +391,123 @@ class _Istio:
                     elif host and host not in seen_hosts:
                         seen_hosts.add(host)
                         stripped.append(host)
-                        if len(stripped) > max_hosts:
-                            raise InputError(f"more than {max_hosts} hosts on an Istio httpsRedirect server")
+                        total_hosts += 1
+                        if total_hosts > max_hosts:
+                            raise InputError(f"more than {max_hosts} hosts across Istio httpsRedirect servers")
                 if not any_host and not stripped:
                     continue
-                redirects.append(((gw_ns, gw_name), srv_idx, server, [] if any_host else stripped))
-        if not redirects:
-            return
-        has_live_https = any(not r.skip and not r.refusals and "https" in (r.protocols or ())
-                             for r in self.plan.routes)
-        has_other_plain = any(not r.skip and not r.requires_tls and r.listen_port is None for r in self.plan.routes)
-        can_fold = (
-            has_live_https
-            and not has_other_plain
-            and all(server["port"] == settings.main_http_port for _, _, server, _ in redirects)
-        )
-        if can_fold:
-            settings.https_redirect_seen = True
-            for _, _, server, _ in redirects:
-                self.report.info("istio-https-redirect", server["ref"], "httpsRedirect server: not emitted; the "
-                                 "TLS-only profile disables the plaintext listener instead.")
-            return
-        existing_main = [p for p in self.projections if p["listen_port"] is None]
-        for (gw_ns, gw_name), srv_idx, server, hosts in redirects:
-            listen_port = None if server["port"] == settings.main_http_port else server["port"]
+                bucket = main_redirects if server["port"] == settings.main_http_port else extra_redirects
+                bucket.append(((gw_ns, gw_name), srv_idx, server, [] if any_host else stripped))
+        for (gw_ns, gw_name), srv_idx, server, hosts in extra_redirects:
             route = RouteSpec(
                 ref=server["ref"],
                 name=f"{gw_ns}-{gw_name}-https-redirect-{srv_idx}",
                 hosts=list(hosts),
                 kind="prefix",
                 path="/",
-                listen_port=listen_port,
+                listen_port=server["port"],
                 requires_tls=False,
-                protocols=frozenset() if listen_port is not None else frozenset({"http"}),
+                protocols=frozenset(),
+            )
+            route.refuse("Gateway httpsRedirect server on a non-main HTTP port is not migrated")
+            self.plan.routes.append(route)
+            if hosts:
+                self.plan.host_scopes.append(HostScope(server["ref"], list(hosts), server["port"]))
+        if not main_redirects:
+            return
+        has_live_https = any(not r.skip and not r.refusals and "https" in (r.protocols or ())
+                             for r in self.plan.routes)
+        has_other_plain = any(not r.skip and not r.requires_tls and r.listen_port is None for r in self.plan.routes)
+        if has_live_https and not has_other_plain:
+            for (gw_ns, gw_name), srv_idx, server, hosts in main_redirects:
+                route = RouteSpec(
+                    ref=server["ref"],
+                    name=f"{gw_ns}-{gw_name}-https-redirect-{srv_idx}",
+                    hosts=list(hosts),
+                    kind="prefix",
+                    path="/",
+                    listen_port=None,
+                    requires_tls=False,
+                    protocols=frozenset({"http"}),
+                    skip=True,
+                    skip_reason="HTTPS redirect",
+                    https_redirect_fold=("istio-https-redirect", server["ref"]),
+                )
+                self.plan.routes.append(route)
+            return
+        any_redir_ref: str | None = None
+        exact_redir: dict[str, str] = {}
+        wild_redir: dict[str, str] = {}
+        for (gw_ns, gw_name), srv_idx, server, hosts in main_redirects:
+            route = RouteSpec(
+                ref=server["ref"],
+                name=f"{gw_ns}-{gw_name}-https-redirect-{srv_idx}",
+                hosts=list(hosts),
+                kind="prefix",
+                path="/",
+                listen_port=None,
+                requires_tls=False,
+                protocols=frozenset({"http"}),
             )
             route.refuse("Gateway httpsRedirect server cannot be folded away alongside other plaintext routes or "
                          "without a live HTTPS server")
             self.plan.routes.append(route)
             if hosts:
-                self.plan.host_scopes.append(HostScope(server["ref"], list(hosts), listen_port))
-            if listen_port is None:
-                # Refuse any overlapping main-port projection so a longer-prefix plaintext route (e.g. /api) on a
-                # matching or broader host cannot bypass the Gateway-level httpsRedirect.
-                for proj in existing_main:
-                    if matching.hosts_overlap(hosts, proj["hosts"]):
-                        reason = (f"{server['ref']} enforces Gateway-level httpsRedirect for overlapping hosts; "
-                                  "Ferrum cannot keep the redirect and plaintext routes apart on the same listener")
-                        for proj_route in proj["routes"]:
-                            proj_route.refuse(reason)
-                        self.report.error("istio-frontend-scope-conflict", proj["ref"],
-                                          f"This projection overlaps {server['ref']} (httpsRedirect) while plaintext "
-                                          "routes remain active. Every route of this projection was refused "
-                                          "(fail closed).",
-                                          "Serve redirected hosts and plaintext hosts on separate Ferrum instances, or "
-                                          "remove plaintext routes so Ferrum can run TLS-only.")
+                self.plan.host_scopes.append(HostScope(server["ref"], list(hosts), None))
+                for host in hosts:
+                    if host.startswith("*."):
+                        wild_redir.setdefault(host[1:], server["ref"])
+                    else:
+                        exact_redir.setdefault(host, server["ref"])
+            elif any_redir_ref is None:
+                any_redir_ref = server["ref"]
+        # Index-backed check against plaintext main-port projections only: refuse a projection only when its host
+        # scope can tie with or outrank a redirect placeholder in Ferrum (exact > wildcard > catch-all).
+        for proj in self.projections:
+            if proj["listen_port"] is not None or proj["frontend"][0]:
+                continue
+            matched_ref: str | None = any_redir_ref
+            if matched_ref is None and proj["hosts"]:
+                for host in proj["hosts"]:
+                    if host.startswith("*."):
+                        # A wildcard plaintext host ties with an identical wildcard redirect or is covered by a
+                        # broader wildcard redirect.
+                        suffix = host[1:]
+                        if suffix in wild_redir:
+                            matched_ref = wild_redir[suffix]
+                            break
+                        dot = suffix.find(".", 1)
+                        while dot != -1:
+                            parent = suffix[dot:]
+                            if parent in wild_redir:
+                                matched_ref = wild_redir[parent]
+                                break
+                            dot = suffix.find(".", dot + 1)
+                        if matched_ref is not None:
+                            break
+                    else:
+                        if host in exact_redir:
+                            matched_ref = exact_redir[host]
+                            break
+                        dot = host.find(".")
+                        while dot != -1:
+                            parent = host[dot:]
+                            if parent in wild_redir:
+                                matched_ref = wild_redir[parent]
+                                break
+                            dot = host.find(".", dot + 1)
+                        if matched_ref is not None:
+                            break
+            if matched_ref is not None:
+                reason = (f"{matched_ref} enforces Gateway-level httpsRedirect for overlapping hosts; "
+                          "Ferrum cannot keep the redirect and plaintext routes apart on the same listener")
+                for proj_route in proj["routes"]:
+                    proj_route.refuse(reason)
+                self.report.error("istio-frontend-scope-conflict", proj["ref"],
+                                  f"This projection overlaps {matched_ref} (httpsRedirect) while plaintext "
+                                  "routes remain active. Every route of this projection was refused (fail closed).",
+                                  "Serve redirected hosts and plaintext hosts on separate Ferrum instances, or "
+                                  "remove plaintext routes so Ferrum can run TLS-only.")
 
     def _check_frontend_scopes(self) -> None:
         """Refuse overlapping projections from different bindings whose source frontends differ.
