@@ -545,27 +545,12 @@ class EnvoyHardeningTest(unittest.TestCase):
 
     def test_grpc_web_compressor_fault_jwt_authn_and_request_mirror_policies(self):
         doc = minimal_bootstrap({"path_separated_prefix": "/api"})
-        doc["static_resources"]["clusters"].extend([
-            {
-                "name": "shadow", "type": "STRICT_DNS",
-                "load_assignment": {"endpoints": [{"lb_endpoints": [
-                    {"endpoint": {"address": {"socket_address": {"address": "shadow.internal", "port_value": 9000}}}}
-                ]}]},
-            },
-            {
-                "name": "jwks", "type": "STRICT_DNS",
-                "load_assignment": {"endpoints": [{"lb_endpoints": [
-                    {"endpoint": {"address": {"socket_address": {"address": "idp.example.test", "port_value": 443}}}}
-                ]}]},
-                "transport_socket": {
-                    "name": "envoy.transport_sockets.tls",
-                    "typed_config": {
-                        "@type": "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext",
-                        "sni": "idp.example.test",
-                    },
-                },
-            },
-        ])
+        doc["static_resources"]["clusters"].append({
+            "name": "shadow", "type": "STRICT_DNS",
+            "load_assignment": {"endpoints": [{"lb_endpoints": [
+                {"endpoint": {"address": {"socket_address": {"address": "shadow.internal", "port_value": 9000}}}}
+            ]}]},
+        })
         hcm = doc["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"]
         hcm["http_filters"] = [
             {"name": "envoy.filters.http.grpc_web",
@@ -587,21 +572,6 @@ class EnvoyHardeningTest(unittest.TestCase):
                  "delay": {"fixed_delay": "0.5s", "percentage": {"numerator": 10, "denominator": "HUNDRED"}},
                  "abort": {"http_status": 503, "percentage": {"numerator": 5, "denominator": "HUNDRED"}},
              }},
-            {"name": "envoy.filters.http.jwt_authn",
-             "typed_config": {
-                 "@type": "type.googleapis.com/envoy.extensions.filters.http.jwt_authn.v3.JwtAuthentication",
-                 "providers": {
-                     "idp": {
-                         "issuer": "https://idp.example.test",
-                         "audiences": ["api"],
-                         "remote_jwks": {"http_uri": {"uri": "https://idp.example.test/.well-known/jwks.json",
-                                                      "cluster": "jwks", "timeout": "5s"}},
-                         "from_headers": [{"name": "Authorization", "value_prefix": "Bearer "}],
-                         "claim_to_headers": [{"header_name": "x-jwt-sub", "claim_name": "sub"}],
-                     }
-                 },
-                 "rules": [{"match": {"prefix": "/"}, "requires": {"provider_name": "idp"}}],
-             }},
             {"name": "envoy.filters.http.router"},
         ]
         route = hcm["route_config"]["virtual_hosts"][0]["routes"][0]
@@ -609,11 +579,6 @@ class EnvoyHardeningTest(unittest.TestCase):
             "cluster": "shadow",
             "runtime_fraction": {"default_value": {"numerator": 2500, "denominator": "TEN_THOUSAND"}},
         }]
-        # Also add a direct_response route to verify fail-closed refusal when jwt_authn is active.
-        hcm["route_config"]["virtual_hosts"][0]["routes"].append({
-            "name": "health", "match": {"path": "/healthz"},
-            "direct_response": {"status": 200, "body": {"inline_string": "ok"}},
-        })
         result, report, _ = migrate("envoy", yaml.safe_dump(doc))
         assert_structurally_valid(self, result.config)
         api = one_proxy(self, result.config, "/api")
@@ -627,33 +592,6 @@ class EnvoyHardeningTest(unittest.TestCase):
             "delay": {"duration_ms": 500, "percentage": 10.0},
             "abort": {"status_code": 503, "percentage": 5.0},
         })
-        # Omitted `forward` -> False, omitted `require_expiration` -> False, omitted `clock_skew_seconds` -> 60,
-        # and omitted remote_jwks.cache_duration -> 600s staleness/refresh.
-        self.assertEqual(plugin(self, result.config, api, "jwks_auth")["config"], {
-            "providers": [{
-                "jwks_uri": "https://idp.example.test/.well-known/jwks.json",
-                "issuer": "https://idp.example.test",
-                "audiences": ["api"],
-                "from_headers": [{"name": "authorization", "prefix": "Bearer "}],
-                "forward_original_token": False,
-                "output_claim_headers": [{"claim": "sub", "header": "x-jwt-sub"}],
-                "jwks_max_stale_seconds": 600,
-                "require_exp": False,
-                "clock_skew_seconds": 60,
-            }],
-            "jwks_refresh_interval_secs": 600,
-        })
-        # Explicit clock_skew_seconds: 0 (proto3 default) also maps to Envoy's 60s default, and require_expiration:
-        # true emits require_exp: True.
-        jwt_opts = copy.deepcopy(doc)
-        jwt_opts["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"][
-            "http_filters"][3]["typed_config"]["providers"]["idp"].update(
-                {"clock_skew_seconds": 0, "require_expiration": True})
-        jo_res, _jo_rep, _ = migrate("envoy", yaml.safe_dump(jwt_opts))
-        jo_prov = plugin(self, jo_res.config, one_proxy(self, jo_res.config, "/api"), "jwks_auth")["config"][
-            "providers"][0]
-        self.assertEqual(jo_prov["clock_skew_seconds"], 60)
-        self.assertTrue(jo_prov["require_exp"])
         # Active Envoy mirrors are dropped with warning (Envoy -shadow authority vs Ferrum file-mode Host strip).
         self.assertNotIn("request_mirror", [p["plugin_name"] for p in result.config["plugin_configs"]])
         self.assertIn("envoy-mirror", codes(report, "warning"))
@@ -665,16 +603,20 @@ class EnvoyHardeningTest(unittest.TestCase):
         ]
         _im_res, im_rep, _ = migrate("envoy", yaml.safe_dump(inert_mirror))
         self.assertNotIn("envoy-mirror", codes(im_rep))
-        # Terminated route under jwt_authn refuses (Ferrum request_termination runs before jwks_auth).
-        self.assertEqual(one_proxy(self, result.config, "=/healthz")["labels"]["ferrum-migration/status"], "refused")
 
         # Fail-closed regressions:
-        # 1) Misnamed ext_authz masquerading as grpc_web name, or dynamic config_discovery, must refuse.
+        # 1) Misnamed ext_authz, dynamic config_discovery, and jwt_authn all refuse fail-closed.
         for bad_filter in (
             {"name": "envoy.filters.http.grpc_web",
              "typed_config": {"@type": "type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthz"}},
             {"name": "envoy.filters.http.grpc_web",
              "config_discovery": {"config_source": {"ads": {}}}},
+            {"name": "envoy.filters.http.jwt_authn",
+             "typed_config": {
+                 "@type": "type.googleapis.com/envoy.extensions.filters.http.jwt_authn.v3.JwtAuthentication",
+                 "providers": {"idp": {"issuer": "https://idp.example.test", "audiences": ["api"]}},
+                 "rules": [{"match": {"prefix": "/"}, "requires": {"provider_name": "idp"}}],
+             }},
         ):
             misnamed = minimal_bootstrap({"path_separated_prefix": "/api"})
             misnamed["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"][
@@ -694,77 +636,6 @@ class EnvoyHardeningTest(unittest.TestCase):
         }
         self.assertEqual(one_proxy(self, migrate("envoy", yaml.safe_dump(cors_jwt))[0].config, "/api")[
             "labels"]["ferrum-migration/status"], "refused")
-        # 3) Reserved claim destination, implicit locations, from_params, query in jwks_uri, whitespace issuer/aud,
-        #    and custom DNS resolvers refuse.
-        for mutate in (
-            lambda d: d["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"][
-                "http_filters"][3]["typed_config"]["providers"]["idp"]["claim_to_headers"].append(
-                    {"header_name": "x-forwarded-user", "claim_name": "sub"}),
-            lambda d: d["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"][
-                "http_filters"][3]["typed_config"]["providers"]["idp"].pop("from_headers"),
-            lambda d: d["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"][
-                "http_filters"][3]["typed_config"]["providers"]["idp"].update(
-                    {"from_headers": [], "from_params": ["access_token"]}),
-            lambda d: d["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"][
-                "http_filters"][3]["typed_config"]["providers"]["idp"]["remote_jwks"]["http_uri"].update(
-                    {"uri": "https://idp.example.test/.well-known/jwks.json?api_key=secret"}),
-            lambda d: d["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"][
-                "http_filters"][3]["typed_config"]["providers"]["idp"].update(
-                    {"issuer": "https://idp.example.test "}),
-            lambda d: d["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"][
-                "http_filters"][3]["typed_config"]["providers"]["idp"].update(
-                    {"audiences": [" api"]}),
-            lambda d: d["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"][
-                "http_filters"][3]["typed_config"]["providers"]["idp"].pop("audiences"),
-            lambda d: d["static_resources"]["clusters"][2].update(
-                {"dns_resolvers": [{"socket_address": {"address": "10.0.0.53", "port_value": 53}}]}),
-            # Request header write colliding with jwks_auth claim destination (including underscore fold) refuses.
-            lambda d: d["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"][
-                "route_config"]["virtual_hosts"][0]["routes"][0].update(
-                    {"request_headers_to_add": [{"header": {"key": "X_JWT_SUB", "value": "spoof"},
-                                                 "append_action": "OVERWRITE_IF_EXISTS_OR_ADD"}]}),
-        ):
-            bad_jwt = copy.deepcopy(doc)
-            mutate(bad_jwt)
-            self.assertEqual(one_proxy(self, migrate("envoy", yaml.safe_dump(bad_jwt))[0].config, "/api")[
-                "labels"]["ferrum-migration/status"], "refused")
-        # 4) Inline JWKS: rebuilds public fields only (strips x5u), rejects noncanonical base64url & non-sig key_ops.
-        valid_ed_x = "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo"
-        noncanon_ed_x = "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURp"
-        inline_doc = minimal_bootstrap({"path_separated_prefix": "/api"})
-        inline_doc["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"][
-            "http_filters"] = [
-            {"name": "envoy.filters.http.jwt_authn", "typed_config": {
-                "@type": "type.googleapis.com/envoy.extensions.filters.http.jwt_authn.v3.JwtAuthentication",
-                "providers": {"idp": {
-                    "issuer": "https://idp.example.test",
-                    "audiences": ["api"],
-                    "local_jwks": {"inline_string": json.dumps({"keys": [{
-                        "kty": "OKP", "crv": "Ed25519", "kid": "k1", "x": valid_ed_x,
-                        "key_ops": ["verify"],
-                        "x5u": "https://secret.example.test/cert?token=leak",
-                    }]})},
-                    "from_headers": [{"name": "Authorization", "value_prefix": "Bearer "}],
-                }},
-                "rules": [{"match": {"prefix": "/"}, "requires": {"provider_name": "idp"}}],
-            }},
-            {"name": "envoy.filters.http.router"},
-        ]
-        in_res, _in_rep, _ = migrate("envoy", yaml.safe_dump(inline_doc))
-        self.assertEqual(one_proxy(self, in_res.config, "/api")["labels"]["ferrum-migration/status"], "migrated")
-        self.assertNotIn("token=leak", json.dumps(in_res.config))
-        self.assertNotIn("x5u", json.dumps(in_res.config))
-        for bad_jwk in (
-            {"kty": "OKP", "crv": "Ed25519", "kid": "k1", "x": noncanon_ed_x},
-            {"kty": "OKP", "crv": "Ed25519", "kid": "k1", "x": valid_ed_x, "key_ops": ["verify", "leak=secret"]},
-        ):
-            bad_in = copy.deepcopy(inline_doc)
-            bad_in["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"][
-                "http_filters"][0]["typed_config"]["providers"]["idp"]["local_jwks"]["inline_string"] = json.dumps(
-                    {"keys": [bad_jwk]})
-            bad_in_res = migrate("envoy", yaml.safe_dump(bad_in))[0]
-            self.assertEqual(one_proxy(self, bad_in_res.config, "/api")["labels"]["ferrum-migration/status"], "refused")
-            self.assertNotIn("leak=secret", json.dumps(bad_in_res.config))
         # 5) Fault filter regressions: max_active_faults: 0 and header matchers refuse; 0% fault omits only without
         #    runtime layers, and ANY fault filter (including positive delay + 0% abort) refuses under layered_runtime.
         for bad_fault in (
@@ -925,6 +796,17 @@ class EnvoyHardeningTest(unittest.TestCase):
         nc_res, _nc_rep, _ = migrate("envoy", yaml.safe_dump(non_cred_star))
         nc_cors = plugin(self, nc_res.config, one_proxy(self, nc_res.config, "/api"), "cors")["config"]
         self.assertEqual(nc_cors["allowed_headers"], ["*", "authorization"])
+
+        # Mixed allow_headers ("*, X-Trace") must NOT add authorization; deeply nested (>20) regex omits CORS.
+        nc_hcm["route_config"]["typed_per_filter_config"]["envoy.filters.http.cors"]["allow_headers"] = "*, X-Trace"
+        mix_res, _mix_rep, _ = migrate("envoy", yaml.safe_dump(non_cred_star))
+        mix_cors = plugin(self, mix_res.config, one_proxy(self, mix_res.config, "/api"), "cors")["config"]
+        self.assertEqual(mix_cors["allowed_headers"], ["*", "X-Trace"])
+        nc_hcm["route_config"]["typed_per_filter_config"]["envoy.filters.http.cors"][
+            "allow_origin_string_match"] = [{"safe_regex": {"regex": "(" * 26 + r"https://app\.example\.test" + ")" * 26}}]
+        nest_res, nest_rep, _ = migrate("envoy", yaml.safe_dump(non_cred_star))
+        self.assertEqual(nest_res.config["plugin_configs"], [])
+        self.assertIn("envoy-cors", codes(nest_rep, "warning"))
 
         two_cors = minimal_bootstrap({"path_separated_prefix": "/api"})
         tchcm = two_cors["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"]

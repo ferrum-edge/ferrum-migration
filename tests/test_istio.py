@@ -973,9 +973,14 @@ class IstioCaseAndNamesTest(unittest.TestCase):
                   route: [{destination: {host: svc.edge.svc.cluster.local, port: {number: 8080}}}]
                   fault:
                     delay: {fixedDelay: 250ms, percentage: {value: 15}}
-                    abort: {httpStatus: 503, grpcStatus: UNAVAILABLE, percentage: {value: 5}}
+                    abort: {httpStatus: 503, percentage: {value: 5}}
                   mirror: {host: shadow.edge.svc.cluster.local, port: {number: 9090}}
                   mirrorPercentage: {value: 10}
+                - name: grpc-abort
+                  match: [{uri: {exact: /grpc}}]
+                  route: [{destination: {host: svc.edge.svc.cluster.local, port: {number: 8080}}}]
+                  fault:
+                    abort: {grpcStatus: UNAVAILABLE, percentage: {value: 5}}
                 - name: zero-fault
                   match: [{uri: {exact: /zero}}]
                   route: [{destination: {host: svc.edge.svc.cluster.local, port: {number: 8080}}}]
@@ -988,6 +993,10 @@ class IstioCaseAndNamesTest(unittest.TestCase):
         self.assertEqual(api["labels"]["ferrum-migration/status"], "migrated")
         self.assertEqual(plugin(self, result.config, api, "fault_injection")["config"], {
             "delay": {"duration_ms": 250, "percentage": 15.0},
+            "abort": {"status_code": 503, "percentage": 5.0},
+        })
+        grpc_p = one_proxy(self, result.config, "=/grpc", "api.example.test")
+        self.assertEqual(plugin(self, result.config, grpc_p, "fault_injection")["config"], {
             "abort": {"status_code": 503, "grpc_status": 14, "percentage": 5.0},
         })
         # Active Istio mirrors are dropped with warning (-shadow authority + mesh Auto mTLS vs file-mode Host strip).
@@ -1004,7 +1013,8 @@ class IstioCaseAndNamesTest(unittest.TestCase):
         self.assertNotIn("istio-dropped", codes(im_rep))
 
         # RequestAuthentication in istio-system still refuses fail-closed because static CRDs omit
-        # meshConfig.rootNamespace and gateway pod namespaces (issuer policy scope cannot be proven authoritative).
+        # meshConfig.rootNamespace and gateway pod namespaces; a targetRef matching a legacy Gateway's
+        # gateway.networking.k8s.io/gateway-name workload label also refuses fail-closed.
         ra_text = text + textwrap.dedent("""
             ---
             apiVersion: security.istio.io/v1
@@ -1021,6 +1031,28 @@ class IstioCaseAndNamesTest(unittest.TestCase):
         """)
         ra_res, _ra_rep, _ = migrate("istio", ra_text)
         self.assertEqual(one_proxy(self, ra_res.config, "=/api", "api.example.test")["labels"][
+            "ferrum-migration/status"], "refused")
+
+        k8s_gw_label_text = text.replace(
+            "selector: {istio: ingressgateway}",
+            "selector: {gateway.networking.k8s.io/gateway-name: edge-api}",
+        ) + textwrap.dedent("""
+            ---
+            apiVersion: security.istio.io/v1
+            kind: RequestAuthentication
+            metadata: {name: k8s-gw-jwt, namespace: edge}
+            spec:
+              targetRef:
+                group: gateway.networking.k8s.io
+                kind: Gateway
+                name: edge-api
+              jwtRules:
+                - issuer: https://idp.example.test
+                  jwksUri: https://idp.example.test/.well-known/jwks.json
+                  audiences: [api]
+        """)
+        k8s_res, _k8s_rep, _ = migrate("istio", k8s_gw_label_text)
+        self.assertEqual(one_proxy(self, k8s_res.config, "=/api", "api.example.test")["labels"][
             "ferrum-migration/status"], "refused")
 
 

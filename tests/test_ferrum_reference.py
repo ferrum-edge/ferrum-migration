@@ -503,23 +503,6 @@ class FerrumBinaryValidateTest(unittest.TestCase):
                                      "delay": {"fixed_delay": "0.25s", "percentage": {"numerator": 10, "denominator": "HUNDRED"}},
                                      "abort": {"http_status": 503, "percentage": {"numerator": 5, "denominator": "HUNDRED"}},
                                  }},
-                                {"name": "envoy.filters.http.jwt_authn",
-                                 "typed_config": {
-                                     "@type": "type.googleapis.com/envoy.extensions.filters.http.jwt_authn.v3.JwtAuthentication",
-                                     "providers": {
-                                         "idp": {
-                                             "issuer": "https://idp.example.test",
-                                             "audiences": ["api"],
-                                             "remote_jwks": {"http_uri": {
-                                                 "uri": "https://idp.example.test/.well-known/jwks.json",
-                                                 "cluster": "jwks", "timeout": "5s",
-                                             }},
-                                             "from_headers": [{"name": "Authorization", "value_prefix": "Bearer "}],
-                                             "claim_to_headers": [{"header_name": "x-jwt-sub", "claim_name": "sub"}],
-                                         }
-                                     },
-                                     "rules": [{"match": {"prefix": "/"}, "requires": {"provider_name": "idp"}}],
-                                 }},
                                 {"name": "envoy.filters.http.router"},
                             ],
                         },
@@ -528,16 +511,6 @@ class FerrumBinaryValidateTest(unittest.TestCase):
                 "clusters": [
                     {"name": "app", "type": "STRICT_DNS", "load_assignment": {"endpoints": [{"lb_endpoints": [
                         {"endpoint": {"address": {"socket_address": {"address": "app.internal", "port_value": 8080}}}}]}]}},
-                    {"name": "jwks", "type": "STRICT_DNS",
-                     "load_assignment": {"endpoints": [{"lb_endpoints": [
-                         {"endpoint": {"address": {"socket_address": {"address": "idp.example.test", "port_value": 443}}}}]}]},
-                     "transport_socket": {
-                         "name": "envoy.transport_sockets.tls",
-                         "typed_config": {
-                             "@type": "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext",
-                             "sni": "idp.example.test",
-                         },
-                     }},
                 ],
             }
         })
@@ -551,14 +524,14 @@ class FerrumBinaryValidateTest(unittest.TestCase):
             "    - name: api\n      match: [{uri: {exact: /api}}]\n"
             "      route: [{destination: {host: svc.edge.svc.cluster.local, port: {number: 8080}}}]\n"
             "      fault:\n        delay: {fixedDelay: 250ms, percentage: {value: 15}}\n"
-            "        abort: {httpStatus: 503, grpcStatus: UNAVAILABLE, percentage: {value: 5}}\n"
+            "        abort: {httpStatus: 503, percentage: {value: 5}}\n"
         )
         for label, platform, text, kw, expected_plugins in (
             ("kong-extended", "kong", kong_text, {}, {"correlation_id"}),
             ("nginx-extended", "nginx", nginx_text, {"fmt": "nginx"}, {"compression"}),
             ("traefik-extended", "traefik", traefik_text, {"traefik_controls_asserted": True},
              {"compression", "response_size_limiting", "request_mirror"}),
-            ("envoy-extended", "envoy", envoy_text, {}, {"cors", "grpc_web", "compression", "fault_injection", "jwks_auth"}),
+            ("envoy-extended", "envoy", envoy_text, {}, {"cors", "grpc_web", "compression", "fault_injection"}),
             ("istio-extended", "istio", istio_text, {}, {"fault_injection"}),
         ):
             result, _report, _plan = migrate(platform, text, **kw)

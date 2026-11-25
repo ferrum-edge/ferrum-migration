@@ -194,14 +194,21 @@ class _Istio:
         """
         gw_ns, gw_name = _meta(gateway)
         selector = mapping(mapping(gateway.get("spec")).get("selector"))
+        gw_label_name = selector.get("gateway.networking.k8s.io/gateway-name")
         reasons: list[str] = []
         for policy in self.policies:
             ns, name = _meta(policy)
             spec = mapping(policy.get("spec"))
             kind = str(policy.get("kind"))
             refs = [mapping(r) for r in seq(spec.get("targetRefs")) + seq(spec.get("targetRef"))]
-            targeted = any(r.get("kind") == "Gateway" and r.get("name") == gw_name and
-                           (r.get("namespace") or ns) == gw_ns for r in refs)
+            targeted = any(
+                r.get("kind") == "Gateway"
+                and (
+                    (r.get("name") == gw_name and (r.get("namespace") or ns) == gw_ns)
+                    or (isinstance(gw_label_name, str) and r.get("name") == gw_label_name)
+                )
+                for r in refs
+            )
             labels = mapping(mapping(spec.get("selector")).get("matchLabels")) or \
                 mapping(mapping(spec.get("workloadSelector")).get("labels"))
             label = f"{kind} {safe_label(ns)}/{safe_label(name)}"
@@ -1004,6 +1011,8 @@ def _translate_istio_fault(raw: Any) -> tuple[str, Any]:
             return "drop", "abort percentage is invalid"
         http_status = util.as_int(abort.get("httpStatus"))
         grpc_raw = abort.get("grpcStatus")
+        if http_status is not None and grpc_raw is not None:
+            return "drop", "abort cannot set both httpStatus and grpcStatus (mutually exclusive in Istio)"
         grpc_code: int | None = None
         if grpc_raw is not None:
             if isinstance(grpc_raw, str) and grpc_raw.upper() in _GRPC_STATUS_NAMES:

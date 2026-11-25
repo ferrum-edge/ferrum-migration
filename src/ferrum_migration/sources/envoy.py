@@ -13,17 +13,16 @@ from __future__ import annotations
 
 import re
 from typing import Any
-from urllib.parse import urlsplit
 
 from .. import util
 from ..errors import InputError
 from ..model import BackendRef, HostScope, Plan, PluginSpec, RouteSpec, Target, TlsSpec, UpstreamSpec
-from ..redact import contains_secret_reference, safe_label
+from ..redact import safe_label
 from ..safe_load import load_structured
-from .common import (MAX_JWKS_MAX_STALE_SECONDS, SourceContext, apply_first_match_order, check_route_budget,
-                     choose_main_port, compression_config, cors_config, fault_injection_config, fold, header_value_ok,
-                     jwks_provider_config, literal_value, mapping, merge_weighted_targets, request_header_rule,
-                     response_header_rule, retry_from_policy, seq, split_csv, str_list, validate_jwks_providers)
+from .common import (SourceContext, apply_first_match_order, check_route_budget, choose_main_port, compression_config,
+                     cors_config, fault_injection_config, header_value_ok, literal_value, mapping,
+                     merge_weighted_targets, request_header_rule, response_header_rule, retry_from_policy, seq,
+                     split_csv, str_list)
 
 PLATFORM = "envoy"
 _REDIRECT_CODES = {"MOVED_PERMANENTLY": 301, "FOUND": 302, "SEE_OTHER": 303, "TEMPORARY_REDIRECT": 307,
@@ -290,7 +289,6 @@ class _Envoy:
         buffer_limit = None
         hcm_plugins: list[PluginSpec] = []
         hcm_fault: PluginSpec | None = None
-        hcm_jwt: PluginSpec | None = None
         hcm_filter_kinds: dict[str, str] = {}
         fault_filter_count = 0
         cors_filter_count = 0
@@ -354,14 +352,10 @@ class _Envoy:
                 else:
                     filter_refusal = f"HTTP filter fault cannot be migrated ({fault_val})"
             elif kind == "jwt_authn":
-                jwt_cfg, jwt_err = self._parse_jwt_authn(typed, ref)
-                if jwt_cfg is not None:
-                    if hcm_jwt is not None:
-                        filter_refusal = "multiple jwt_authn HTTP filters in one connection manager are not supported"
-                    else:
-                        hcm_jwt = PluginSpec("jwks_auth", jwt_cfg, ref)
-                else:
-                    filter_refusal = f"HTTP filter jwt_authn cannot be migrated ({jwt_err})"
+                filter_refusal = ("HTTP filter jwt_authn is not auto-migrated: Ferrum jwks_auth requires every JWT "
+                                  "header to include a matching kid (whereas Envoy verifies kid-less tokens) and "
+                                  "omits non-integer float claim headers; configure jwks_auth manually after "
+                                  "confirming IdP token format")
             else:
                 filter_refusal = f"HTTP filter {safe_label(kind, 80)} has no safe Ferrum equivalent"
         route_config = mapping(config.get("route_config"))
@@ -372,8 +366,7 @@ class _Envoy:
                   "typed_per_filter_config": mapping(route_config.get("typed_per_filter_config")),
                   "hcm_filter_kinds": hcm_filter_kinds,
                   "hcm_plugins": hcm_plugins,
-                  "hcm_fault": hcm_fault,
-                  "hcm_jwt": hcm_jwt}
+                  "hcm_fault": hcm_fault}
         for index, vhost in enumerate(seq(route_config.get("virtual_hosts"))):
             if isinstance(vhost, dict):
                 self._vhost(vhost, index, ref, listen_port, tls, cors_enabled, filter_refusal, buffer_limit, shared)
@@ -418,46 +411,9 @@ class _Envoy:
                 spec.refuse(filter_refusal)
             if buffer_limit and buffer_limit > 0 and not spec.termination:
                 spec.plugins.append(PluginSpec("request_size_limiting", {"max_bytes": buffer_limit}, ref))
-            if shared.get("hcm_jwt") is not None:
-                if spec.termination is not None or getattr(spec, "https_redirect", False):
-                    spec.refuse("jwt_authn runs before direct_response/redirect in Envoy, whereas Ferrum "
-                                "request_termination answers before authentication")
-                else:
-                    jwt_p = shared["hcm_jwt"]
-                    spec.plugins.append(PluginSpec(jwt_p.name, jwt_p.config, jwt_p.ref))
             if not spec.termination:
                 for hp in shared.get("hcm_plugins", []):
                     spec.plugins.append(PluginSpec(hp.name, hp.config, hp.ref))
-            if shared.get("hcm_jwt") is not None and not spec.refusals:
-                jwt_cfg = shared["hcm_jwt"].config
-                owned_claims = {fold(entry["header"]) for prov in jwt_cfg.get("providers", [])
-                                for entry in prov.get("output_claim_headers", [])}
-                if owned_claims:
-                    has_grpc_web = any(p.name == "grpc_web" for p in spec.plugins)
-                    for pl in spec.plugins:
-                        if pl.name != "request_transformer":
-                            continue
-                        for rule in pl.config.get("rules", []):
-                            if rule.get("target") != "header":
-                                continue
-                            op = rule.get("operation")
-                            if op not in ("add", "update", "rename"):
-                                continue
-                            dest = rule.get("new_key") if op == "rename" else rule.get("key")
-                            if not isinstance(dest, str):
-                                continue
-                            folded_dest = fold(dest)
-                            if folded_dest in owned_claims:
-                                spec.refuse(f"request_transformer writes header {dest}, which jwks_auth owns as "
-                                            "a claim header destination (Ferrum rejects overlapping header writes)")
-                                break
-                            if not has_grpc_web and folded_dest == "content-type":
-                                val = rule.get("value")
-                                if not isinstance(val, str) or "$(" in val \
-                                        or val.strip().lower().startswith("application/grpc-web"):
-                                    spec.refuse("request_transformer writes a gRPC-Web or dynamic content-type on a "
-                                                "route with jwks_auth claim headers and no grpc_web plugin")
-                                    break
             routes.append(spec)
         if not tls and routes and all(getattr(r, "https_redirect", False) and not r.refusals for r in routes):
             self.plan.settings.https_redirect_seen = True
@@ -895,11 +851,11 @@ class _Envoy:
                         "allow_methods/allow_headers/expose_headers, which Ferrum returns literally; specify "
                         "explicit method and header lists")
             return
-        if creds is not True and parsed_headers and "*" in parsed_headers \
-                and not any(h.lower() == "authorization" for h in parsed_headers):
-            # In Fetch preflights, Access-Control-Allow-Headers: * does not authorize 'authorization' even without
-            # credentials, whereas Envoy's allow_headers: "*" reflects 'authorization'. Include both explicitly.
-            parsed_headers = list(parsed_headers) + ["authorization"]
+        if creds is not True and isinstance(merged_headers, str) and merged_headers.strip() == "*":
+            # For standalone allow_headers: "*" without credentials, emit ["*", "authorization"] so Fetch
+            # preflights for bearer-token requests succeed (Fetch does not cover Authorization with bare '*').
+            # Mixed lists such as "*, X-Trace" are left untouched so Authorization is never newly added there.
+            parsed_headers = ["*", "authorization"]
         # Use Ferrum's unmatched_preflights mode so omitted allow_methods/allow_headers stay empty and omitted
         # max_age stays absent (matching Envoy cors_filter.cc instead of inheriting Ferrum's permissive defaults).
         built, problem = cors_config(origins, parsed_methods, parsed_headers, parsed_expose,
@@ -1156,207 +1112,6 @@ class _Envoy:
                 "connect": first.get("connect")}
 
 
-    def _verify_jwks_cluster(self, cluster_name: Any, uri: str, ref: str) -> str | None:
-        """Ensure Envoy's remote_jwks cluster has no custom endpoint/TLS trust that Ferrum's direct fetch would bypass."""
-        if not isinstance(cluster_name, str) or not cluster_name:
-            return "remote_jwks.http_uri.cluster is missing"
-        cluster_raw = self.clusters.get(cluster_name)
-        if cluster_raw is None:
-            return f"remote_jwks cluster {safe_label(cluster_name, 48)} is undefined"
-        cluster_type = str(cluster_raw.get("type", "STATIC")).upper()
-        if cluster_raw.get("cluster_type") or cluster_type not in ("STATIC", "STRICT_DNS", "LOGICAL_DNS"):
-            return "remote_jwks cluster uses dynamic or custom discovery"
-        if any(cluster_raw.get(k) is not None
-               for k in ("dns_resolvers", "dns_resolution_config", "typed_dns_resolver_config")):
-            return "remote_jwks cluster configures custom DNS resolvers that Ferrum jwks_auth cannot reproduce"
-        targets, ep_problems = self._endpoints(cluster_raw, ref)
-        if ep_problems or len(targets) != 1:
-            return "remote_jwks cluster must resolve to a single endpoint matching jwks_uri"
-        tls, scheme, tls_problems = self._upstream_tls(cluster_raw, ref)
-        if tls_problems:
-            return "remote_jwks cluster has unsupported upstream TLS settings"
-        parts = urlsplit(uri)
-        uri_scheme = parts.scheme.lower()
-        uri_host = (parts.hostname or "").lower()
-        if parts.port == 0:
-            return "remote_jwks jwks_uri port must be 1-65535"
-        uri_port = parts.port if parts.port is not None else (443 if uri_scheme == "https" else 80)
-        if scheme != uri_scheme:
-            return "remote_jwks cluster transport scheme disagrees with jwks_uri"
-        if targets[0].host.strip("[]").lower() != uri_host or targets[0].port != uri_port:
-            return "remote_jwks cluster endpoint disagrees with jwks_uri host/port"
-        if scheme == "https":
-            if tls.ca_path or tls.client_cert_path or tls.san_allow_list:
-                return "remote_jwks cluster pins custom CA, SANs, or client certificates that jwks_auth cannot reproduce"
-            if tls.sni and tls.sni.lower() != uri_host:
-                return "remote_jwks cluster SNI overrides jwks_uri hostname"
-        return None
-
-    def _parse_jwt_authn(self, typed: dict, ref: str) -> tuple[dict | None, str | None]:
-        if contains_secret_reference(typed):
-            return None, "jwt_authn contains a secret/vault reference"
-        unknown_root = [str(k) for k in typed if k not in _ENVOY_JWT_ROOT_KEYS]
-        if unknown_root:
-            return None, f"unsupported jwt_authn field(s): {', '.join(sorted(unknown_root)[:4])}"
-        raw_providers = typed.get("providers")
-        if not isinstance(raw_providers, dict) or not raw_providers:
-            return None, "jwt_authn requires a non-empty providers map"
-        parsed_providers: dict[str, dict[str, Any]] = {}
-        all_claim_dests: dict[str, set[str]] = {}
-        for pname, praw in raw_providers.items():
-            if not isinstance(pname, str) or not isinstance(praw, dict):
-                return None, "jwt_authn provider entry is malformed"
-            unknown_p = [str(k) for k in praw if k not in _ENVOY_JWT_PROVIDER_KEYS]
-            if unknown_p:
-                return None, f"unsupported provider field(s): {', '.join(sorted(unknown_p)[:4])}"
-            jwks_uri = None
-            inline_jwks = None
-            cluster_name = None
-            cache_secs: int | None = None
-            if praw.get("remote_jwks") is not None:
-                rjwks = mapping(praw["remote_jwks"])
-                unknown_rj = [str(k) for k in rjwks if k not in ("http_uri", "cache_duration")]
-                if unknown_rj:
-                    return None, f"unsupported remote_jwks field(s): {', '.join(sorted(unknown_rj)[:4])}"
-                http_uri = mapping(rjwks.get("http_uri"))
-                uri = http_uri.get("uri")
-                if not isinstance(uri, str) or not uri.strip():
-                    return None, "remote_jwks.http_uri.uri is missing or invalid"
-                jwks_uri = uri.strip()
-                cluster_name = http_uri.get("cluster")
-                raw_cd = rjwks.get("cache_duration")
-                if raw_cd is None:
-                    # Envoy defaults remote_jwks.cache_duration to 600s; bound Ferrum staleness/refresh within 600s.
-                    cache_secs = 600
-                else:
-                    cd_ms = util.proto_duration_ms(raw_cd)
-                    if cd_ms is None or cd_ms < 1000 or cd_ms % 1000 != 0:
-                        return None, "remote_jwks.cache_duration must be a positive whole number of seconds"
-                    cache_secs = cd_ms // 1000
-                    if cache_secs > MAX_JWKS_MAX_STALE_SECONDS:
-                        return None, f"remote_jwks.cache_duration exceeds Ferrum's {MAX_JWKS_MAX_STALE_SECONDS}s limit"
-            if praw.get("local_jwks") is not None:
-                ljwks = mapping(praw["local_jwks"])
-                if set(ljwks) - {"inline_string"} or not isinstance(ljwks.get("inline_string"), str):
-                    return None, "only local_jwks.inline_string is supported"
-                inline_jwks = ljwks["inline_string"]
-            raw_fh = praw.get("from_headers")
-            fh: list[dict[str, Any]] | None = None
-            if raw_fh is not None:
-                if not isinstance(raw_fh, list):
-                    return None, "from_headers must be a list"
-                fh = []
-                for entry in raw_fh:
-                    if not isinstance(entry, dict) or set(entry) - {"name", "value_prefix"}:
-                        return None, "from_headers entry has unsupported fields"
-                    item: dict[str, Any] = {"name": entry.get("name")}
-                    if entry.get("value_prefix") is not None:
-                        item["prefix"] = entry["value_prefix"]
-                    fh.append(item)
-            raw_cth = praw.get("claim_to_headers")
-            och: list[dict[str, Any]] | None = None
-            if raw_cth is not None:
-                if not isinstance(raw_cth, list):
-                    return None, "claim_to_headers must be a list"
-                och = []
-                for entry in raw_cth:
-                    if not isinstance(entry, dict) or set(entry) - {"header_name", "claim_name"}:
-                        return None, "claim_to_headers entry has unsupported fields"
-                    och.append({"claim": entry.get("claim_name"), "header": entry.get("header_name")})
-            # Envoy defaults `forward` to false (strips the original token); Ferrum defaults to true.
-            raw_forward = praw.get("forward", False)
-            prov_cfg, problem = jwks_provider_config(
-                issuer=praw.get("issuer"),
-                jwks_uri=jwks_uri,
-                jwks=inline_jwks,
-                audiences=praw.get("audiences"),
-                from_headers=fh,
-                from_params=praw.get("from_params"),
-                forward_original_token=raw_forward,
-                output_claim_headers=och,
-            )
-            if prov_cfg is None:
-                return None, problem
-            if jwks_uri is not None:
-                cluster_err = self._verify_jwks_cluster(cluster_name, jwks_uri, ref)
-                if cluster_err is not None:
-                    return None, cluster_err
-                if cache_secs is not None:
-                    prov_cfg["jwks_max_stale_seconds"] = cache_secs
-            # Envoy defaults require_expiration to false (Ferrum defaults require_exp to true) and treats omitted
-            # or explicit 0 clock_skew_seconds (proto3 uint32 default) as 60 seconds (Ferrum defaults to 0).
-            raw_req_exp = praw.get("require_expiration", False)
-            if not isinstance(raw_req_exp, bool):
-                return None, "require_expiration must be a boolean"
-            prov_cfg["require_exp"] = raw_req_exp
-            raw_skew = praw.get("clock_skew_seconds")
-            if raw_skew is None:
-                prov_cfg["clock_skew_seconds"] = 60
-            else:
-                skew = util.as_int(raw_skew)
-                if skew is None or not 0 <= skew <= 300:
-                    return None, "clock_skew_seconds must be 0-300"
-                prov_cfg["clock_skew_seconds"] = 60 if skew == 0 else skew
-            parsed_providers[pname] = prov_cfg
-            all_claim_dests[pname] = {fold(entry["header"]) for entry in prov_cfg.get("output_claim_headers", [])}
-        raw_rules = typed.get("rules")
-        if not isinstance(raw_rules, list) or len(raw_rules) != 1 or not isinstance(raw_rules[0], dict):
-            return None, "only a single unconditional catch-all jwt_authn rule (prefix: '/') is supported"
-        rule = raw_rules[0]
-        if set(rule) - {"match", "requires"}:
-            return None, "jwt_authn rule contains unsupported fields"
-        match = mapping(rule.get("match"))
-        if set(match) - {"prefix"} or match.get("prefix", "/") not in ("", "/"):
-            return None, "jwt_authn rule match must be catch-all (prefix: '/')"
-        requires = rule.get("requires")
-        if not isinstance(requires, dict) or len(requires) != 1:
-            return None, "jwt_authn rule requires must specify provider_name or requires_any"
-        allow_missing = False
-        selected_names: list[str] = []
-        if isinstance(requires.get("provider_name"), str):
-            selected_names.append(requires["provider_name"])
-        elif isinstance(requires.get("requires_any"), dict):
-            reqs = seq(requires["requires_any"].get("requirements"))
-            if not reqs:
-                return None, "requires_any.requirements must not be empty"
-            for sub in reqs:
-                if not isinstance(sub, dict) or len(sub) != 1:
-                    return None, "unsupported nested jwt_authn requirement"
-                if isinstance(sub.get("provider_name"), str):
-                    selected_names.append(sub["provider_name"])
-                elif "allow_missing" in sub:
-                    allow_missing = True
-                else:
-                    return None, "only provider_name and allow_missing are supported inside requires_any"
-        else:
-            return None, "only provider_name or requires_any requirements are supported"
-        if not selected_names:
-            return None, "jwt_authn rule selects no providers"
-        deduped_names = list(dict.fromkeys(selected_names))
-        providers_out: list[dict[str, Any]] = []
-        emitted_dests: set[str] = set()
-        for pname in deduped_names:
-            if pname not in parsed_providers:
-                return None, f"jwt_authn rule references undefined provider {safe_label(pname, 40)}"
-            providers_out.append(parsed_providers[pname])
-            emitted_dests.update(all_claim_dests[pname])
-        # Envoy sanitizes claim_to_headers destinations across ALL configured providers, even unselected ones.
-        for pname, dests in all_claim_dests.items():
-            if pname not in deduped_names and not dests <= emitted_dests:
-                return None, (f"unselected provider {safe_label(pname, 40)} declares claim_to_headers destinations "
-                              "absent from selected providers (sanitization would be dropped)")
-        bound_err = validate_jwks_providers(providers_out, allow_missing_token=allow_missing)
-        if bound_err is not None:
-            return None, bound_err
-        result: dict[str, Any] = {"providers": providers_out}
-        stale_bounds = [p["jwks_max_stale_seconds"] for p in providers_out if "jwks_max_stale_seconds" in p]
-        if stale_bounds:
-            result["jwks_refresh_interval_secs"] = min(min(stale_bounds), 900)
-        if allow_missing:
-            result["allow_missing_token"] = True
-        return result, None
-
-
 def _envoy_fractional_percent(value: Any) -> float | None:
     if not isinstance(value, dict):
         return None
@@ -1497,13 +1252,6 @@ def _parse_envoy_fault(typed: dict, *, has_runtime: bool = False) -> tuple[str, 
                               "whereas Ferrum matches any individual header line)")
     cfg, err = fault_injection_config(abort=abort_cfg, delay=delay_cfg)
     return ("plugin", cfg) if cfg is not None else ("refuse", err)
-
-
-_ENVOY_JWT_PROVIDER_KEYS = frozenset({
-    "issuer", "audiences", "remote_jwks", "local_jwks", "from_headers", "from_params",
-    "forward", "claim_to_headers", "jwt_cache_config", "clock_skew_seconds", "require_expiration",
-})
-_ENVOY_JWT_ROOT_KEYS = frozenset({"@type", "providers", "rules"})
 
 
 def _envoy_value(value: str) -> str | None:

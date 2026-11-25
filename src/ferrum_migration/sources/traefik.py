@@ -431,6 +431,7 @@ class _Acc:
     https_redirect: bool = False
     retry: dict | None = None
     allowed_hosts: list[str] | None = None
+    resp_size_limited: bool = False
 
 
 class _Traefik:
@@ -1072,12 +1073,18 @@ class _Traefik:
             if resp_size and resp_size > 0:
                 acc.plugins.append(PluginSpec("response_size_limiting",
                                               {"max_bytes": resp_size, "require_buffered_check": True}, ref))
+                acc.resp_size_limited = True
             if any(config.get(k) for k in ("memRequestBodyBytes", "memResponseBodyBytes", "retryExpression")) \
                     or not ((req_size and req_size > 0) or (resp_size and resp_size > 0)):
                 self.report.info("traefik-buffering", ref,
                                  "Only maxResponseBodyBytes is migrated from buffering.")
         elif mw_type == "compress":
-            self._compress(config, acc, ref)
+            if acc.resp_size_limited:
+                acc.refusals.append("buffering.maxResponseBodyBytes ordered before compress measures compressed "
+                                    "response size in Traefik, whereas Ferrum response_size_limiting checks the "
+                                    "uncompressed backend Content-Length")
+            else:
+                self._compress(config, acc, ref)
         elif mw_type == "grpcWeb":
             acc.refusals.append("grpcWeb enforces local CORS preflight handling and allowOrigins (including an empty "
                                 "allow-list), whereas Ferrum grpc_web forwards unhandled preflights upstream; "

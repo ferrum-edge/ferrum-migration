@@ -1268,7 +1268,8 @@ class TraefikHardeningTest(unittest.TestCase):
             ct_p = one_proxy(self, ct_res.config, "/api", "a.example.test")
             self.assertEqual(plugins_of(ct_res.config, ct_p), [], bad_ct)
             self.assertIn("traefik-compress", codes(ct_rep, "warning"))
-        # Mirror on a path-rewriting route (stripPrefix) or HTTPS mirror with insecureSkipVerify: true is dropped.
+        # Mirror on a path-rewriting route (stripPrefix) or HTTPS mirror with insecureSkipVerify: true is dropped;
+        # buffering.maxResponseBodyBytes ordered before compress (including via chain) is refused.
         for label, extra_doc in (
             ("strip-prefix-mirror", {
                 "http": {
@@ -1304,6 +1305,21 @@ class TraefikHardeningTest(unittest.TestCase):
                 self.assertEqual(mr_p["labels"]["ferrum-migration/status"], "migrated")
                 self.assertNotIn("request_mirror", [p["plugin_name"] for p in plugins_of(mr_res.config, mr_p)])
                 self.assertIn("traefik-mirroring", codes(mr_rep, "warning"))
+        buf_before_comp = yaml.safe_dump({
+            "http": {
+                "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "main",
+                                  "middlewares": ["ch"]}},
+                "middlewares": {
+                    "ch": {"chain": {"middlewares": ["buf", "comp"]}},
+                    "buf": {"buffering": {"maxResponseBodyBytes": 1048576}},
+                    "comp": {"compress": {"encodings": ["gzip"]}},
+                },
+                "services": {"main": {"loadBalancer": {"servers": [{"url": "http://main.internal:8080"}]}}},
+            }
+        })
+        bc_res, _bc_rep, _ = asserted(buf_before_comp)
+        self.assertEqual(one_proxy(self, bc_res.config, "/api", "a.example.test")["labels"][
+            "ferrum-migration/status"], "refused")
         # Canonical schema gate checks newly supported compress/grpcWeb/mirror fields.
         bad = yaml.safe_dump({"http": {"middlewares": {"c": {"compress": {"Encodings": ["gzip"]}}}}})
         with self.assertRaises(InputError):

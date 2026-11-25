@@ -2,14 +2,11 @@
 
 from __future__ import annotations
 
-import base64
 import ipaddress
-import json
 import math
 import re
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import urlsplit
 
 from .. import matching, util
 from ..errors import InputError
@@ -243,6 +240,40 @@ def _cors_origin_effectively_universal(origin: Any) -> bool:
     return False
 
 
+def _regex_nesting_depth(pattern: str) -> int:
+    """Upper bound on regex nesting depth (groups and character classes) to stay under Ferrum's limit of 24."""
+    depth = 0
+    max_depth = 0
+    in_class = False
+    i = 0
+    n = len(pattern)
+    while i < n:
+        ch = pattern[i]
+        if ch == "\\":
+            i += 2
+            continue
+        if in_class:
+            if ch == "[":
+                depth += 1
+                max_depth = max(max_depth, depth)
+            elif ch == "]":
+                depth = max(0, depth - 1)
+                if depth == 0:
+                    in_class = False
+        else:
+            if ch == "(":
+                depth += 1
+                max_depth = max(max_depth, depth)
+            elif ch == ")":
+                depth = max(0, depth - 1)
+            elif ch == "[":
+                in_class = True
+                depth += 1
+                max_depth = max(max_depth, depth)
+        i += 1
+    return max_depth
+
+
 def cors_config(origins: Any, methods: Any = None, headers: Any = None, exposed: Any = None,
                 credentials: Any = None, max_age: Any = None, preflight_continue: Any = None,
                 private_network: Any = None, unmatched_preflights: str | None = None) -> tuple[dict | None, str | None]:
@@ -253,17 +284,17 @@ def cors_config(origins: Any, methods: Any = None, headers: Any = None, exposed:
     clean: list[Any] = []
     for origin in origins:
         if isinstance(origin, str):
-            if not origin or len(origin) > 512 or not header_value_ok(origin, nonempty=True, strict_ws=True):
+            if not origin or len(origin.encode("utf-8")) > 512 or not header_value_ok(origin, nonempty=True, strict_ws=True):
                 return None, "an allowed origin is not representable"
             clean.append(origin)
         elif isinstance(origin, dict) and len(origin) == 1 and next(iter(origin)) in ("exact", "prefix", "regex"):
             kind, value = next(iter(origin.items()))
-            if not isinstance(value, str) or not value or len(value) > 512:
+            if not isinstance(value, str) or not value or len(value.encode("utf-8")) > 512:
                 return None, "an allowed origin matcher is not representable"
             if kind in ("exact", "prefix") and not header_value_ok(value, nonempty=True, strict_ws=True):
                 return None, "an allowed origin matcher is not representable"
-            if kind == "regex" and util.regex_problem(value):
-                return None, "an allowed origin regex is not representable"
+            if kind == "regex" and (util.regex_problem(value) or _regex_nesting_depth(value) > 20):
+                return None, "an allowed origin regex is not representable or exceeds Ferrum nesting limits"
             clean.append({kind: value})
         else:
             return None, "an allowed origin matcher is not representable"
@@ -307,7 +338,6 @@ def cors_config(origins: Any, methods: Any = None, headers: Any = None, exposed:
 
 _MEDIA_TYPE_RULE_RE = re.compile(r"^[!#$%&'+.^_`|~0-9A-Za-z-]+/(?:\*|[!#$%&'+.^_`|~0-9A-Za-z-]+)$")
 _EXACT_MEDIA_TYPE_RE = re.compile(r"^[!#$%&'+.^_`|~0-9A-Za-z-]+/[!#$%&'+.^_`|~0-9A-Za-z-]+$")
-_B64URL_NO_PAD_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 _CORRELATION_ID_RESERVED_HEADERS = frozenset({
     "api-key", "authentication-info", "authorization", "connection", "content-encoding", "content-length",
     "cookie", "early-data", "expect", "forwarded", "grpc-message", "grpc-status", "grpc-status-details-bin",
@@ -320,49 +350,10 @@ _CORRELATION_ID_RESERVED_HEADERS = frozenset({
     "x-xsrf-token", "x-authenticated-identity", "x-geo-country", "x-ferrum-hops",
 })
 _GATEWAY_ASSERTION_HEADERS = frozenset({"x-authenticated-identity", "x-geo-country", "x-ferrum-hops"})
-_OUTPUT_CLAIM_RESERVED_HEADERS = (
-    GATEWAY_OWNED_REQUEST_HEADERS
-    | _CORRELATION_ID_RESERVED_HEADERS
-    | frozenset({
-        "a-im", "accept", "b3", "baggage", "cache-control", "cdn-loop", "date", "dnt",
-        "from", "http2-settings", "max-forwards", "origin", "pragma", "prefer", "priority",
-        "range", "referer", "upgrade-insecure-requests", "user-agent",
-        "x-forwarded-client-cert", "x-envoy-peer-metadata", "x-envoy-peer-metadata-id",
-    })
-)
-_OUTPUT_CLAIM_RESERVED_PREFIXES = (
-    "accept-", "access-control-", "content-", "grpc-", "if-", "proxy-", "sec-",
-    "x-b3-", "x-consumer-", "x-ferrum-", "x-forwarded-", "x-path-param-",
-)
 MAX_COMPRESSION_CONTENT_TYPES = 64
 MAX_FAULT_DELAY_MS = 60_000
 MAX_FAULT_MATCH_HEADERS = 16
-MAX_OUTPUT_CLAIM_HEADERS = 16
-MAX_OUTPUT_CLAIM_HEADER_LEN = 128
-MAX_OUTPUT_CLAIM_PATH_LEN = 256
 MAX_MIRROR_BODY_BYTES = 10 * 1024 * 1024
-MAX_JWKS_KEYS = 256
-MAX_JWKS_PROVIDERS = 64
-MAX_JWKS_CANDIDATE_PROVIDERS = 8
-MAX_JWK_ID_BYTES = 1024
-MAX_JWK_COMPONENT_BYTES = 4096
-MAX_JWK_KEY_OPS = 16
-MAX_JWKS_MAX_STALE_SECONDS = 86_400
-
-
-def _decode_b64url_no_pad(raw: Any) -> bytes | None:
-    if not isinstance(raw, str) or not raw or len(raw.encode("utf-8")) > MAX_JWK_COMPONENT_BYTES \
-            or not _B64URL_NO_PAD_RE.fullmatch(raw) or len(raw) % 4 == 1:
-        return None
-    pad = "=" * ((4 - len(raw) % 4) % 4)
-    try:
-        decoded = base64.urlsafe_b64decode(raw + pad)
-    except ValueError:
-        return None
-    # Match Rust base64::URL_SAFE_NO_PAD (rejects non-zero trailing bits).
-    if base64.urlsafe_b64encode(decoded).rstrip(b"=").decode("ascii") != raw:
-        return None
-    return decoded
 
 
 def is_loopback_ip_literal(host: str) -> bool:
@@ -569,263 +560,6 @@ def request_mirror_config(
             return None, "max_mirrored_request_body_bytes must be a positive integer"
         config["max_mirrored_request_body_bytes"] = min(max_body_bytes, MAX_MIRROR_BODY_BYTES)
     return config, None
-
-
-def jwks_provider_config(
-    *,
-    issuer: Any = None,
-    jwks_uri: Any = None,
-    jwks: Any = None,
-    audiences: Any = None,
-    from_headers: Any = None,
-    from_params: Any = None,
-    forward_original_token: Any = None,
-    output_claim_headers: Any = None,
-) -> tuple[dict | None, str | None]:
-    """Build one validated Ferrum v0.9.21 ``jwks_auth.providers[]`` entry."""
-    has_uri = jwks_uri is not None
-    has_inline = jwks is not None
-    if has_uri == has_inline:
-        return None, "provider must specify exactly one of jwks_uri or inline jwks"
-    provider: dict[str, Any] = {}
-    if has_uri:
-        if not isinstance(jwks_uri, str) or not jwks_uri.strip():
-            return None, "jwks_uri must be a non-empty URL string"
-        uri = jwks_uri.strip()
-        if any(ord(ch) <= 0x20 or ord(ch) == 0x7F for ch in uri):
-            return None, "jwks_uri contains whitespace or control characters"
-        try:
-            parts = urlsplit(uri)
-            port_val = parts.port
-        except ValueError:
-            return None, "jwks_uri is not a valid URL"
-        if parts.username is not None or parts.password is not None or not parts.hostname:
-            return None, "jwks_uri must have a host and no userinfo"
-        if port_val == 0:
-            return None, "jwks_uri port must be 1-65535"
-        if parts.query or parts.fragment:
-            return None, "jwks_uri must not contain query parameters or fragments"
-        scheme = parts.scheme.lower()
-        if scheme == "https":
-            pass
-        elif scheme == "http" and is_loopback_ip_literal(parts.hostname):
-            pass
-        else:
-            return None, "jwks_uri must use https (or http to a loopback IP literal)"
-        provider["jwks_uri"] = uri
-    else:
-        if isinstance(jwks, str):
-            raw_jwks = jwks.strip()
-            if not raw_jwks:
-                return None, "inline jwks must not be empty"
-            try:
-                parsed_jwks = json.loads(raw_jwks)
-            except ValueError:
-                return None, "inline jwks is not valid JSON"
-        elif isinstance(jwks, dict):
-            parsed_jwks = jwks
-        else:
-            return None, "inline jwks must be a JSON string or object"
-        if not isinstance(parsed_jwks, dict) or not isinstance(parsed_jwks.get("keys"), list) \
-                or not parsed_jwks["keys"] or not all(isinstance(k, dict) for k in parsed_jwks["keys"]):
-            return None, "inline jwks must be a JWKS object with a non-empty keys array"
-        if len(parsed_jwks["keys"]) > MAX_JWKS_KEYS:
-            return None, f"inline jwks exceeds Ferrum's {MAX_JWKS_KEYS}-key limit"
-        seen_kids: set[str] = set()
-        clean_keys: list[dict[str, Any]] = []
-        for key_entry in parsed_jwks["keys"]:
-            kty = key_entry.get("kty")
-            if not isinstance(kty, str) or kty not in ("RSA", "EC", "OKP") \
-                    or any(secret_field in key_entry for secret_field in ("d", "p", "q", "dp", "dq", "qi", "k", "oth")):
-                return None, "inline jwks contains unsupported, private, or symmetric key material"
-            kid = key_entry.get("kid")
-            if not isinstance(kid, str) or not kid.strip() or len(kid.encode("utf-8")) > MAX_JWK_ID_BYTES \
-                    or contains_secret_reference(kid) or any(ord(c) < 0x20 or ord(c) == 0x7F for c in kid):
-                return None, f"every inline jwks key must declare a safe non-empty kid <= {MAX_JWK_ID_BYTES} bytes"
-            if kid in seen_kids:
-                return None, "inline jwks contains duplicate kid values"
-            seen_kids.add(kid)
-            for comp_name in ("alg", "use", "n", "e", "crv", "x", "y"):
-                comp_val = key_entry.get(comp_name)
-                if comp_val is not None and (not isinstance(comp_val, str)
-                                             or len(comp_val.encode("utf-8")) > MAX_JWK_COMPONENT_BYTES):
-                    return None, f"inline jwks {comp_name} field is invalid or exceeds size limit"
-            use = key_entry.get("use")
-            if use is not None and use != "sig":
-                return None, "inline jwks keys must have use 'sig' when specified"
-            key_ops = key_entry.get("key_ops")
-            if key_ops is not None:
-                if not isinstance(key_ops, list) or len(key_ops) > MAX_JWK_KEY_OPS \
-                        or not all(isinstance(op, str) and len(op.encode("utf-8")) <= MAX_JWK_COMPONENT_BYTES
-                                   for op in key_ops):
-                    return None, "inline jwks key_ops must be a bounded list of strings"
-                if "verify" not in key_ops:
-                    return None, "inline jwks key_ops must include 'verify' when specified"
-                if any(op not in ("sign", "verify") for op in key_ops):
-                    return None, "inline jwks key_ops may only contain 'sign' and 'verify'"
-            alg = key_entry.get("alg")
-            clean_key: dict[str, Any] = {"kty": kty, "kid": kid}
-            if use is not None:
-                clean_key["use"] = use
-            if key_ops is not None:
-                clean_key["key_ops"] = list(key_ops)
-            if alg is not None:
-                clean_key["alg"] = alg
-            if kty == "RSA":
-                if alg is not None and alg not in ("RS256", "RS384", "RS512", "PS256", "PS384", "PS512"):
-                    return None, "inline jwks RSA key has unsupported alg"
-                n_bytes = _decode_b64url_no_pad(key_entry.get("n"))
-                e_bytes = _decode_b64url_no_pad(key_entry.get("e"))
-                if not n_bytes or not e_bytes:
-                    return None, "inline jwks RSA key has invalid base64url n/e"
-                n_int = int.from_bytes(n_bytes, "big")
-                e_int = int.from_bytes(e_bytes, "big")
-                if not (2048 <= n_int.bit_length() <= 8192) or e_int < 3 or e_int % 2 == 0:
-                    return None, "inline jwks RSA key fails Ferrum modulus/exponent requirements"
-                clean_key["n"] = key_entry["n"]
-                clean_key["e"] = key_entry["e"]
-            elif kty == "EC":
-                crv = key_entry.get("crv")
-                expected_len = {"P-256": 32, None: 32, "P-384": 48}.get(crv)
-                expected_alg = "ES384" if crv == "P-384" else "ES256"
-                if expected_len is None:
-                    return None, "inline jwks EC key uses an unsupported curve"
-                if alg is not None and alg != expected_alg:
-                    return None, "inline jwks EC key alg disagrees with curve"
-                x_bytes = _decode_b64url_no_pad(key_entry.get("x"))
-                y_bytes = _decode_b64url_no_pad(key_entry.get("y"))
-                if not x_bytes or not y_bytes or len(x_bytes) != expected_len or len(y_bytes) != expected_len:
-                    return None, "inline jwks EC key has invalid x/y coordinates"
-                if crv is not None:
-                    clean_key["crv"] = crv
-                clean_key["x"] = key_entry["x"]
-                clean_key["y"] = key_entry["y"]
-            else:  # OKP
-                if key_entry.get("crv") != "Ed25519":
-                    return None, "inline jwks OKP key must use Ed25519 curve"
-                if alg is not None and alg != "EdDSA":
-                    return None, "inline jwks OKP key alg must be EdDSA when specified"
-                x_bytes = _decode_b64url_no_pad(key_entry.get("x"))
-                if not x_bytes or len(x_bytes) != 32:
-                    return None, "inline jwks OKP Ed25519 key x must decode to 32 bytes"
-                clean_key["crv"] = "Ed25519"
-                clean_key["x"] = key_entry["x"]
-            # Rebuild strictly from validated public fields (never copies x5u URLs or arbitrary metadata).
-            clean_keys.append(clean_key)
-        provider["jwks"] = {"keys": clean_keys}
-    if issuer is not None:
-        if not isinstance(issuer, str) or not issuer or issuer != issuer.strip() \
-                or any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in issuer):
-            return None, "issuer must be a non-empty printable string without leading or trailing whitespace"
-        provider["issuer"] = issuer
-    auds = str_list(audiences) if audiences is not None else None
-    if not auds or any(not a or a != a.strip() or any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in a) for a in auds):
-        return None, ("provider must declare explicit non-empty audiences without leading or trailing whitespace "
-                      "(Envoy/Istio skip audience checking when omitted, whereas Ferrum rejects tokens carrying aud)")
-    provider["audiences"] = auds
-    if from_headers is not None:
-        if not isinstance(from_headers, list):
-            return None, "from_headers must be a list"
-        clean_fh: list[dict[str, str]] = []
-        for item in from_headers:
-            if not isinstance(item, dict):
-                return None, "from_headers entry must be a mapping"
-            hname = item.get("name")
-            if not isinstance(hname, str) or not hname.strip() or not header_name_ok(hname.strip()):
-                return None, "from_headers entry has an invalid header name"
-            entry: dict[str, str] = {"name": hname.strip().lower()}
-            prefix = item.get("prefix")
-            if prefix is not None:
-                if not isinstance(prefix, str):
-                    return None, "from_headers prefix must be a string"
-                if prefix:
-                    entry["prefix"] = prefix
-            clean_fh.append(entry)
-        if clean_fh:
-            provider["from_headers"] = clean_fh
-    if from_params is not None:
-        params = str_list(from_params)
-        if params is None or any(not p.strip() or any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7F for ch in p)
-                                 for p in params):
-            return None, "from_params must be a list of valid parameter names"
-        if params:
-            provider["from_params"] = [p.strip() for p in params]
-    if forward_original_token is not None:
-        if not isinstance(forward_original_token, bool):
-            return None, "forward_original_token must be a boolean"
-        provider["forward_original_token"] = forward_original_token
-    if output_claim_headers is not None:
-        if not isinstance(output_claim_headers, list):
-            return None, "output_claim_headers must be a list"
-        if len(output_claim_headers) > MAX_OUTPUT_CLAIM_HEADERS:
-            return None, f"output_claim_headers exceeds Ferrum's {MAX_OUTPUT_CLAIM_HEADERS}-entry limit"
-        seen_dests: set[str] = set()
-        clean_och: list[dict[str, str]] = []
-        for item in output_claim_headers:
-            if not isinstance(item, dict):
-                return None, "output_claim_headers entry must be a mapping"
-            claim = item.get("claim")
-            header = item.get("header")
-            if not isinstance(claim, str) or not claim or len(claim.encode("utf-8")) > MAX_OUTPUT_CLAIM_PATH_LEN \
-                    or any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7F for ch in claim) \
-                    or any(seg == "" for seg in claim.split(".")):
-                return None, "output_claim_headers claim path is not valid"
-            if not isinstance(header, str) or not header.strip() or not header_name_ok(header.strip()):
-                return None, "output_claim_headers header name is not valid"
-            dest = header.strip().lower()
-            folded = fold(dest)
-            if len(dest.encode("utf-8")) > MAX_OUTPUT_CLAIM_HEADER_LEN \
-                    or dest in _OUTPUT_CLAIM_RESERVED_HEADERS or folded in _OUTPUT_CLAIM_RESERVED_HEADERS \
-                    or folded.startswith(_OUTPUT_CLAIM_RESERVED_PREFIXES):
-                return None, f"output_claim_headers cannot target reserved header {dest}"
-            if folded in seen_dests:
-                return None, f"output_claim_headers declares header {dest} more than once"
-            seen_dests.add(folded)
-            clean_och.append({"claim": claim, "header": dest})
-        if clean_och:
-            provider["output_claim_headers"] = clean_och
-    return provider, None
-
-
-def validate_jwks_providers(providers: list[dict[str, Any]], *, allow_missing_token: bool = False) -> str | None:
-    """Enforce Ferrum v0.9.21 aggregate provider bounds and extraction equivalence."""
-    if not providers:
-        return "jwks_auth requires at least one provider"
-    if len(providers) > MAX_JWKS_PROVIDERS:
-        return f"at most {MAX_JWKS_PROVIDERS} jwks_auth providers are supported in one instance"
-    open_count = 0
-    per_issuer: dict[str, int] = {}
-    location_sigs: set[tuple] = set()
-    for prov in providers:
-        iss = prov.get("issuer")
-        if iss is None:
-            open_count += 1
-        else:
-            per_issuer[iss] = per_issuer.get(iss, 0) + 1
-        fh = prov.get("from_headers") or []
-        fp = prov.get("from_params") or []
-        if fp:
-            return ("query-parameter JWT extraction (from_params) is not migrated: Envoy reads the first matching "
-                    "query parameter while Ferrum reads the last")
-        if len(fh) != 1:
-            return ("every provider must declare exactly one explicit from_headers location; multi-location and "
-                    "implicit default (Authorization + access_token) extraction cannot be proven equivalent")
-        hname = fh[0]["name"]
-        prefix = fh[0].get("prefix")
-        if hname == "authorization" and prefix != "Bearer ":
-            return "unprefixed or non-Bearer Authorization header extraction differs in Ferrum"
-        if allow_missing_token and (hname == "authorization" or prefix is not None):
-            return ("with allow_missing_token enabled, prefixed or Authorization header extraction differs from "
-                    "Envoy/Istio (Envoy searches for prefix anywhere in the field while Ferrum uses strip_prefix, "
-                    "which can treat an invalid token as missing)")
-        location_sigs.add((hname, prefix))
-    if open_count > MAX_JWKS_CANDIDATE_PROVIDERS:
-        return f"at most {MAX_JWKS_CANDIDATE_PROVIDERS} jwks_auth providers may omit issuer"
-    if any(count + open_count > MAX_JWKS_CANDIDATE_PROVIDERS for count in per_issuer.values()):
-        return f"at most {MAX_JWKS_CANDIDATE_PROVIDERS} candidate jwks_auth providers may match any issuer"
-    if len(location_sigs) > 1:
-        return "all providers in one jwks_auth instance must share the same single explicit from_headers location"
-    return None
 
 
 def split_csv(value: Any) -> list[str]:
