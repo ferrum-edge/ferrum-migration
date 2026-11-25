@@ -270,6 +270,9 @@ class _Nginx:
                 value = util.parse_nginx_time_ms(args[0])
                 if value is not None:
                     child.timeouts[name.split("_", 1)[1].replace("_timeout", "")] = value
+                else:
+                    self.report.warning("nginx-timeout", ref,
+                                        f"{safe_label(name, 40)} has an invalid or oversized duration and was ignored.")
             elif name == "auth_basic" and args:
                 child.auth_basic = args[0]
             elif name == "auth_basic_user_file" and args:
@@ -352,8 +355,8 @@ class _Nginx:
         self._elect_ports(infos)
         for info in infos:
             self._translate_server(info)
-        self._resolve_https_redirects()
         self._apply_ssl_reject_handshake(infos)
+        self._resolve_https_redirects()
         self._refuse_conflicting_defaults()
         # Each route records the main listeners its server was served on (RouteSpec.protocols). The emitter keeps a
         # plaintext-only server's routes off Ferrum's HTTPS listener (and vice versa) for every host name.
@@ -560,7 +563,7 @@ class _Nginx:
         if server_return is not None:
             if _is_https_redirect(server_return.args) and not tls_ports:
                 route = self._new_route(base, "/", "prefix", ref + " return")
-                self._apply_return(route, server_return.args)
+                route.https_redirect = True  # type: ignore[attr-defined]
                 for problem in scope.problems:
                     route.refuse(problem)
                 self.redirect_servers.append((ref, info, base, [route]))
@@ -578,13 +581,15 @@ class _Nginx:
             return
         routes = []
         for location in locations:
-            route = self._location(location, scope, base)
+            route = self._location(location, scope, base, allow_https_redirect=not tls_ports)
             if route is not None:
                 routes.append(route)
-        if all(route.termination and _is_https_redirect_termination(route.termination) for route in routes) \
-                and routes and not tls_ports:
+        if routes and not tls_ports and all(getattr(route, "https_redirect", False) for route in routes):
             self.redirect_servers.append((ref, info, base, routes))
             return
+        for route in routes:
+            if getattr(route, "https_redirect", False):
+                route.refuse("HTTP-to-HTTPS redirect location mixed with non-redirect locations")
         _check_precedence(routes)
         self.plan.routes.extend(routes)
         self._note_catch_all(info, base, routes)
@@ -597,22 +602,25 @@ class _Nginx:
             self.catch_all_routes.setdefault(info["index"], []).extend(routes)
 
     def _resolve_https_redirects(self) -> None:
-        """Fold plaintext HTTP-to-HTTPS redirect servers away only when no other main plaintext routes exist.
+        """Fold plaintext HTTP-to-HTTPS redirect servers away only when live HTTPS exists and no other plain routes do.
 
-        If another plaintext server keeps Ferrum's HTTP listener open, no HTTPS server exists in the input, or a
-        redirect server carries refusals or plugins, keep its routes as fail-closed refused placeholders so a
-        broader wildcard/default plaintext server cannot absorb the redirected host's traffic.
+        If another plaintext server keeps Ferrum's HTTP listener open, no live (unrefused) HTTPS route exists in the
+        input, or a redirect server carries refusals or local-answering plugins, keep its routes as fail-closed refused
+        placeholders so a broader wildcard/default plaintext server cannot absorb the redirected host's traffic.
         """
         if not self.redirect_servers:
             return
-        has_https = any(not r.skip and (r.requires_tls or "https" in (r.protocols or ())) for r in self.plan.routes)
+        local_plugins = {"cors", "basic_auth", "key_auth", "jwt_auth", "ip_restriction", "rate_limiting",
+                         "request_termination"}
+        has_live_https = any(not r.skip and not r.refusals and "https" in (r.protocols or ())
+                             for r in self.plan.routes)
         has_other_plain = any(not r.skip and not r.requires_tls and r.listen_port is None for r in self.plan.routes)
         can_fold = (
-            has_https
+            has_live_https
             and not has_other_plain
             and all(
                 base["listen_port"] is None and not base["extra"]
-                and all(not r.refusals and not r.plugins for r in routes)
+                and all(not r.refusals and not any(p.name in local_plugins for p in r.plugins) for r in routes)
                 for _, _, base, routes in self.redirect_servers
             )
         )
@@ -625,7 +633,7 @@ class _Nginx:
         for ref, info, base, routes in self.redirect_servers:
             for route in routes:
                 route.refuse("HTTP-to-HTTPS redirect server cannot be folded away alongside other plaintext routes, "
-                             "without an HTTPS server, or with local policies/errors")
+                             "without a live HTTPS server, or with local policies/errors")
             _check_precedence(routes)
             self.plan.routes.extend(routes)
             self._note_catch_all(info, base, routes)
@@ -773,7 +781,8 @@ class _Nginx:
 
     # ------------------------------------------------------------ locations
 
-    def _location(self, location: Directive, server_scope: _Scope, base: dict) -> RouteSpec | None:
+    def _location(self, location: Directive, server_scope: _Scope, base: dict,
+                  *, allow_https_redirect: bool = False) -> RouteSpec | None:
         args = location.args
         if len(args) == 1:
             modifier, path = None, args[0]
@@ -821,6 +830,11 @@ class _Nginx:
         if access_problem:
             route.refuse(access_problem)
         if returns:
+            if allow_https_redirect and _is_https_redirect(returns[0].args):
+                route.https_redirect = True  # type: ignore[attr-defined]
+                if access_config:
+                    route.plugins.insert(0, PluginSpec("ip_restriction", access_config, ref))
+                return route
             self._apply_return(route, returns[0].args)
             return route
         if deny_all:

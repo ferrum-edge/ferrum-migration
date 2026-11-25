@@ -512,9 +512,9 @@ class _Envoy:
                                vhost, shared)
             if filter_refusal:
                 spec.refuse(filter_refusal)
-            if buffer_limit and buffer_limit > 0 and not spec.termination:
+            if buffer_limit and buffer_limit > 0 and not spec.termination and not getattr(spec, "https_redirect", False):
                 spec.plugins.append(PluginSpec("request_size_limiting", {"max_bytes": buffer_limit}, ref))
-            if not spec.termination:
+            if not spec.termination and not getattr(spec, "https_redirect", False):
                 for hp in shared.get("hcm_plugins", []):
                     spec.plugins.append(PluginSpec(hp.name, hp.config, hp.ref))
             routes.append(spec)
@@ -534,16 +534,20 @@ class _Envoy:
             self.plan.host_scopes.append(HostScope(ref, list(hosts), listen_port))
 
     def _resolve_https_redirects(self) -> None:
-        """Fold plaintext HTTP-to-HTTPS redirect virtual hosts away only when no other main plaintext routes exist."""
+        """Fold plaintext HTTP-to-HTTPS redirect virtual hosts away only when live HTTPS exists and no other plain routes do."""
         if not self.redirect_vhosts:
             return
-        has_https = any(not r.skip and (r.requires_tls or "https" in (r.protocols or ())) for r in self.plan.routes)
+        local_plugins = {"cors", "basic_auth", "key_auth", "jwt_auth", "ip_restriction", "rate_limiting",
+                         "request_termination", "fault_injection"}
+        has_live_https = any(not r.skip and not r.refusals and "https" in (r.protocols or ())
+                             for r in self.plan.routes)
         has_other_plain = any(not r.skip and not r.requires_tls and r.listen_port is None for r in self.plan.routes)
         can_fold = (
-            has_https
+            has_live_https
             and not has_other_plain
             and all(
-                listen_port is None and all(not r.refusals and not r.plugins for r in routes)
+                listen_port is None
+                and all(not r.refusals and not any(p.name in local_plugins for p in r.plugins) for r in routes)
                 for _, _, listen_port, routes in self.redirect_vhosts
             )
         )
@@ -559,7 +563,7 @@ class _Envoy:
                 route.skip = False
                 route.skip_reason = ""
                 route.refuse("HTTP-to-HTTPS redirect virtual host cannot be folded away alongside other plaintext "
-                             "routes, without an HTTPS listener, or with local filters/errors")
+                             "routes, without a live HTTPS listener, or with local filters/errors")
             apply_first_match_order(routes, self.report)
             self.plan.routes.extend(routes)
             if hosts:
@@ -769,7 +773,16 @@ class _Envoy:
             spec.termination = {"status_code": status, "content_type": "text/plain", "body": str(text)}
 
     def _redirect(self, spec: RouteSpec, redirect: dict, tls: bool) -> None:
-        if redirect.get("https_redirect") or redirect.get("scheme_redirect") == "https":
+        raw_port = redirect.get("port_redirect")
+        port_redir: int | None = None
+        if raw_port is not None:
+            parsed_port = util.as_int(raw_port)
+            if parsed_port is None or not 1 <= parsed_port <= 65535:
+                spec.refuse("redirect port_redirect is invalid")
+                return
+            port_redir = parsed_port
+        if (redirect.get("https_redirect") or redirect.get("scheme_redirect") == "https") \
+                and port_redir in (None, 443):
             if not tls and not redirect.get("host_redirect") and not redirect.get("path_redirect"):
                 spec.https_redirect = True  # type: ignore[attr-defined]
                 spec.skip = True
@@ -782,7 +795,15 @@ class _Envoy:
         if code is None or not (scheme and host and path):
             spec.refuse("only fully static redirects (scheme, host and path) are migrated")
             return
-        location = f"{scheme}://{host}{path}"
+        host_str = str(host)
+        if port_redir is not None:
+            if ":" in host_str and not (host_str.startswith("[") and host_str.endswith("]")):
+                spec.refuse("redirect specifies both host_redirect port and port_redirect")
+                return
+            authority = f"{host_str}:{port_redir}"
+        else:
+            authority = host_str
+        location = f"{scheme}://{authority}{path}"
         if not header_value_ok(location, nonempty=True, strict_ws=True):
             spec.refuse("redirect location is not a valid header value")
             return

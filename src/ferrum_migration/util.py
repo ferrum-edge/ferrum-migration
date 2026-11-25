@@ -447,7 +447,7 @@ def parse_go_duration_ns(value: object, *, allow_unitless_float: bool = True) ->
             dec_f = Decimal(str(value)) * Decimal(1_000_000_000)
         except (DecimalException, ValueError, OverflowError):
             return None
-        if dec_f < 0 or dec_f > _MAX_DURATION_NS:
+        if dec_f.is_nan() or dec_f.is_infinite() or dec_f < 0 or dec_f >= _MAX_DURATION_NS + 1:
             return None
         return int(dec_f)
     if not isinstance(value, str):
@@ -473,29 +473,29 @@ def parse_go_duration_ns(value: object, *, allow_unitless_float: bool = True) ->
             dec = Decimal(unsigned) * Decimal(1_000_000_000)
         except (DecimalException, ValueError, OverflowError):
             return None
-        if dec == 0:
-            return 0
-        if neg or dec < 0 or dec > _MAX_DURATION_NS:
+        if dec.is_nan() or dec.is_infinite() or dec < 0 or dec >= _MAX_DURATION_NS + 1:
             return None
-        return int(dec)
+        ns = int(dec)
+        if ns == 0:
+            return 0
+        if neg:
+            return None
+        return ns
     if not _GO_DURATION.match(text):
         return None
     total_ns = 0
-    any_nonzero = False
     for number, unit in _GO_PART.findall(unsigned):
-        if any(ch != "0" and ch != "." for ch in number):
-            any_nonzero = True
         try:
             part = Decimal(number) * _GO_UNIT_NS[unit]
         except (DecimalException, ValueError, OverflowError):
             return None
-        if part < 0 or part > _MAX_DURATION_NS:
+        if part.is_nan() or part.is_infinite() or part < 0 or part >= _MAX_DURATION_NS + 1:
             return None
         # Go time.ParseDuration truncates each component's fractional nanoseconds before summing.
         total_ns += int(part)
         if total_ns > _MAX_DURATION_NS:
             return None
-    if not any_nonzero:
+    if total_ns == 0:
         return 0
     if neg:
         return None
@@ -525,31 +525,34 @@ def parse_go_duration_ms(value: object, *, allow_unitless_float: bool = True) ->
 
 
 def proto_duration_ms(value: object) -> int | None:
-    """protobuf JSON Duration (``"15s"``, ``"0.25s"``) or ``{seconds, nanos}``."""
+    """protobuf JSON Duration (``"15s"``, ``"0.25s"``) or ``{seconds, nanos}`` (truncated to whole ms)."""
     if isinstance(value, dict):
         seconds = as_int(value.get("seconds", 0))
         nanos = as_int(value.get("nanos", 0))
         if seconds is None or nanos is None or not (0 <= seconds <= _MAX_DURATION_MS // 1000) \
                 or not (0 <= nanos < 1_000_000_000):
             return None
-        return seconds * 1000 + nanos // 1_000_000
+        total_ms = seconds * 1000 + nanos // 1_000_000
+        return total_ms if total_ms <= _MAX_DURATION_MS else None
     if isinstance(value, str):
         match = re.fullmatch(r"(\d+(?:\.\d+)?)s", value.strip(), re.ASCII)
         if match:
             try:
-                secs = float(match.group(1))
-            except ValueError:
+                dec_ms = Decimal(match.group(1)) * Decimal(1000)
+            except (DecimalException, ValueError, OverflowError):
                 return None
-            if not math.isfinite(secs) or secs < 0.0 or secs > _MAX_DURATION_MS / 1000.0:
+            if dec_ms.is_nan() or dec_ms.is_infinite() or dec_ms < 0 or dec_ms >= _MAX_DURATION_MS + 1:
                 return None
-            return int(round(secs * 1000.0))
-        return parse_go_duration_ms(value)
+            return int(dec_ms)
+        ns = parse_go_duration_ns(value)
+        return None if ns is None else ns // 1_000_000
     return None
 
 
-_NGINX_TIME_PART = re.compile(r"(\d+)(ms|s|m|h|d|w|M|y)?", re.ASCII)
+_NGINX_TIME_PART = re.compile(r"\s*(\d+)(ms|s|m|h|d|w|M|y)?", re.ASCII)
 _NGINX_TIME_MS = {"ms": 1, "s": 1000, None: 1000, "m": 60_000, "h": 3_600_000, "d": 86_400_000,
                   "w": 604_800_000, "M": 2_592_000_000, "y": 31_536_000_000}
+_NGINX_TIME_RANK = {"y": 7, "M": 6, "w": 5, "d": 4, "h": 3, "m": 2, "s": 1, None: 1, "ms": 0}
 
 
 def parse_nginx_time_ms(value: object) -> int | None:
@@ -560,13 +563,19 @@ def parse_nginx_time_ms(value: object) -> int | None:
         return None
     total = 0
     pos = 0
+    prev_rank = 8
     for match in _NGINX_TIME_PART.finditer(text):
         if match.start() != pos:
             return None
-        if match.group(2) is None and match.end() != len(text):
+        unit = match.group(2)
+        if unit is None and match.end() != len(text):
             return None
+        rank = _NGINX_TIME_RANK[unit]
+        if rank >= prev_rank:
+            return None
+        prev_rank = rank
         try:
-            total += int(match.group(1)) * _NGINX_TIME_MS[match.group(2) or None]
+            total += int(match.group(1)) * _NGINX_TIME_MS[unit]
         except ValueError:
             return None
         if total > _MAX_DURATION_MS:

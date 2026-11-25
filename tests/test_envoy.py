@@ -1330,6 +1330,61 @@ class EnvoyHardeningTest(unittest.TestCase):
         self.assertEqual(len(catchall), 1)
         self.assertEqual(catchall[0]["labels"]["ferrum-migration/status"], "migrated")
 
+        # Custom port_redirect (9443) alongside a live HTTPS listener does NOT fold away; it refuses fail-closed.
+        port_redir = minimal_bootstrap({"prefix": "/"})
+        port_redir["static_resources"]["listeners"] = [
+            {
+                "name": "plain",
+                "address": {"socket_address": {"address": "0.0.0.0", "port_value": 80}},
+                "filter_chains": [{"filters": [{
+                    "name": "envoy.filters.network.http_connection_manager",
+                    "typed_config": {
+                        "@type": "type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager",
+                        "stat_prefix": "plain",
+                        "http_filters": [{"name": "envoy.filters.http.router"}],
+                        "route_config": {"virtual_hosts": [{
+                            "name": "redir_vh", "domains": ["app.example.test"],
+                            "routes": [{"name": "r", "match": {"prefix": "/"},
+                                        "redirect": {"https_redirect": True, "port_redirect": 9443}}],
+                        }]},
+                    },
+                }]}],
+            },
+            {
+                "name": "tls",
+                "address": {"socket_address": {"address": "0.0.0.0", "port_value": 443}},
+                "filter_chains": [{
+                    "transport_socket": {
+                        "name": "envoy.transport_sockets.tls",
+                        "typed_config": {
+                            "@type": "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext",
+                            "common_tls_context": {"tls_certificates": [{
+                                "certificate_chain": {"filename": "/etc/certs/tls.crt"},
+                                "private_key": {"filename": "/etc/certs/tls.key"},
+                            }]},
+                        },
+                    },
+                    "filters": [{
+                        "name": "envoy.filters.network.http_connection_manager",
+                        "typed_config": {
+                            "@type": "type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager",
+                            "stat_prefix": "tls",
+                            "http_filters": [{"name": "envoy.filters.http.router"}],
+                            "route_config": {"virtual_hosts": [{
+                                "name": "tls_vh", "domains": ["app.example.test"],
+                                "routes": [{"name": "api", "match": {"path_separated_prefix": "/api"},
+                                            "route": {"cluster": "c"}}],
+                            }]},
+                        },
+                    }],
+                }],
+            },
+        ]
+        pr_res, pr_rep, _ = migrate("envoy", yaml.safe_dump(port_redir))
+        self.assertNotIn("envoy-https-redirect", codes(pr_rep, "info"))
+        self.assertEqual(one_proxy(self, pr_res.config, "/", "app.example.test")["labels"][
+            "ferrum-migration/status"], "refused")
+
 
 if __name__ == "__main__":
     unittest.main()

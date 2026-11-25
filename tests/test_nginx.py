@@ -827,7 +827,7 @@ class NginxFrontendScopeTest(unittest.TestCase):
             self.assertEqual(plugins_of(hm_res.config, one_proxy(self, hm_res.config, "/html", "def.example.test")), [])
             self.assertIn("nginx-gzip", codes(hm_rep, "warning"))
 
-        # Malformed or huge proxy_read_timeout values do not backtrack catastrophically or crash int().
+        # Malformed or huge proxy_read_timeout values do not backtrack catastrophically or crash int() (and warn).
         for bad_to in ("1" * 37 + "x", "9" * 4400 + "s"):
             bad_to_conf = f"""
             server {{
@@ -837,9 +837,21 @@ class NginxFrontendScopeTest(unittest.TestCase):
                 location /api/ {{ proxy_pass http://api.internal:8080; }}
             }}
             """
-            bt_res, _bt_rep, _ = nginx(bad_to_conf)
+            bt_res, bt_rep, _ = nginx(bad_to_conf)
             self.assertEqual(one_proxy(self, bt_res.config, "/api", "to.example.test")["labels"][
                 "ferrum-migration/status"], "migrated")
+            self.assertIn("nginx-timeout", codes(bt_rep, "warning"))
+        # Valid spaced compound NGINX timeout ("1m 500ms") is parsed accurately.
+        spaced_to_res, _spaced_rep, _ = nginx("""
+            server {
+                listen 80;
+                server_name to.example.test;
+                proxy_read_timeout "1m 500ms";
+                location /api/ { proxy_pass http://api.internal:8080; }
+            }
+        """)
+        self.assertEqual(one_proxy(self, spaced_to_res.config, "/api", "to.example.test")["backend_read_timeout_ms"],
+                         60_500)
 
         # Redirect-only plaintext server alongside a wildcard/default plaintext server stays as a refused placeholder
         # so the broader plaintext server cannot absorb the redirected host's traffic.

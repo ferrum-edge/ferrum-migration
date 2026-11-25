@@ -106,6 +106,7 @@ class _Kong:
         self.global_correlation_id: tuple[_Plugin, PluginSpec] | None = None
         self.global_cors: PluginSpec | None = None
         self.global_cors_refusal: str | None = None
+        self.has_global_termination: bool = False
 
     # ------------------------------------------------------------ indexing
 
@@ -660,6 +661,7 @@ class _Kong:
                 else:
                     self.plan.global_plugins.append(outcome[1])
             elif outcome[0] == "termination":
+                self.has_global_termination = True
                 self.plan.global_plugins.append(PluginSpec("request_termination", outcome[1], ref))
             elif outcome[0] == "refuse":
                 if plugin.name == "cors":
@@ -1072,14 +1074,18 @@ class _Kong:
             if termination is not None:
                 spec.termination = termination
                 if any(p.name == "cors" for p in plugins):
-                    spec.refuse("route combines cors with request-termination; Kong runs cors before "
-                                "request-termination (answering preflights), whereas Ferrum request_termination "
-                                "answers before cors")
+                    spec.refuse("route combines cors with request-termination; Kong runs cors on preflight and "
+                                "terminated responses, which this converter does not combine with a static "
+                                "termination route")
                 elif plugins:
                     self.report.warning("kong-termination-order", spec.ref,
                                         "Ferrum's request_termination runs before authentication, so callers get the "
                                         "termination response without authenticating first.")
             else:
+                if self.has_global_termination and any(p.name == "cors" for p in plugins):
+                    spec.refuse("route combines cors with global request-termination; Kong runs cors on preflight "
+                                "and terminated responses, which this converter does not combine with global "
+                                "request_termination")
                 for problem in backend_info["problems"]:
                     spec.refuse(problem)
                 spec.backend = backend_info.get("backend")
@@ -1278,10 +1284,12 @@ def _kong_cors(self: _Kong, config: dict, ref: str) -> tuple:
         if not is_canonical_http_origin(origin):
             return ("refuse", "CORS origin is not a canonical http(s)://host[:port] URL or 'null'; Kong's loose "
                               "host/URL origin matching cannot be proven equivalent in Ferrum")
-        # In Kong, a single-origin literal is emitted verbatim (so default ports like :443 or zero-padded ports
-        # like :08443 are NOT normalized), whereas multi-origin lists parse URLs (stripping default ports and
-        # normalizing numeric ports). Match both behaviors cleanly.
-        if (single_origin and (has_explicit_default_origin_port(origin) or has_leading_zero_origin_port(origin))) \
+        # In Kong, a single-origin literal is compared/emitted verbatim (so default ports like :443 are NOT
+        # normalized), whereas multi-origin lists parse via LuaSocket (stripping only literal default ports 80/443
+        # while preserving zero-padded port text such as :08443 verbatim). Wrap single-origin default ports, all
+        # zero-padded ports, and non-lowercase origins as {'exact': ...} so Ferrum never widens them.
+        if (single_origin and has_explicit_default_origin_port(origin)) \
+                or has_leading_zero_origin_port(origin) \
                 or origin != origin.lower():
             ferrum_origins.append({"exact": origin})
         else:

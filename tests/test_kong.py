@@ -559,16 +559,16 @@ class KongHardeningTest(unittest.TestCase):
                     paths: [/exact/]
                     plugins:
                       - name: cors
-                        config: {origins: ["null", "https://app.example.test:443"], methods: [], headers: [], credentials: false}
+                        config: {origins: ["null", "https://app.example.test:443", "https://app.example.test:08443"], methods: [], headers: [], credentials: false}
                   - name: single-leading-zero-port
                     paths: [/zport/]
                     plugins:
                       - name: cors
-                        config: {origins: ["https://app.example.test:08443"], credentials: false}
+                        config: {origins: ["https://app.example.test:08443"], headers: [X-App], credentials: false}
                   - name: inherits-global
                     paths: [/g/]
         """)
-        cors_res, cors_rep, _ = migrate("kong", cors_text)
+        cors_res, _cors_rep, _ = migrate("kong", cors_text)
         assert_structurally_valid(self, cors_res.config)
         for refused_path in ("/c", "/cp", "/host", "/v6", "/term"):
             self.assertEqual(one_proxy(self, cors_res.config, refused_path)["labels"]["ferrum-migration/status"],
@@ -578,11 +578,11 @@ class KongHardeningTest(unittest.TestCase):
         exact_p = one_proxy(self, cors_res.config, "/exact")
         exact_cors = plugin(self, cors_res.config, exact_p, "cors")["config"]
         self.assertEqual(exact_cors["allowed_origins"],
-                         [{"exact": "null"}, "https://app.example.test:443"])
+                         [{"exact": "null"}, "https://app.example.test:443",
+                          {"exact": "https://app.example.test:08443"}])
         self.assertEqual(exact_cors["unmatched_preflights"], "ignore")
         self.assertNotIn("allowed_methods", exact_cors)
-        self.assertIn("authorization", exact_cors["allowed_headers"])
-        self.assertIn("kong-cors-headers", codes(cors_rep, "warning"))
+        self.assertIn("authorization", [h.lower() for h in exact_cors["allowed_headers"]])
         zport_p = one_proxy(self, cors_res.config, "/zport")
         self.assertEqual(plugin(self, cors_res.config, zport_p, "cors")["config"]["allowed_origins"],
                          [{"exact": "https://app.example.test:08443"}])
@@ -590,6 +590,39 @@ class KongHardeningTest(unittest.TestCase):
         g_cors = plugin(self, cors_res.config, g_p, "cors")["config"]
         self.assertEqual(g_cors["allowed_origins"], ["https://global.example.test"])
         self.assertEqual(g_cors["unmatched_preflights"], "ignore")
+
+        # Isolated explicit empty headers: [] emits kong-cors-headers warning; global request-termination + cors refuses.
+        empty_hdr_res, empty_hdr_rep, _ = migrate("kong", textwrap.dedent("""
+            _format_version: "3.0"
+            services:
+              - name: s
+                url: http://s.internal:8080
+                routes:
+                  - name: r
+                    paths: [/eh/]
+                    plugins:
+                      - name: cors
+                        config: {origins: ["https://ok.example.test"], headers: []}
+        """))
+        self.assertIn("kong-cors-headers", codes(empty_hdr_rep, "warning"))
+        eh_cors = plugin(self, empty_hdr_res.config, one_proxy(self, empty_hdr_res.config, "/eh"), "cors")["config"]
+        self.assertIn("authorization", [h.lower() for h in eh_cors["allowed_headers"]])
+        glob_term_res, _glob_term_rep, _ = migrate("kong", textwrap.dedent("""
+            _format_version: "3.0"
+            plugins:
+              - name: request-termination
+                config: {status_code: 503, message: maintenance}
+            services:
+              - name: s
+                url: http://s.internal:8080
+                routes:
+                  - name: r
+                    paths: [/gt/]
+                    plugins:
+                      - name: cors
+                        config: {origins: ["https://ok.example.test"]}
+        """))
+        self.assertEqual(one_proxy(self, glob_term_res.config, "/gt")["labels"]["ferrum-migration/status"], "refused")
 
     def test_top_level_consumer_group_plugin_quarantines_group_members(self):
         text = textwrap.dedent("""

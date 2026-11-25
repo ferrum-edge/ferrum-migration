@@ -1243,8 +1243,9 @@ class IstioCaseAndNamesTest(unittest.TestCase):
         self.assertEqual(plugins_of(hp_res.config, hp_api), [])
         self.assertIn("istio-dropped", codes(hp_rep, "warning"))
 
-        # Gateway httpsRedirect server alongside a wildcard plaintext server stays as a refused placeholder so
-        # plaintext traffic for the redirected host cannot fall through to the wildcard backend.
+        # Gateway httpsRedirect server alongside a wildcard plaintext server refuses both the redirect placeholder
+        # AND overlapping plaintext routes (even longer prefixes like /api) so plaintext cannot bypass httpsRedirect;
+        # disjoint plaintext hosts stay live.
         mixed_redir = textwrap.dedent("""
             apiVersion: networking.istio.io/v1
             kind: Gateway
@@ -1255,22 +1256,34 @@ class IstioCaseAndNamesTest(unittest.TestCase):
                   hosts: ["*/secure.example.test"]
                   tls: {httpsRedirect: true}
                 - port: {number: 80, name: http-pub, protocol: HTTP}
-                  hosts: ["*/*.example.test"]
+                  hosts: ["*/*.example.test", "*/public.other.test"]
             ---
             apiVersion: networking.istio.io/v1
             kind: VirtualService
-            metadata: {name: vs, namespace: default}
+            metadata: {name: vs-overlap, namespace: default}
             spec:
               hosts: ["*.example.test"]
               gateways: [gw]
               http:
-                - match: [{uri: {prefix: /}}]
+                - match: [{uri: {prefix: /api}}]
+                  route: [{destination: {host: pub.default.svc.cluster.local, port: {number: 8080}}}]
+            ---
+            apiVersion: networking.istio.io/v1
+            kind: VirtualService
+            metadata: {name: vs-disjoint, namespace: default}
+            spec:
+              hosts: ["public.other.test"]
+              gateways: [gw]
+              http:
+                - match: [{uri: {prefix: /ok}}]
                   route: [{destination: {host: pub.default.svc.cluster.local, port: {number: 8080}}}]
         """)
         mr_res = migrate("istio", mixed_redir)[0]
         self.assertEqual(one_proxy(self, mr_res.config, "/", "secure.example.test")["labels"][
             "ferrum-migration/status"], "refused")
-        self.assertEqual(one_proxy(self, mr_res.config, "/", "*.example.test")["labels"][
+        self.assertEqual(one_proxy(self, mr_res.config, "/api", "*.example.test")["labels"][
+            "ferrum-migration/status"], "refused")
+        self.assertEqual(one_proxy(self, mr_res.config, "/ok", "public.other.test")["labels"][
             "ferrum-migration/status"], "migrated")
 
 

@@ -252,10 +252,17 @@ class MatchingTest(unittest.TestCase):
 
     def test_durations_and_sizes(self):
         self.assertEqual(util.parse_go_duration_ms("1m30s"), 90_000)
+        self.assertEqual(util.parse_go_duration_ns("9223372036854775807.1ns"), 9_223_372_036_854_775_807)
+        self.assertEqual(util.parse_go_duration_ns("-0.1ns"), 0)
+        self.assertIsNone(util.parse_go_duration_ns("-1ns"))
         self.assertEqual(util.parse_nginx_time_ms("60s"), 60_000)
         self.assertEqual(util.parse_nginx_time_ms("5"), 5_000)
+        self.assertEqual(util.parse_nginx_time_ms("1m 500ms"), 60_500)
+        self.assertIsNone(util.parse_nginx_time_ms("500ms 1m"))
         self.assertEqual(util.parse_nginx_size("10m"), 10 * 1024 * 1024)
         self.assertEqual(util.proto_duration_ms("0.25s"), 250)
+        self.assertEqual(util.proto_duration_ms("0.0009s"), 0)
+        self.assertEqual(util.proto_duration_ms({"seconds": 0, "nanos": 900_000}), 0)
         self.assertEqual(util.canonical_cidr("10.1.2.3/8"), "10.0.0.0/8")
 
     def test_segment_prefix_shadows_only_segment_descendants(self):
