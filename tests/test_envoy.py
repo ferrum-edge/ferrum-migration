@@ -1219,9 +1219,10 @@ class EnvoyHardeningTest(unittest.TestCase):
             {"name": "dr", "match": {"path": "/healthz"}, "direct_response": {"status": 200}},
             {"name": "redir", "match": {"prefix": "/"}, "redirect": {"https_redirect": True}},
         ]
-        ll_res = migrate("envoy", yaml.safe_dump(lr_local))[0]
+        ll_res, ll_rep, _ = migrate("envoy", yaml.safe_dump(lr_local))
         self.assertEqual(one_proxy(self, ll_res.config, "=/healthz")["labels"]["ferrum-migration/status"], "refused")
         self.assertEqual(one_proxy(self, ll_res.config, "/")["labels"]["ferrum-migration/status"], "refused")
+        self.assertIn("envoy-local-reply", codes(ll_rep, "warning"))
 
         for star_pattern in (r"\*", r"\x{2a}", r"\Q*\E", r"(?:a?|\*?){30}"):
             with self.subTest(star_pattern=star_pattern):

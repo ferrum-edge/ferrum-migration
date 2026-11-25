@@ -816,6 +816,27 @@ def cors_origin_star_probe(origin: Any) -> str:
     return "error"
 
 
+def is_canonical_http_origin(origin: str) -> bool:
+    """Whether ``origin`` is a plain ``http(s)://host[:port]`` URL accepted by Ferrum ``cors`` string origins."""
+    if not origin or any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7F for ch in origin):
+        return False
+    lower = origin.lower()
+    if lower.startswith("http://"):
+        authority = origin[7:]
+    elif lower.startswith("https://"):
+        authority = origin[8:]
+    else:
+        return False
+    if not authority or any(ch in authority for ch in "/\\?#@%"):
+        return False
+    parsed = util.split_host_port(authority, 80)
+    if parsed is None:
+        return False
+    host, _port = parsed
+    norm_host = util.normalize_backend_host(host)
+    return norm_host is not None and _is_valid_mirror_host(norm_host)
+
+
 def cors_config(origins: Any, methods: Any = None, headers: Any = None, exposed: Any = None,
                 credentials: Any = None, max_age: Any = None, preflight_continue: Any = None,
                 private_network: Any = None, unmatched_preflights: str | None = None) -> tuple[dict | None, str | None]:
@@ -828,6 +849,8 @@ def cors_config(origins: Any, methods: Any = None, headers: Any = None, exposed:
         if isinstance(origin, str):
             if not origin or len(origin.encode("utf-8")) > 512 or not header_value_ok(origin, nonempty=True, strict_ws=True):
                 return None, "an allowed origin is not representable"
+            if origin != "*" and not is_canonical_http_origin(origin):
+                return None, "plain string allowed_origins entry must be '*' or a canonical http(s)://host[:port] origin"
             clean.append(origin)
         elif isinstance(origin, dict) and len(origin) == 1 and next(iter(origin)) in ("exact", "prefix", "regex"):
             kind, value = next(iter(origin.items()))

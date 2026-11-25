@@ -448,6 +448,12 @@ class _Envoy:
                                 "validators when compressing, whereas Ferrum v0.9.21 requires a matching Content-Type "
                                 "and skips strong-ETag responses by default.")
         route_config = mapping(config.get("route_config"))
+        has_local_reply = bool(config.get("local_reply_config"))
+        if has_local_reply:
+            self.report.warning("envoy-local-reply", ref,
+                                "HCM local_reply_config is not migrated; direct_response, redirect, and active fault "
+                                "aborts are refused, while gateway-generated errors on forwarding routes (such as "
+                                "upstream timeouts) will use Ferrum's default status and body.")
         shared = {"request_add": seq(route_config.get("request_headers_to_add")),
                   "request_remove": seq(route_config.get("request_headers_to_remove")),
                   "response_add": seq(route_config.get("response_headers_to_add")),
@@ -461,7 +467,7 @@ class _Envoy:
                   "fault_index": fault_index,
                   "cors_index": cors_index,
                   "grpc_web_index": grpc_web_index,
-                  "has_local_reply": bool(config.get("local_reply_config"))}
+                  "has_local_reply": has_local_reply}
         for index, vhost in enumerate(seq(route_config.get("virtual_hosts"))):
             if isinstance(vhost, dict):
                 self._vhost(vhost, index, ref, listen_port, tls, cors_enabled, filter_refusal, buffer_limit, shared)

@@ -1712,11 +1712,46 @@ class TraefikHardeningTest(unittest.TestCase):
                     "services": {"main": {"loadBalancer": {"servers": [{"url": "http://main.internal:8080"}]}}},
                 }
             }),
+            ("compress-uppercase-encoding", {
+                "http": {
+                    "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "main",
+                                      "middlewares": ["c"]}},
+                    "middlewares": {"c": {"compress": {"encodings": ["GZIP"]}}},
+                    "services": {"main": {"loadBalancer": {"servers": [{"url": "http://main.internal:8080"}]}}},
+                }
+            }),
             ("headers-cors-regex-refused", {
                 "http": {
                     "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "main",
                                       "middlewares": ["h"]}},
                     "middlewares": {"h": {"headers": {"accessControlAllowOriginListRegex": ["^https://.*\\.example$"]}}},
+                    "services": {"main": {"loadBalancer": {"servers": [{"url": "http://main.internal:8080"}]}}},
+                }
+            }),
+            ("headers-cors-add-vary-only", {
+                "http": {
+                    "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "main",
+                                      "middlewares": ["h"]}},
+                    "middlewares": {"h": {"headers": {"addVaryHeader": True}}},
+                    "services": {"main": {"loadBalancer": {"servers": [{"url": "http://main.internal:8080"}]}}},
+                }
+            }),
+            ("headers-cors-max-age-zero-only", {
+                "http": {
+                    "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "main",
+                                      "middlewares": ["h"]}},
+                    "middlewares": {"h": {"headers": {"accessControlMaxAge": 0}}},
+                    "services": {"main": {"loadBalancer": {"servers": [{"url": "http://main.internal:8080"}]}}},
+                }
+            }),
+            ("headers-cors-regex-with-https-redirect", {
+                "http": {
+                    "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "main",
+                                      "middlewares": ["h", "redir"]}},
+                    "middlewares": {
+                        "h": {"headers": {"accessControlAllowOriginListRegex": ["^https://.*\\.example$"]}},
+                        "redir": {"redirectScheme": {"scheme": "https"}},
+                    },
                     "services": {"main": {"loadBalancer": {"servers": [{"url": "http://main.internal:8080"}]}}},
                 }
             }),
@@ -1728,25 +1763,75 @@ class TraefikHardeningTest(unittest.TestCase):
                     "serversTransports": {"t": {"forwardingTimeouts": {"responseHeaderTimeout": "100\u03bcs"}}},
                 }
             }),
+            ("transport-subms-750us-timeout", {
+                "http": {
+                    "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "main"}},
+                    "services": {"main": {"loadBalancer": {"serversTransport": "t",
+                                                           "servers": [{"url": "http://main.internal:8080"}]}}},
+                    "serversTransports": {"t": {"forwardingTimeouts": {"dialTimeout": "750us"}}},
+                }
+            }),
+            ("transport-unitless-float-timeout", {
+                "http": {
+                    "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/api/`)", "service": "main"}},
+                    "services": {"main": {"loadBalancer": {"serversTransport": "t",
+                                                           "servers": [{"url": "http://main.internal:8080"}]}}},
+                    "serversTransports": {"t": {"forwardingTimeouts": {"dialTimeout": "0.25"}}},
+                }
+            }),
         ):
             with self.subTest(case=label):
                 res_bad, _rep_bad, _ = asserted(yaml.safe_dump(bad_doc))
                 self.assertEqual(one_proxy(self, res_bad.config, "/api", "a.example.test")["labels"][
                     "ferrum-migration/status"], "refused")
-        # Health-check interval and timeout clamp to Ferrum bounds (3600s and MAX_TIMEOUT_MS).
-        hc_doc = yaml.safe_dump({
+        # Traefik literal CORS origins ('*.example.test', 'null') emit exact matchers with unmatched_preflights:
+        # ignore so omitted allow-lists never inherit Ferrum's permissive defaults; active buffering.retryExpression
+        # warns via traefik-buffering-retry; healthCheck clamps interval/timeout, carries status, and omits non-GET.
+        cors_lit_doc = yaml.safe_dump({
             "http": {
-                "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/hc/`)", "service": "main"}},
-                "services": {"main": {"loadBalancer": {
-                    "healthCheck": {"path": "/healthz", "interval": "2h", "timeout": "48h"},
-                    "servers": [{"url": "http://main.internal:8080"}],
-                }}},
+                "routers": {"r": {"rule": "Host(`a.example.test`) && PathPrefix(`/c/`)", "service": "main",
+                                  "middlewares": ["h", "b"]}},
+                "middlewares": {
+                    "h": {"headers": {"accessControlAllowOriginList": ["*.example.test", "null"]}},
+                    "b": {"buffering": {"maxResponseBodyBytes": 1024, "retryExpression": "IsNetworkError()"}},
+                },
+                "services": {"main": {"loadBalancer": {"servers": [{"url": "http://main.internal:8080"}]}}},
             }
         })
-        hc_res = asserted(hc_doc)[0]
+        cl_res, cl_rep, _ = asserted(cors_lit_doc)
+        cl_p = one_proxy(self, cl_res.config, "/c", "a.example.test")
+        self.assertEqual(plugin(self, cl_res.config, cl_p, "cors")["config"], {
+            "allowed_origins": [{"exact": "*.example.test"}, {"exact": "null"}],
+            "unmatched_preflights": "ignore",
+        })
+        self.assertIn("traefik-buffering-retry", codes(cl_rep, "warning"))
+        # Health-check interval and timeout clamp to Ferrum bounds (3600s and MAX_TIMEOUT_MS), status carries over,
+        # and non-GET method omits the health check with a warning.
+        hc_doc = yaml.safe_dump({
+            "http": {
+                "routers": {
+                    "r": {"rule": "Host(`a.example.test`) && PathPrefix(`/hc/`)", "service": "main"},
+                    "r_head": {"rule": "Host(`a.example.test`) && PathPrefix(`/head/`)", "service": "head_svc"},
+                },
+                "services": {
+                    "main": {"loadBalancer": {
+                        "healthCheck": {"path": "/healthz", "interval": "2h", "timeout": "48h", "status": 204},
+                        "servers": [{"url": "http://main.internal:8080"}],
+                    }},
+                    "head_svc": {"loadBalancer": {
+                        "healthCheck": {"path": "/healthz", "method": "HEAD", "status": 204},
+                        "servers": [{"url": "http://head.internal:8080"}],
+                    }},
+                },
+            }
+        })
+        hc_res, hc_rep, _ = asserted(hc_doc)
         hc_active = hc_res.config["upstreams"][0]["health_checks"]["active"]
         self.assertEqual(hc_active["interval_seconds"], 3600)
         self.assertEqual(hc_active["timeout_ms"], 86_400_000)
+        self.assertEqual(hc_active["healthy_status_codes"], [204])
+        self.assertEqual(len(hc_res.config["upstreams"]), 1)
+        self.assertIn("traefik-health", codes(hc_rep, "warning"))
         # compress.minResponseBodyBytes above u64::MAX omits compression cleanly instead of emitting invalid config.
         over_comp_doc = yaml.safe_dump({
             "http": {

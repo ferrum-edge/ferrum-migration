@@ -728,7 +728,7 @@ class _Traefik:
         if not groups:
             self.report.warning("traefik-rule-unsatisfiable", ref, "Rule can never match; not emitted.")
             return
-        if acc.https_redirect and not requires_tls:
+        if acc.https_redirect and not requires_tls and not acc.refusals:
             self.plan.settings.https_redirect_seen = True
             self.report.info("traefik-https-redirect", ref, "HTTP-to-HTTPS redirect router: not emitted; Ferrum's "
                              "TLS-only profile disables the plaintext listener instead.")
@@ -1102,7 +1102,11 @@ class _Traefik:
                                 "raise FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES to honor this route limit.")
                     self.report.warning("traefik-buffering", ref, msg)
                 acc.resp_size_limited = True
-            if any(config.get(k) for k in ("memRequestBodyBytes", "memResponseBodyBytes", "retryExpression")) \
+            if config.get("retryExpression"):
+                self.report.warning("traefik-buffering-retry", ref,
+                                    "buffering.retryExpression is not migrated; configured retries are not preserved "
+                                    "in Ferrum.")
+            if any(config.get(k) for k in ("memRequestBodyBytes", "memResponseBodyBytes")) \
                     or not ((req_size and req_size > 0) or (resp_size and resp_size > 0)):
                 self.report.info("traefik-buffering", ref,
                                  "Only active maxResponseBodyBytes is migrated from buffering.")
@@ -1157,8 +1161,9 @@ class _Traefik:
                 return
             if not encodings:
                 encodings = ["gzip", "br", "zstd"]
-            elif any(enc.lower() not in ("gzip", "br", "zstd") for enc in encodings):
-                acc.refusals.append("compress.encodings names an encoding rejected by Traefik or unsupported in Ferrum")
+            elif any(enc not in ("gzip", "br", "zstd") for enc in encodings):
+                acc.refusals.append("compress.encodings names an encoding rejected by Traefik (case-sensitive) or "
+                                    "unsupported in Ferrum")
                 return
         else:
             encodings = ["gzip", "br", "zstd"]
@@ -1167,7 +1172,7 @@ class _Traefik:
             if not isinstance(default_enc, str):
                 acc.refusals.append("compress.defaultEncoding must be a string")
                 return
-            if default_enc and default_enc.lower() not in {enc.lower() for enc in encodings}:
+            if default_enc and default_enc not in encodings:
                 acc.refusals.append("compress.defaultEncoding is not in the configured encodings list, which Traefik "
                                     "rejects at middleware construction")
                 return
@@ -1270,27 +1275,53 @@ class _Traefik:
                 acc.refusals.append(f"security header {header} not representable ({problem})")
         if security and not config.get("forceSTSHeader") and sts:
             self.report.warning("traefik-sts", ref, "Traefik only sent HSTS over HTTPS; Ferrum sets it on every response.")
-        if any(key.startswith("accessControl") for key in config):
-            if config.get("accessControlAllowOriginListRegex"):
-                acc.refusals.append("headers.accessControlAllowOriginListRegex answers CORS preflights locally and "
-                                    "cannot be migrated (omitting would forward preflights to the backend)")
-            elif any(config.get(key) for key in config if key.startswith("accessControl")):
-                raw_origins = config.get("accessControlAllowOriginList")
-                origins = str_list(raw_origins) if raw_origins is not None else []
-                if raw_origins is not None and origins is None:
-                    acc.refusals.append("headers.accessControlAllowOriginList has unexpected types")
+        # Match Traefik Headers.HasCorsHeadersDefined() (middlewares.go): any active accessControl* setting,
+        # explicit accessControlMaxAge (including 0), or addVaryHeader: true activates local preflight handling.
+        raw_vary = config.get("addVaryHeader")
+        raw_creds = config.get("accessControlAllowCredentials")
+        if (raw_vary is not None and not isinstance(raw_vary, bool)) \
+                or (raw_creds is not None and not isinstance(raw_creds, bool)):
+            acc.refusals.append("headers addVaryHeader/accessControlAllowCredentials must be a boolean")
+        else:
+            has_cors = (
+                raw_vary is True
+                or raw_creds is True
+                or config.get("accessControlMaxAge") is not None
+                or any(config.get(k) for k in (
+                    "accessControlAllowHeaders", "accessControlAllowMethods",
+                    "accessControlAllowOriginList", "accessControlAllowOriginListRegex",
+                    "accessControlExposeHeaders",
+                ))
+            )
+            if has_cors:
+                if config.get("accessControlAllowOriginListRegex"):
+                    acc.refusals.append("headers.accessControlAllowOriginListRegex answers CORS preflights locally and "
+                                        "cannot be migrated (omitting would forward preflights to the backend)")
                 else:
-                    built, problem = cors_config(origins or [],
-                                                 config.get("accessControlAllowMethods"),
-                                                 config.get("accessControlAllowHeaders"),
-                                                 config.get("accessControlExposeHeaders"),
-                                                 config.get("accessControlAllowCredentials"),
-                                                 config.get("accessControlMaxAge"))
-                    if built:
-                        acc.plugins.append(PluginSpec("cors", built, ref))
+                    raw_origins = config.get("accessControlAllowOriginList")
+                    origins_raw = str_list(raw_origins) if raw_origins is not None else []
+                    if raw_origins is not None and origins_raw is None:
+                        acc.refusals.append("headers.accessControlAllowOriginList has unexpected types")
                     else:
-                        acc.refusals.append(f"headers CORS policy answers preflights locally and cannot be migrated "
-                                            f"({problem})")
+                        # Traefik matches origins literally (so '*.example.test' is literal, not a subdomain wildcard,
+                        # and 'null' is a literal origin); wrap non-'*' entries as {'exact': origin} and set
+                        # unmatched_preflights='ignore' so empty/omitted methods/headers/max_age stay absent instead of
+                        # inheriting Ferrum's permissive native defaults.
+                        exact_origins: list[Any] = [
+                            "*" if item == "*" else {"exact": item} for item in (origins_raw or [])
+                        ]
+                        built, problem = cors_config(exact_origins,
+                                                     config.get("accessControlAllowMethods"),
+                                                     config.get("accessControlAllowHeaders"),
+                                                     config.get("accessControlExposeHeaders"),
+                                                     raw_creds,
+                                                     config.get("accessControlMaxAge"),
+                                                     unmatched_preflights="ignore")
+                        if built:
+                            acc.plugins.append(PluginSpec("cors", built, ref))
+                        else:
+                            acc.refusals.append(f"headers CORS policy answers preflights locally and cannot be "
+                                                f"migrated ({problem})")
         if config.get("allowedHosts"):
             hosts = [host.lower() for host in (str_list(config.get("allowedHosts")) or [])]
             # Every headers middleware in the chain checks its own list, so a request must pass all of them:
@@ -1527,21 +1558,21 @@ class _Traefik:
             tls.sni = transport["serverName"]
         forwarding = mapping(transport.get("forwardingTimeouts"))
         for rw_key in ("readTimeout", "writeTimeout"):
-            if util.classify_go_duration(forwarding.get(rw_key)) != "zero":
+            if util.classify_go_duration(forwarding.get(rw_key), allow_unitless_float=False) != "zero":
                 problems.append(f"serversTransport forwardingTimeouts.{rw_key} (Traefik v3.8+ per-socket deadline) "
                                 "has no Ferrum equivalent")
         for src_key, dst_key in (("dialTimeout", "connect"), ("responseHeaderTimeout", "read")):
             raw_dur = forwarding.get(src_key)
-            dur_cls = util.classify_go_duration(raw_dur)
-            if dur_cls == "invalid":
+            if raw_dur is None or (isinstance(raw_dur, str) and not raw_dur.strip()):
+                continue
+            dur_ns = util.parse_go_duration_ns(raw_dur, allow_unitless_float=False)
+            if dur_ns is None:
                 problems.append(f"serversTransport forwardingTimeouts.{src_key} is not a valid duration")
-            elif dur_cls == "nonzero":
-                dur_ms = util.parse_go_duration_ms(raw_dur)
-                if not dur_ms:
-                    problems.append(f"serversTransport forwardingTimeouts.{src_key} is positive but below Ferrum's "
-                                    "1ms timeout resolution")
-                else:
-                    timeouts[dst_key] = dur_ms
+            elif 0 < dur_ns < 1_000_000:
+                problems.append(f"serversTransport forwardingTimeouts.{src_key} is positive but below Ferrum's "
+                                "1ms timeout resolution")
+            elif dur_ns >= 1_000_000:
+                timeouts[dst_key] = (dur_ns + 500_000) // 1_000_000
         return tls, timeouts, problems
 
     def _servers(self, lb: dict, ref: str) -> tuple[str | None, list[Target], list[str]]:
@@ -1614,16 +1645,40 @@ class _Traefik:
         if not http_path.startswith("/") or len(http_path.encode("utf-8")) > util.MAX_BACKEND_PATH_LENGTH \
                 or any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in http_path):
             self.report.warning("traefik-health", ref,
-                                "Active health check path is not representable in Ferrum (must start with '/' and "
-                                f"be at most {util.MAX_BACKEND_PATH_LENGTH} bytes); active health check omitted.")
+                                "Active health check path is not representable in Ferrum (must start with '/', "
+                                f"contain no control characters, and be at most {util.MAX_BACKEND_PATH_LENGTH} bytes); "
+                                "active health check omitted.")
             return None
+        raw_method = health.get("method")
+        if raw_method is not None and (not isinstance(raw_method, str) or raw_method.strip().upper() != "GET"):
+            self.report.warning("traefik-health", ref,
+                                "Active health check uses a non-GET HTTP method; Ferrum active HTTP probes only "
+                                "send GET, so the health check was omitted.")
+            return None
+        raw_status = health.get("status")
+        status_code: int | None = None
+        if raw_status is not None:
+            parsed_status = util.as_int(raw_status)
+            if parsed_status is None or (parsed_status != 0 and not 100 <= parsed_status <= 599):
+                self.report.warning("traefik-health", ref,
+                                    "Active health check status is invalid; active health check omitted.")
+                return None
+            if 100 <= parsed_status <= 599:
+                status_code = parsed_status
         entry: dict[str, Any] = {"http_path": http_path}
-        interval = util.parse_go_duration_ms(health.get("interval", "30s"))
-        timeout = util.parse_go_duration_ms(health.get("timeout", "5s"))
+        interval = util.parse_go_duration_ms(health.get("interval", "30s"), allow_unitless_float=False)
+        timeout = util.parse_go_duration_ms(health.get("timeout", "5s"), allow_unitless_float=False)
         if interval:
             entry["interval_seconds"] = max(1, min(interval // 1000, 3600))
         if timeout:
             entry["timeout_ms"] = max(1, min(timeout, util.MAX_TIMEOUT_MS))
+        if status_code is not None:
+            entry["healthy_status_codes"] = [status_code]
+        else:
+            self.report.warning("traefik-health", ref,
+                                "Active health check omits status (Traefik accepts HTTP 200-399), whereas Ferrum "
+                                "uses its default healthy_status_codes; configure healthy_status_codes explicitly "
+                                "if other 2xx/3xx responses must count as healthy.")
         if health.get("scheme") == "https":
             entry["use_tls"] = True
         if health.get("port") or health.get("hostname") or health.get("headers"):
@@ -1762,7 +1817,7 @@ def _mirror_transport_problem(tdoc: dict) -> str | None:
                 if fv is None:
                     continue
                 if fk in _ZERO_DEFAULT_FORWARDING_TIMEOUTS:
-                    if util.classify_go_duration(fv) != "zero":
+                    if util.classify_go_duration(fv, allow_unitless_float=False) != "zero":
                         return f"forwardingTimeouts.{fk}"
                 else:
                     return f"forwardingTimeouts.{fk}"

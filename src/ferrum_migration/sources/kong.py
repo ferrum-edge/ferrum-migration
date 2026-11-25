@@ -20,7 +20,8 @@ from ..model import BackendRef, ConsumerSpec, Plan, PluginSpec, RouteSpec, Targe
 from ..redact import contains_secret_reference, safe_label
 from ..safe_load import load_structured
 from .common import (SourceContext, check_route_budget, correlation_id_header_ok, cors_config, header_name_ok,
-                     header_value_ok, mapping, query_rule, request_header_rule, response_header_rule, seq, str_list)
+                     header_value_ok, is_canonical_http_origin, mapping, query_rule, request_header_rule,
+                     response_header_rule, seq, str_list)
 
 PLATFORM = "kong"
 HTTP_PROTOCOLS = {"http", "https", "grpc", "grpcs", "ws", "wss"}
@@ -102,6 +103,8 @@ class _Kong:
         self.format_version = "3.0"
         self.pretransformed = False
         self.global_correlation_id: tuple[_Plugin, PluginSpec] | None = None
+        self.global_cors: PluginSpec | None = None
+        self.global_cors_refusal: str | None = None
 
     # ------------------------------------------------------------ indexing
 
@@ -648,14 +651,24 @@ class _Kong:
                     # activates on a route where Kong did not run it.
                     if self.global_correlation_id is None:
                         self.global_correlation_id = (plugin, outcome[1])
+                elif plugin.name == "cors":
+                    # Resolve global cors per route so an omitted scoped override (e.g. preflight_continue: true
+                    # with regex origins) never lets a broader global Ferrum CORS plugin activate on that route.
+                    if self.global_cors is None:
+                        self.global_cors = outcome[1]
                 else:
                     self.plan.global_plugins.append(outcome[1])
             elif outcome[0] == "termination":
                 self.plan.global_plugins.append(PluginSpec("request_termination", outcome[1], ref))
             elif outcome[0] == "refuse":
-                self.plan.global_refusals.append(f"{plugin.name}: {outcome[1]}")
-                self.report.error("kong-plugin-refused", ref, f"Not translatable: {outcome[1]}. Every route is "
-                                  "refused because this plugin applied globally.")
+                if plugin.name == "cors":
+                    self.global_cors_refusal = outcome[1]
+                    self.report.error("kong-plugin-refused", ref, f"Not translatable: {outcome[1]}. Every route "
+                                      "without a scoped cors override is refused.")
+                else:
+                    self.plan.global_refusals.append(f"{plugin.name}: {outcome[1]}")
+                    self.report.error("kong-plugin-refused", ref, f"Not translatable: {outcome[1]}. Every route is "
+                                      "refused because this plugin applied globally.")
 
     def _translate_plugin(self, plugin: _Plugin, ref: str) -> tuple:
         raw = plugin.raw
@@ -704,8 +717,11 @@ class _Kong:
         refusals: list[str] = []
         termination = None
         cid_suppressed = False
+        cors_suppressed = False
         for name, (plugin, level) in by_name.items():
             ref = f"kong {level} plugin {safe_label(name, 40)}"
+            if name == "cors":
+                cors_suppressed = True
             if name == "correlation-id":
                 p_protos = _plugin_protocols(plugin.raw)
                 if p_protos is not None and not p_protos:
@@ -727,6 +743,12 @@ class _Kong:
                 termination = outcome[1]
             elif outcome[0] == "refuse":
                 refusals.append(f"{level} plugin {safe_label(name, 40)}: {outcome[1]}")
+        if not cors_suppressed:
+            if self.global_cors is not None:
+                plugins.append(PluginSpec(self.global_cors.name, dict(self.global_cors.config), self.global_cors.ref,
+                                          shared_key="global-cors"))
+            elif self.global_cors_refusal is not None:
+                refusals.append(f"global plugin cors: {self.global_cors_refusal}")
         if not cid_suppressed and self.global_correlation_id is not None and route_protocols:
             gplugin, gspec = self.global_correlation_id
             g_protos = _plugin_protocols(gplugin.raw)
@@ -1243,9 +1265,14 @@ def _kong_cors(self: _Kong, config: dict, ref: str) -> tuple:
     if config.get("headers") is None:
         self.report.warning("kong-cors-headers", ref, "Kong reflected requested headers; Ferrum allows its default "
                             "header list (stricter).")
-    built, problem = cors_config(origins, config.get("methods"), config.get("headers"), config.get("exposed_headers"),
-                                 config.get("credentials"), config.get("max_age"), config.get("preflight_continue"),
-                                 config.get("private_network"))
+    # Ferrum plain-string allowed_origins only accept '*' or canonical http(s)://host[:port] URLs (and treat
+    # '*.host' as a subdomain wildcard); wrap literal non-URL origins such as 'null' in {'exact': origin}.
+    ferrum_origins: list[Any] = [
+        o if (o == "*" or is_canonical_http_origin(o)) else {"exact": o} for o in origins
+    ]
+    built, problem = cors_config(ferrum_origins, config.get("methods"), config.get("headers"),
+                                 config.get("exposed_headers"), config.get("credentials"), config.get("max_age"),
+                                 config.get("preflight_continue"), config.get("private_network"))
     if built is None:
         if local_preflight:
             return ("refuse", f"CORS plugin answers preflights locally and cannot be migrated ({problem})")

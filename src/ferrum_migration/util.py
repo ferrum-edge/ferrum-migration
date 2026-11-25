@@ -9,6 +9,7 @@ problem so the caller can refuse it instead of emitting an invalid route.
 from __future__ import annotations
 
 import hashlib
+from decimal import Decimal, InvalidOperation
 import ipaddress
 import math
 import re
@@ -414,81 +415,35 @@ def has_top_level_alternation(pattern: str) -> bool:
 
 _GO_DURATION = re.compile(r"^[+-]?(?:(?:\d+(?:\.\d*)?|\.\d+)(?:ns|us|µs|μs|ms|s|m|h))+$", re.ASCII)
 _GO_PART = re.compile(r"(\d+(?:\.\d*)?|\.\d+)(ns|us|µs|μs|ms|s|m|h)", re.ASCII)
-_GO_UNIT_MS = {
-    "ns": 1e-6, "us": 1e-3, "µs": 1e-3, "μs": 1e-3, "ms": 1.0, "s": 1000.0, "m": 60_000.0, "h": 3_600_000.0,
+_GO_UNIT_NS = {
+    "ns": Decimal(1),
+    "us": Decimal(1_000),
+    "µs": Decimal(1_000),
+    "μs": Decimal(1_000),
+    "ms": Decimal(1_000_000),
+    "s": Decimal(1_000_000_000),
+    "m": Decimal(60_000_000_000),
+    "h": Decimal(3_600_000_000_000),
 }
-_MAX_DURATION_MS = (1 << 63) - 1
+_MAX_DURATION_NS = (1 << 63) - 1
 
 
-def classify_go_duration(value: object) -> str:
-    """Classify a Go/Traefik/Istio duration without rounding sub-ms values to 0 or overflowing.
-
-    Returns ``"zero"`` (unset, empty, or valid zero duration such as ``"0m"``, ``"+0s"``, ``"0μs"``),
-    ``"nonzero"`` (valid positive duration, including sub-ms like ``"100us"``), or ``"invalid"``.
-    """
-    if value is None:
-        return "zero"
-    if isinstance(value, bool):
-        return "invalid"
-    if isinstance(value, int):
-        if value < 0 or value > _MAX_DURATION_MS // 1000:
-            return "invalid"
-        return "zero" if value == 0 else "nonzero"
-    if isinstance(value, float):
-        if not math.isfinite(value) or value < 0.0 or value > _MAX_DURATION_MS / 1000.0:
-            return "invalid"
-        return "zero" if value == 0.0 else "nonzero"
-    if not isinstance(value, str):
-        return "invalid"
-    text = value.strip()
-    if not text:
-        return "zero"
-    neg = text.startswith("-")
-    unsigned = text[1:] if text[0] in "+-" else text
-    num_body = unsigned.replace(".", "", 1)
-    if num_body and num_body.isascii() and num_body.isdigit():
-        try:
-            secs = float(unsigned)
-        except ValueError:
-            return "invalid"
-        if not math.isfinite(secs) or secs < 0.0 or secs > _MAX_DURATION_MS / 1000.0:
-            return "invalid"
-        if secs == 0.0:
-            return "zero"
-        return "invalid" if neg else "nonzero"
-    if not _GO_DURATION.match(text):
-        return "invalid"
-    total = 0.0
-    any_nonzero = False
-    for number, unit in _GO_PART.findall(unsigned):
-        if any(ch != "0" and ch != "." for ch in number):
-            any_nonzero = True
-        try:
-            part = float(number) * _GO_UNIT_MS[unit]
-        except (ValueError, OverflowError):
-            return "invalid"
-        if not math.isfinite(part) or part < 0.0:
-            return "invalid"
-        total += part
-        if not math.isfinite(total) or total > _MAX_DURATION_MS:
-            return "invalid"
-    if not any_nonzero:
-        return "zero"
-    return "invalid" if neg else "nonzero"
-
-
-def parse_go_duration_ms(value: object) -> int | None:
-    """Go/Traefik/Istio style durations (``1m30s``, ``500ms``, ``1.5s``); bare numbers are seconds."""
+def parse_go_duration_ns(value: object, *, allow_unitless_float: bool = True) -> int | None:
+    """Parse a non-negative Go/Traefik/Istio duration into exact integer nanoseconds (or ``None`` if invalid)."""
     if isinstance(value, bool):
         return None
     if isinstance(value, int):
-        if 0 <= value <= _MAX_DURATION_MS // 1000:
-            return value * 1000
+        if 0 <= value <= _MAX_DURATION_NS // 1_000_000_000:
+            return value * 1_000_000_000
         return None
     if isinstance(value, float):
-        if math.isfinite(value) and 0.0 <= value <= _MAX_DURATION_MS / 1000.0:
-            return int(round(value * 1000.0))
-        return None
+        if not allow_unitless_float or not math.isfinite(value) or value < 0.0:
+            return None
+        try:
+            ns = int((Decimal(str(value)) * Decimal(1_000_000_000)).to_integral_value())
+        except (InvalidOperation, ValueError, OverflowError):
+            return None
+        return ns if 0 <= ns <= _MAX_DURATION_NS else None
     if not isinstance(value, str):
         return None
     text = value.strip()
@@ -496,36 +451,70 @@ def parse_go_duration_ms(value: object) -> int | None:
         return None
     neg = text.startswith("-")
     unsigned = text[1:] if text[0] in "+-" else text
-    num_body = unsigned.replace(".", "", 1)
-    if num_body and num_body.isascii() and num_body.isdigit():
+    if unsigned.isascii() and unsigned.isdigit():
         try:
-            secs = float(unsigned)
+            secs_int = int(unsigned)
         except ValueError:
             return None
-        if not math.isfinite(secs) or secs < 0.0 or secs > _MAX_DURATION_MS / 1000.0:
-            return None
-        if secs == 0.0:
+        if secs_int == 0:
             return 0
-        return None if neg else int(round(secs * 1000.0))
+        if neg or secs_int > _MAX_DURATION_NS // 1_000_000_000:
+            return None
+        return secs_int * 1_000_000_000
+    num_body = unsigned.replace(".", "", 1)
+    if allow_unitless_float and num_body and num_body.isascii() and num_body.isdigit():
+        try:
+            dec = Decimal(unsigned) * Decimal(1_000_000_000)
+        except (InvalidOperation, ValueError):
+            return None
+        if dec == 0:
+            return 0
+        if neg or dec < 0 or dec > _MAX_DURATION_NS:
+            return None
+        return max(1, int(dec.to_integral_value()))
     if not _GO_DURATION.match(text):
         return None
-    total = 0.0
+    total = Decimal(0)
     any_nonzero = False
     for number, unit in _GO_PART.findall(unsigned):
         if any(ch != "0" and ch != "." for ch in number):
             any_nonzero = True
         try:
-            part = float(number) * _GO_UNIT_MS[unit]
-        except (ValueError, OverflowError):
+            part = Decimal(number) * _GO_UNIT_NS[unit]
+        except (InvalidOperation, ValueError):
             return None
-        if not math.isfinite(part) or part < 0.0:
+        if part < 0:
             return None
         total += part
-        if not math.isfinite(total) or total > _MAX_DURATION_MS:
+        if total > _MAX_DURATION_NS:
             return None
     if not any_nonzero:
         return 0
-    return None if neg else int(round(total))
+    if neg:
+        return None
+    return max(1, int(total.to_integral_value()))
+
+
+def classify_go_duration(value: object, *, allow_unitless_float: bool = True) -> str:
+    """Classify a Go/Traefik/Istio duration without rounding sub-ms values to 0 or overflowing.
+
+    Returns ``"zero"`` (unset, empty, or valid zero duration such as ``"0m"``, ``"+0s"``, ``"0μs"``),
+    ``"nonzero"`` (valid positive duration, including sub-ms like ``"100us"`` or ``"750us"``), or ``"invalid"``.
+    """
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return "zero"
+    ns = parse_go_duration_ns(value, allow_unitless_float=allow_unitless_float)
+    if ns is None:
+        return "invalid"
+    return "zero" if ns == 0 else "nonzero"
+
+
+def parse_go_duration_ms(value: object, *, allow_unitless_float: bool = True) -> int | None:
+    """Go/Traefik/Istio style durations (``1m30s``, ``500ms``, ``1.5s``); bare numbers are seconds."""
+    ns = parse_go_duration_ns(value, allow_unitless_float=allow_unitless_float)
+    if ns is None:
+        return None
+    return (ns + 500_000) // 1_000_000
 
 
 def proto_duration_ms(value: object) -> int | None:
