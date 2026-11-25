@@ -739,8 +739,14 @@ class IstioCaseAndNamesTest(unittest.TestCase):
                 assert_structurally_valid(self, result.config)
                 names = [p["name"] for p in result.config["proxies"]]
                 self.assertEqual(len(names), len(set(names)))
-                self.assertEqual(len(result.config["proxies"]), 4)  # two routes, two closures
-                self.assertIn("maintenance", names)
+                # Two projected =/maintenance routes (unique names) + one closure for the enabled listener.
+                self.assertEqual(len(result.config["proxies"]), 3)
+                maint = [p for p in result.config["proxies"] if p.get("listen_path") == "=/maintenance"]
+                self.assertEqual(len(maint), 2)
+                self.assertIn("maintenance", [p["name"] for p in maint])
+                closures = [p for p in result.config["proxies"] if p.get("listen_path") is None]
+                self.assertEqual(len(closures), 1)
+                self.assertEqual(closures[0]["hosts"], ["b.example.test" if tls_only else "a.example.test"])
                 again, _report, _plan = migrate("istio", text, tls_only=tls_only)
                 self.assertEqual(names, [p["name"] for p in again.config["proxies"]])
 

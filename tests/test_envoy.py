@@ -1425,6 +1425,74 @@ class EnvoyHardeningTest(unittest.TestCase):
         self.assertEqual(one_proxy(self, bs_res.config, "=/old")["labels"]["ferrum-migration/status"], "refused")
         self.assertEqual(one_proxy(self, bs_res.config, "=/healthz")["labels"]["ferrum-migration/status"], "refused")
 
+    def test_tls_only_plaintext_exact_and_case_insensitive_routes_do_not_shadow_or_poison_https(self):
+        # Plaintext named exact =/extra (including case_sensitive: false) must neither poison a live HTTPS catch-all
+        # '/' nor shadow a live HTTPS named or wildcard '/' route in --tls-only mode.
+        for tls_domains in (["*"], ["plain.example.test"], ["*.example.test"]):
+            with self.subTest(tls_domains=tls_domains):
+                doc = {
+                    "static_resources": {
+                        "clusters": [{
+                            "name": "c", "type": "STRICT_DNS",
+                            "load_assignment": {"endpoints": [{"lb_endpoints": [{
+                                "endpoint": {"address": {"socket_address": {"address": "app.internal", "port_value": 8080}}}
+                            }]}]},
+                        }],
+                        "listeners": [
+                            {
+                                "name": "http",
+                                "address": {"socket_address": {"address": "0.0.0.0", "port_value": 80}},
+                                "filter_chains": [{"filters": [{
+                                    "name": "envoy.filters.network.http_connection_manager",
+                                    "typed_config": {
+                                        "@type": "type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager",
+                                        "stat_prefix": "http",
+                                        "http_filters": [{"name": "envoy.filters.http.router"}],
+                                        "route_config": {"virtual_hosts": [{
+                                            "name": "plain_vh", "domains": ["plain.example.test"],
+                                            "routes": [{"name": "extra", "match": {"path": "/extra", "case_sensitive": False},
+                                                        "route": {"cluster": "c"}}],
+                                        }]},
+                                    },
+                                }]}],
+                            },
+                            {
+                                "name": "tls",
+                                "address": {"socket_address": {"address": "0.0.0.0", "port_value": 443}},
+                                "filter_chains": [{
+                                    "transport_socket": {
+                                        "name": "envoy.transport_sockets.tls",
+                                        "typed_config": {
+                                            "@type": "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext",
+                                            "common_tls_context": {"tls_certificates": [{
+                                                "certificate_chain": {"filename": "/etc/certs/tls.crt"},
+                                                "private_key": {"filename": "/etc/certs/tls.key"},
+                                            }]},
+                                        },
+                                    },
+                                    "filters": [{
+                                        "name": "envoy.filters.network.http_connection_manager",
+                                        "typed_config": {
+                                            "@type": "type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager",
+                                            "stat_prefix": "tls",
+                                            "http_filters": [{"name": "envoy.filters.http.router"}],
+                                            "route_config": {"virtual_hosts": [{
+                                                "name": "tls_vh", "domains": tls_domains,
+                                                "routes": [{"name": "root", "match": {"prefix": "/"}, "route": {"cluster": "c"}}],
+                                            }]},
+                                        },
+                                    }],
+                                }],
+                            },
+                        ],
+                    }
+                }
+                res, _rep, _ = migrate("envoy", yaml.safe_dump(doc), tls_only=True)
+                assert_structurally_valid(self, res.config)
+                self.assertEqual(proxies(res.config, "=/extra"), [])
+                root_p = one_proxy(self, res.config, "/")
+                self.assertEqual(root_p["labels"]["ferrum-migration/status"], "migrated")
+
 
 if __name__ == "__main__":
     unittest.main()

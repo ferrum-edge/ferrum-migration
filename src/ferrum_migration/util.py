@@ -205,6 +205,10 @@ def canonical_path_problem(path: object) -> str | None:
 
 _RUST_REGEX_FLAGS = frozenset("imsURux")
 _RUST_BRACE_QUANT = re.compile(r"\{(\d+)(?:,(\d*))?\}", re.ASCII)
+_POSIX_CLASS_RE = re.compile(
+    r"\[:\^?(?:alnum|alpha|ascii|blank|cntrl|digit|graph|lower|print|punct|space|upper|word|xdigit):\]",
+    re.ASCII,
+)
 _UNICODE_CLASS_ESCAPES = frozenset("wWdDsSpP")
 _RUST_CLASS_LETTER_ESCAPES = frozenset("aftnrvxuUpPdDsSwW")
 _RUST_OUTER_LETTER_ESCAPES = _RUST_CLASS_LETTER_ESCAPES | frozenset("AzbB")
@@ -262,7 +266,15 @@ def _rust_regex_syntax_problem(pattern: str) -> str | None:
             continue
         if in_class:
             if ch == "[":
+                pm = _POSIX_CLASS_RE.match(pattern, i)
+                if pm is not None:
+                    class_cost += 4
+                    i = pm.end()
+                    continue
                 return "regex uses unescaped '[' inside a character class (nested class syntax differs in Rust regex)"
+            if i + 1 < n and pattern[i:i + 2] in ("&&", "--", "~~"):
+                return ("regex uses '&&', '--', or '~~' inside a character class, which Rust regex parses as a "
+                        "character-class set operator rather than literal characters")
             if x_on and (ch == "#" or ch.isspace()):
                 return ("regex uses unescaped '#' or whitespace inside a character class under verbose (?x) mode, "
                         "which Rust regex parses differently from PCRE/Python")

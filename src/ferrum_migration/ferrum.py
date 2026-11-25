@@ -67,6 +67,7 @@ Fail-closed rules applied here (see ``docs/design.md``):
 
 from __future__ import annotations
 
+import bisect
 import copy
 import json
 import re
@@ -165,8 +166,8 @@ def emit(plan: Plan, options: EmitOptions, report: Report) -> EmitResult:
         scope for scope in plan.host_scopes
         if scope.protocols is None or bool(opened & scope.protocols)
     ]
-    _poison(routes)
-    _poison_case_variants(plan, routes)
+    _poison(routes, mode)
+    _poison_case_variants(plan, routes, mode)
     _resolve_frontend_client_ca(plan, routes, report, mode)
     candidates = _build_candidates(routes)
     candidates = _drop_off_protocol_slot_conflicts(plan, candidates, mode)
@@ -245,8 +246,8 @@ def _finalize_https_redirects(plan: Plan, routes: list[RouteSpec], candidates: l
         route.https_redirect_fold = None
         route.refuse("HTTP-to-HTTPS redirect cannot be folded away because no live HTTPS route survived validation")
         _validate_route(route, plan, options, report)
-    _poison(routes)
-    _poison_case_variants(plan, routes)
+    _poison(routes, mode)
+    _poison_case_variants(plan, routes, mode)
     rebuilt = _build_candidates(routes)
     rebuilt = _drop_off_protocol_slot_conflicts(plan, rebuilt, mode)
     rebuilt = _resolve_conflicts(rebuilt, report)
@@ -737,7 +738,7 @@ def _hosts_merge_in_slot(a: list[str], b: list[str], *, host_only: bool) -> bool
     return False
 
 
-def _poison(routes: list[RouteSpec]) -> None:
+def _poison(routes: list[RouteSpec], mode: str = "both") -> None:
     """Refuse routes that could receive traffic the source sent to an unrepresentable route.
 
     When the unrepresentable route's envelope (hosts + path) is itself
@@ -745,7 +746,12 @@ def _poison(routes: list[RouteSpec]) -> None:
     request in that envelope to the placeholder unless the other route is
     more specific. Only such more-specific (or ambiguous) routes are refused.
     """
-    unrepresentable = [r for r in routes if not r.skip and r.refusals and r.extra_conditions]
+    opened = FRONTEND_MODES[mode]
+    unrepresentable = [
+        r for r in routes
+        if not r.skip and r.refusals and r.extra_conditions
+        and ((protos := _effective_protocols(r)) is None or bool(opened & protos))
+    ]
     for bad in unrepresentable:
         envelope_ok = bad.hosts is not None and bad.path_ok
         for other in routes:
@@ -762,7 +768,7 @@ def _poison(routes: list[RouteSpec]) -> None:
             other.refuse(f"its match overlaps {bad.ref}, whose match conditions Ferrum cannot express")
 
 
-def _poison_case_variants(plan: Plan, routes: list[RouteSpec]) -> None:
+def _poison_case_variants(plan: Plan, routes: list[RouteSpec], mode: str = "both") -> None:
     """Refuse routes that could forward case variants of a path the source matched case-insensitively.
 
     Ferrum matches literal paths case-sensitively, so a case-insensitive source route (Envoy
@@ -774,8 +780,13 @@ def _poison_case_variants(plan: Plan, routes: list[RouteSpec]) -> None:
     its fallthrough targets are refused (``scope-closure-skipped``), so the variants never fall through to it.
     Without such a scope every overlapping route is refused. Unmatched variants answer 404.
     """
+    opened = FRONTEND_MODES[mode]
     scopes = [set(_scope_hosts(scope)) for scope in plan.host_scopes if scope.listen_port is None]
-    sources = [route for route in routes if not route.skip and route.case_insensitive]
+    sources = [
+        route for route in routes
+        if not route.skip and route.case_insensitive
+        and ((protos := _effective_protocols(route)) is None or bool(opened & protos))
+    ]
     for source in sources:
         closed = bool(source.hosts) and set(source.hosts) in scopes
         for other in routes:
@@ -834,63 +845,165 @@ def _build_candidates(routes: list[RouteSpec]) -> list[_Cand]:
     return candidates
 
 
+def _has_sorted_prefix(paths: list[str], prefix: str) -> bool:
+    idx = bisect.bisect_left(paths, prefix)
+    return idx < len(paths) and paths[idx].startswith(prefix)
+
+
+def _has_sorted_exact(paths: list[str], target: str) -> bool:
+    idx = bisect.bisect_left(paths, target)
+    return idx < len(paths) and paths[idx] == target
+
+
 def _drop_off_protocol_slot_conflicts(plan: Plan, candidates: list[_Cand], mode: str) -> list[_Cand]:
     """Omit refused off-protocol placeholders that collide with or shadow live routes on the selected frontend.
 
     When the profile disables a listener (for example ``mode == "https"`` with plaintext disabled), a refused
     route served exclusively on the disabled listener never existed on the selected frontend. Keeping its
     placeholder when it collides in the same ``(listen_port, listen_path)`` slot with a live route would either
-    conflict in Ferrum's validator or collapse the live route into a 503; keeping a named off-protocol
-    placeholder whose hosts have no scope on the selected frontend would shadow a live catch-all default route
-    that answered those hosts in the source. Omitting such off-protocol placeholders preserves the live frontend
-    routes while keeping the route's refusal diagnostics in the report.
+    conflict in Ferrum's validator or collapse the live route into a 503; keeping one that outranks a live
+    same-tier route (for example plaintext ``=/extra`` over HTTPS ``/``) or shadows a lower-tier live wildcard
+    or catch-all route (when the placeholder's hosts have no scope on the selected frontend) would intercept
+    live HTTPS/HTTP traffic with a 503. All checks run via hash indices and sorted-path binary search in
+    O(N log N) time.
     """
     opened = FRONTEND_MODES[mode]
     live_by_path: dict[str | None, _PortHostIndex] = {}
-    live_catchall_by_port: dict[int | None, list[_Cand]] = {}
-    has_root_catchall: set[int | None] = set()
+    live_prefix_by_path: dict[str, _PortHostIndex] = {}
+    live_string_prefix_by_path: dict[str, _PortHostIndex] = {}
+    live_literal_by_path: dict[str, _PortHostIndex] = {}
+    live_hostonly_idx = _PortHostIndex()
+    live_regex_idx = _PortHostIndex()
+    live_ci_idx = _PortHostIndex()
+    live_any_idx = _PortHostIndex()
+    live_catchall_paths_set: dict[int | None, set[str]] = {}
+    live_wild_paths_set: dict[int | None, dict[str, set[str]]] = {}
     on_protocol_scope_idx = _PortHostIndex()
+    has_any_live = False
     for cand in candidates:
-        if not cand.placeholder:
-            live_by_path.setdefault(cand.listen_path, _PortHostIndex()).add(cand)
+        if cand.placeholder:
+            continue
+        has_any_live = True
+        live_by_path.setdefault(cand.listen_path, _PortHostIndex()).add(cand)
+        live_any_idx.add(cand)
+        if cand.hosts:
+            on_protocol_scope_idx.add(cand)
+        r = cand.route
+        if r.case_insensitive:
+            live_ci_idx.add(cand)
+        if r.kind == "hostonly":
+            live_hostonly_idx.add(cand)
+        elif r.kind == "regex":
+            live_regex_idx.add(cand)
+        else:
+            p = r.path or "/"
+            live_literal_by_path.setdefault(p, _PortHostIndex()).add(cand)
+            if r.kind == "prefix":
+                live_prefix_by_path.setdefault(p, _PortHostIndex()).add(cand)
+                if r.prefix_semantics == "string" and not r.trailing_slash:
+                    live_string_prefix_by_path.setdefault(p, _PortHostIndex()).add(cand)
             if not cand.hosts:
-                live_catchall_by_port.setdefault(cand.listen_port, []).append(cand)
-                if cand.listen_path in ("/", None):
-                    has_root_catchall.add(cand.listen_port)
+                live_catchall_paths_set.setdefault(cand.listen_port, set()).add(p)
             else:
-                on_protocol_scope_idx.add(cand)
-    if not live_by_path:
+                wmap = live_wild_paths_set.setdefault(cand.listen_port, {})
+                for h in cand.hosts:
+                    if h.startswith("*."):
+                        wmap.setdefault(h[1:], set()).add(p)
+    if not has_any_live:
         return candidates
-    if live_catchall_by_port:
-        for scope in plan.host_scopes:
-            sh = _scope_hosts(scope)
-            if sh:
-                dummy = RouteSpec(ref=scope.ref, name=scope.ref, hosts=sh, kind="hostonly", path=None,
-                                  listen_port=scope.listen_port)
-                on_protocol_scope_idx.add(_Cand(dummy, True, sh, None, scope.listen_port))
+    for scope in plan.host_scopes:
+        sh = _scope_hosts(scope)
+        if sh:
+            dummy = RouteSpec(ref=scope.ref, name=scope.ref, hosts=sh, kind="hostonly", path=None,
+                              listen_port=scope.listen_port)
+            on_protocol_scope_idx.add(_Cand(dummy, True, sh, None, scope.listen_port))
 
-    catchall_overlap_cache: dict[tuple[int | None, str, str | None, str, bool, bool], bool] = {}
+    sorted_catchall_paths: dict[int | None, list[str]] = {
+        port: sorted(paths) for port, paths in live_catchall_paths_set.items()
+    }
+    sorted_wild_paths: dict[int | None, dict[str, list[str]]] = {
+        port: {suf: sorted(paths) for suf, paths in smap.items()}
+        for port, smap in live_wild_paths_set.items()
+    }
 
-    def _shadows_live_catchall(cand: _Cand) -> bool:
-        if not live_catchall_by_port:
+    def _shadows_same_tier(cand: _Cand) -> bool:
+        port = cand.listen_port
+        r = cand.route
+        if r.kind in ("exact", "prefix"):
+            p = r.path or "/"
+            if live_hostonly_idx.has_same_tier_overlap(port, cand.hosts) \
+                    or live_regex_idx.has_same_tier_overlap(port, cand.hosts) \
+                    or live_ci_idx.has_same_tier_overlap(port, cand.hosts):
+                return True
+            limit = len(p) + 1 if r.kind == "exact" else len(p)
+            for k in range(1, limit):
+                anc = p[:k]
+                boundary = (anc == "/" or k == len(p) or p[k] == "/")
+                table = live_prefix_by_path if boundary else live_string_prefix_by_path
+                idx = table.get(anc)
+                if idx is not None and idx.has_same_tier_overlap(port, cand.hosts):
+                    return True
+            return False
+        if r.kind == "regex":
+            return (
+                live_hostonly_idx.has_same_tier_overlap(port, cand.hosts)
+                or live_regex_idx.has_same_tier_overlap(port, cand.hosts)
+            )
+        return False
+
+    def _has_lower_descendant(cand: _Cand, p: str) -> bool:
+        port = cand.listen_port
+        r = cand.route
+        seg_only = r.prefix_semantics == "segment" or r.trailing_slash
+        seg_prefix = p + "/"
+
+        def _matches_list(paths: list[str]) -> bool:
+            if not seg_only:
+                return _has_sorted_prefix(paths, p)
+            if not r.trailing_slash and _has_sorted_exact(paths, p):
+                return True
+            return _has_sorted_prefix(paths, seg_prefix)
+
+        ca_paths = sorted_catchall_paths.get(port)
+        if ca_paths and _matches_list(ca_paths):
+            return True
+        wmap = sorted_wild_paths.get(port)
+        if wmap:
+            for h in cand.hosts:
+                if not h.startswith("*."):
+                    dot = h.find(".")
+                    while dot != -1:
+                        wpaths = wmap.get(h[dot:])
+                        if wpaths and _matches_list(wpaths):
+                            return True
+                        dot = h.find(".", dot + 1)
+        return False
+
+    def _shadows_lower_tier(cand: _Cand) -> bool:
+        if not cand.hosts:
             return False
         port = cand.listen_port
-        ports = list(live_catchall_by_port) if port is None else [p for p in (port, None) if p in live_catchall_by_port]
-        if not ports:
+        if on_protocol_scope_idx.has_conflict(port, cand.hosts, path_slot=True):
             return False
-        if any(p in has_root_catchall for p in ports):
-            return True
         r = cand.route
-        cache_key = (port, r.kind, r.path, r.prefix_semantics, r.trailing_slash, r.case_insensitive)
-        cached = catchall_overlap_cache.get(cache_key)
-        if cached is not None:
-            return cached
-        probe = RouteSpec(ref="", name="", hosts=[], kind=r.kind, path=r.path,
-                          prefix_semantics=r.prefix_semantics, trailing_slash=r.trailing_slash,
-                          case_insensitive=r.case_insensitive, listen_port=port)
-        hit = any(matching.route_overlaps(ca.route, probe) for p in ports for ca in live_catchall_by_port[p])
-        catchall_overlap_cache[cache_key] = hit
-        return hit
+        if r.kind in ("hostonly", "regex") or r.case_insensitive or (r.kind == "prefix" and (r.path or "/") == "/"):
+            return live_any_idx.has_lower_tier_overlap(port, cand.hosts)
+        if live_hostonly_idx.has_lower_tier_overlap(port, cand.hosts) \
+                or live_regex_idx.has_lower_tier_overlap(port, cand.hosts) \
+                or live_ci_idx.has_lower_tier_overlap(port, cand.hosts):
+            return True
+        p = r.path or "/"
+        for k in range(1, len(p) + 1):
+            anc = p[:k]
+            boundary = (anc == "/" or k == len(p) or p[k] == "/")
+            table = live_prefix_by_path if boundary else live_string_prefix_by_path
+            idx = table.get(anc)
+            if idx is not None and idx.has_lower_tier_overlap(port, cand.hosts):
+                return True
+        if r.kind == "exact":
+            lit_idx = live_literal_by_path.get(p)
+            return lit_idx is not None and lit_idx.has_lower_tier_overlap(port, cand.hosts)
+        return _has_lower_descendant(cand, p)
 
     kept: list[_Cand] = []
     dropped_routes: list[RouteSpec] = []
@@ -902,14 +1015,7 @@ def _drop_off_protocol_slot_conflicts(plan: Plan, candidates: list[_Cand], mode:
                 same_slot = idx is not None and idx.has_conflict(
                     cand.listen_port, cand.hosts, path_slot=cand.listen_path is not None
                 )
-                shadows_catchall = (
-                    not same_slot
-                    and bool(cand.hosts)
-                    and bool(live_catchall_by_port)
-                    and not on_protocol_scope_idx.has_conflict(cand.listen_port, cand.hosts, path_slot=True)
-                    and _shadows_live_catchall(cand)
-                )
-                if same_slot or shadows_catchall:
+                if same_slot or _shadows_same_tier(cand) or _shadows_lower_tier(cand):
                     dropped_routes.append(cand.route)
                     continue
         kept.append(cand)
@@ -1014,48 +1120,105 @@ def _resolve_conflicts(candidates: list[_Cand], report: Report) -> list[_Cand]:
     for cand in candidates:
         groups.setdefault((cand.listen_port, cand.listen_path), []).append(cand)
     replacement: dict[int, list[_Cand]] = {}
-    named_live_idx: _PortHostIndex | None = None
+    outrank_indices: dict[str, Any] | None = None
+
+    def _build_outrank_indices() -> dict[str, Any]:
+        all_idx = _PortHostIndex()
+        prefix_by_path: dict[str, _PortHostIndex] = {}
+        literal_by_path: dict[str, _PortHostIndex] = {}
+        special_idx = _PortHostIndex()
+        for item in candidates:
+            if item.placeholder or not item.hosts:
+                continue
+            all_idx.add(item)
+            r = item.route
+            if r.kind in ("hostonly", "regex") or r.case_insensitive:
+                special_idx.add(item)
+            else:
+                p = r.path or "/"
+                literal_by_path.setdefault(p, _PortHostIndex()).add(item)
+                if r.kind == "prefix":
+                    prefix_by_path.setdefault(p, _PortHostIndex()).add(item)
+        return {
+            "all": all_idx,
+            "prefix_by_path": prefix_by_path,
+            "literal_by_path": literal_by_path,
+            "sorted_literal_paths": sorted(literal_by_path),
+            "special": special_idx,
+        }
 
     def _fail_close_outranking(named_hosts: list[str], slot_members: list[_Cand],
                                port: int | None, reason: str) -> int:
-        nonlocal named_live_idx
-        if named_live_idx is None:
-            named_live_idx = _PortHostIndex()
-            for item in candidates:
-                if not item.placeholder and item.hosts:
-                    named_live_idx.add(item)
-        if not named_live_idx.all_by_port:
+        nonlocal outrank_indices
+        if outrank_indices is None:
+            outrank_indices = _build_outrank_indices()
+        all_idx: _PortHostIndex = outrank_indices["all"]
+        if not all_idx.all_by_port:
             return 0
         ports = (
-            list(named_live_idx.all_by_port)
+            list(all_idx.all_by_port)
             if port is None
-            else [p for p in (port, None) if p in named_live_idx.all_by_port]
+            else [p for p in (port, None) if p in all_idx.all_by_port]
         )
         if not ports:
             return 0
         excluded_ids = {id(m) for m in slot_members}
         probes: list[RouteSpec] = []
         seen_sigs: set[tuple[str, str | None, str, bool, bool]] = set()
+        needs_all = False
+        has_prefix = False
+        literal_paths: set[str] = set()
         for m in slot_members:
             r = m.route
             sig = (r.kind, r.path, r.prefix_semantics, r.trailing_slash, r.case_insensitive)
             if sig in seen_sigs:
                 continue
             seen_sigs.add(sig)
+            if r.kind in ("regex", "hostonly") or r.case_insensitive:
+                needs_all = True
+            else:
+                literal_paths.add(r.path or "/")
+                if r.kind == "prefix":
+                    has_prefix = True
             probes.append(RouteSpec(ref="", name="", hosts=list(named_hosts), kind=r.kind, path=r.path,
                                     prefix_semantics=r.prefix_semantics, trailing_slash=r.trailing_slash,
                                     case_insensitive=r.case_insensitive, listen_port=port))
+        target_indices: list[_PortHostIndex] = []
+        if needs_all:
+            target_indices.append(all_idx)
+        else:
+            prefix_by_path: dict[str, _PortHostIndex] = outrank_indices["prefix_by_path"]
+            literal_by_path: dict[str, _PortHostIndex] = outrank_indices["literal_by_path"]
+            sorted_literal_paths: list[str] = outrank_indices["sorted_literal_paths"]
+            seen_idx_ids: set[int] = set()
+
+            def _add_idx(idx: _PortHostIndex | None) -> None:
+                if idx is not None and id(idx) not in seen_idx_ids:
+                    seen_idx_ids.add(id(idx))
+                    target_indices.append(idx)
+
+            _add_idx(outrank_indices["special"])
+            for path_str in literal_paths:
+                for k in range(1, len(path_str) + 1):
+                    _add_idx(prefix_by_path.get(path_str[:k]))
+                _add_idx(literal_by_path.get(path_str))
+                if has_prefix:
+                    lo = bisect.bisect_left(sorted_literal_paths, path_str)
+                    while lo < len(sorted_literal_paths) and sorted_literal_paths[lo].startswith(path_str):
+                        _add_idx(literal_by_path[sorted_literal_paths[lo]])
+                        lo += 1
         refused_outrank = 0
         seen_other: set[int] = set()
-        for p in ports:
-            for other in named_live_idx.query(p, named_hosts, path_slot=False):
-                oid = id(other)
-                if oid in seen_other or oid in excluded_ids or oid in replacement or other.placeholder:
-                    continue
-                seen_other.add(oid)
-                if any(matching.route_overlaps(probe, other.route) for probe in probes):
-                    _fail_close(other, reason)
-                    refused_outrank += 1
+        for target_idx in target_indices:
+            for p in ports:
+                for other in target_idx.query(p, named_hosts, path_slot=False):
+                    oid = id(other)
+                    if oid in seen_other or oid in excluded_ids or oid in replacement or other.placeholder:
+                        continue
+                    seen_other.add(oid)
+                    if any(matching.route_overlaps(probe, other.route) for probe in probes):
+                        _fail_close(other, reason)
+                        refused_outrank += 1
         return refused_outrank
 
     for (port, path), members in list(groups.items()):
@@ -1382,6 +1545,48 @@ class _PortHostIndex:
                 while dot != -1:
                     ex_suf.setdefault(h[dot:], []).append(cand)
                     dot = h.find(".", dot + 1)
+
+    def has_same_tier_overlap(self, port: int | None, scope_hosts: list[str]) -> bool:
+        """Whether an indexed candidate in the same host tier overlaps ``scope_hosts``."""
+        if not scope_hosts:
+            return bool(self.catchall.get(port))
+        ex_map = self.exact.get(port)
+        wi_map = self.wild.get(port)
+        wi_par = self.wild_by_parent.get(port)
+        for h in scope_hosts:
+            if h.startswith("*."):
+                suffix = h[1:]
+                if wi_map and suffix in wi_map:
+                    return True
+                if wi_par and suffix in wi_par:
+                    return True
+                if wi_map:
+                    dot = suffix.find(".", 1)
+                    while dot != -1:
+                        if suffix[dot:] in wi_map:
+                            return True
+                        dot = suffix.find(".", dot + 1)
+            else:
+                if ex_map and h in ex_map:
+                    return True
+        return False
+
+    def has_lower_tier_overlap(self, port: int | None, scope_hosts: list[str]) -> bool:
+        """Whether an indexed candidate in a lower host tier (catch-all or covering wildcard) overlaps ``scope_hosts``."""
+        if not scope_hosts:
+            return False
+        if self.catchall.get(port):
+            return True
+        wi_map = self.wild.get(port)
+        if wi_map:
+            for h in scope_hosts:
+                if not h.startswith("*."):
+                    dot = h.find(".")
+                    while dot != -1:
+                        if h[dot:] in wi_map:
+                            return True
+                        dot = h.find(".", dot + 1)
+        return False
 
     def has_conflict(self, port: int | None, scope_hosts: list[str], *, path_slot: bool = False) -> bool:
         """O(|scope_hosts| * labels) existence check without scanning candidate buckets."""

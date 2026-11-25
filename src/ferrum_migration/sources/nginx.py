@@ -599,7 +599,7 @@ class _Nginx:
             self._note_catch_all(info, base, [route])
             if base["hosts"]:
                 self.plan.host_scopes.append(
-                    HostScope(ref, list(base["hosts"]), listen_port, protocols=base["protocols"])
+                    HostScope(ref, list(base["hosts"]), listen_port, protocols=self._base_protocols(base))
                 )
             return
         locations = [d for d in server.block or [] if d.name == "location"]
@@ -625,7 +625,7 @@ class _Nginx:
         self._note_catch_all(info, base, routes)
         if base["hosts"]:
             self.plan.host_scopes.append(
-                HostScope(ref, list(base["hosts"]), listen_port, protocols=base["protocols"])
+                HostScope(ref, list(base["hosts"]), listen_port, protocols=self._base_protocols(base))
             )
 
     def _note_catch_all(self, info: dict, base: dict, routes: list[RouteSpec]) -> None:
@@ -680,7 +680,7 @@ class _Nginx:
             self._note_catch_all(info, base, routes)
             if base["hosts"]:
                 self.plan.host_scopes.append(
-                    HostScope(ref, list(base["hosts"]), base["listen_port"], protocols=base["protocols"])
+                    HostScope(ref, list(base["hosts"]), base["listen_port"], protocols=self._base_protocols(base))
                 )
 
     def _apply_ssl_reject_handshake(self, infos: list[dict]) -> None:
@@ -773,21 +773,23 @@ class _Nginx:
                 return True
         return False
 
-    def _new_route(self, base: dict, path: str, kind: str, ref: str) -> RouteSpec:
-        route = RouteSpec(ref=ref, name=f"{base['server_label']}-{path}")
-        route.hosts = None if base["hosts"] is None else list(base["hosts"])
-        route.kind, route.path = kind, path
-        route.listen_port = base["listen_port"]
-        route.requires_tls = base["requires_tls"]
-        # The main listeners NGINX served this server on (a plaintext side that only redirects to HTTPS does not
-        # count; neither do dropped extra ports). Extra-listener servers are never emitted.
+    def _base_protocols(self, base: dict) -> frozenset[str]:
+        """Main listeners NGINX served this server on (redirect-only plaintext and extra ports excluded)."""
         protocols = set()
         if base["listen_port"] is None:
             if base["on_plain"] and not base["requires_tls"]:
                 protocols.add("http")
             if base["on_tls"]:
                 protocols.add("https")
-        route.protocols = frozenset(protocols)
+        return frozenset(protocols)
+
+    def _new_route(self, base: dict, path: str, kind: str, ref: str) -> RouteSpec:
+        route = RouteSpec(ref=ref, name=f"{base['server_label']}-{path}")
+        route.hosts = None if base["hosts"] is None else list(base["hosts"])
+        route.kind, route.path = kind, path
+        route.listen_port = base["listen_port"]
+        route.requires_tls = base["requires_tls"]
+        route.protocols = self._base_protocols(base)
         if base["extra"]:
             route.extra_conditions = True
             route.refuse("server_name is not representable")
