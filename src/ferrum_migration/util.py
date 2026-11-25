@@ -201,12 +201,12 @@ _BACKREF = re.compile(r"\\[1-9]")
 _POSSESSIVE = re.compile(r"(?<!\\)[*+?}]\+")
 
 
-def regex_problem(pattern: object) -> str | None:
+def regex_problem(pattern: object, *, max_bytes: int = MAX_REGEX_LENGTH) -> str | None:
     """Conservative check that ``pattern`` is accepted by Ferrum's Rust regex engine."""
     if not isinstance(pattern, str) or not pattern:
         return "empty regex"
-    if len(pattern.encode("utf-8")) > MAX_REGEX_LENGTH:
-        return "regex longer than 1024 bytes"
+    if len(pattern.encode("utf-8")) > max_bytes:
+        return f"regex longer than {max_bytes} bytes"
     if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in pattern):
         return "regex contains control characters"
     if "%" in pattern:
@@ -216,7 +216,7 @@ def regex_problem(pattern: object) -> str | None:
         return "regex uses lookaround, backreferences or other features the Rust regex engine lacks"
     try:
         re.compile(pattern)
-    except (re.error, OverflowError):
+    except (re.error, OverflowError, RecursionError):
         return "regex does not compile"
     return None
 

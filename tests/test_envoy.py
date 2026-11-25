@@ -1326,6 +1326,7 @@ class EnvoyHardeningTest(unittest.TestCase):
         mr_res = migrate("envoy", yaml.safe_dump(mixed_redir))[0]
         self.assertEqual(one_proxy(self, mr_res.config, None, "secure.example.test")["labels"][
             "ferrum-migration/status"], "refused")
+        self.assertEqual(proxies(mr_res.config, "~/.*", "secure.example.test"), [])
         catchall = [p for p in proxies(mr_res.config, "/") if "hosts" not in p]
         self.assertEqual(len(catchall), 1)
         self.assertEqual(catchall[0]["labels"]["ferrum-migration/status"], "migrated")

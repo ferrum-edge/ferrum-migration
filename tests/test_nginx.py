@@ -903,6 +903,7 @@ class NginxFrontendScopeTest(unittest.TestCase):
             """)
             legacy_p = one_proxy(self, fixed_dest_res.config, None, "legacy.example.test")
             self.assertEqual(legacy_p["labels"]["ferrum-migration/status"], "terminated")
+            self.assertEqual(proxies(fixed_dest_res.config, "~/.*", "legacy.example.test"), [])
             self.assertEqual(plugin(self, fixed_dest_res.config, legacy_p, "request_termination")["config"]["headers"][
                 "location"], "https://auth.example.test/login")
             passive = fixed_dest_res.config["upstreams"][0]["health_checks"]["passive"]
@@ -912,7 +913,7 @@ class NginxFrontendScopeTest(unittest.TestCase):
                                 for c in fixed_dest_rep.caveats))
 
         # Redirect-only plaintext server alongside a wildcard/default plaintext server stays as a refused host-only
-        # placeholder so the default server's '/' route stays live for unrelated hosts.
+        # placeholder without any shadowing ~/.* 404 closure, so the default server's '/' stays live for other hosts.
         mixed_redir_conf = """
         server {
             listen 80;
@@ -927,6 +928,7 @@ class NginxFrontendScopeTest(unittest.TestCase):
         mr_res, _mr_rep, _ = nginx(mixed_redir_conf)
         self.assertEqual(one_proxy(self, mr_res.config, None, "secure.example.test")["labels"][
             "ferrum-migration/status"], "refused")
+        self.assertEqual(proxies(mr_res.config, "~/.*", "secure.example.test"), [])
         catchall = [p for p in proxies(mr_res.config, "/") if "hosts" not in p]
         self.assertEqual(len(catchall), 1)
         self.assertEqual(catchall[0]["labels"]["ferrum-migration/status"], "migrated")

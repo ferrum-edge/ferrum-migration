@@ -165,10 +165,11 @@ def emit(plan: Plan, options: EmitOptions, report: Report) -> EmitResult:
     _resolve_frontend_client_ca(plan, routes, report, mode)
     candidates = _build_candidates(routes)
     candidates = _resolve_conflicts(candidates, report)
-    _add_scope_closures(plan, candidates, report)
-    _add_trailing_slash_placeholders(candidates, report)
-    _add_divergence_guards(plan, candidates, report)
-    candidates = _finalize_https_redirects(plan, routes, candidates, mode, options, report)
+    staged_report = Report(report.platform, report.source)
+    _add_scope_closures(plan, candidates, staged_report)
+    _add_trailing_slash_placeholders(candidates, staged_report)
+    _add_divergence_guards(plan, candidates, staged_report)
+    candidates = _finalize_https_redirects(plan, routes, candidates, mode, options, report, staged_report)
     _assert_frontend_protocols(candidates, mode)
     builder = _Builder(plan, options, report)
     config = builder.build(candidates)
@@ -186,22 +187,25 @@ def emit(plan: Plan, options: EmitOptions, report: Report) -> EmitResult:
 
 
 def _finalize_https_redirects(plan: Plan, routes: list[RouteSpec], candidates: list[_Cand], mode: str,
-                              options: EmitOptions, report: Report) -> list[_Cand]:
+                              options: EmitOptions, report: Report, staged_report: Report) -> list[_Cand]:
     """Confirm deferred plaintext HTTP-to-HTTPS redirect folds only after final candidate resolution.
 
     A redirect candidate folds away (and emits its ``*-https-redirect`` info diagnostic) only if the final
     profile disables plaintext (``mode == "https"``) AND at least one live (non-placeholder) HTTPS candidate
-    survived validation, precedence, poisoning, client-CA scope, and slot conflict resolution. Otherwise,
-    un-skip, refuse, validate, poison, and resolve the restored redirect candidates through the same pipeline.
+    survived validation, precedence, poisoning, client-CA scope, slot conflict resolution, and scope closures.
+    Otherwise, discard provisional closure/guard diagnostics, un-skip and validate the restored redirect
+    candidates, and rebuild candidates, closures, and guards cleanly.
     """
     deferred = [route for route in routes if route.https_redirect_fold is not None]
     if not deferred:
+        report.caveats.extend(staged_report.caveats)
         return candidates
     has_surviving_https = mode == "https" and any(
         not cand.placeholder and "https" in (_effective_protocols(cand.route) or ())
         for cand in candidates
     )
     if has_surviving_https:
+        report.caveats.extend(staged_report.caveats)
         plan.settings.https_redirect_seen = True
         seen: set[tuple[str, str]] = set()
         for route in deferred:
@@ -334,6 +338,10 @@ def _validate_route(route: RouteSpec, plan: Plan, options: EmitOptions, report: 
         problem = util.canonical_path_problem(path)
         if not problem and route.kind == "exact" and len(path.encode("utf-8")) + 1 > util.MAX_LISTEN_PATH_LENGTH:
             problem = f"serialized exact listen_path exceeds {util.MAX_LISTEN_PATH_LENGTH} bytes"
+        if not problem and route.kind == "prefix" and route.trailing_slash \
+                and route.prefix_semantics == "string" \
+                and len(path.encode("utf-8")) + 1 > util.MAX_LISTEN_PATH_LENGTH:
+            problem = (f"trailing-slash prefix bare-path exact guard exceeds {util.MAX_LISTEN_PATH_LENGTH} bytes")
         if problem:
             route.refuse(f"path is not representable ({problem})")
             route.path_ok = False
@@ -341,9 +349,7 @@ def _validate_route(route: RouteSpec, plan: Plan, options: EmitOptions, report: 
         else:
             route.path = path
     elif route.kind == "regex":
-        problem = util.regex_problem(route.path)
-        if not problem and len((route.path or "").encode("utf-8")) + 1 > util.MAX_LISTEN_PATH_LENGTH:
-            problem = f"serialized regex listen_path exceeds {util.MAX_LISTEN_PATH_LENGTH} bytes"
+        problem = util.regex_problem(route.path, max_bytes=util.MAX_LISTEN_PATH_LENGTH - 1)
         if problem:
             route.refuse(f"path regex is not representable ({problem})")
             route.path_ok = False
@@ -808,10 +814,34 @@ def _chunk_hosts_no_prune(hosts: list[str], host_only: bool) -> list[list[str]] 
             i = parent[i]
         return i
 
-    for i in range(len(unique)):
-        for j in range(i + 1, len(unique)):
-            if _hosts_conflict_in_ferrum(unique[i], unique[j], host_only):
-                parent[find(i)] = find(j)
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    wild_owner: dict[str, int] = {}
+    exact_entries: list[tuple[str, int]] = []
+    for idx, host in enumerate(unique):
+        if host.startswith("*."):
+            wild_owner[host[1:]] = idx
+        elif host_only:
+            exact_entries.append((host, idx))
+    if wild_owner:
+        for suffix, idx in wild_owner.items():
+            dot = suffix.find(".", 1)
+            while dot != -1:
+                w = wild_owner.get(suffix[dot:])
+                if w is not None:
+                    union(idx, w)
+                dot = suffix.find(".", dot + 1)
+        if host_only:
+            for host, idx in exact_entries:
+                dot = host.find(".")
+                while dot != -1:
+                    w = wild_owner.get(host[dot:])
+                    if w is not None:
+                        union(idx, w)
+                    dot = host.find(".", dot + 1)
     comps: dict[int, list[str]] = {}
     for idx, host in enumerate(unique):
         comps.setdefault(find(idx), []).append(host)
@@ -819,15 +849,27 @@ def _chunk_hosts_no_prune(hosts: list[str], host_only: bool) -> list[list[str]] 
     if any(len(comp) > limit for comp in ordered):
         return None
     chunks: list[list[str]] = []
+    # Bucket chunk indices by remaining capacity (1..limit) so placement scans at most `limit` buckets.
+    by_rem: dict[int, list[int]] = {}
     for comp in ordered:
-        placed = False
-        for chunk in chunks:
-            if len(chunk) + len(comp) <= limit:
-                chunk.extend(comp)
-                placed = True
+        size = len(comp)
+        placed_idx: int | None = None
+        for rem in range(size, limit + 1):
+            bucket = by_rem.get(rem)
+            if bucket:
+                placed_idx = bucket.pop()
+                if not bucket:
+                    del by_rem[rem]
                 break
-        if not placed:
+        if placed_idx is None:
+            placed_idx = len(chunks)
             chunks.append(list(comp))
+            new_rem = limit - size
+        else:
+            chunks[placed_idx].extend(comp)
+            new_rem = limit - len(chunks[placed_idx])
+        if new_rem > 0:
+            by_rem.setdefault(new_rem, []).append(placed_idx)
     return chunks
 
 
@@ -854,10 +896,7 @@ def _resolve_conflicts(candidates: list[_Cand], report: Report) -> list[_Cand]:
                 member.route.placeholder_emitted = True
             hosts: list[str] = []
             if not any(not m.hosts for m in component):
-                for member in component:
-                    for host in member.hosts:
-                        if host not in hosts:
-                            hosts.append(host)
+                hosts = list(dict.fromkeys(host for member in component for host in member.hosts))
             first = component[0]
             if not hosts:
                 host_chunks: list[list[str]] | None = [[]]
@@ -1132,7 +1171,7 @@ def _add_scope_closures(plan: Plan, candidates: list[_Cand], report: Report) -> 
         # Only a closure for the very same host names closes this scope. A covering wildcard closure does not:
         # Ferrum tries every path route of every matching wildcard pattern (and of the exact tier) before any
         # wildcard host-only route, so another scope's routes would still receive these hosts' unmatched paths.
-        if overlapping and all(c.kind_label == "scope-default" for c in overlapping) and \
+        if overlapping and all(c.route.methods is None for c in overlapping) and \
                 all(any(host in c.hosts for c in overlapping) for host in hosts):
             continue
         chunks = None if overlapping else _chunk_hosts_no_prune(hosts, host_only=True)
@@ -1171,6 +1210,9 @@ def _add_trailing_slash_placeholders(candidates: list[_Cand], report: Report) ->
                 or route.prefix_semantics != "string":
             continue
         exact = "=" + (route.path or "/")
+        if len(exact.encode("utf-8")) > util.MAX_LISTEN_PATH_LENGTH:
+            _fail_close(cand, f"trailing-slash prefix bare-path exact guard exceeds {util.MAX_LISTEN_PATH_LENGTH} bytes")
+            continue
         if any(matching.hosts_overlap(o.hosts, cand.hosts) for o in slots.get((cand.listen_port, exact), [])):
             continue
         synthetic = RouteSpec(ref=route.ref, name=f"{route.name}-bare", hosts=list(cand.hosts), kind="exact",

@@ -1282,8 +1282,9 @@ class IstioCaseAndNamesTest(unittest.TestCase):
                   route: [{destination: {host: pub.default.svc.cluster.local, port: {number: 8080}}}]
         """)
         mr_res = migrate("istio", mixed_redir)[0]
-        self.assertEqual(one_proxy(self, mr_res.config, "/", "secure.example.test")["labels"][
+        self.assertEqual(one_proxy(self, mr_res.config, None, "secure.example.test")["labels"][
             "ferrum-migration/status"], "refused")
+        self.assertEqual(proxies(mr_res.config, "~/.*", "secure.example.test"), [])
         self.assertEqual(one_proxy(self, mr_res.config, "/api", "*.example.test")["labels"][
             "ferrum-migration/status"], "migrated")
         self.assertEqual(one_proxy(self, mr_res.config, "/api", "api.blocked.test")["labels"][

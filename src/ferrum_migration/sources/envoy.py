@@ -398,11 +398,12 @@ class _Envoy:
             elif kind in ("grpc_stats", "health_check"):
                 self.report.warning("envoy-http-filter-omitted", ref, f"HTTP filter {kind} is not migrated.")
             elif kind == "buffer":
-                parsed_max = _proto_uint32(typed.get("max_request_bytes"))
-                if parsed_max is None or parsed_max <= 0:
-                    filter_refusal = "HTTP filter buffer has an unreadable or non-positive max_request_bytes"
-                else:
-                    buffer_limit = parsed_max
+                # Envoy's buffer filter buffers the entire request body before forwarding or running local replies
+                # (returning HTTP 413 on oversized chunked uploads), whereas Ferrum request_size_limiting streams
+                # unknown-length chunked bodies upstream. Refuse fail-closed like Traefik buffering.maxRequestBodyBytes.
+                filter_refusal = ("HTTP filter buffer buffers and rejects oversized chunked uploads before "
+                                  "forwarding or local replies, whereas Ferrum request_size_limiting streams "
+                                  "chunked bodies up to max_bytes")
             elif kind == "grpc_web":
                 if set(typed) - {"@type"}:
                     filter_refusal = "HTTP filter grpc_web has unsupported configuration fields"
