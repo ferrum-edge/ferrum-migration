@@ -1,0 +1,40 @@
+# Synthetic Traefik dynamic configuration (file provider). Loopback only; the harness fills its
+# upper-case placeholders.
+http:
+  routers:
+    orders:
+      rule: "Host(`paths.example.test`) && PathPrefix(`/api/orders`)"
+      service: svc-a
+      middlewares:
+        - strip-api
+        - add-v1
+    plain:
+      rule: "Host(`paths.example.test`) && PathPrefix(`/plain`)"
+      service: svc-b
+      middlewares:
+        - strip-plain
+        - add-v2
+  middlewares:
+    strip-api:
+      stripPrefix:
+        prefixes:
+          - /api
+    add-v1:
+      addPrefix:
+        prefix: /v1/
+    strip-plain:
+      stripPrefix:
+        prefixes:
+          - /plain
+    add-v2:
+      addPrefix:
+        prefix: /v2
+  services:
+    svc-a:
+      loadBalancer:
+        servers:
+          - url: "http://127.0.0.1:${ECHO_A_PORT}"
+    svc-b:
+      loadBalancer:
+        servers:
+          - url: "http://127.0.0.1:${ECHO_B_PORT}"

@@ -1,6 +1,6 @@
 # Releasing ferrum-migration
 
-Ferrum Migration is a preview on `0.x` (see the README's Status section). A release is a
+Ferrum Migration is currently a `0.x` preview (see the README's Status section). A release is a
 `vX.Y.Z` tag on `main` (strict `X.Y.Z`: no `-rc`, `-beta` or other suffix), a GitHub release
 with the sdist, the wheel, `SHA256SUMS` and build provenance attestations, and, once enabled,
 the same files on PyPI. Everything after the tag push is done by
@@ -136,8 +136,8 @@ re-verification, not a version bump alone:
   `FERRUM_EDGE_SHA256` (the release asset's digest, cross-checked against the release's
   `.sha256` file) and the source commit fetched for the schema checks.
 * `README.md` (badge, the verified-against paragraph, Limitations, Development, Status) and
-  `docs/mappings.md`, after re-checking every mapping and "Open questions" entry against the
-  new release's source.
+  `docs/mappings.md`, after re-checking every mapping and every "Resolved from Ferrum Edge source"
+  entry against the new release's source.
 * Code comments, docstrings and report messages that cite the old Edge version (search for
   it, for example `rg -n '0\.9\.21'` while v0.9.21 is the pin).
 * A `CHANGELOG.md` entry.

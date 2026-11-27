@@ -1100,7 +1100,23 @@ class _Kong:
                 for problem in backend_info["problems"]:
                     spec.refuse(problem)
                 spec.backend = backend_info.get("backend")
-                spec.backend_path = backend_info.get("path")
+                # Kong path_handling v0 (kong/router/utils.lua get_upstream_uri_v0) joins the service path and the
+                # stripped request path dropping a doubled '/', and keeps a trailing '/' only when the request had
+                # one; Ferrum reproduces that with the service path minus its trailing '/'.
+                service_path = backend_info.get("path")
+                spec.backend_path = (service_path[:-1] if service_path and service_path.endswith("/")
+                                     else service_path) or None
+                # A request for '/' reaches Kong's bare service path (get_upstream_uri_v0), but Ferrum appends
+                # the request's '/' wherever its route does not strip that slash: host-only routes (strip is a
+                # no-op), and unstripped routes that can match '/' (path '/', or a regex that may match it).
+                root_unstripped = spec.kind == "hostonly" or (not strip and (
+                    (spec.kind == "prefix" and spec.path == "/")
+                    or (spec.kind == "regex" and isinstance(spec.path, str)
+                        and util.regex_literal_prefix(spec.path) in ("", "/"))))
+                if service_path and not service_path.endswith("/") and root_unstripped:
+                    self.report.warning("kong-path-composition", spec.ref,
+                                        "Kong forwards a request for '/' to the bare service path, whereas Ferrum "
+                                        "appends the request's '/' (for example /v1/ instead of /v1).")
                 spec.connect_timeout_ms = backend_info.get("connect")
                 spec.read_timeout_ms = backend_info.get("read")
                 spec.write_timeout_ms = backend_info.get("write")

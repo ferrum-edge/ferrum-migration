@@ -22,8 +22,8 @@ from ..redact import safe_label
 from ..safe_load import load_structured
 from .common import (SourceContext, apply_first_match_order, check_route_budget, choose_main_port, compression_config,
                      cors_config, cors_origin_star_probe, envoy_cookie_hash, fault_injection_config, hash_on_value,
-                     header_value_ok, literal_value, mapping, merge_weighted_targets, request_header_rule,
-                     response_header_rule, retry_from_policy, seq, split_csv, str_list)
+                     header_value_ok, literal_value, mapping, merge_weighted_targets, replaced_prefix_backend_path,
+                     request_header_rule, response_header_rule, retry_from_policy, seq, split_csv, str_list)
 
 PLATFORM = "envoy"
 _REDIRECT_CODES = {"MOVED_PERMANENTLY": 301, "FOUND": 302, "SEE_OTHER": 303, "TEMPORARY_REDIRECT": 307,
@@ -241,6 +241,38 @@ class _Envoy:
             self.plan.settings.bind_address = next(iter(specific))
         self.bind_conflict = bool(specific) and (None in addresses or len(specific) > 1)
 
+    def _proxy_protocol(self, config: dict, ref: str) -> None:
+        """The proxy_protocol listener filter into Ferrum's PROXY protocol suggestion, where it is representable.
+
+        Envoy (``envoy.extensions.filters.listener.proxy_protocol.v3.ProxyProtocol``) accepts v1 and v2 unless
+        ``disallowed_versions`` excludes one, and requires the header unless
+        ``allow_requests_without_proxy_protocol`` is true. Ferrum's ``FERRUM_FRONTEND_PROXY_PROTOCOL_*``
+        (``off|v1|v2|auto``) always requires the header once enabled, so an optional header is reported and
+        not suggested.
+        """
+        settings = self.plan.settings
+        disallowed = {str(v).upper() for v in seq(config.get("disallowed_versions"))}
+        if _proto_bool(config.get("allow_requests_without_proxy_protocol")) is True:
+            version = None
+            self.report.warning("envoy-proxy-protocol-optional", ref,
+                                "The listener accepts connections with or without a PROXY header; Ferrum requires "
+                                "the header once PROXY protocol is enabled, so it is not suggested. Configure it "
+                                "manually if every connection carries the header.")
+        elif {"V1", "V2"} <= disallowed:
+            version = None
+            self.report.warning("envoy-proxy-protocol", ref, "The listener disallows both PROXY versions; nothing is "
+                                "suggested.")
+        else:
+            version = "v2" if "V1" in disallowed else "v1" if "V2" in disallowed else "auto"
+            self.report.warning("envoy-proxy-protocol", ref, "PROXY protocol is only suggested in ferrum.conf.")
+        if config.get("rules") or config.get("pass_through_tlvs"):
+            self.report.warning("envoy-proxy-protocol", ref, "PROXY protocol TLV rules are not migrated.")
+        if settings.proxy_protocol and settings.proxy_protocol_version != version:
+            settings.proxy_protocol_version = None  # listeners disagree: suggest nothing
+        else:
+            settings.proxy_protocol_version = version
+        settings.proxy_protocol = True
+
     def _listener(self, info: dict) -> None:
         ref, listener = info["ref"], info["listener"]
         settings = self.plan.settings
@@ -254,8 +286,7 @@ class _Envoy:
         for listener_filter in seq(listener.get("listener_filters")):
             kind = _kind(listener_filter)
             if kind == "proxy_protocol":
-                settings.proxy_protocol = True
-                self.report.warning("envoy-proxy-protocol", ref, "PROXY protocol is only suggested in ferrum.conf.")
+                self._proxy_protocol(mapping(mapping(listener_filter).get("typed_config")), ref)
             elif kind == "original_dst":
                 self.report.error("envoy-original-dst", ref, "original_dst listeners are not migrated.")
                 return
@@ -610,6 +641,7 @@ class _Envoy:
         match = mapping(raw.get("match"))
         if "prefix" in match:
             spec.kind, spec.path = "prefix", match.get("prefix") or "/"
+            spec.empty_source_prefix = match.get("prefix") == ""
             # `prefix` is a plain string prefix (/api also matches /apix); `path_separated_prefix` below is
             # segment-based like Ferrum and needs no sibling report.
             spec.report_prefix_siblings = True
@@ -866,15 +898,21 @@ class _Envoy:
         spec.backend = backend.get("backend")
         spec.connect_timeout_ms = backend.get("connect")
         rewrite = action.get("prefix_rewrite")
-        if isinstance(rewrite, str):
+        # Envoy treats an empty prefix_rewrite as unset (router config_impl.cc): the path is forwarded unchanged.
+        if isinstance(rewrite, str) and rewrite:
             if spec.kind == "regex":
                 spec.refuse("prefix_rewrite on a regex route")
+            elif spec.empty_source_prefix:
+                # An empty matched prefix is replaced by the rewrite: rewrite + the whole path, no stripping.
+                spec.strip = False
+                spec.backend_path = rewrite
             else:
                 spec.strip = True
-                spec.backend_path = rewrite if rewrite not in ("", "/") else None
-                if spec.kind == "exact":
-                    self.report.warning("envoy-exact-rewrite", ref, "prefix_rewrite on an exact path: verify the "
-                                        "forwarded path.")
+                spec.backend_path, exact = replaced_prefix_backend_path(spec.kind, spec.path, rewrite)
+                if not exact:
+                    self.report.warning("envoy-rewrite-slash", ref, "The prefix ends with '/' but prefix_rewrite does "
+                                        "not: Envoy joins the rest of the path without a slash (/v1 + x = /v1x), "
+                                        "whereas Ferrum inserts one (/v1/x).")
         if action.get("regex_rewrite") or action.get("path_rewrite_policy"):
             spec.refuse("regex/path rewrite policies are not supported")
         if action.get("host_rewrite_header") or action.get("host_rewrite_path_regex"):

@@ -7,6 +7,8 @@
   "claims": [
     "proxy_pass with URI /inner/ under location /svc/ forwards /svc/x/y?q=1 as /inner/x/y?q=1",
     "proxy_pass without URI forwards /raw/z?k=v unchanged",
+    "proxy_pass with URI /inner/ forwards /svc/ as /inner/ (the trailing slash is kept)",
+    "proxy_pass with URI /deep/ under location /dbl forwards /dbl/x as /deep//x and /dbl as /deep/",
     "location = /exact forwards only the exact path",
     "a server without location / does not gain a broad fallback route"
   ],
@@ -19,6 +21,12 @@
   "probes": [
     {"id": "uri-replaced", "path": "/svc/x/y?q=1",
      "expect": {"forward": {"backend": "a", "path": "/inner/x/y?q=1"}}},
+    {"id": "uri-replaced-bare", "path": "/svc/",
+     "expect": {"forward": {"backend": "a", "path": "/inner/"}}},
+    {"id": "uri-doubled-slash", "path": "/dbl/x",
+     "expect": {"forward": {"backend": "b", "path": "/deep//x"}}},
+    {"id": "uri-bare-trailing-slash", "path": "/dbl",
+     "expect": {"forward": {"backend": "b", "path": "/deep/"}}},
     {"id": "uri-passthrough", "path": "/raw/z?k=v",
      "expect": {"forward": {"backend": "b", "path": "/raw/z?k=v"}}},
     {"id": "exact-hit", "path": "/exact",

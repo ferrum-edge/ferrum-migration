@@ -138,6 +138,35 @@ def cookie_domain_ok(domain: Any) -> bool:
                and label[0] != "-" and label[-1] != "-" for label in body.split("."))
 
 
+def replaced_prefix_backend_path(kind: str, source_path: str | None, rewrite: str) -> tuple[str | None, bool]:
+    """Ferrum ``backend_path`` reproducing "replace the matched prefix with ``rewrite``".
+
+    That is NGINX ``proxy_pass`` with a URI, Envoy ``prefix_rewrite`` and Istio ``rewrite.uri``:
+    the backend receives ``rewrite`` followed by the rest of the request path after the matched
+    source prefix, joined without adding or removing a slash (``/v1/`` + ``/x`` is ``/v1//x``).
+
+    Ferrum forwards ``backend_path`` followed by the request path after the proxy's listen path,
+    inserting ``/`` only when neither side has one, and ``/`` when both are empty
+    (``with_backend_path_parts`` / ``backend_path_layout`` in Edge ``src/proxy/mod.rs``). The emitter
+    drops one trailing ``/`` from a source prefix to form the listen path, so after a prefix ending
+    in ``/`` the remainder keeps that slash: ``rewrite`` then loses one trailing slash to compensate.
+
+    Returns ``(backend_path, exact)``. ``exact`` is False only when the source joins without a slash
+    where Ferrum inserts one (a prefix ending in ``/``, or the root prefix, rewritten to a value not
+    ending in ``/``: ``/v1`` + ``x`` is ``/v1x`` in the source, ``/v1/x`` in Ferrum).
+    """
+    if kind != "prefix":
+        return (rewrite or None), True
+    path = source_path or "/"
+    if path == "/":
+        return (rewrite or None), rewrite.endswith("/") or rewrite == ""
+    if path.endswith("/"):
+        if rewrite.endswith("/"):
+            return (rewrite[:-1] or None), True
+        return (rewrite or None), rewrite == ""
+    return (rewrite or None), True
+
+
 def envoy_cookie_hash(cookie: dict, report: Report, code: str, ref: str) -> tuple[str | None, dict | None]:
     """Envoy ``hash_policy.cookie`` / Istio ``consistentHash.httpCookie`` into Ferrum cookie hashing.
 

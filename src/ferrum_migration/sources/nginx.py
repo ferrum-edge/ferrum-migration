@@ -18,8 +18,9 @@ from ..errors import InputError
 from ..limits import Limits
 from ..model import BackendRef, HostScope, Plan, PluginSpec, RouteSpec, Target, TlsSpec, UpstreamSpec
 from ..redact import safe_label
-from .common import (SourceContext, check_route_budget, choose_main_port, compression_config, header_value_ok,
-                     is_sensitive_header, literal_value, request_header_rule, response_header_rule)
+from .common import (SourceContext, check_route_budget, choose_main_port, compression_config, header_name_ok,
+                     header_value_ok, is_sensitive_header, literal_value, replaced_prefix_backend_path,
+                     request_header_rule, response_header_rule)
 
 PLATFORM = "nginx"
 
@@ -335,6 +336,8 @@ class _Nginx:
         self.http_directives = http
         self.http_scope = self.apply(_Scope(), [d for d in http if d.name not in ("server",)], "nginx http")
         servers = []
+        real_ip_header: str | None = None
+        real_ip_recursive = False  # NGINX default: off
         for directive in http:
             if directive.name == "upstream" and directive.args and directive.block is not None:
                 self.upstream_blocks[directive.args[0]] = directive
@@ -343,9 +346,12 @@ class _Nginx:
             elif directive.name == "server" and directive.block is not None:
                 servers.append(directive)
             elif directive.name == "set_real_ip_from" and directive.args:
-                self.plan.settings.trusted_proxies.append(directive.args[0])
+                self._trusted_proxy(directive.args[0])
             elif directive.name == "real_ip_header" and directive.args:
-                self.plan.settings.real_ip_header = directive.args[0]
+                real_ip_header = directive.args[0]
+            elif directive.name == "real_ip_recursive" and directive.args:
+                real_ip_recursive = directive.args[0].lower() == "on"
+        self._real_ip(real_ip_header, real_ip_recursive)
         if self.plan.settings.trusted_proxies or self.plan.settings.real_ip_header:
             self.report.warning("nginx-real-ip", "nginx http", "Client-IP resolution behind trusted proxies is only "
                                 "suggested in ferrum.conf; ip_restriction and rate limits use the socket peer until "
@@ -364,6 +370,75 @@ class _Nginx:
         check_route_budget(len(self.plan.routes), self.ctx.limits)
         self._finish_body_sizes()
         return self.plan
+
+    def _trusted_proxy(self, value: str) -> None:
+        """``set_real_ip_from`` into a ``FERRUM_TRUSTED_PROXIES`` entry.
+
+        Ferrum parses that comma-separated list strictly: every entry must be an IP address or CIDR, and one
+        bad entry fails ``ferrum-edge validate`` and startup (Edge ``docs/configuration.md``). NGINX also
+        accepts ``unix:`` (trust connections on UNIX sockets) and host names; neither has a Ferrum entry.
+        """
+        settings = self.plan.settings
+        if value.startswith("unix:"):
+            self.report.warning("nginx-real-ip-source", "nginx http", "set_real_ip_from unix: has no Ferrum "
+                                "equivalent (Ferrum's proxy listeners are TCP only); it was left out of the "
+                                "suggested FERRUM_TRUSTED_PROXIES.")
+            return
+        try:
+            network = ipaddress.ip_network(value, strict=False)
+        except ValueError:
+            self.report.warning("nginx-real-ip-source", "nginx http", "A set_real_ip_from entry is not an IP address "
+                                "or CIDR; it was left out of the suggested FERRUM_TRUSTED_PROXIES.")
+            return
+        entry = str(network.network_address) if network.num_addresses == 1 and "/" not in value else str(network)
+        if entry not in settings.trusted_proxies:
+            settings.trusted_proxies.append(entry)
+
+    def _real_ip(self, header: str | None, recursive: bool) -> None:
+        """``real_ip_header`` / ``real_ip_recursive`` into Ferrum's client-IP settings, only where they agree.
+
+        NGINX (ngx_http_realip_module) replaces the client address only for connections from a
+        ``set_real_ip_from`` address, from ``real_ip_header`` (default ``X-Real-IP``). With
+        ``real_ip_recursive off`` (the default) it takes the last address of the header, even a trusted
+        one; with ``on`` the last address that is not trusted.
+
+        Ferrum (``docs/client_ip_resolution.md``) reads ``FERRUM_REAL_IP_HEADER`` (one field-line holding one
+        address) from a trusted peer and, when that header is absent, walks ``X-Forwarded-For`` right to left
+        skipping trusted addresses. So ``X-Forwarded-For`` translates only with ``real_ip_recursive on``, and a
+        single-address header translates with a reported difference when it is missing.
+        """
+        settings = self.plan.settings
+        if not settings.trusted_proxies:
+            return  # without set_real_ip_from NGINX never replaces the client address
+        header = header or "X-Real-IP"
+        lowered = header.lower()
+        if lowered == "x-forwarded-for":
+            if not recursive:
+                settings.trusted_proxies = []
+                self.report.warning("nginx-real-ip-recursive", "nginx http",
+                                    "real_ip_recursive is off: NGINX takes the last X-Forwarded-For address even when "
+                                    "it is a trusted proxy, whereas Ferrum skips trusted addresses. "
+                                    "FERRUM_TRUSTED_PROXIES is not suggested; configure client-IP resolution "
+                                    "manually.")
+            return
+        if lowered == "proxy_protocol":
+            # The address comes from the PROXY header of connections from the trusted addresses.
+            settings.proxy_protocol = True
+            settings.proxy_protocol_trusted = list(settings.trusted_proxies)
+            settings.trusted_proxies = []
+            return
+        if not header_name_ok(header):
+            settings.trusted_proxies = []
+            self.report.warning("nginx-real-ip-source", "nginx http", "real_ip_header does not name an HTTP header; "
+                                "client-IP resolution is not suggested.")
+            return
+        settings.real_ip_header = header
+        message = (f"When {safe_label(header, 40)} is absent, NGINX keeps the connection's address whereas Ferrum "
+                   "walks X-Forwarded-For from the trusted peer; have the proxies always send the header.")
+        if recursive:
+            message += (" real_ip_recursive on also lets NGINX read an address list in the header, whereas Ferrum "
+                        "accepts exactly one address.")
+        self.report.warning("nginx-real-ip-fallback", "nginx http", message)
 
     def _zone(self, directive: Directive) -> None:
         key = directive.args[0] if directive.args else ""
@@ -994,18 +1069,17 @@ class _Nginx:
             if route.kind == "regex":
                 route.refuse("proxy_pass with a URI inside a regex location is invalid in NGINX")
             elif route.kind == "exact":
+                # An exact location forwards exactly the URI (Ferrum: backend_path with an empty remainder).
                 if uri != route.path:
                     route.strip = True
                     route.backend_path = uri
-                    self.report.warning("nginx-exact-rewrite", ref, "Exact location with a different proxy_pass URI: "
-                                        "verify the forwarded path (Ferrum may append '/').")
             else:
                 route.strip = True
-                route.backend_path = uri if uri != "/" else None
-                if (route.path or "").endswith("/") != uri.endswith("/"):
-                    self.report.warning("nginx-slash-mismatch", ref, "Location and proxy_pass URI disagree on the "
-                                        "trailing slash; NGINX produces doubled or missing slashes, Ferrum joins them "
-                                        "cleanly.")
+                route.backend_path, exact = replaced_prefix_backend_path("prefix", route.path, uri)
+                if not exact:
+                    self.report.warning("nginx-slash-mismatch", ref, "The location ends with '/' but the proxy_pass "
+                                        "URI does not: NGINX joins the rest of the path without a slash "
+                                        "(/v1 + x = /v1x), whereas Ferrum inserts one (/v1/x).")
         for name, attr in (("connect", "connect_timeout_ms"), ("read", "read_timeout_ms"), ("send", "write_timeout_ms")):
             if name in scope.timeouts:
                 setattr(route, attr, scope.timeouts[name])

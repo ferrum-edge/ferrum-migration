@@ -151,7 +151,9 @@ rather than opening routes or downgrading security:
   reach it. Trailing-slash prefixes get an exact 404 route for the bare path. Routes are never
   widened to cover `/apix`. When `/apix` would not reach an equivalent route in Ferrum, the report
   carries a `prefix-string-siblings` error (exit 4) instead of a silent 404. This applies to NGINX
-  prefix locations, Kong `paths`, Traefik `PathPrefix`, Envoy `prefix` and Istio `uri.prefix`.
+  prefix locations, Kong `paths`, Traefik `PathPrefix`, Envoy `prefix` and Istio `uri.prefix`
+  (except in VirtualServices Istio generates from Ingress or Gateway API resources, marked
+  `internal.istio.io/route-semantics`, whose prefixes match by path segment like Ferrum's).
   It does not apply to Envoy `path_separated_prefix` (already segment-based), exact or regex
   matches, or prefixes ending in `/`. A refused route's placeholder is guarded the same way, so
   `/adminx` cannot reach a broader, open route when `/admin` was refused. If the broader route
@@ -326,8 +328,9 @@ See [docs/design.md](https://github.com/ferrum-edge/ferrum-migration/blob/main/d
   Ferrum host.
 * Host-level refusals (regex `server_name`, unrepresentable domains) only poison catch-all
   routes; the residual cross-scope risk is described in docs/design.md.
-* Some Ferrum behaviors could not be confirmed from source alone. They are listed under
-  "Open questions" in [docs/mappings.md](https://github.com/ferrum-edge/ferrum-migration/blob/main/docs/mappings.md).
+* Every Ferrum behavior the mappings rely on is cited to Ferrum Edge source in
+  [docs/mappings.md](https://github.com/ferrum-edge/ferrum-migration/blob/main/docs/mappings.md)
+  ("Resolved from Ferrum Edge source" and "Forwarded path composition").
 
 ## Development
 
@@ -351,10 +354,11 @@ in them is a fake test string. See [CONTRIBUTING.md](https://github.com/ferrum-e
 
 ## Status
 
-**Preview.** Ferrum Migration is offered alongside the Ferrum 1.0 product family (Ferrum Edge
-and its companion tools) as a preview: it stays on `0.x` and is **not** covered by the
-compatibility promises that Ferrum's 1.0 products make. It is young, and it has only been
-checked with synthetic fixtures, not against real deployments (see Limitations).
+**Preview.** Ferrum Migration is currently a `0.x` preview, offered alongside the Ferrum 1.0
+product family (Ferrum Edge and its companion tools). Its `0.x` releases are **not** covered by the
+compatibility promises that Ferrum's 1.0 products make. It is young, and it has only been checked
+with synthetic fixtures, not against real deployments (see Limitations). A `1.0.0` release of this
+tool, when it comes, will state its own compatibility promises in this section and the changelog.
 
 * **No compatibility promise on `0.x`.** Any minor release (`0.x` to `0.y`) may change
   report codes and the JSON report layout, exit codes, CLI flags and output files. Every

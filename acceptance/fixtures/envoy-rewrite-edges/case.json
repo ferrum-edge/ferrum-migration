@@ -1,0 +1,21 @@
+{
+  "id": "envoy-rewrite-edges",
+  "adapter": "envoy",
+  "title": "Envoy prefix_rewrite edge cases: empty rewrite, empty match prefix",
+  "source": "envoy.yaml",
+  "allow_rejection": false,
+  "claims": [
+    "an empty prefix_rewrite is unset: prefix /keep forwards /keep/x unchanged",
+    "an empty match prefix with prefix_rewrite /v1/ forwards /zz as /v1//zz (the rewrite replaces the empty matched prefix)"
+  ],
+  "not_claimed": [
+    "Envoy string-prefix matching of /keepx (Ferrum matches by path segment; the converter guards /keepx with a 404 instead of letting it reach the catch-all, which is stricter)"
+  ],
+  "source_semantics": "Envoy router (source/common/router/config_impl.cc): an empty prefix_rewrite is treated as unset; prefix_rewrite replaces exactly the matched prefix bytes, so an empty prefix gains the rewrite in front of the whole path. Source-code-inferred unless the upstream differential runs.",
+  "probes": [
+    {"id": "empty-rewrite-unset", "host": "edges.example.test", "path": "/keep/x?y=1",
+     "expect": {"forward": {"backend": "a", "path": "/keep/x?y=1"}}},
+    {"id": "empty-prefix-rewrite", "host": "edges.example.test", "path": "/zz",
+     "expect": {"forward": {"backend": "b", "path": "/v1//zz"}}}
+  ]
+}

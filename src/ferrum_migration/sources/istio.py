@@ -26,8 +26,8 @@ from ..safe_load import load_structured
 from .common import (SourceContext, apply_first_match_order, check_route_budget, choose_main_port, cors_config,
                      cors_origin_star_probe, envoy_cookie_hash, fault_injection_config, hash_on_value,
                      header_value_ok, literal_value, mapping,
-                     merge_weighted_targets, parse_percentage, request_header_rule, response_header_rule,
-                     retry_from_policy, seq, str_list)
+                     merge_weighted_targets, parse_percentage, replaced_prefix_backend_path, request_header_rule,
+                     response_header_rule, retry_from_policy, seq, str_list)
 
 PLATFORM = "istio"
 ROOT_NAMESPACE = "istio-system"
@@ -54,6 +54,8 @@ class _Istio:
         self.service_entries: list[dict] = []
         self.policies: list[dict] = []
         self.no_dr_warned = False
+        # internal.istio.io/route-semantics of the VirtualService being translated ("ingress", "gateway" or None).
+        self.route_semantics: str | None = None
         self.shared_bind: str | None = None
         # One entry per emitted projection (VirtualService x Gateway binding x frontend group), checked together
         # once every binding is known (see _check_frontend_scopes).
@@ -231,6 +233,13 @@ class _Istio:
         namespace, name = _meta(vs)
         ref = f"istio VirtualService '{safe_label(namespace)}/{safe_label(name)}'"
         spec = mapping(vs.get("spec"))
+        # Istio marks the VirtualServices it generates from Kubernetes Ingress and Gateway API resources with
+        # internal.istio.io/route-semantics: ingress|gateway. For those, a uri.prefix other than "/" is a
+        # path-separated prefix with one trailing "/" trimmed, and under "gateway" a rewrite to "/" drops the
+        # prefix and keeps a leading "/" (pilot/pkg/networking/core/route/route.go, translateRouteMatch and
+        # the RegexRewrite for UseGatewaySemantics).
+        semantics = mapping(mapping(vs.get("metadata")).get("annotations")).get("internal.istio.io/route-semantics")
+        self.route_semantics = semantics if semantics in ("ingress", "gateway") else None
         if spec.get("tls") or spec.get("tcp"):
             self.report.error("istio-l4-routes", ref, "tls/tcp routes are not migrated (HTTP only).")
         raw_gateways = spec.get("gateways")
@@ -708,8 +717,11 @@ class _Istio:
                 kind, path = "exact", uri["exact"]
             elif "prefix" in uri:
                 # A VirtualService uri.prefix is a plain string prefix (/api also matches /apix); flagged for the
-                # emitter's sibling report below. exact and regex matches are not prefixes.
+                # emitter's sibling report below. exact and regex matches are not prefixes. Istio-generated
+                # (route-semantics) VirtualServices use path-separated prefixes instead.
                 kind, path = "prefix", uri["prefix"] or "/"
+                if self.route_semantics and isinstance(path, str) and path != "/":
+                    kind, path = "segment", (path[:-1] if path.endswith("/") else path) or "/"
             elif "regex" in uri:
                 kind, path = "regex", uri["regex"]
             elif uri:
@@ -720,7 +732,7 @@ class _Istio:
             # ignoreUriCase applies to exact and prefix URI matches only. Ferrum matches paths case-sensitively:
             # the route keeps its exact-case path and the emitter refuses every route that could receive the case
             # variants (fail closed), instead of letting them reach an overlapping route.
-            ignore_case = bool(match.get("ignoreUriCase")) and kind in ("exact", "prefix")
+            ignore_case = bool(match.get("ignoreUriCase")) and kind in ("exact", "prefix", "segment")
             if ignore_case:
                 self.report.warning("istio-ignore-case", base_ref,
                                     "ignoreUriCase: Ferrum matches this path case-sensitively. Only the exact-case "
@@ -745,6 +757,8 @@ class _Istio:
                              name=name if number == 0 else f"{name}-{number + 1}",
                              hosts=list(hosts), kind=kind, path=path, listen_port=listen_port,
                              requires_tls=requires_tls)
+            if kind == "segment":
+                spec.kind, spec.prefix_semantics = "prefix", "segment"
             spec.case_insensitive = ignore_case
             spec.methods = None if block["all"] else list(block["methods"])
             spec.report_prefix_siblings = kind == "prefix"
@@ -793,15 +807,22 @@ class _Istio:
         rewrite = mapping(entry.get("rewrite"))
         if rewrite.get("uriRegexRewrite"):
             spec.refuse("uriRegexRewrite is not supported")
-        if isinstance(rewrite.get("uri"), str):
+        # Istio builds a URI rewrite only for a nonempty uri (route.go): "" leaves the path unchanged.
+        if isinstance(rewrite.get("uri"), str) and rewrite["uri"] != "":
             if spec.kind == "regex":
                 spec.refuse("uri rewrite on a regex match is not supported")
             else:
                 spec.strip = True
-                spec.backend_path = rewrite["uri"] if rewrite["uri"] not in ("", "/") else None
-                if spec.kind == "exact":
-                    self.report.warning("istio-exact-rewrite", ref, "uri rewrite on an exact match: verify the "
-                                        "forwarded path.")
+                if self.route_semantics == "gateway" and spec.prefix_semantics == "segment" \
+                        and rewrite["uri"] == "/":
+                    # Istio's regex rewrite keeps "/" + the rest after the prefix: Ferrum's remainder exactly.
+                    spec.backend_path = None
+                else:
+                    spec.backend_path, exact = replaced_prefix_backend_path(spec.kind, spec.path, rewrite["uri"])
+                    if not exact:
+                        self.report.warning("istio-rewrite-slash", ref, "The uri prefix ends with '/' but the "
+                                            "rewrite does not: Envoy joins the rest of the path without a slash "
+                                            "(/v1 + x = /v1x), whereas Ferrum inserts one (/v1/x).")
         spec.preserve_host = True
         if rewrite.get("authority"):
             spec.preserve_host = False

@@ -1,0 +1,25 @@
+{
+  "id": "traefik-path-composition",
+  "adapter": "traefik",
+  "title": "Traefik stripPrefix + addPrefix composition: doubled slash and a bare route path",
+  "source": "dynamic.yaml",
+  "allow_rejection": false,
+  "converter_assertions": ["traefik-input-includes-effective-controls"],
+  "claims": [
+    "PathPrefix(/api/orders) with stripPrefix /api then addPrefix /v1/ forwards /api/orders/x as /v1//orders/x",
+    "PathPrefix(/plain) with stripPrefix /plain (forceSlash false) then addPrefix /v2 forwards /plain as /v2 and /plain/x as /v2/x"
+  ],
+  "not_claimed": [
+    "Traefik string-prefix matching of /plainx (Ferrum matches by path segment and answers 404, which is stricter)",
+    "entryPoint selection (static configuration is not part of the input)"
+  ],
+  "source_semantics": "Traefik v3.8 pkg/middlewares: stripPrefix removes the first matching prefix and adds a leading slash to a nonempty rest (an empty rest stays empty without forceSlash); addPrefix prepends its value without adding or removing a slash; an empty path is sent as /. Source-code-inferred unless the upstream differential runs. The static configuration is the harness's own (one plaintext loopback entryPoint, file provider only), so the input includes every effective control and the case passes traefik-input-includes-effective-controls.",
+  "probes": [
+    {"id": "strip-add-doubled-slash", "host": "paths.example.test", "path": "/api/orders/x",
+     "expect": {"forward": {"backend": "a", "path": "/v1//orders/x"}}},
+    {"id": "strip-add-bare", "host": "paths.example.test", "path": "/plain",
+     "expect": {"forward": {"backend": "b", "path": "/v2"}}},
+    {"id": "strip-add-child", "host": "paths.example.test", "path": "/plain/x?q=1",
+     "expect": {"forward": {"backend": "b", "path": "/v2/x?q=1"}}}
+  ]
+}

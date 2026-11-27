@@ -106,6 +106,9 @@ class RouteSpec:
     kind: str = "prefix"
     path: str | None = "/"
     prefix_semantics: str = "string"
+    #: The source matched an explicit empty prefix (Envoy ``prefix: ""``): it matches every path, and a prefix
+    #: rewrite then prepends the rewrite to the whole path instead of replacing one byte.
+    empty_source_prefix: bool = False
     report_prefix_siblings: bool = False
     methods: list[str] | None = None
     listen_port: int | None = None
@@ -178,6 +181,11 @@ class SettingsHints:
     trusted_proxies: list[str] = field(default_factory=list)
     real_ip_header: str | None = None
     proxy_protocol: bool = False
+    #: PROXY protocol versions the source accepts: "auto" (v1 and v2), "v1" or "v2"; None when the source's
+    #: listeners disagree (nothing is suggested then).
+    proxy_protocol_version: str | None = "auto"
+    #: Addresses the source accepts PROXY headers from (NGINX ``real_ip_header proxy_protocol``).
+    proxy_protocol_trusted: list[str] = field(default_factory=list)
     http3: bool = False
     max_request_body_bytes: int | None = None
     https_redirect_seen: bool = False

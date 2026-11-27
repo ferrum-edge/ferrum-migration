@@ -202,6 +202,32 @@ def canonical_path_problem(path: object) -> str | None:
     return None
 
 
+def backend_path_problem(path: object) -> str | None:
+    """Return why ``path`` cannot be a Ferrum ``backend_path`` as the tool emits it, or None.
+
+    The same alphabet and safety checks as a listen path, except that empty segments are allowed: a source
+    can forward ``/v1//orders`` (Traefik ``addPrefix: /v1/`` after ``stripPrefix``, NGINX ``proxy_pass`` with a
+    URI ending in ``/`` on a prefix without one), and Ferrum appends the backend path verbatim.
+    """
+    if not isinstance(path, str) or not path.startswith("/"):
+        return "must start with '/'"
+    if len(path) > MAX_BACKEND_PATH_LENGTH:
+        return "too long"
+    for char in path:
+        code = ord(char)
+        if code < 0x21 or code > 0x7E:
+            return "contains whitespace, control or non-ASCII characters"
+        if not (char.isalnum() or char in _PATH_EXTRA):
+            return "contains characters outside the canonical path alphabet"
+    if "%" in path:
+        return "contains percent-escapes"
+    if ";" in path:
+        return "contains ';' path parameters"
+    if any(segment in (".", "..") for segment in path.split("/")[1:]):
+        return "contains dot segments"
+    return None
+
+
 # --------------------------------------------------------------------- regex
 
 _RUST_REGEX_FLAGS = frozenset("imsURux")

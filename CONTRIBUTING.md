@@ -13,7 +13,7 @@
 * Every new mapping needs a positive test **and** a fail-closed test (what happens when the
   source uses an unsupported variant).
 * Verify Ferrum behavior against Ferrum Edge source or docs before relying on it, and cite the
-  file in `docs/mappings.md`. Unverifiable behavior goes under "Open questions".
+  file in `docs/mappings.md`. Behavior that cannot be verified from source is not relied on: refuse it or report it.
 * Fixtures must be original and synthetic. Never commit real configs, credentials, certificates,
   keys or logs; credential-like values in fixtures must be obviously fake (`test-only-...`).
 * Never copy code or documentation text from Kong, NGINX, Traefik, Envoy, Istio or Ferrum.
