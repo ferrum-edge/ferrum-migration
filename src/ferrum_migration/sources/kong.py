@@ -899,6 +899,10 @@ class _Kong:
                 # (kong/runloop/balancer/init.lua set_cookie): a browser session cookie. Its misspelled
                 # `Same-Site` attribute is ignored by browsers, so no SameSite is emitted either.
                 spec.hash_on_cookie_config = {"path": cookie_path, "session_cookie": True, "http_only": True}
+                self.report.warning("kong-hash-cookie", ref,
+                                    "Ferrum issues and resolves its own binding under this cookie name: a value it did "
+                                    "not issue (one the application sets itself, unlike Kong, which hashes any value "
+                                    "it finds) is replaced. Use a cookie name only the gateway sets.")
             else:
                 self.report.warning("kong-hash-on", ref,
                                     "hash_on source has no equivalent; using round robin (stickiness lost).")

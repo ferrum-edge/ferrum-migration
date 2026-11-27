@@ -6,6 +6,8 @@
   ``ferrum.conf`` key must be in Ferrum's public settings inventory. The source is
   read at the pinned ``FERRUM_EDGE_REFERENCE_COMMIT`` unless ``FERRUM_EDGE_SRC_COMMIT``
   names another full commit (the Edge main drift workflow checks Edge ``main`` this way).
+* ``FERRUM_EDGE_REQUIRE_SYNTHETIC_CA`` (set by CI): failing to create the synthetic CA below fails the
+  admission test instead of skipping the fixture.
 * ``FERRUM_EDGE_BIN``: every fixture's generated resources must pass
   ``ferrum-edge validate -m file -c resources.yaml`` (Ferrum's real admission
   pipeline). The command runs in an empty temp directory with a minimal
@@ -242,6 +244,30 @@ def make_synthetic_ca(directory: str) -> dict | None:
     return None
 
 
+def missing_synthetic_ca(case: unittest.TestCase, message: str) -> None:
+    """A fixture that needs the synthetic CA cannot be admitted: fail under CI, skip it locally."""
+    if os.environ.get("FERRUM_EDGE_REQUIRE_SYNTHETIC_CA"):
+        # CI and the drift workflows: a fixture that never reaches Edge admission is a failure, not a skip.
+        case.fail(message)
+    case.skipTest(message)
+
+
+class SyntheticCaPolicyTest(unittest.TestCase):
+    def test_required_in_ci_optional_locally(self):
+        probe = unittest.TestCase()
+        saved = os.environ.pop("FERRUM_EDGE_REQUIRE_SYNTHETIC_CA", None)
+        try:
+            with self.assertRaises(unittest.SkipTest):
+                missing_synthetic_ca(probe, "no CA")
+            os.environ["FERRUM_EDGE_REQUIRE_SYNTHETIC_CA"] = "1"
+            with self.assertRaises(AssertionError):
+                missing_synthetic_ca(probe, "no CA")
+        finally:
+            os.environ.pop("FERRUM_EDGE_REQUIRE_SYNTHETIC_CA", None)
+            if saved is not None:
+                os.environ["FERRUM_EDGE_REQUIRE_SYNTHETIC_CA"] = saved
+
+
 def with_synthetic_tls_files(config: dict, files: dict) -> dict:
     """Copy of ``config`` whose backend TLS file fields point at the synthetic files."""
     patched = copy.deepcopy(config)
@@ -273,8 +299,9 @@ class FerrumBinaryValidateTest(unittest.TestCase):
                 if operator_tls_files(config):
                     files = make_synthetic_ca(directory)
                     if files is None:
-                        self.skipTest("fixture names operator-supplied backend TLS files; openssl is needed to "
-                                      "create a synthetic CA for admission testing")
+                        message = ("fixture names operator-supplied backend TLS files; openssl is needed to create "
+                                   "a synthetic CA for admission testing")
+                        missing_synthetic_ca(self, message)
                     config = with_synthetic_tls_files(config, files)
                 completed = self.validate(binary, directory, config, result.basic_auth_used)
                 self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)

@@ -1757,8 +1757,9 @@ class _Traefik:
                                     "The sticky cookie domain is not a domain name Ferrum accepts; the cookie is "
                                     "host-only.")
         same_site = sticky.get("sameSite")
-        if same_site in ("none", "lax", "strict"):
-            cookie["same_site"] = str(same_site).capitalize()
+        # Traefik lowercases the value before choosing the policy (pkg/server/service/loadbalancer/sticky.go).
+        if isinstance(same_site, str) and same_site.lower() in ("none", "lax", "strict"):
+            cookie["same_site"] = same_site.lower().capitalize()
         elif same_site not in (None, ""):
             self.report.warning("traefik-sticky-cookie-same-site", ref,
                                 "The sticky cookie sameSite value is not one Ferrum supports; SameSite is omitted.")

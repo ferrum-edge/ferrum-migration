@@ -848,10 +848,7 @@ class _Envoy:
                                         "round robin is used (stickiness lost).")
             elif mapping(policy.get("cookie")).get("name"):
                 cookie_hash, cookie_config = envoy_cookie_hash(mapping(policy["cookie"]), self.report, "envoy-hash", ref)
-                if cookie_hash is None:
-                    self.report.warning("envoy-hash", ref, "The hash cookie name is not an HTTP token Ferrum accepts; "
-                                        "round robin is used (stickiness lost).")
-                else:
+                if cookie_hash is not None:
                     hash_on = json.dumps([cookie_hash, cookie_config], sort_keys=True)
                     self._hash_policies[hash_on] = (cookie_hash, cookie_config)
             elif mapping(policy.get("connection_properties")).get("source_ip"):
@@ -1219,16 +1216,27 @@ class _Envoy:
         result["connect"] = connect
         if problems:
             return result
-        key = f"{name}|{hash_on}"
+        hash_key, cookie_config = self._hash_policies.get(hash_on, (hash_on, None)) if hash_on else (None, None)
+        # One upstream per cluster and hashing key: routes that hash the same cookie into one cluster share
+        # Envoy's affinity, so they must share one Ferrum upstream (its bindings are per upstream). The first
+        # route's cookie policy is kept and a differing one is reported.
+        key = f"{name}|{hash_key}"
+        existing = self.plan.upstreams.get(key)
+        if existing is not None and existing.hash_on_cookie_config is not None and cookie_config is not None \
+                and existing.hash_on_cookie_config != cookie_config:
+            self.report.warning("envoy-hash-cookie-conflict", ref,
+                                "Routes hash the same cookie into this cluster with different cookie settings (ttl or "
+                                "path). Ferrum keeps one upstream with the first route's settings so the affinity "
+                                "stays shared; reconcile the cookie settings manually.")
         if key not in self.plan.upstreams:
             spec = UpstreamSpec(key=key, name=name, ref=ref, targets=targets, tls=tls)
             policy = str(raw.get("lb_policy", "ROUND_ROBIN")).upper()
             spec.algorithm = {"ROUND_ROBIN": "round_robin", "LEAST_REQUEST": "least_connections",
                               "RANDOM": "random"}.get(policy, "round_robin")
             if policy in ("RING_HASH", "MAGLEV"):
-                if hash_on:
+                if hash_key:
                     spec.algorithm = "consistent_hashing"
-                    spec.hash_on, spec.hash_on_cookie_config = self._hash_policies.get(hash_on, (hash_on, None))
+                    spec.hash_on, spec.hash_on_cookie_config = hash_key, cookie_config
                 else:
                     self.report.warning("envoy-hash", ref, "Ring-hash without a route hash policy; using round robin.")
             elif policy not in ("ROUND_ROBIN", "LEAST_REQUEST", "RANDOM"):

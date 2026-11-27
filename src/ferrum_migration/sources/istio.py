@@ -1199,10 +1199,7 @@ class _Istio:
             elif mapping(consistent.get("httpCookie")).get("name"):
                 cookie_hash, cookie_config = envoy_cookie_hash(mapping(consistent["httpCookie"]), self.report,
                                                                "istio-hash", ref)
-                if cookie_hash is None:
-                    self.report.warning("istio-hash", ref, "consistentHash httpCookie name is not an HTTP token Ferrum "
-                                        "accepts; round robin.")
-                else:
+                if cookie_hash is not None:
                     algorithm, hash_on = "consistent_hashing", (cookie_hash, cookie_config)
             elif consistent.get("useSourceIp"):
                 algorithm, hash_on = "consistent_hashing", "ip"

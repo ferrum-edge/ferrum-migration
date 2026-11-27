@@ -2516,7 +2516,8 @@ def _admissible_hash_policy(spec: UpstreamSpec, report: Report) -> tuple[str | N
         cleaned["path"] = "/"
         problems.append("path")
     ttl = cleaned.get("ttl_seconds")
-    if ttl is not None and (isinstance(ttl, bool) or not isinstance(ttl, int) or not 0 <= ttl <= MAX_COOKIE_TTL_SECONDS):
+    if "ttl_seconds" in cleaned and (isinstance(ttl, bool) or not isinstance(ttl, int)
+                                     or not 0 <= ttl <= MAX_COOKIE_TTL_SECONDS):
         cleaned.pop("ttl_seconds")
         cleaned["session_cookie"] = True
         problems.append("ttl_seconds")

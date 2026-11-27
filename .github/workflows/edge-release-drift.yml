@@ -94,6 +94,8 @@ jobs:
           echo "FERRUM_EDGE_BIN=$dir/$FERRUM_EDGE_ASSET" >> "$GITHUB_ENV"
 
       - name: Converter output passes ferrum-edge validate (synthetic CA for operator-CA fixtures)
+        env:
+          FERRUM_EDGE_REQUIRE_SYNTHETIC_CA: "1"
         run: python -m unittest discover -s tests -p 'test_ferrum_reference.py' -v
 
       - name: Runtime smoke gate (one working migration per source, loopback)

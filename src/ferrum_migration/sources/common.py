@@ -141,15 +141,26 @@ def cookie_domain_ok(domain: Any) -> bool:
 def envoy_cookie_hash(cookie: dict, report: Report, code: str, ref: str) -> tuple[str | None, dict | None]:
     """Envoy ``hash_policy.cookie`` / Istio ``consistentHash.httpCookie`` into Ferrum cookie hashing.
 
-    Returns ``(hash_on, hash_on_cookie_config)``, or ``(None, None)`` when the cookie name is not an
-    HTTP token Ferrum accepts (the caller falls back to round robin). Envoy generates the cookie only
-    when ``ttl`` is set (``Max-Age=<ttl>``, or a session cookie for a zero ttl), with ``HttpOnly`` and
-    the configured ``path``. Ferrum always issues its own sticky cookie to a client that has none, so
-    a policy without ``ttl`` (hash only on a cookie the application sets) gets a browser session
-    cookie and a warning.
+    Returns ``(hash_on, hash_on_cookie_config)``, or ``(None, None)`` (the caller falls back to round
+    robin; this function reports why). Envoy (``source/common/http/hash_policy.cc``) generates the
+    cookie only when ``ttl`` is set: ``Max-Age`` is the ttl's whole seconds, and a ttl under one second
+    (zero included) gives a session cookie; the cookie is ``HttpOnly`` with the configured ``path``.
+
+    Without ``ttl`` the source only reads a cookie the application owns and hashes its value. Ferrum
+    cannot do that: its cookie hashing resolves a gateway-issued binding, and a value it did not issue
+    makes it re-pin the client and send ``Set-Cookie`` under that name, which would overwrite the
+    application's cookie (a session cookie, for example). That policy is therefore not migrated.
     """
     hash_on = hash_on_value("cookie", cookie.get("name"))
     if hash_on is None:
+        report.warning(code, ref, "The hash cookie name is not an HTTP token Ferrum accepts; round robin is used "
+                                  "(stickiness lost).")
+        return None, None
+    if cookie.get("ttl") is None:
+        report.warning(code, ref, "The source hashes on a cookie the application sets and never issues one. Ferrum "
+                                  "would replace that cookie with its own binding (overwriting, for example, an "
+                                  "application session), so cookie hashing was not migrated: round robin is used "
+                                  "(stickiness lost).")
         return None, None
     config: dict[str, Any] = {"path": "/", "http_only": True}
     path = cookie.get("path")
@@ -164,21 +175,17 @@ def envoy_cookie_hash(cookie: dict, report: Report, code: str, ref: str) -> tupl
                                   "path; Ferrum's sticky cookie uses Path=/.")
     if cookie.get("attributes"):
         report.warning(code, ref, "Extra hash cookie attributes are not migrated.")
-    if cookie.get("ttl") is None:
-        config["session_cookie"] = True
-        report.warning(code, ref, "The source hashes only on a cookie the client already has and never issues one; "
-                                  "Ferrum issues its own sticky (browser session) cookie to clients without it, so "
-                                  "those clients become sticky.")
-        return hash_on, config
     ttl_ms = util.proto_duration_ms(cookie.get("ttl"))
     if ttl_ms is None:
         config["session_cookie"] = True
         report.warning(code, ref, "The hash cookie ttl is not a representable duration; a browser session cookie "
                                   "is used.")
-    elif ttl_ms == 0:
+        return hash_on, config
+    seconds = ttl_ms // 1000
+    if seconds == 0:
+        # Envoy writes Max-Age only for a nonzero whole-second ttl: zero and sub-second ttls are session cookies.
         config["session_cookie"] = True
     else:
-        seconds = ttl_ms // 1000  # Envoy truncates to whole seconds: a sub-second ttl sends Max-Age=0
         if seconds > MAX_COOKIE_TTL_SECONDS:
             seconds = MAX_COOKIE_TTL_SECONDS
             report.warning(code, ref, f"The hash cookie ttl exceeds Ferrum's {MAX_COOKIE_TTL_SECONDS}s limit and was "

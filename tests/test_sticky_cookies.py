@@ -49,10 +49,12 @@ class TraefikStickyTest(unittest.TestCase):
     def test_default_session_cookie_and_invalid_path(self):
         upstream = upstream_for(self.result.config, "session-1.internal")
         self.assertTrue(upstream["hash_on"].startswith("cookie:traefik-"))
+        # sameSite: Strict (capitalized) keeps its policy: Traefik lowercases the value before matching it.
         self.assertEqual(upstream["hash_on_cookie_config"],
                          {"path": "/", "http_only": False, "secure": False, "session_cookie": True,
                           "same_site": "Strict"})
         self.assertIn("traefik-sticky-cookie-path", codes(self.report))
+        self.assertNotIn("traefik-sticky-cookie-same-site", codes(self.report))
 
 
 class KongStickyTest(unittest.TestCase):
@@ -61,6 +63,7 @@ class KongStickyTest(unittest.TestCase):
         carts = upstream_for(result.config, "carts-1.internal")
         self.assertEqual(carts["hash_on"], "cookie:cart_affinity")
         self.assertEqual(carts["hash_on_cookie_config"], {"path": "/carts", "session_cookie": True, "http_only": True})
+        self.assertIn("kong-hash-cookie", codes(_report))
         users = upstream_for(result.config, "users-1.internal")
         self.assertEqual(users["hash_on"], "header:x-user-id")
         self.assertNotIn("hash_on_cookie_config", users)
@@ -76,15 +79,28 @@ class KongStickyTest(unittest.TestCase):
 
 
 class EnvoyIstioStickyTest(unittest.TestCase):
-    def test_envoy_generated_and_existing_cookies(self):
+    def test_envoy_generated_cookie_routes_share_one_upstream(self):
+        # Two routes hash the same cookie into one cluster with different ttls: one upstream (shared affinity),
+        # the first route's settings (172800s, clamped to Ferrum's 86400s), and a conflict report.
         result, report, _plan = migrate("envoy", read_fixture("sticky", "envoy.yaml"))
         generated = upstream_for(result.config, "generated-1.internal")
         self.assertEqual(generated["hash_on"], "cookie:envoy_affinity")
         self.assertEqual(generated["hash_on_cookie_config"], {"path": "/", "http_only": True, "ttl_seconds": 86400})
+        upstream_ids = {proxy.get("upstream_id") for proxy in result.config["proxies"]
+                        if "sticky.example.test" in proxy.get("hosts", []) and proxy.get("upstream_id")}
+        self.assertEqual(upstream_ids, {generated["id"]})
+        self.assertIn("envoy-hash-cookie-conflict", codes(report))
+
+    def test_envoy_application_cookie_is_never_overwritten(self):
+        # No ttl: Envoy only reads the application's cookie. Ferrum would replace it with its own binding, so
+        # cookie hashing is not emitted at all (round robin, stickiness lost, reported).
+        result, report, _plan = migrate("envoy", read_fixture("sticky", "envoy.yaml"))
         existing = upstream_for(result.config, "existing-1.internal")
-        self.assertEqual(existing["hash_on"], "cookie:app_session")
-        self.assertEqual(existing["hash_on_cookie_config"], {"path": "/", "http_only": True, "session_cookie": True})
-        self.assertIn("envoy-hash", codes(report))
+        self.assertNotIn("hash_on", existing)
+        self.assertNotIn("hash_on_cookie_config", existing)
+        self.assertNotEqual(existing["algorithm"], "consistent_hashing")
+        messages = " ".join(item.message for item in report.ordered() if item.code == "envoy-hash")
+        self.assertIn("never issues one", messages)
 
     def test_istio_session_and_sub_second_ttl(self):
         result, report, _plan = migrate("istio", read_fixture("sticky", "istio.yaml"))
@@ -93,8 +109,8 @@ class EnvoyIstioStickyTest(unittest.TestCase):
         self.assertEqual(session["hash_on_cookie_config"],
                          {"path": "/session", "http_only": True, "session_cookie": True})
         timed = upstream_for(result.config, "timed.shop.svc.cluster.local")
-        # Envoy truncates a 0.5s ttl to Max-Age=0.
-        self.assertEqual(timed["hash_on_cookie_config"], {"path": "/", "http_only": True, "ttl_seconds": 0})
+        # Envoy writes Max-Age only for a nonzero whole-second ttl: a 0.5s ttl is a session cookie.
+        self.assertEqual(timed["hash_on_cookie_config"], {"path": "/", "http_only": True, "session_cookie": True})
         self.assertIn("istio-hash", codes(report))
 
 
@@ -116,6 +132,12 @@ class EmitterSafetyNetTest(unittest.TestCase):
             "path": "relative", "ttl_seconds": -1, "domain": "bad domain", "same_site": "lax", "secure": "yes",
             "unknown": 1}), report)
         self.assertEqual(hash_on, "cookie:a")
+        self.assertEqual(cookie, {"path": "/", "session_cookie": True})
+        self.assertIn("hash-cookie-not-representable", codes(report))
+
+    def test_null_ttl_is_never_emitted(self):
+        report = Report("test", "input")
+        _hash_on, cookie = _admissible_hash_policy(self.spec("cookie:a", {"path": "/", "ttl_seconds": None}), report)
         self.assertEqual(cookie, {"path": "/", "session_cookie": True})
         self.assertIn("hash-cookie-not-representable", codes(report))
 

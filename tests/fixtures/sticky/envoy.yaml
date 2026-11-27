@@ -16,12 +16,18 @@ static_resources:
                     - name: sticky
                       domains: ["sticky.example.test"]
                       routes:
+                        - name: generated-cookie-short
+                          match: {prefix: "/short"}
+                          route:
+                            cluster: generated
+                            hash_policy:
+                              - cookie: {name: envoy_affinity, ttl: 172800s, path: /}
                         - name: generated-cookie
                           match: {prefix: "/"}
                           route:
                             cluster: generated
                             hash_policy:
-                              - cookie: {name: envoy_affinity, ttl: 172800s, path: /}
+                              - cookie: {name: envoy_affinity, ttl: 60s, path: /}
                     - name: existing
                       domains: ["existing.example.test"]
                       routes:

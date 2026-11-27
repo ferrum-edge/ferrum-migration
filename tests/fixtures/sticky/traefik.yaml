@@ -39,7 +39,7 @@ http:
         sticky:
           cookie:
             path: "/bad;path"
-            sameSite: strict
+            sameSite: Strict
         servers:
           - url: "http://session-1.internal:8080"
           - url: "http://session-2.internal:8080"

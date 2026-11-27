@@ -220,6 +220,8 @@ jobs:
       - name: Schema checks against Edge main source, and ferrum-edge validate on every fixture's output
         id: admission
         continue-on-error: true
+        env:
+          FERRUM_EDGE_REQUIRE_SYNTHETIC_CA: "1"
         run: python -m unittest discover -s tests -p 'test_ferrum_reference.py' -v
 
       - name: Full runtime acceptance against Edge main (loopback)
