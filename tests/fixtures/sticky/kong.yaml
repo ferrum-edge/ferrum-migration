@@ -1,0 +1,33 @@
+# Synthetic Kong upstreams hashing on a cookie and a header for ferrum-migration tests.
+_format_version: "3.0"
+upstreams:
+  - name: carts-upstream
+    algorithm: consistent-hashing
+    hash_on: cookie
+    hash_on_cookie: cart_affinity
+    hash_on_cookie_path: /carts
+    targets:
+      - target: carts-1.internal:8080
+      - target: carts-2.internal:8080
+  - name: users-upstream
+    algorithm: consistent-hashing
+    hash_on: header
+    hash_on_header: X-User-Id
+    targets:
+      - target: users-1.internal:8080
+      - target: users-2.internal:8080
+services:
+  - name: carts
+    host: carts-upstream
+    protocol: http
+    port: 80
+    routes:
+      - name: carts
+        hosts: [carts.example.test]
+  - name: users
+    host: users-upstream
+    protocol: http
+    port: 80
+    routes:
+      - name: users
+        hosts: [users.example.test]

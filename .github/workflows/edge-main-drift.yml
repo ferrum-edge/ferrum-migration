@@ -31,8 +31,10 @@ on:
 permissions:
   contents: read
 
+# Keyed by ref alone, so a scheduled and a manual run on the default branch queue behind each other
+# instead of filing the tracking issue concurrently; only pull request runs are cancelled.
 concurrency:
-  group: edge-main-drift-${{ github.event_name }}-${{ github.ref }}
+  group: edge-main-drift-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -143,12 +145,27 @@ jobs:
               exit 1
               ;;
           esac
+          # Whether the newest published Edge release already contains this commit. An unreadable
+          # release or comparison is reported as unknown, never as released or unreleased.
+          release_tag=$(gh api repos/ferrum-edge/ferrum-edge/releases/latest --jq .tag_name 2>/dev/null || true)
+          release_state=unknown
+          if [[ "$release_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            status=$(gh api "repos/ferrum-edge/ferrum-edge/compare/$release_tag...$commit" --jq .status 2>/dev/null || true)
+            case "$status" in
+              identical | behind) release_state=released ;;
+              ahead | diverged) release_state=unreleased ;;
+            esac
+          else
+            release_tag=""
+          fi
           {
             echo "image=$image"
             echo "platform-digest=$platform"
             echo "commit=$commit"
             echo "main-head=$main_head"
             echo "behind=$behind"
+            echo "release-tag=$release_tag"
+            echo "release-state=$release_state"
           } >> "$GITHUB_OUTPUT"
           echo "Checking Ferrum Edge main at $commit ($image), $behind commit(s) behind main $main_head."
 
@@ -210,13 +227,29 @@ jobs:
         continue-on-error: true
         env:
           EDGE_VERSION: ${{ steps.binary.outputs.version }}
+        # --strict: a case that could not run (BLOCKED, SKIPPED, STATIC_ONLY) fails the step, so only PASS
+        # and the expected safe refusals (REJECTED_ACCEPTABLE) can make the report clean.
         run: >-
           python acceptance/run.py --ferrum-bin "$FERRUM_EDGE_BIN" --expect-ferrum-version "$EDGE_VERSION"
-          --converter-env "PYTHONPATH=$GITHUB_WORKSPACE/src" --work-root "$RUNNER_TEMP/acceptance-main"
+          --strict --converter-env "PYTHONPATH=$GITHUB_WORKSPACE/src" --work-root "$RUNNER_TEMP/acceptance-main"
+          --results "$RUNNER_TEMP/acceptance-main-results.json"
+
+      - name: Summarize acceptance statuses
+        id: statuses
+        if: ${{ !cancelled() && steps.acceptance.outcome != 'skipped' }}
+        run: |
+          set -euo pipefail
+          results="$RUNNER_TEMP/acceptance-main-results.json"
+          if [ -s "$results" ]; then
+            summary=$(jq -r '.counts | to_entries | sort_by(.key) | map("\(.key)=\(.value)") | join(", ")' "$results")
+          else
+            summary="no results written"
+          fi
+          echo "summary=$summary" >> "$GITHUB_OUTPUT"
 
       - name: Remove work dirs (may hold per-run synthetic credentials)
         if: always()
-        run: rm -rf "$RUNNER_TEMP/acceptance-main" "$RUNNER_TEMP/edge-main"
+        run: rm -rf "$RUNNER_TEMP/acceptance-main" "$RUNNER_TEMP/acceptance-main-results.json" "$RUNNER_TEMP/edge-main"
 
       # Always, so a run that could not check anything still reaches the tracking issue as
       # `error` instead of going silent.
@@ -232,6 +265,9 @@ jobs:
           BEHIND: ${{ steps.edge.outputs.behind }}
           ADMISSION: ${{ steps.admission.outcome }}
           ACCEPTANCE: ${{ steps.acceptance.outcome }}
+          ACCEPTANCE_SUMMARY: ${{ steps.statuses.outputs.summary }}
+          RELEASE_TAG: ${{ steps.edge.outputs.release-tag }}
+          RELEASE_STATE: ${{ steps.edge.outputs.release-state }}
           SETUP: >-
             checkout=${{ steps.checkout.outcome }}
             setup-python=${{ steps.python.outcome }}
@@ -260,7 +296,12 @@ jobs:
             if [ "$outcome" = error ]; then
               echo "The Edge main drift check could not run: \`${failed_setup# }\` did not succeed, so nothing was checked against Ferrum Edge \`main\`. See the run log; a clean scheduled run closes this issue."
             elif [ "$outcome" = drift ]; then
-              echo "\`$REPOSITORY\` output fails checks against Ferrum Edge \`main\`. This is an early warning: the change is on Edge \`main\` and not released yet, so there is time to ship a compatible converter before Edge releases it."
+              case "$RELEASE_STATE" in
+                released) release_note="The newest published release, \`$RELEASE_TAG\`, already contains the checked commit, so users of that release can be affected now." ;;
+                unreleased) release_note="The checked commit is not contained in the newest published release${RELEASE_TAG:+ (\`$RELEASE_TAG\`)}, so the failing change may not be released yet." ;;
+                *) release_note="Whether a published Edge release contains the checked commit could not be determined." ;;
+              esac
+              echo "\`$REPOSITORY\` output fails checks against the signed Ferrum Edge \`main\` image. $release_note"
             else
               echo "\`$REPOSITORY\` output passes its checks against Ferrum Edge \`main\`."
             fi
@@ -269,13 +310,15 @@ jobs:
             echo "|---|---|"
             echo "| Edge commit checked | [\`${EDGE_COMMIT:0:12}\`](https://github.com/ferrum-edge/ferrum-edge/commit/$EDGE_COMMIT) (version \`${EDGE_VERSION:-unknown}\`), image \`$EDGE_REF\` (signed by Edge's Main Latest Image workflow) |"
             echo "| Edge \`main\` | \`${MAIN_HEAD:0:12}\`, ${BEHIND:-?} commit(s) after the checked commit |"
+            case "$RELEASE_STATE" in released) contains=yes ;; unreleased) contains=no ;; *) contains=unknown ;; esac
+            echo "| Newest published Edge release | \`${RELEASE_TAG:-unknown}\` (contains the checked commit: $contains) |"
             echo "| Run | $run_url |"
             if [ "$outcome" != error ]; then
               echo
               echo "| Check | Result |"
               echo "|---|---|"
               echo "| Schema checks against Edge \`main\` source, and \`ferrum-edge validate\` on every fixture's output (\`tests/test_ferrum_reference.py\`) | $(verdict "$ADMISSION") |"
-              echo "| Full loopback runtime acceptance (\`acceptance/run.py\`) | $(verdict "$ACCEPTANCE") |"
+              echo "| Full loopback runtime acceptance (\`acceptance/run.py --strict\`; ${ACCEPTANCE_SUMMARY:-no results}) | $(verdict "$ACCEPTANCE") |"
             fi
             echo
             echo "The run log names each failing test or case. A clean scheduled run closes this issue."
@@ -301,6 +344,11 @@ jobs:
       github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     runs-on: ubuntu-26.04
     timeout-minutes: 10
+    # One writer at a time, across every run of this workflow, so the single tracking issue is never
+    # created twice; queued runs are not cancelled.
+    concurrency:
+      group: edge-main-drift-issue
+      cancel-in-progress: false
     permissions:
       contents: read
       issues: write
@@ -333,9 +381,18 @@ jobs:
           esac
           # Only an issue this workflow wrote (its body starts with the marker) is edited or
           # closed; a human-labelled issue is left alone.
-          number=$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues?state=open&labels=$label&per_page=100" \
+          # One tracking issue: the lowest-numbered open issue this workflow wrote. Any other open one
+          # (left by an earlier concurrent run) is closed as a duplicate.
+          open_issues=$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues?state=open&labels=$label&per_page=100" \
             --jq '.[] | select(.pull_request == null and ((.body // "") | startswith("<!-- edge-main-drift -->"))) | .number' \
-            | sort -n | sed -n 1p)
+            | sort -n)
+          number=$(sed -n 1p <<< "$open_issues")
+          while read -r duplicate; do
+            [ -n "$duplicate" ] || continue
+            gh issue close "$duplicate" --repo "$GITHUB_REPOSITORY" --reason "not planned" \
+              --comment "Duplicate of #$number (one tracking issue is kept): $run_url"
+            echo "::notice::Closed duplicate tracking issue #$duplicate."
+          done < <(sed -n '2,$p' <<< "$open_issues")
           case "$OUTCOME" in
             drift | error)
               if [ "$OUTCOME" = drift ]; then

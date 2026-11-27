@@ -209,6 +209,21 @@ The resources file is `resources.yaml` or `resources.json`. Ferrum's spec discov
 write one format next to an existing file of the other format. The report's next steps always pass
 `--spec` explicitly.
 
+## Sticky sessions (consistent hashing)
+
+Ferrum admits `hash_on` only as `ip`, `header:<token>` or `cookie:<token>` (at most 255 bytes) and
+`hash_on_cookie_config` only with a `/`-rooted path without `;` or control characters, a
+`ttl_seconds` from 0 to 86400, a valid domain and `SameSite` `Strict`/`Lax`/`None`
+(`src/config/types.rs`); one invalid value rejects the whole resources file. Ferrum always issues
+its own sticky cookie (`Max-Age=<ttl_seconds>`, or none for `session_cookie`) to a client without one.
+
+| Source | Mapping |
+|---|---|
+| Kong `hash_on: cookie` | `cookie:<hash_on_cookie>`, `path` from `hash_on_cookie_path`, `session_cookie: true`, `http_only: true` (Kong's balancer writes a session cookie with `HttpOnly`; its misspelled `Same-Site` attribute is ignored by browsers, so no `SameSite`). A non-token name or unrepresentable path falls back to round robin (`kong-hash-on`). |
+| Traefik `sticky.cookie` | `maxAge` 0 (default) → `session_cookie`; negative → `ttl_seconds: 0` (Go sends `Max-Age=0`); above 86400 → clamped (`traefik-sticky-max-age`). `httpOnly`, `secure`, `sameSite`, `path`, `domain` carried over; a non-token name, invalid path, domain or sameSite is replaced with a warning (`traefik-sticky-cookie-*`). |
+| Envoy `hash_policy.cookie`, Istio `consistentHash.httpCookie` | `ttl` → `ttl_seconds` (truncated to seconds like Envoy; 0 → `session_cookie`; above 86400 clamped), `path` (absent → `/`, warning), `http_only: true`. Without `ttl` the source only hashes an existing cookie and never issues one; Ferrum still issues a session cookie (warning). |
+| every source | a header or cookie name that is not an HTTP token falls back to round robin; the emitter re-checks every value and drops anything Ferrum would refuse (`hash-on-not-representable`, `hash-cookie-not-representable`). |
+
 Resolved from source: `request_termination`'s `trigger.path_prefix` is a plain string prefix of
 the canonical request path (`Trigger::PathPrefix(prefix) => ctx.path.starts_with(prefix)` in
 `src/plugins/request_termination.rs`, unchanged between v0.9.21 and Edge `main` at

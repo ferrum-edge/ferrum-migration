@@ -78,6 +78,7 @@ from . import matching, util
 from .model import BackendRef, Plan, PluginSpec, RouteSpec, TlsSpec, UpstreamSpec
 from .redact import safe_label
 from .report import Report
+from .sources.common import MAX_COOKIE_TTL_SECONDS, cookie_domain_ok, cookie_path_ok, hash_on_value
 
 PLACEHOLDER_HOST = "ferrum-migration-refused.invalid"
 PLACEHOLDER_PORT = 9
@@ -2484,6 +2485,58 @@ def _fit_bytes(text: str, limit: int) -> str:
     return encoded[:limit].decode("utf-8", errors="ignore")
 
 
+_COOKIE_KEYS = {"path", "ttl_seconds", "session_cookie", "domain", "http_only", "secure", "same_site"}
+
+
+def _admissible_hash_policy(spec: UpstreamSpec, report: Report) -> tuple[str | None, dict | None]:
+    """The upstream's ``hash_on`` and ``hash_on_cookie_config`` exactly as Ferrum admits them.
+
+    Sources already map these within Ferrum's limits; this is the emitter's last check, so an
+    unrepresentable value never reaches the resources file (Ferrum rejects the whole file). An
+    invalid ``hash_on`` falls back to round robin, and an invalid cookie setting is dropped, each with
+    a report finding.
+    """
+    hash_on = spec.hash_on
+    if hash_on and hash_on != "ip":
+        kind, _, name = hash_on.partition(":")
+        if kind not in ("header", "cookie") or hash_on_value(kind, name) != (hash_on if kind == "cookie"
+                                                                              else f"header:{name.lower()}"):
+            report.warning("hash-on-not-representable", spec.ref,
+                           "The consistent-hashing key is not one Ferrum accepts; round robin is used "
+                           "(stickiness lost).")
+            return None, None
+        if kind == "header":
+            hash_on = f"header:{name.lower()}"
+    config = spec.hash_on_cookie_config
+    if not config or not (hash_on or "").startswith("cookie:"):
+        return hash_on, None
+    cleaned = {key: value for key, value in config.items() if key in _COOKIE_KEYS}
+    problems = [key for key in config if key not in _COOKIE_KEYS]
+    if "path" in cleaned and not cookie_path_ok(cleaned["path"]):
+        cleaned["path"] = "/"
+        problems.append("path")
+    ttl = cleaned.get("ttl_seconds")
+    if ttl is not None and (isinstance(ttl, bool) or not isinstance(ttl, int) or not 0 <= ttl <= MAX_COOKIE_TTL_SECONDS):
+        cleaned.pop("ttl_seconds")
+        cleaned["session_cookie"] = True
+        problems.append("ttl_seconds")
+    if "domain" in cleaned and not cookie_domain_ok(cleaned["domain"]):
+        cleaned.pop("domain")
+        problems.append("domain")
+    if "same_site" in cleaned and cleaned["same_site"] not in ("Strict", "Lax", "None"):
+        cleaned.pop("same_site")
+        problems.append("same_site")
+    for key in ("session_cookie", "http_only", "secure"):
+        if key in cleaned and not isinstance(cleaned[key], bool):
+            cleaned.pop(key)
+            problems.append(key)
+    if problems:
+        report.warning("hash-cookie-not-representable", spec.ref,
+                       "Sticky cookie settings Ferrum would refuse were replaced or dropped: "
+                       + ", ".join(sorted(set(problems))) + ".")
+    return hash_on, cleaned
+
+
 class _NameAllocator:
     """Deterministic, readable, unique resource names.
 
@@ -2589,6 +2642,9 @@ class _Builder:
 
     def _upstream_entry(self, uid: str, spec: UpstreamSpec, https: bool) -> dict[str, Any]:
         algorithm = spec.algorithm
+        hash_on, cookie_config = _admissible_hash_policy(spec, self.report)
+        if algorithm == "consistent_hashing" and spec.hash_on and hash_on is None:
+            algorithm = "round_robin"
         weights = {t.weight for t in spec.targets}
         if algorithm == "round_robin" and len(weights) > 1:
             algorithm = "weighted_round_robin"
@@ -2599,10 +2655,10 @@ class _Builder:
             "targets": [{"host": t.host, "port": int(t.port), "weight": int(t.weight)} for t in spec.targets],
             "algorithm": algorithm,
         }
-        if spec.hash_on:
-            entry["hash_on"] = spec.hash_on
-        if spec.hash_on_cookie_config:
-            entry["hash_on_cookie_config"] = copy.deepcopy(spec.hash_on_cookie_config)
+        if hash_on:
+            entry["hash_on"] = hash_on
+        if cookie_config:
+            entry["hash_on_cookie_config"] = cookie_config
         if spec.health_checks:
             entry["health_checks"] = copy.deepcopy(spec.health_checks)
         if https:

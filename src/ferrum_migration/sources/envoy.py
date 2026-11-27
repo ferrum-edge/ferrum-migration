@@ -11,6 +11,7 @@ route of their connection manager (fail closed).
 
 from __future__ import annotations
 
+import json
 import re
 from typing import Any
 
@@ -20,9 +21,9 @@ from ..model import BackendRef, HostScope, Plan, PluginSpec, RouteSpec, Target, 
 from ..redact import safe_label
 from ..safe_load import load_structured
 from .common import (SourceContext, apply_first_match_order, check_route_budget, choose_main_port, compression_config,
-                     cors_config, cors_origin_star_probe, fault_injection_config, header_value_ok, literal_value,
-                     mapping, merge_weighted_targets, request_header_rule, response_header_rule, retry_from_policy, seq,
-                     split_csv, str_list)
+                     cors_config, cors_origin_star_probe, envoy_cookie_hash, fault_injection_config, hash_on_value,
+                     header_value_ok, literal_value, mapping, merge_weighted_targets, request_header_rule,
+                     response_header_rule, retry_from_policy, seq, split_csv, str_list)
 
 PLATFORM = "envoy"
 _REDIRECT_CODES = {"MOVED_PERMANENTLY": 301, "FOUND": 302, "SEE_OTHER": 303, "TEMPORARY_REDIRECT": 307,
@@ -183,6 +184,8 @@ class _Envoy:
         self.redirect_vhosts: list[tuple[str, list[str] | None, int | None, list[RouteSpec]]] = []
         self._cors_origin_cache: dict[int, tuple[Any, list[Any], str | None, str]] = {}
         self._cors_config_cache: dict[tuple, tuple[Any, dict | None, str | None]] = {}
+        # Hash policy key (as passed to _cluster and part of the upstream key) -> (hash_on, cookie config).
+        self._hash_policies: dict[str, tuple[str, dict | None]] = {}
 
     def run(self) -> Plan:
         if self.root.get("dynamic_resources"):
@@ -839,9 +842,18 @@ class _Envoy:
         for policy in seq(action.get("hash_policy")):
             policy = mapping(policy)
             if mapping(policy.get("header")).get("header_name"):
-                hash_on = f"header:{str(policy['header']['header_name']).lower()}"
+                hash_on = hash_on_value("header", policy["header"]["header_name"])
+                if hash_on is None:
+                    self.report.warning("envoy-hash", ref, "The hash header name is not an HTTP token Ferrum accepts; "
+                                        "round robin is used (stickiness lost).")
             elif mapping(policy.get("cookie")).get("name"):
-                hash_on = f"cookie:{policy['cookie']['name']}"
+                cookie_hash, cookie_config = envoy_cookie_hash(mapping(policy["cookie"]), self.report, "envoy-hash", ref)
+                if cookie_hash is None:
+                    self.report.warning("envoy-hash", ref, "The hash cookie name is not an HTTP token Ferrum accepts; "
+                                        "round robin is used (stickiness lost).")
+                else:
+                    hash_on = json.dumps([cookie_hash, cookie_config], sort_keys=True)
+                    self._hash_policies[hash_on] = (cookie_hash, cookie_config)
             elif mapping(policy.get("connection_properties")).get("source_ip"):
                 hash_on = "ip"
             break
@@ -1215,7 +1227,8 @@ class _Envoy:
                               "RANDOM": "random"}.get(policy, "round_robin")
             if policy in ("RING_HASH", "MAGLEV"):
                 if hash_on:
-                    spec.algorithm, spec.hash_on = "consistent_hashing", hash_on
+                    spec.algorithm = "consistent_hashing"
+                    spec.hash_on, spec.hash_on_cookie_config = self._hash_policies.get(hash_on, (hash_on, None))
                 else:
                     self.report.warning("envoy-hash", ref, "Ring-hash without a route hash policy; using round robin.")
             elif policy not in ("ROUND_ROBIN", "LEAST_REQUEST", "RANDOM"):

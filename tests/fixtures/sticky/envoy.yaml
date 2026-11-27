@@ -1,0 +1,56 @@
+# Synthetic Envoy v3 static bootstrap with ring-hash clusters keyed by cookies for ferrum-migration tests.
+static_resources:
+  listeners:
+    - name: http_listener
+      address:
+        socket_address: {address: 0.0.0.0, port_value: 8080}
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress_http
+                route_config:
+                  name: local_route
+                  virtual_hosts:
+                    - name: sticky
+                      domains: ["sticky.example.test"]
+                      routes:
+                        - name: generated-cookie
+                          match: {prefix: "/"}
+                          route:
+                            cluster: generated
+                            hash_policy:
+                              - cookie: {name: envoy_affinity, ttl: 172800s, path: /}
+                    - name: existing
+                      domains: ["existing.example.test"]
+                      routes:
+                        - name: existing-cookie
+                          match: {prefix: "/"}
+                          route:
+                            cluster: existing
+                            hash_policy:
+                              - cookie: {name: app_session}
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters:
+    - name: generated
+      type: STRICT_DNS
+      lb_policy: RING_HASH
+      load_assignment:
+        cluster_name: generated
+        endpoints:
+          - lb_endpoints:
+              - endpoint: {address: {socket_address: {address: generated-1.internal, port_value: 8080}}}
+              - endpoint: {address: {socket_address: {address: generated-2.internal, port_value: 8080}}}
+    - name: existing
+      type: STRICT_DNS
+      lb_policy: MAGLEV
+      load_assignment:
+        cluster_name: existing
+        endpoints:
+          - lb_endpoints:
+              - endpoint: {address: {socket_address: {address: existing-1.internal, port_value: 8080}}}
+              - endpoint: {address: {socket_address: {address: existing-2.internal, port_value: 8080}}}

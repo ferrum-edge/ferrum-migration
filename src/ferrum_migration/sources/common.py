@@ -101,6 +101,92 @@ def header_value_ok(value: Any, nonempty: bool = False, strict_ws: bool = False)
     return all(ch == "\t" or 0x20 <= ord(ch) <= 0x7E for ch in value)
 
 
+#: Ferrum Edge limits for consistent-hashing keys and sticky cookies (``src/config/types.rs``:
+#: ``MAX_HASH_ON_LENGTH``, ``MAX_COOKIE_PATH_LENGTH``, ``MAX_COOKIE_DOMAIN_LENGTH`` and
+#: ``MAX_TIMEOUT_SECONDS``, which bounds ``hash_on_cookie_config.ttl_seconds``).
+MAX_HASH_ON_LENGTH = 255
+MAX_COOKIE_PATH_LENGTH = 2048
+MAX_COOKIE_DOMAIN_LENGTH = 253
+MAX_COOKIE_TTL_SECONDS = 86_400
+
+
+def hash_on_value(kind: str, name: Any) -> str | None:
+    """``header:<name>`` / ``cookie:<name>`` as Ferrum's ``hash_on`` accepts it, or None.
+
+    Ferrum requires an HTTP token name and at most 255 bytes in total (``validate_hash_on_field``).
+    """
+    if not header_name_ok(name):
+        return None
+    value = f"{kind}:{name.lower() if kind == 'header' else name}"
+    return value if len(value) <= MAX_HASH_ON_LENGTH else None
+
+
+def cookie_path_ok(path: Any) -> bool:
+    """Ferrum ``hash_on_cookie_config.path``: starts with '/', printable ASCII without ';', bounded."""
+    return (isinstance(path, str) and path.startswith("/") and len(path) <= MAX_COOKIE_PATH_LENGTH
+            and ";" not in path and all(0x20 <= ord(ch) <= 0x7E for ch in path))
+
+
+def cookie_domain_ok(domain: Any) -> bool:
+    """Ferrum ``hash_on_cookie_config.domain``: an ASCII domain name (optional leading dot), bounded."""
+    if not isinstance(domain, str) or not domain or len(domain) > MAX_COOKIE_DOMAIN_LENGTH:
+        return False
+    body = domain[1:] if domain.startswith(".") else domain
+    if not body or body.endswith("."):
+        return False
+    return all(0 < len(label) <= 63 and label.isascii() and all(ch.isalnum() or ch == "-" for ch in label)
+               and label[0] != "-" and label[-1] != "-" for label in body.split("."))
+
+
+def envoy_cookie_hash(cookie: dict, report: Report, code: str, ref: str) -> tuple[str | None, dict | None]:
+    """Envoy ``hash_policy.cookie`` / Istio ``consistentHash.httpCookie`` into Ferrum cookie hashing.
+
+    Returns ``(hash_on, hash_on_cookie_config)``, or ``(None, None)`` when the cookie name is not an
+    HTTP token Ferrum accepts (the caller falls back to round robin). Envoy generates the cookie only
+    when ``ttl`` is set (``Max-Age=<ttl>``, or a session cookie for a zero ttl), with ``HttpOnly`` and
+    the configured ``path``. Ferrum always issues its own sticky cookie to a client that has none, so
+    a policy without ``ttl`` (hash only on a cookie the application sets) gets a browser session
+    cookie and a warning.
+    """
+    hash_on = hash_on_value("cookie", cookie.get("name"))
+    if hash_on is None:
+        return None, None
+    config: dict[str, Any] = {"path": "/", "http_only": True}
+    path = cookie.get("path")
+    if path not in (None, ""):
+        if cookie_path_ok(path):
+            config["path"] = path
+        else:
+            report.warning(code, ref, "The hash cookie path is not representable in Ferrum (it must start with '/' "
+                                      "and contain no ';' or control characters); Path=/ is used.")
+    else:
+        report.warning(code, ref, "The hash cookie has no path, so the source's cookie takes the browser's default "
+                                  "path; Ferrum's sticky cookie uses Path=/.")
+    if cookie.get("attributes"):
+        report.warning(code, ref, "Extra hash cookie attributes are not migrated.")
+    if cookie.get("ttl") is None:
+        config["session_cookie"] = True
+        report.warning(code, ref, "The source hashes only on a cookie the client already has and never issues one; "
+                                  "Ferrum issues its own sticky (browser session) cookie to clients without it, so "
+                                  "those clients become sticky.")
+        return hash_on, config
+    ttl_ms = util.proto_duration_ms(cookie.get("ttl"))
+    if ttl_ms is None:
+        config["session_cookie"] = True
+        report.warning(code, ref, "The hash cookie ttl is not a representable duration; a browser session cookie "
+                                  "is used.")
+    elif ttl_ms == 0:
+        config["session_cookie"] = True
+    else:
+        seconds = ttl_ms // 1000  # Envoy truncates to whole seconds: a sub-second ttl sends Max-Age=0
+        if seconds > MAX_COOKIE_TTL_SECONDS:
+            seconds = MAX_COOKIE_TTL_SECONDS
+            report.warning(code, ref, f"The hash cookie ttl exceeds Ferrum's {MAX_COOKIE_TTL_SECONDS}s limit and was "
+                                      "clamped; clients are re-pinned after a day instead.")
+        config["ttl_seconds"] = seconds
+    return hash_on, config
+
+
 def is_gateway_owned_request_header(name: str) -> bool:
     folded = fold(name)
     return folded in GATEWAY_OWNED_REQUEST_HEADERS or folded.startswith(GATEWAY_OWNED_PREFIXES)

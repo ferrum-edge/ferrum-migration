@@ -40,7 +40,11 @@ from ferrum_migration.envprofile import KNOWN_SETTINGS, render
 
 CASES = [("kong", ("kong", "kong.yaml"), "yaml"), ("nginx", ("nginx", "nginx.conf"), "nginx"),
          ("traefik", ("traefik", "dynamic.yaml"), "yaml"), ("traefik", ("traefik", "dynamic.toml"), "toml"),
-         ("envoy", ("envoy", "envoy.yaml"), "yaml"), ("istio", ("istio", "istio.yaml"), "yaml")]
+         ("envoy", ("envoy", "envoy.yaml"), "yaml"), ("istio", ("istio", "istio.yaml"), "yaml"),
+         # Consistent hashing on cookies and headers, including values Ferrum would refuse as written (negative
+         # or oversized cookie ages, non-token names, invalid paths): every source that emits hash_on_cookie_config.
+         ("kong", ("sticky", "kong.yaml"), "yaml"), ("traefik", ("sticky", "traefik.yaml"), "yaml"),
+         ("envoy", ("sticky", "envoy.yaml"), "yaml"), ("istio", ("sticky", "istio.yaml"), "yaml")]
 
 
 def source_commit() -> str:

@@ -180,9 +180,9 @@ jobs:
           --case kong-dbless-smoke --case kong-deck-smoke --case nginx-proxy-pass-uri
           --case traefik-smoke --case envoy-smoke --case istio-smoke
 
-      - name: Full runtime acceptance (loopback)
+      - name: Full runtime acceptance (loopback; a case that could not run fails it)
         run: >-
-          python acceptance/run.py --ferrum-bin "$FERRUM_EDGE_BIN"
+          python acceptance/run.py --ferrum-bin "$FERRUM_EDGE_BIN" --strict
           --converter-env "PYTHONPATH=$GITHUB_WORKSPACE/src" --work-root "$RUNNER_TEMP/acceptance-full"
 
       - name: Remove work dirs (may hold per-run synthetic credentials)
