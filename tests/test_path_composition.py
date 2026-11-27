@@ -70,10 +70,10 @@ class NginxPathTest(unittest.TestCase):
               location = /exact { proxy_pass http://a.internal:8080/target/; }
             }
             """)
-        svc = one_proxy(self, result.config, "/svc", "app.example.test")
+        svc = one_proxy(self, result.config, "/svc")
         self.assertEqual(svc["backend_path"], "/inner")
         self.assertEqual(compose("/svc", svc["backend_path"], "/svc/"), "/inner/")  # was /inner before the fix
-        exact = one_proxy(self, result.config, "=/exact", "app.example.test")
+        exact = one_proxy(self, result.config, "=/exact")
         self.assertEqual(exact["backend_path"], "/target/")
         self.assertNotIn("nginx-exact-rewrite", codes(report))
         self.assertNotIn("nginx-slash-mismatch", codes(report))
