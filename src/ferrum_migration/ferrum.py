@@ -2484,6 +2484,8 @@ def _fit_bytes(text: str, limit: int) -> str:
     return encoded[:limit].decode("utf-8", errors="ignore")
 
 
+_PROXY_POOL_KEYS = frozenset({"backend_connect_timeout_ms", "pool_idle_timeout_seconds", "pool_tcp_keepalive_seconds",
+                              "pool_http2_max_concurrent_streams"})
 _COOKIE_KEYS = {"path", "ttl_seconds", "session_cookie", "domain", "http_only", "secure", "same_site"}
 
 
@@ -2597,6 +2599,7 @@ class _Builder:
             self.plugin_configs.append(self._plugin_entry(pid, plugin.name, plugin.config, "global", None, plugin.ref))
         upstreams = self._build_upstreams(candidates)
         proxies = [self._build_proxy(cand) for cand in candidates]
+        self._scope_outlier_detection(upstreams, proxies)
         consumers = self._build_consumers()
         return {
             "version": "1",
@@ -2625,6 +2628,31 @@ class _Builder:
         entry["config"] = copy.deepcopy(config)
         entry["labels"] = self.labels(ref)
         return entry
+
+    def _scope_outlier_detection(self, upstreams: list[dict[str, Any]], proxies: list[dict[str, Any]]) -> None:
+        """Keep a translated outlier detector only where one proxy uses its upstream.
+
+        The source counts a host's failure streak once per cluster/destination, across every route. Ferrum keeps
+        passive health state per proxy (Edge ``src/health_check.rs``, keyed by namespace and proxy id), so two
+        proxies sharing the upstream would each need the full streak.
+        """
+        key_by_uid = {uid: key for key, uid in self.upstream_id_by_key.items()}
+        users: dict[str, int] = {}
+        for proxy in proxies:
+            if proxy.get("upstream_id"):
+                users[proxy["upstream_id"]] = users.get(proxy["upstream_id"], 0) + 1
+        for entry in upstreams:
+            spec = self.plan.upstreams.get(key_by_uid.get(entry["id"], ""))
+            checks = entry.get("health_checks") or {}
+            if spec is None or not spec.outlier_scoped or "passive" not in checks or users.get(entry["id"], 0) <= 1:
+                continue
+            checks.pop("passive")
+            if not checks:
+                entry.pop("health_checks")
+            self.report.warning("outlier-detection-scope", spec.ref,
+                                f"{users[entry['id']]} routes use this destination. The source counts each host's "
+                                "consecutive failures across all of them; Ferrum keeps one streak per route, so a host "
+                                "would need the full count on one route. Outlier detection was not migrated.")
 
     def _build_upstreams(self, candidates: list[_Cand]) -> list[dict[str, Any]]:
         result: list[dict[str, Any]] = []
@@ -2709,8 +2737,10 @@ class _Builder:
             proxy["allowed_methods"] = list(route.methods)
         backend: BackendRef = route.backend
         proxy["backend_scheme"] = backend.scheme
+        pool_settings: dict[str, Any] = {}
         if backend.upstream_key:
             proxy["upstream_id"] = self.upstream_id_by_key[backend.upstream_key]
+            pool_settings = self.plan.upstreams[backend.upstream_key].proxy_settings
         else:
             proxy["backend_host"] = backend.host
             proxy["backend_port"] = int(backend.port)
@@ -2720,6 +2750,10 @@ class _Builder:
         proxy["preserve_host_header"] = bool(route.preserve_host)
         if route.connect_timeout_ms:
             proxy["backend_connect_timeout_ms"] = route.connect_timeout_ms
+        for key in sorted(pool_settings):
+            # The destination's connection-pool policy (its connect timeout yields to a route-level one).
+            if key in _PROXY_POOL_KEYS and key not in proxy:
+                proxy[key] = pool_settings[key]
         if route.read_timeout_ms:
             proxy["backend_read_timeout_ms"] = route.read_timeout_ms
         if route.write_timeout_ms:

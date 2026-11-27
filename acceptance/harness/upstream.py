@@ -125,6 +125,10 @@ def run_differential(
             resp = http_probe.send(listen_port, p.method, p.path, p.host, headers, request_timeout)
             records = recorder.for_probe(pid)
             entry_out = {"probe": p.id, "status": resp["status"], "transport_error": resp["error"]}
+            if p.prime:
+                entry_out["confirmed"] = True  # drives state only
+                outcome["probes"].append(entry_out)
+                continue
             if p.positive:
                 ok = bool(records) and all(
                     r["backend"] == p.forward_backend and r["path"] == p.forward_path for r in records

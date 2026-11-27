@@ -1,0 +1,79 @@
+# Synthetic Istio resources with DestinationRule outlierDetection and connectionPool for ferrum-migration tests.
+apiVersion: networking.istio.io/v1
+kind: Gateway
+metadata: {name: gw, namespace: edge}
+spec:
+  selector: {istio: ingressgateway}
+  servers:
+    - port: {number: 80, name: http, protocol: HTTP}
+      hosts: ["*/resilience.example.test"]
+---
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata: {name: resilience, namespace: shop}
+spec:
+  hosts: [resilience.example.test]
+  gateways: [edge/gw]
+  http:
+    - name: pay
+      match: [{uri: {prefix: /pay}}]
+      route: [{destination: {host: pay.external.test, port: {number: 8080}}}]
+    - name: ported
+      match: [{uri: {prefix: /ported}}]
+      route: [{destination: {host: ported.shop.svc.cluster.local, port: {number: 8080}}}]
+    - name: orders
+      route: [{destination: {host: orders.shop.svc.cluster.local, port: {number: 8080}}}]
+---
+apiVersion: networking.istio.io/v1
+kind: ServiceEntry
+metadata: {name: pay, namespace: shop}
+spec:
+  hosts: [pay.external.test]
+  ports: [{number: 8080, name: http, protocol: HTTP}]
+  resolution: STATIC
+  endpoints: [{address: 10.2.0.1}, {address: 10.2.0.2}]
+---
+apiVersion: networking.istio.io/v1
+kind: DestinationRule
+metadata: {name: pay, namespace: shop}
+spec:
+  host: pay.external.test
+  trafficPolicy:
+    outlierDetection:
+      consecutive5xxErrors: 7
+      interval: 5s
+      baseEjectionTime: 300s
+      maxEjectionPercent: 50
+      minHealthPercent: 50
+---
+apiVersion: networking.istio.io/v1
+kind: DestinationRule
+metadata: {name: orders, namespace: shop}
+spec:
+  host: orders.shop.svc.cluster.local
+  trafficPolicy:
+    outlierDetection:
+      consecutive5xxErrors: 7
+      baseEjectionTime: 45s
+    connectionPool:
+      tcp:
+        connectTimeout: 2s
+        maxConnections: 100
+        tcpKeepalive: {time: 600s, probes: 3}
+      http:
+        idleTimeout: 90s
+        maxConcurrentStreams: 50
+        http2MaxRequests: 1000
+        http2KeepAlive: {time: 30s}
+---
+apiVersion: networking.istio.io/v1
+kind: DestinationRule
+metadata: {name: ported, namespace: shop}
+spec:
+  host: ported.shop.svc.cluster.local
+  trafficPolicy:
+    connectionPool: {tcp: {connectTimeout: 100ms}}
+    outlierDetection: {consecutive5xxErrors: 2, baseEjectionTime: 300s}
+    portLevelSettings:
+      - port: {number: 8080}
+        loadBalancer: {simple: LEAST_REQUEST}

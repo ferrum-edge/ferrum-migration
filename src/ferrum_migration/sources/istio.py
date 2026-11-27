@@ -25,7 +25,8 @@ from ..redact import safe_label
 from ..safe_load import load_structured
 from .common import (SourceContext, apply_first_match_order, check_route_budget, choose_main_port, cors_config,
                      cors_origin_star_probe, envoy_cookie_hash, fault_injection_config, hash_on_value,
-                     header_value_ok, literal_value, mapping,
+                     endpoints_are_hosts, header_value_ok, istio_connection_pool, istio_outlier_passive,
+                     literal_value, mapping,
                      merge_weighted_targets, parse_percentage, replaced_prefix_backend_path, request_header_rule,
                      response_header_rule, retry_from_policy, seq, str_list)
 
@@ -56,6 +57,7 @@ class _Istio:
         self.no_dr_warned = False
         # internal.istio.io/route-semantics of the VirtualService being translated ("ingress", "gateway" or None).
         self.route_semantics: str | None = None
+        self.resilience_cache: dict[tuple[int, int | None], tuple[dict | None, dict]] = {}
         self.shared_bind: str | None = None
         # One entry per emitted projection (VirtualService x Gateway binding x frontend group), checked together
         # once every binding is known (see _check_frontend_scopes).
@@ -1061,8 +1063,10 @@ class _Istio:
                 return
             weight = util.as_int(raw.get("weight"))
             resolved.append((100 if weight is None and len(destinations) == 1 else (weight or 0), result))
-        if len(resolved) == 1:
-            spec.backend = resolved[0][1]["backend"]
+        live = [item for item in resolved if item[0] > 0]
+        if len(resolved) == 1 or len(live) == 1:
+            # One destination receives all the traffic: route to it as it is, with its own policy.
+            spec.backend = (live or resolved)[0][1]["backend"]
             return
         keys = {item[1]["tls_key"] for item in resolved}
         if len(keys) > 1:
@@ -1076,9 +1080,25 @@ class _Istio:
         if approximate:
             self.report.warning("istio-weights", spec.ref, "Weighted split was rounded to integer target weights.")
         first = self.plan.upstreams[resolved[0][1]["backend"].upstream_key]
+        members = [self.plan.upstreams[item[1]["backend"].upstream_key] for item in live]
+        settings = members[0].proxy_settings
+        if any(m.proxy_settings != settings for m in members):
+            self.report.warning("istio-resilience-weighted", spec.ref,
+                                "Weighted destinations have different connectionPool settings; Ferrum serves them "
+                                "from one merged upstream, so they were not migrated for this route.")
+            settings = {}
+        # Outlier detection applies to each destination's own endpoints (its ejection cap included); one merged
+        # upstream would pool them, even when the settings match.
+        health = None
+        if any((m.health_checks or {}).get("passive") for m in members):
+            self.report.warning("istio-outlier-weighted", spec.ref,
+                                "Each weighted destination's outlierDetection applies to its own endpoints; Ferrum "
+                                "serves the split from one merged upstream, so it was not migrated for this route.")
         key = f"weighted:{spec.ref}"
         self.plan.upstreams[key] = UpstreamSpec(key=key, name=f"{spec.name}-weighted", ref=spec.ref, targets=targets,
-                                                tls=first.tls, algorithm="weighted_round_robin")
+                                                tls=first.tls, algorithm="weighted_round_robin",
+                                                health_checks=dict(health) if health else None,
+                                                proxy_settings=dict(settings))
         spec.backend = BackendRef(scheme=resolved[0][1]["backend"].scheme, upstream_key=key)
 
     def _backend(self, fqdn: str, port: int | None, gw_ns: str, ref: str) -> dict:
@@ -1090,16 +1110,19 @@ class _Istio:
         if problem:
             return {"problem": problem}
         hash_on, cookie_config = hash_policy if hash_policy else (None, None)
+        passive, pool_settings = self._resilience(rule, port, f"istio destination {safe_label(fqdn)}:{port}", targets)
         if rule is None and not self.no_dr_warned:
             self.no_dr_warned = True
             self.report.warning("istio-no-destination-rule", ref, "Destinations without a DestinationRule are reached "
                                 "over plaintext HTTP; workloads requiring mesh mTLS reject these requests (fail closed).")
         key = (f"{fqdn}:{port}|{scheme}|{tls.key()}|{algorithm}|{hash_on}|"
-               f"{json.dumps(cookie_config, sort_keys=True) if cookie_config else ''}")
+               f"{json.dumps([cookie_config, passive, pool_settings], sort_keys=True)}")
         if key not in self.plan.upstreams:
             self.plan.upstreams[key] = UpstreamSpec(key=key, name=f"{fqdn}-{port}", ref=f"istio destination {fqdn}:{port}",
                                                     targets=targets, tls=tls, algorithm=algorithm, hash_on=hash_on,
-                                                    hash_on_cookie_config=cookie_config)
+                                                    hash_on_cookie_config=cookie_config,
+                                                    health_checks={"passive": passive} if passive else None,
+                                                    proxy_settings=dict(pool_settings), outlier_scoped=bool(passive))
         return {"backend": BackendRef(scheme=scheme, upstream_key=key), "targets": targets,
                 "tls_key": scheme + tls.key()}
 
@@ -1153,15 +1176,40 @@ class _Istio:
                 best, best_rank = rule, rank
         return best
 
-    def _traffic_policy(self, rule: dict | None, port: int | None, ref: str, se_sans: list[str] | None = None):
-        tls = TlsSpec()
-        if rule is None:
-            return tls, "http", "round_robin", None, None
+    @staticmethod
+    def _effective_policy(rule: dict, port: int | None) -> dict:
+        """The DestinationRule trafficPolicy for one port. A matching portLevelSettings entry replaces the whole
+        destination-level policy: settings it omits take their defaults, they are not inherited (Istio
+        ``GetPortLevelTrafficPolicy`` in pilot/pkg/networking/util/util.go)."""
         policy = mapping(mapping(rule.get("spec")).get("trafficPolicy"))
         for level in seq(policy.get("portLevelSettings")):
             level = mapping(level)
             if util.parse_port(mapping(level.get("port")).get("number")) == port:
-                policy = {**policy, **{k: v for k, v in level.items() if k != "port"}}
+                return {k: v for k, v in level.items() if k != "port"}
+        return policy
+
+    def _resilience(self, rule: dict | None, port: int | None, ref: str, targets: list) -> tuple[dict | None, dict]:
+        """(passive health check, per-proxy pool settings) from outlierDetection and connectionPool."""
+        if rule is None:
+            return None, {}
+        cache_key = (id(rule), port)
+        if cache_key in self.resilience_cache:  # one report per destination, however many routes use it
+            return self.resilience_cache[cache_key]
+        policy = self._effective_policy(rule, port)
+        passive = None
+        if isinstance(policy.get("outlierDetection"), dict):
+            passive = istio_outlier_passive(policy["outlierDetection"], endpoints_are_hosts(targets), self.report, ref)
+        settings = {}
+        if isinstance(policy.get("connectionPool"), dict):
+            settings = istio_connection_pool(policy["connectionPool"], self.report, ref)
+        self.resilience_cache[cache_key] = (passive, settings)
+        return passive, settings
+
+    def _traffic_policy(self, rule: dict | None, port: int | None, ref: str, se_sans: list[str] | None = None):
+        tls = TlsSpec()
+        if rule is None:
+            return tls, "http", "round_robin", None, None
+        policy = self._effective_policy(rule, port)
         tls_policy = mapping(policy.get("tls"))
         mode = str(tls_policy.get("mode", "DISABLE")).upper()
         scheme = "http"
@@ -1226,8 +1274,6 @@ class _Istio:
                 algorithm, hash_on = "consistent_hashing", "ip"
             else:
                 self.report.warning("istio-hash", ref, "consistentHash source has no equivalent; round robin.")
-        if policy.get("outlierDetection") or policy.get("connectionPool"):
-            self.report.warning("istio-resilience", ref, "outlierDetection/connectionPool are not migrated.")
         # (hash_on, hash_on_cookie_config), or None without consistent hashing.
         hash_policy = hash_on if isinstance(hash_on, tuple) else ((hash_on, None) if hash_on else None)
         return tls, scheme, algorithm, hash_policy, None

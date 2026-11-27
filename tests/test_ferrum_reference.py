@@ -46,7 +46,9 @@ CASES = [("kong", ("kong", "kong.yaml"), "yaml"), ("nginx", ("nginx", "nginx.con
          # Consistent hashing on cookies and headers, including values Ferrum would refuse as written (negative
          # or oversized cookie ages, non-token names, invalid paths): every source that emits hash_on_cookie_config.
          ("kong", ("sticky", "kong.yaml"), "yaml"), ("traefik", ("sticky", "traefik.yaml"), "yaml"),
-         ("envoy", ("sticky", "envoy.yaml"), "yaml"), ("istio", ("sticky", "istio.yaml"), "yaml")]
+         ("envoy", ("sticky", "envoy.yaml"), "yaml"), ("istio", ("sticky", "istio.yaml"), "yaml"),
+         # Outlier detection, circuit breakers and connection pools: passive health and pool overrides.
+         ("envoy", ("resilience", "envoy.yaml"), "yaml"), ("istio", ("resilience", "istio.yaml"), "yaml")]
 
 
 def source_commit() -> str:

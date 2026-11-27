@@ -4,7 +4,7 @@ All notable changes to Ferrum Migration (`ferrum-migrate`) are recorded here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
-Ferrum Migration is a **preview** on `0.x`: until `1.0.0`, any minor release may
+Ferrum Migration is currently a **preview** on `0.x`: until `1.0.0`, any minor release may
 change report codes, exit codes, CLI flags and output layout (see
 [Status](README.md#status)). Releases are `vX.Y.Z` tags; see
 [docs/releasing.md](docs/releasing.md).
@@ -32,6 +32,21 @@ change report codes, exit codes, CLI flags and output layout (see
   files, and a Markdown readme whose image and links resolve outside GitHub.
 - README status section (preview, no compatibility promise on `0.x`, the Ferrum Edge
   release the output targets, installation from a tag) and `docs/releasing.md`.
+- Envoy cluster `outlier_detection` and Istio DestinationRule `outlierDetection` map to
+  passive health checks on consecutive 5xx errors (Ferrum Edge's own DestinationRule
+  projection) where Ferrum reproduces them exactly: individual IP endpoints, a constant
+  ejection time, no split local-origin counting, and one route per destination.
+  Istio `connectionPool.tcp.connectTimeout` maps to the proxy connect timeout. Every
+  other case and field (Envoy `circuit_breakers`, success-rate ejection, DNS-named
+  endpoints, growing ejection times, Istio `minHealthPercent`, `maxConcurrentStreams`,
+  `idleTimeout`, `http2MaxRequests`, ...) is reported with its own code instead of
+  being approximated.
+- Istio `portLevelSettings` replace the destination-level traffic policy wholesale
+  (TLS and load balancer included), as Istio does, instead of inheriting omitted
+  settings.
+- The acceptance harness can run a backend that fails on demand (`backend_faults`) and
+  send state-priming probes; the new `envoy-outlier-ejection` case shows an outlier
+  ejection against the pinned Ferrum Edge.
 
 ### Changed
 
