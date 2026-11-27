@@ -48,6 +48,11 @@ change report codes, exit codes, CLI flags and output layout (see
   send state-priming probes; the new `envoy-outlier-ejection` case shows an outlier
   ejection against the pinned Ferrum Edge.
 
+- `--kubernetes-service-discovery` (Istio): in-cluster Service destinations use Ferrum's
+  Kubernetes service discovery (EndpointSlices, one target per ready pod) instead of the
+  Service DNS name, with the port chosen from the Kubernetes `Service` objects in the
+  input; destinations that cannot be mapped exactly keep their DNS name and are reported.
+
 ### Changed
 
 - The version has one source, `ferrum_migration.__version__`; `pyproject.toml`

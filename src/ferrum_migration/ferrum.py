@@ -491,7 +491,7 @@ def _validate_backend(route: RouteSpec, plan: Plan, options: EmitOptions, report
         return
     if backend.upstream_key:
         upstream = plan.upstreams.get(backend.upstream_key)
-        if upstream is None or not upstream.targets:
+        if upstream is None or not (upstream.targets or upstream.service_discovery):
             route.refuse("upstream has no usable targets")
             return
         if len(upstream.targets) > util.MAX_TARGETS_PER_UPSTREAM:
@@ -2689,6 +2689,8 @@ class _Builder:
             entry["hash_on_cookie_config"] = cookie_config
         if spec.health_checks:
             entry["health_checks"] = copy.deepcopy(spec.health_checks)
+        if spec.service_discovery:
+            entry["service_discovery"] = copy.deepcopy(spec.service_discovery)
         if https:
             tls = spec.tls
             entry["backend_tls_verify_server_cert"] = True

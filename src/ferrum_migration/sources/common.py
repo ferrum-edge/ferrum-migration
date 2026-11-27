@@ -26,6 +26,9 @@ class SourceContext:
     #: access control within the converted scope, or that no additional control applies. The operator's scoped
     #: representation, never a validation; every other adapter ignores it.
     traefik_controls_asserted: bool = False
+    #: Istio only (``--kubernetes-service-discovery``): resolve in-cluster Service destinations through Ferrum's
+    #: Kubernetes service discovery (EndpointSlices, one target per ready pod) instead of the Service's DNS name.
+    kubernetes_service_discovery: bool = False
 
 
 def expect_mapping(value: Any, what: str) -> dict:
