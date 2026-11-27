@@ -21,7 +21,8 @@ from ..model import BackendRef, HostScope, Plan, PluginSpec, RouteSpec, Target, 
 from ..redact import safe_label
 from ..safe_load import load_structured
 from .common import (SourceContext, apply_first_match_order, check_route_budget, choose_main_port, compression_config,
-                     cors_config, cors_origin_star_probe, envoy_cookie_hash, fault_injection_config, hash_on_value,
+                     cors_config, cors_origin_star_probe, envoy_cookie_hash, envoy_outlier_passive,
+                     fault_injection_config, hash_on_value,
                      header_value_ok, literal_value, mapping, merge_weighted_targets, replaced_prefix_backend_path,
                      request_header_rule, response_header_rule, retry_from_policy, seq, split_csv, str_list)
 
@@ -1280,13 +1281,32 @@ class _Envoy:
             elif policy not in ("ROUND_ROBIN", "LEAST_REQUEST", "RANDOM"):
                 self.report.warning("envoy-lb-policy", ref, "Load-balancing policy has no equivalent; round robin.")
             spec.health_checks = self._health(raw, ref)
-            if raw.get("outlier_detection") or raw.get("circuit_breakers"):
-                self.report.warning("envoy-resilience", ref, "Outlier detection and circuit breakers are not migrated.")
+            if isinstance(raw.get("outlier_detection"), dict):
+                passive = envoy_outlier_passive(raw["outlier_detection"], len(targets), self.report, ref)
+                if passive:
+                    spec.health_checks = {**(spec.health_checks or {}), "passive": passive}
+            self._circuit_breakers(raw.get("circuit_breakers"), ref)
             self.plan.upstreams[key] = spec
         result["backend"] = BackendRef(scheme=scheme, upstream_key=key)
         result["tls_key"] = tls.key() + scheme
         result["targets"] = targets
         return result
+
+    def _circuit_breakers(self, raw: Any, ref: str) -> None:
+        """Envoy cluster ``circuit_breakers`` thresholds are concurrency limits on the cluster (connections,
+        pending requests, active requests, outstanding retries). Ferrum Edge enforces the comparable limits only
+        for mesh-projected destinations (``src/backend_active_request_limit.rs``); file-mode proxies and upstreams
+        have no such fields, so every threshold the source sets is reported. Ferrum's own ``circuit_breaker`` is a
+        failure-rate breaker, not a concurrency limit, and is not used for them."""
+        fields = set()
+        for threshold in seq(mapping(raw).get("thresholds")):
+            fields |= {key for key in ("max_connections", "max_pending_requests", "max_requests", "max_retries",
+                                        "retry_budget", "max_connection_pools") if mapping(threshold).get(key) is not None}
+        if fields or seq(mapping(raw).get("per_host_thresholds")):
+            self.report.warning("envoy-circuit-breakers", ref,
+                                "circuit_breakers " + (", ".join(sorted(fields)) or "per_host_thresholds") +
+                                " are not migrated: Ferrum file mode has no per-upstream connection, pending-request, "
+                                "active-request or retry concurrency limits.")
 
     def _endpoints(self, raw: dict, ref: str) -> tuple[list[Target], list[str]]:
         targets: list[Target] = []

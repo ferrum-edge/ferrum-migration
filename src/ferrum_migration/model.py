@@ -41,6 +41,9 @@ class UpstreamSpec:
     hash_on_cookie_config: dict | None = None
     health_checks: dict | None = None
     tls: TlsSpec = field(default_factory=TlsSpec)
+    #: Per-proxy settings every proxy using this upstream carries (connection-pool overrides from the
+    #: destination's policy, for example Istio DestinationRule connectionPool).
+    proxy_settings: dict = field(default_factory=dict)
 
 
 @dataclass

@@ -1,0 +1,41 @@
+# Synthetic Istio resources with DestinationRule outlierDetection and connectionPool for ferrum-migration tests.
+apiVersion: networking.istio.io/v1
+kind: Gateway
+metadata: {name: gw, namespace: edge}
+spec:
+  selector: {istio: ingressgateway}
+  servers:
+    - port: {number: 80, name: http, protocol: HTTP}
+      hosts: ["*/resilience.example.test"]
+---
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata: {name: resilience, namespace: shop}
+spec:
+  hosts: [resilience.example.test]
+  gateways: [edge/gw]
+  http:
+    - name: orders
+      route: [{destination: {host: orders.shop.svc.cluster.local, port: {number: 8080}}}]
+---
+apiVersion: networking.istio.io/v1
+kind: DestinationRule
+metadata: {name: orders, namespace: shop}
+spec:
+  host: orders.shop.svc.cluster.local
+  trafficPolicy:
+    outlierDetection:
+      consecutive5xxErrors: 7
+      interval: 5s
+      baseEjectionTime: 45s
+      maxEjectionPercent: 30
+      minHealthPercent: 50
+    connectionPool:
+      tcp:
+        connectTimeout: 2s
+        maxConnections: 100
+        tcpKeepalive: {time: 600s, probes: 3}
+      http:
+        idleTimeout: 90s
+        maxConcurrentStreams: 50
+        http2MaxRequests: 1000

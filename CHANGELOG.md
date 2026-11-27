@@ -4,7 +4,7 @@ All notable changes to Ferrum Migration (`ferrum-migrate`) are recorded here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
-Ferrum Migration is a **preview** on `0.x`: until `1.0.0`, any minor release may
+Ferrum Migration is currently a **preview** on `0.x`: until `1.0.0`, any minor release may
 change report codes, exit codes, CLI flags and output layout (see
 [Status](README.md#status)). Releases are `vX.Y.Z` tags; see
 [docs/releasing.md](docs/releasing.md).
@@ -32,6 +32,13 @@ change report codes, exit codes, CLI flags and output layout (see
   files, and a Markdown readme whose image and links resolve outside GitHub.
 - README status section (preview, no compatibility promise on `0.x`, the Ferrum Edge
   release the output targets, installation from a tag) and `docs/releasing.md`.
+- Envoy cluster `outlier_detection` and Istio DestinationRule `outlierDetection` map to
+  passive health checks on consecutive 5xx errors, following Ferrum Edge's own
+  DestinationRule projection; Istio `connectionPool` maps `connectTimeout`, HTTP
+  `idleTimeout`, `maxConcurrentStreams` and the TCP keepalive time to proxy pool
+  settings. Detectors and limits Ferrum file mode does not apply (Envoy
+  `circuit_breakers`, success-rate ejection, Istio `minHealthPercent`,
+  `http2MaxRequests`, ...) are reported per field instead of being dropped silently.
 
 ### Changed
 

@@ -1,0 +1,59 @@
+# Synthetic Envoy v3 static bootstrap with outlier detection and circuit breakers for ferrum-migration tests.
+static_resources:
+  listeners:
+    - name: http_listener
+      address:
+        socket_address: {address: 0.0.0.0, port_value: 8080}
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress_http
+                route_config:
+                  name: local_route
+                  virtual_hosts:
+                    - name: resilience
+                      domains: ["resilience.example.test"]
+                      routes:
+                        - {name: ejecting, match: {path_separated_prefix: "/ejecting"}, route: {cluster: ejecting}}
+                        - {name: partial, match: {path_separated_prefix: "/partial"}, route: {cluster: partial}}
+                        - {name: disabled, match: {path_separated_prefix: "/disabled"}, route: {cluster: disabled}}
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters:
+    - name: ejecting
+      type: STRICT_DNS
+      outlier_detection:
+        consecutive_5xx: 3
+        interval: 5s
+        base_ejection_time: 60s
+        max_ejection_percent: 50
+        enforcing_success_rate: 0
+      circuit_breakers:
+        thresholds:
+          - {max_connections: 100, max_requests: 500}
+      load_assignment:
+        cluster_name: ejecting
+        endpoints:
+          - lb_endpoints:
+              - endpoint: {address: {socket_address: {address: ejecting-1.internal, port_value: 8080}}}
+              - endpoint: {address: {socket_address: {address: ejecting-2.internal, port_value: 8080}}}
+    - name: partial
+      type: STRICT_DNS
+      outlier_detection: {enforcing_consecutive_5xx: 50}
+      load_assignment:
+        cluster_name: partial
+        endpoints:
+          - lb_endpoints:
+              - endpoint: {address: {socket_address: {address: partial-1.internal, port_value: 8080}}}
+    - name: disabled
+      type: STRICT_DNS
+      outlier_detection: {consecutive_5xx: 0}
+      load_assignment:
+        cluster_name: disabled
+        endpoints:
+          - lb_endpoints:
+              - endpoint: {address: {socket_address: {address: disabled-1.internal, port_value: 8080}}}

@@ -1510,3 +1510,201 @@ def apply_first_match_order(routes: list[RouteSpec], report: Report) -> None:
                       "specificity order would pick differently")
             earlier.refuse(reason)
             later.refuse(reason)
+
+
+# ------------------------------------------------------------ outlier detection / connection pools
+
+#: Ferrum Edge limits for passive health checks and pool overrides (``src/config/types.rs``:
+#: ``MAX_RECENT_FAILURES_PER_TARGET``, ``MAX_TIMEOUT_SECONDS``, ``MAX_POOL_IDLE_TIMEOUT``).
+MAX_PASSIVE_THRESHOLD = 1000
+MAX_PASSIVE_SECONDS = 86_400
+MAX_POOL_IDLE_SECONDS = 3600
+#: Envoy's consecutive_5xx detector counts every 5xx response (and, with split_external_local_origin_errors
+#: off, locally originated connection failures, which Ferrum's consecutive mode also counts).
+FIVE_XX = list(range(500, 600))
+#: Istio outlierDetection fields Ferrum Edge parses but does not enforce
+#: (``DEFERRED_OUTLIER_DETECTION_FIELDS`` in Edge ``src/config_sources/k8s/istio.rs``).
+ISTIO_DEFERRED_OUTLIER_FIELDS = ("consecutiveGatewayErrors", "consecutiveLocalOriginFailures", "minHealthPercent")
+
+
+def _whole_seconds(ms: int, minimum: int, maximum: int) -> tuple[int, bool]:
+    seconds = -(-ms // 1000)  # round up: a sub-second source value never becomes 0
+    adjusted = min(max(seconds, minimum), maximum)
+    return adjusted, adjusted != ms / 1000
+
+
+def passive_from_outlier(consecutive: int | None, interval_ms: int | None, ejection_ms: int | None,
+                         max_percent: int | None, report: Report, code: str, ref: str) -> dict | None:
+    """Envoy-style outlier detection (consecutive 5xx) as Ferrum passive health, the way Edge applies it.
+
+    Mirrors Edge's own DestinationRule projection (``apply_outlier_detection_to_passive`` in Edge
+    ``src/modes/mesh/mod.rs``): a positive consecutive threshold is a STREAK (``consecutive_error_mode``),
+    ``0`` disables the detector (no passive health is emitted), an omitted threshold is 5, an omitted
+    ejection cap is 10%, the interval lands on ``unhealthy_window_seconds`` (inert in consecutive mode) and
+    the base ejection time on ``healthy_after_seconds``. Unlike Edge's projection, every 5xx counts (Envoy
+    counts 500-599, not only 500/502/503/504).
+    """
+    threshold = 5 if consecutive is None else consecutive
+    if threshold == 0:
+        report.info(code, ref, "Outlier detection on consecutive 5xx errors is disabled in the source (0); no "
+                               "passive health check is emitted.")
+        return None
+    passive: dict[str, Any] = {"unhealthy_status_codes": list(FIVE_XX), "consecutive_error_mode": True}
+    if threshold > MAX_PASSIVE_THRESHOLD:
+        report.warning(code, ref, f"The consecutive-error threshold exceeds Ferrum's {MAX_PASSIVE_THRESHOLD} and was "
+                                  "lowered to it, so targets are ejected after fewer errors.")
+        threshold = MAX_PASSIVE_THRESHOLD
+    passive["unhealthy_threshold"] = threshold
+    interval, changed = _whole_seconds(10_000 if interval_ms is None else interval_ms, 1, MAX_PASSIVE_SECONDS)
+    passive["unhealthy_window_seconds"] = interval  # the analysis sweep; inert in consecutive mode
+    ejection, changed = _whole_seconds(30_000 if ejection_ms is None else ejection_ms, 1, MAX_PASSIVE_SECONDS)
+    if changed:
+        report.warning(code, ref, "The base ejection time was rounded to Ferrum's whole-second range "
+                                  f"({ejection}s).")
+    passive["healthy_after_seconds"] = ejection
+    percent = 10 if max_percent is None else max_percent
+    passive["max_ejection_percent"] = min(max(percent, 0), 100)
+    report.warning(code, ref, "Outlier detection maps to Ferrum passive health on consecutive 5xx errors and "
+                              "connection failures. The source multiplies the ejection time by the number of times a "
+                              "target was ejected (up to max_ejection_time); Ferrum ejects for the base time each "
+                              "time.")
+    return passive
+
+
+def _uint(value: Any) -> int | None:
+    """An Envoy/Istio uint32 given as a number or a wrapper ``{"value": n}``; None if absent or invalid."""
+    if isinstance(value, dict):
+        value = value.get("value")
+    number = util.as_int(value)
+    return number if number is not None and number >= 0 else None
+
+
+def istio_outlier_passive(od: dict, report: Report, ref: str) -> dict | None:
+    """Istio ``trafficPolicy.outlierDetection`` (Edge ``translate_outlier_detection`` semantics)."""
+    deferred = [field for field in ISTIO_DEFERRED_OUTLIER_FIELDS if od.get(field) is not None]
+    if od.get("splitExternalLocalOriginErrors") is True:
+        deferred.append("splitExternalLocalOriginErrors")
+    if deferred:
+        report.warning("istio-outlier-unsupported", ref,
+                       "outlierDetection " + ", ".join(deferred) + " have no Ferrum equivalent (Ferrum Edge parses "
+                       "them but does not apply them) and were not migrated.")
+    raw = od.get("consecutive5xxErrors", od.get("consecutiveErrors"))
+    consecutive = _uint(raw) if raw is not None else None
+    if raw is not None and consecutive is None:
+        report.warning("istio-outlier", ref, "outlierDetection.consecutive5xxErrors is not a non-negative integer; "
+                                             "outlier detection was not migrated.")
+        return None
+    interval = util.parse_go_duration_ms(od["interval"]) if isinstance(od.get("interval"), str) else None
+    ejection = util.parse_go_duration_ms(od["baseEjectionTime"]) \
+        if isinstance(od.get("baseEjectionTime"), str) else None
+    percent = _uint(od.get("maxEjectionPercent")) if od.get("maxEjectionPercent") is not None else None
+    if (od.get("interval") is not None and not interval) or (od.get("baseEjectionTime") is not None and ejection is None) \
+            or (od.get("maxEjectionPercent") is not None and (percent is None or percent > 100)):
+        report.warning("istio-outlier", ref, "outlierDetection has an invalid interval, baseEjectionTime or "
+                                             "maxEjectionPercent; outlier detection was not migrated.")
+        return None
+    return passive_from_outlier(consecutive, interval, ejection, percent, report, "istio-outlier", ref)
+
+
+def envoy_outlier_passive(od: dict, target_count: int, report: Report, ref: str) -> dict | None:
+    """Envoy cluster ``outlier_detection`` (only the consecutive-5xx detector has a Ferrum equivalent)."""
+    unsupported = []
+    if (_uint(od.get("enforcing_consecutive_gateway_failure")) or 0) > 0:
+        unsupported.append("consecutive_gateway_failure")
+    if _proto_true(od.get("split_external_local_origin_errors")):
+        unsupported.append("split_external_local_origin_errors")
+    success_rate = _uint(od.get("enforcing_success_rate"))
+    minimum_hosts = _uint(od.get("success_rate_minimum_hosts"))
+    if (100 if success_rate is None else success_rate) > 0 and target_count >= (5 if minimum_hosts is None
+                                                                                else minimum_hosts):
+        unsupported.append("success-rate ejection (on by default with enough hosts)")
+    if (_uint(od.get("enforcing_failure_percentage")) or 0) > 0:
+        unsupported.append("failure_percentage")
+    if unsupported:
+        report.warning("envoy-outlier-unsupported", ref,
+                       "outlier_detection " + ", ".join(unsupported) + " have no Ferrum equivalent and were not "
+                       "migrated.")
+    enforcing = _uint(od.get("enforcing_consecutive_5xx"))
+    if enforcing is not None and enforcing == 0:
+        report.info("envoy-outlier", ref, "enforcing_consecutive_5xx is 0: the consecutive 5xx detector never "
+                                          "ejects; no passive health check is emitted.")
+        return None
+    if enforcing is not None and enforcing < 100:
+        report.warning("envoy-outlier", ref, "enforcing_consecutive_5xx below 100% ejects only some of the time, "
+                                             "which Ferrum cannot reproduce; outlier detection was not migrated.")
+        return None
+    raw = od.get("consecutive_5xx")
+    consecutive = _uint(raw) if raw is not None else None
+    interval = util.proto_duration_ms(od.get("interval")) if od.get("interval") is not None else None
+    ejection = util.proto_duration_ms(od.get("base_ejection_time")) if od.get("base_ejection_time") is not None \
+        else None
+    percent = _uint(od.get("max_ejection_percent")) if od.get("max_ejection_percent") is not None else None
+    if (raw is not None and consecutive is None) or (od.get("interval") is not None and not interval) \
+            or (od.get("base_ejection_time") is not None and ejection is None) \
+            or (od.get("max_ejection_percent") is not None and (percent is None or percent > 100)):
+        report.warning("envoy-outlier", ref, "outlier_detection has an invalid value; outlier detection was not "
+                                             "migrated.")
+        return None
+    return passive_from_outlier(consecutive, interval, ejection, percent, report, "envoy-outlier", ref)
+
+
+def _proto_true(value: Any) -> bool:
+    if isinstance(value, dict):
+        value = value.get("value")
+    return value is True
+
+
+def istio_connection_pool(pool: dict, report: Report, ref: str) -> dict:
+    """Istio ``trafficPolicy.connectionPool`` into the per-proxy settings Ferrum file mode applies.
+
+    Mapped where Edge applies the same control to file-mode proxies: ``tcp.connectTimeout`` →
+    ``backend_connect_timeout_ms``, ``http.idleTimeout`` → ``pool_idle_timeout_seconds``,
+    ``http.maxConcurrentStreams`` → ``pool_http2_max_concurrent_streams`` (Edge
+    ``src/backend_active_request_limit.rs`` names that mapping), ``tcp.tcpKeepalive.time`` →
+    ``pool_tcp_keepalive_seconds``. Destination-wide limits (``tcp.maxConnections``,
+    ``http.http1MaxPendingRequests``, ``http.http2MaxRequests``) and the rest are applied by Edge only in
+    mesh mode, so they are reported, not migrated.
+    """
+    settings: dict[str, Any] = {}
+    tcp, http = mapping(pool.get("tcp")), mapping(pool.get("http"))
+    unsupported = [f"tcp.{key}" for key in ("maxConnections", "idleTimeout", "maxConnectionDuration")
+                   if tcp.get(key) is not None]
+    unsupported += [f"http.{key}" for key in ("http1MaxPendingRequests", "http2MaxRequests",
+                                                "maxRequestsPerConnection", "maxRetries", "h2UpgradePolicy",
+                                                "useClientProtocol") if http.get(key) is not None]
+    keepalive = mapping(tcp.get("tcpKeepalive"))
+    unsupported += [f"tcp.tcpKeepalive.{key}" for key in ("probes", "interval") if keepalive.get(key) is not None]
+    if tcp.get("connectTimeout") is not None:
+        connect = util.parse_go_duration_ms(tcp["connectTimeout"]) if isinstance(tcp["connectTimeout"], str) else None
+        if connect:
+            settings["backend_connect_timeout_ms"] = min(connect, util.MAX_TIMEOUT_MS)
+        else:
+            unsupported.append("tcp.connectTimeout (invalid)")
+    if http.get("idleTimeout") is not None:
+        idle = util.parse_go_duration_ms(http["idleTimeout"]) if isinstance(http["idleTimeout"], str) else None
+        if idle:
+            seconds, changed = _whole_seconds(idle, 1, MAX_POOL_IDLE_SECONDS)
+            settings["pool_idle_timeout_seconds"] = seconds
+            if changed:
+                report.warning("istio-connection-pool", ref, "connectionPool.http.idleTimeout was rounded to Ferrum's "
+                                                             f"whole-second range up to {MAX_POOL_IDLE_SECONDS}s "
+                                                             f"({seconds}s).")
+        else:
+            unsupported.append("http.idleTimeout (invalid)")
+    if http.get("maxConcurrentStreams") is not None:
+        streams = _uint(http["maxConcurrentStreams"])
+        if streams and streams <= 2**31 - 1:
+            settings["pool_http2_max_concurrent_streams"] = streams
+        else:
+            unsupported.append("http.maxConcurrentStreams (invalid)")
+    if keepalive.get("time") is not None:
+        idle = util.parse_go_duration_ms(keepalive["time"]) if isinstance(keepalive["time"], str) else None
+        if idle and idle % 1000 == 0 and idle // 1000 <= MAX_PASSIVE_SECONDS:
+            settings["pool_tcp_keepalive_seconds"] = idle // 1000
+        else:
+            unsupported.append("tcp.tcpKeepalive.time (not whole seconds within 86400s)")
+    if unsupported:
+        report.warning("istio-connection-pool", ref,
+                       "connectionPool " + ", ".join(unsupported) + " are not migrated: Ferrum Edge applies those "
+                       "destination-wide limits and options only in mesh mode.")
+    return settings

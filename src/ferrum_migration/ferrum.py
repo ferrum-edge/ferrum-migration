@@ -2484,6 +2484,8 @@ def _fit_bytes(text: str, limit: int) -> str:
     return encoded[:limit].decode("utf-8", errors="ignore")
 
 
+_PROXY_POOL_KEYS = frozenset({"backend_connect_timeout_ms", "pool_idle_timeout_seconds", "pool_tcp_keepalive_seconds",
+                              "pool_http2_max_concurrent_streams"})
 _COOKIE_KEYS = {"path", "ttl_seconds", "session_cookie", "domain", "http_only", "secure", "same_site"}
 
 
@@ -2709,8 +2711,10 @@ class _Builder:
             proxy["allowed_methods"] = list(route.methods)
         backend: BackendRef = route.backend
         proxy["backend_scheme"] = backend.scheme
+        pool_settings: dict[str, Any] = {}
         if backend.upstream_key:
             proxy["upstream_id"] = self.upstream_id_by_key[backend.upstream_key]
+            pool_settings = self.plan.upstreams[backend.upstream_key].proxy_settings
         else:
             proxy["backend_host"] = backend.host
             proxy["backend_port"] = int(backend.port)
@@ -2720,6 +2724,10 @@ class _Builder:
         proxy["preserve_host_header"] = bool(route.preserve_host)
         if route.connect_timeout_ms:
             proxy["backend_connect_timeout_ms"] = route.connect_timeout_ms
+        for key in sorted(pool_settings):
+            # The destination's connection-pool policy (its connect timeout yields to a route-level one).
+            if key in _PROXY_POOL_KEYS and key not in proxy:
+                proxy[key] = pool_settings[key]
         if route.read_timeout_ms:
             proxy["backend_read_timeout_ms"] = route.read_timeout_ms
         if route.write_timeout_ms:
