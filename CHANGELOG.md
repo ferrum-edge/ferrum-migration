@@ -19,7 +19,8 @@ change report codes, exit codes, CLI flags and output layout (see
   wheel, publishes `SHA256SUMS` and GitHub build provenance attestations, and creates
   a GitHub release whose notes are the version's section of this file. Publishing to
   PyPI uses Trusted Publishing and stays off until the repository variable
-  `PYPI_PUBLISH` is `true`.
+  `PYPI_PUBLISH` is `true`; a re-run uploads only the files PyPI does not have yet and
+  fails if a published file's SHA-256 differs from the run's build.
 - CI `package` job: builds the sdist and wheel, runs `twine check --strict`, checks
   the core metadata, and runs the installed wheel's `ferrum-migrate`.
 - Weekly, non-required `edge-release-drift` workflow that runs the admission tests
@@ -41,7 +42,11 @@ change report codes, exit codes, CLI flags and output layout (see
 ## [0.1.0] - 2026-11-25
 
 Initial build-out, merged as ferrum-edge/ferrum-migration#1. This version was set in
-the source but never tagged or published.
+the source but never tagged or published, and it cannot be released: the release
+workflow refuses a section carrying the marker below. The first tagged release gets
+its own section.
+
+<!-- release-check: untagged historical entry; never released -->
 
 ### Added
 

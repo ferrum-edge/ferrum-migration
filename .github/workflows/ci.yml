@@ -109,8 +109,10 @@ jobs:
           expected="$(python scripts/release_check.py version)"
           venv="$RUNNER_TEMP/wheel-venv"
           python -m venv "$venv"
-          "$venv/bin/python" -m pip install -r requirements-ci.txt
-          "$venv/bin/python" -m pip install --no-deps dist/ferrum_migration-*-py3-none-any.whl
+          # Dependencies come from the wheel's own Requires-Dist (resolved into an empty venv);
+          # the CI requirements only constrain the versions, so a wheel that drops a dependency fails.
+          "$venv/bin/python" -m pip install -c requirements-ci.txt dist/ferrum_migration-*-py3-none-any.whl
+          "$venv/bin/python" -m pip check
           installed="$("$venv/bin/python" -c 'import importlib.metadata as m; print(m.version("ferrum-migration"))')"
           test "$installed" = "$expected"
           out="$("$venv/bin/ferrum-migrate" --version)"

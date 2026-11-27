@@ -59,12 +59,14 @@ ferrum-migrate --version
 ```
 
 Each GitHub release also carries the wheel, the sdist, a `SHA256SUMS` file and GitHub build
-provenance attestations. To install a downloaded wheel after checking it:
+provenance attestations. To install a downloaded wheel only if both checks pass (on macOS,
+use `shasum -a 256 -c -` in place of `sha256sum --strict -c -`):
 
 ```bash
-sha256sum --ignore-missing -c SHA256SUMS      # macOS: shasum -a 256 --ignore-missing -c SHA256SUMS
-gh attestation verify ferrum_migration-X.Y.Z-py3-none-any.whl -R ferrum-edge/ferrum-migration
-python -m pip install ferrum_migration-X.Y.Z-py3-none-any.whl
+wheel=ferrum_migration-X.Y.Z-py3-none-any.whl
+grep -F "  $wheel" SHA256SUMS | sha256sum --strict -c - &&
+  gh attestation verify "$wheel" -R ferrum-edge/ferrum-migration &&
+  python -m pip install "$wheel"
 ```
 
 From a checkout of this repository:
@@ -73,9 +75,12 @@ From a checkout of this repository:
 python -m pip install .            # or: python -m pip install -e .
 ```
 
-PyPI: not published yet. Publishing is wired into the release workflow and stays off until
-the maintainers enable it ([docs/releasing.md](https://github.com/ferrum-edge/ferrum-migration/blob/main/docs/releasing.md));
-from then on, `python -m pip install ferrum-migration` installs the newest release.
+PyPI: the release workflow publishes to PyPI only after the maintainers have enabled it
+([docs/releasing.md](https://github.com/ferrum-edge/ferrum-migration/blob/main/docs/releasing.md)),
+so a GitHub release does not imply a PyPI upload. If
+[pypi.org/project/ferrum-migration](https://pypi.org/project/ferrum-migration/) lists a
+release, `python -m pip install ferrum-migration==X.Y.Z` installs it; otherwise install from a
+tag as above.
 
 ## Use
 

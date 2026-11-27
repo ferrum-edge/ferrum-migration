@@ -72,7 +72,21 @@ jobs:
           base="https://github.com/ferrum-edge/ferrum-edge/releases/download/${FERRUM_EDGE_VERSION}"
           curl --proto '=https' --tlsv1.2 -fsSL --retry 3 -o "$FERRUM_EDGE_ASSET" "$base/$FERRUM_EDGE_ASSET"
           curl --proto '=https' --tlsv1.2 -fsSL --retry 3 -o "$FERRUM_EDGE_ASSET.sha256" "$base/$FERRUM_EDGE_ASSET.sha256"
-          sha256sum -c "$FERRUM_EDGE_ASSET.sha256"
+          # The sidecar must hold exactly one well-formed record, for exactly this asset's
+          # basename; its digest is then checked against the downloaded file itself (not
+          # against whatever path the sidecar names) before the binary is executed.
+          if [ "$(wc -l < "$FERRUM_EDGE_ASSET.sha256")" -ne 1 ] \
+            || ! grep -Eqx "[0-9a-f]{64} [ *]${FERRUM_EDGE_ASSET}" "$FERRUM_EDGE_ASSET.sha256"; then
+            echo "::error::${FERRUM_EDGE_ASSET}.sha256 is not exactly one SHA-256 record for ${FERRUM_EDGE_ASSET}"
+            exit 1
+          fi
+          expected="$(cut -c1-64 "$FERRUM_EDGE_ASSET.sha256")"
+          actual="$(sha256sum "$FERRUM_EDGE_ASSET" | cut -c1-64)"
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::${FERRUM_EDGE_ASSET} has SHA-256 ${actual}, but its sidecar records ${expected}"
+            exit 1
+          fi
+          echo "$expected  $FERRUM_EDGE_ASSET" | sha256sum --strict -c -
           chmod 0755 "$FERRUM_EDGE_ASSET"
           ./"$FERRUM_EDGE_ASSET" version --json
           echo "FERRUM_EDGE_BIN=$dir/$FERRUM_EDGE_ASSET" >> "$GITHUB_ENV"

@@ -190,7 +190,7 @@ jobs:
         working-directory: artifacts/dist
         run: sha256sum --strict -c ../SHA256SUMS
 
-      - name: Create the release
+      - name: Create the release (only if the remote tag still names this run's commit)
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -198,6 +198,17 @@ jobs:
           RELEASE_VERSION: ${{ needs.validate.outputs.version }}
         run: |
           set -euo pipefail
+          # The tag was checked in `validate`; re-resolve it now, peeling annotated tags, so
+          # artifacts built from GITHUB_SHA are never attached to a tag that has since moved.
+          read -r obj_type obj_sha < <(gh api "repos/${GH_REPO}/git/ref/tags/${RELEASE_TAG}" --jq '.object.type + " " + .object.sha')
+          for _ in 1 2 3 4 5; do
+            [ "$obj_type" = tag ] || break
+            read -r obj_type obj_sha < <(gh api "repos/${GH_REPO}/git/tags/${obj_sha}" --jq '.object.type + " " + .object.sha')
+          done
+          if [ "$obj_type" != commit ] || [ "$obj_sha" != "$GITHUB_SHA" ]; then
+            echo "::error::tag ${RELEASE_TAG} now resolves to ${obj_type} ${obj_sha}, not ${GITHUB_SHA}; refusing to release"
+            exit 1
+          fi
           gh release create "$RELEASE_TAG" \
             --verify-tag \
             --title "ferrum-migration ${RELEASE_VERSION} (preview)" \
@@ -205,9 +216,11 @@ jobs:
             artifacts/dist/* artifacts/SHA256SUMS
 
   pypi:
-    # Off until the owner has created the PyPI project, its trusted publisher (this
-    # workflow, environment `pypi`) and the `pypi` environment, and set the repository
-    # variable PYPI_PUBLISH to `true` (docs/releasing.md). No token secret is used.
+    # Off until the owner has completed the one-time setup in docs/releasing.md (tag
+    # rulesets, the `pypi` environment with required reviewers, the PyPI trusted publisher)
+    # and set the repository variable PYPI_PUBLISH to `true`. No token secret is used.
+    # Safe to re-run: only files PyPI does not have yet are uploaded, and a published file
+    # whose SHA-256 differs from this run's build fails the job.
     name: publish to PyPI
     needs: github-release
     if: ${{ vars.PYPI_PUBLISH == 'true' }}
@@ -217,8 +230,14 @@ jobs:
       name: pypi
       url: https://pypi.org/project/ferrum-migration/
     permissions:
+      contents: read
       id-token: write
     steps:
+      - name: Checkout (for scripts/release_check.py)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
       - name: Download the distributions
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -229,7 +248,16 @@ jobs:
         working-directory: artifacts/dist
         run: sha256sum --strict -c ../SHA256SUMS
 
+      - name: Select the files PyPI does not have yet (refuse SHA-256 mismatches)
+        id: plan
+        run: >-
+          python3 -I scripts/release_check.py pypi-plan --dir artifacts/dist
+          --upload-dir pypi-upload --github-output "$GITHUB_OUTPUT"
+
       - name: Publish with PyPI Trusted Publishing
+        if: ${{ steps.plan.outputs.upload == 'true' }}
         uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
         with:
-          packages-dir: artifacts/dist/
+          # Relative to the workspace: this is a container action, which sees only the
+          # workspace mount, not the runner's temp directory.
+          packages-dir: pypi-upload/

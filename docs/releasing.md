@@ -15,7 +15,9 @@ the same files on PyPI. Everything after the tag push is done by
    * In `CHANGELOG.md`, move the `## [Unreleased]` entries into a new
      `## [X.Y.Z] - YYYY-MM-DD` section below it and leave `## [Unreleased]` in place. That
      section becomes the GitHub release notes; the workflow refuses a missing, undated or empty
-     one.
+     one, and one marked `<!-- release-check: untagged historical entry; never released -->`.
+     `0.1.0` carries that marker (it was set in the source but never tagged), so the first
+     tagged release needs a new version and section.
    * If the release targets a different Ferrum Edge release, re-pin it in the same or an
      earlier pull request (see "Changing the target Ferrum Edge release").
    * Merge once every CI check on the pull request's head is green.
@@ -31,41 +33,57 @@ the same files on PyPI. Everything after the tag push is done by
    failure:
    * `validate`: the tag is exactly `v` + `__version__`, names the run's commit, that commit is
      reachable from `main`, and the `CHANGELOG.md` section exists (`scripts/release_check.py`).
+     These checks run from the tagged revision itself, so they catch mistakes but are not an
+     authorization control: that is the tag rulesets and the `pypi` environment (see the
+     one-time setup).
    * `ci`: the whole of `ci.yml` (unit and fail-closed tests on Linux and macOS, harness
      self-tests, packaging checks, and admission plus loopback runtime acceptance against the
      pinned Ferrum Edge binary).
    * `build`: sdist, then the wheel from the sdist, `twine check --strict`, metadata checks,
      `SHA256SUMS`.
    * `attest`: GitHub build provenance attestations for the sdist and the wheel.
-   * `github-release`: creates the release with the files and the changelog section.
-   * `pypi`: runs only when the repository variable `PYPI_PUBLISH` is `true`; uploads the same
-     files with PyPI Trusted Publishing (no token).
+   * `github-release`: re-resolves the remote tag and refuses to continue unless it still names
+     the run's commit, then creates the release with the files and the changelog section.
+   * `pypi`: runs only when the repository variable `PYPI_PUBLISH` is `true`, after a required
+     reviewer approves the `pypi` deployment. It reads which files PyPI already has for the
+     version (JSON API), fails if any of them differs in SHA-256 from this run's build or was
+     not built by this run, and uploads only the missing ones with PyPI Trusted Publishing (no
+     token).
 4. **Check the result:** `gh release view vX.Y.Z -R ferrum-edge/ferrum-migration`, and
    `gh attestation verify <wheel> -R ferrum-edge/ferrum-migration` on a downloaded wheel.
 
 A tag is never moved or reused. If the workflow fails because of the code or the changelog,
 fix it on `main` and release the next patch version. If it fails because of the runner or the
-network, re-run the failed jobs. If only `pypi` failed, re-run that job: it uploads the files
-the run already built and attested.
+network, re-run the failed jobs. If `pypi` failed, also after a partial upload, re-run that
+job: it uploads only the files PyPI does not have yet, from the run's already built and
+attested artifacts. PyPI's JSON API can lag a fresh upload by a few minutes; if a re-run then
+fails with PyPI's "file already exists" error, wait and re-run it again. Never re-run with
+`skip-existing`: it would accept a published file without comparing its digest. A digest
+mismatch means PyPI holds different bytes under that version, which cannot be replaced
+(PyPI never reuses a filename); stop and release the next patch version.
 
 ## One-time owner setup
 
-These are repository and account settings that only the owner can make. Until the first three
-are done and `PYPI_PUBLISH` is set, releases go to GitHub only.
+These are repository and account settings that only the owner can make. Do them in this order;
+until the last step, releases go to GitHub only.
 
-1. **PyPI project and trusted publisher.** On PyPI, add a *pending* trusted publisher (Account
-   settings, Publishing) for the project `ferrum-migration`: owner `ferrum-edge`, repository
-   `ferrum-migration`, workflow `release.yml`, environment `pypi`. The first successful upload
-   creates the project. Before enabling it, confirm that publishing a PolyForm Noncommercial
-   package on PyPI is acceptable to you under PyPI's terms of use; the package metadata
-   declares `License-Expression: PolyForm-Noncommercial-1.0.0`.
-2. **GitHub environment `pypi`.** Settings, Environments, New environment `pypi`. Limit its
-   deployment branches and tags to the tag pattern `v*`, and add required reviewers if a manual
-   approval before every PyPI upload is wanted.
-3. **Repository variable `PYPI_PUBLISH`.** Settings, Secrets and variables, Actions,
-   Variables: `PYPI_PUBLISH` = `true` once steps 1 and 2 are done. Any other value, or no
-   variable, skips the `pypi` job.
-4. **Branch ruleset for `main`** (recommended; the repository has none). Require a pull request
+Why the order matters: a workflow triggered by a tag push is loaded from the tagged revision,
+so anyone who can push a `v*` tag decides which `release.yml` runs, including its `validate`
+checks. Those checks cannot authorize a release. PyPI's trusted publisher trusts this
+repository, the `release.yml` workflow name and the `pypi` environment, nothing more. The
+controls that decide who can publish are therefore outside the workflow: the tag rulesets
+(who can create a `v*` tag, and that no tag can be moved) and the `pypi` environment's
+required reviewers.
+
+1. **Tag ruleset "release tags: creation"** (required before PyPI): target tags matching
+   `v*`, enforcement *Active*, rule *Restrict creations*, with only the release maintainers
+   (a team or named users) in the bypass list.
+2. **Tag ruleset "release tags: immutable"** (required before PyPI): target tags matching `v*`,
+   enforcement *Active*, rules *Restrict updates* and *Restrict deletions*, and **no bypass
+   list**. Keep it separate from step 1: a bypass granted for creation would otherwise also
+   exempt maintainers from the update and deletion rules, and a moved tag could get artifacts
+   built from another commit (the workflow also re-checks the tag before creating the release).
+3. **Branch ruleset for `main`** (recommended; the repository has none). Require a pull request
    before merging, block force pushes and deletion, and require these status checks from the
    CI workflow:
    * `test (ubuntu-24.04, python 3.11)`
@@ -76,8 +94,20 @@ are done and `PYPI_PUBLISH` is set, releases go to GitHub only.
    * `ferrum-edge pinned release admission + runtime acceptance (linux)`
 
    Do not require `Edge release drift`: it tracks Edge's newest release and is an early warning.
-5. **Tag ruleset for `v*`** (recommended): restrict creating, updating and deleting `v*` tags
-   to maintainers, so only they can start a release and no published tag can be moved.
+4. **GitHub environment `pypi`** (required before PyPI). Settings, Environments, New
+   environment `pypi`: under deployment branches and tags allow only the tag pattern `v*`, and
+   add **required reviewers** (release maintainers; enable *Prevent self-review* if more than
+   one maintainer can approve). Every PyPI upload then waits for an approval in addition to
+   the tag rulesets.
+5. **PyPI project and trusted publisher.** On PyPI, add a *pending* trusted publisher (Account
+   settings, Publishing) for the project `ferrum-migration`: owner `ferrum-edge`, repository
+   `ferrum-migration`, workflow `release.yml`, environment `pypi`. The first successful upload
+   creates the project. Before this, confirm that publishing a PolyForm Noncommercial package
+   on PyPI is acceptable to you under PyPI's terms of use; the package metadata declares
+   `License-Expression: PolyForm-Noncommercial-1.0.0`.
+6. **Repository variable `PYPI_PUBLISH`, last.** Settings, Secrets and variables, Actions,
+   Variables: `PYPI_PUBLISH` = `true` only after steps 1, 2, 4 and 5. Any other value, or no
+   variable, skips the `pypi` job.
 
 ## Changing the target Ferrum Edge release
 

@@ -1,5 +1,7 @@
 """scripts/release_check.py: the tag, changelog and distribution gates of the release workflow."""
 
+import contextlib
+import hashlib
 import importlib.util
 import io
 import os
@@ -8,6 +10,7 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from unittest import mock
 
 from helpers import ROOT
 
@@ -46,6 +49,8 @@ License-File: LICENSE
 License-File: LICENSE-COMMERCIAL.md
 Project-URL: Source, https://github.com/ferrum-edge/ferrum-migration
 Classifier: Development Status :: 4 - Beta
+Requires-Python: >=3.11
+Requires-Dist: PyYAML<7,>=6.0.1
 Description-Content-Type: text/markdown
 
 # readme
@@ -114,16 +119,29 @@ class ChangelogTest(unittest.TestCase):
             "empty": ("## [1.0.0] - 2026-01-01\n\n## [0.9.0] - 2025-01-01\n\n- x\n", "1.0.0"),
             "duplicate": ("## [1.0.0] - 2026-01-01\n\n- a\n\n## [1.0.0] - 2026-01-02\n\n- b\n", "1.0.0"),
             "unreleased": (CHANGELOG, "Unreleased"),
+            "untagged historical entry": (
+                f"## [1.0.0] - 2026-01-01\n\nNever tagged.\n\n{release_check.UNTAGGED_MARKER}\n\n- x\n", "1.0.0"),
         }
         for label, (text, version) in cases.items():
             with self.subTest(label), self.assertRaises(ReleaseError):
                 release_check.changelog_section(text, version)
 
-    def test_repository_changelog_has_the_current_version(self):
+    def test_untagged_marker_only_blocks_its_own_section(self):
+        text = (f"## [1.0.1] - 2026-02-01\n\n- y\n\n## [1.0.0] - 2026-01-01\n\n{release_check.UNTAGGED_MARKER}\n"
+                "\n- x\n")
+        self.assertEqual(release_check.changelog_section(text, "1.0.1"), "- y\n")
+        with self.assertRaises(ReleaseError):
+            release_check.changelog_section(text, "1.0.0")
+
+    def test_repository_changelog_cannot_release_the_untagged_0_1_0(self):
+        # 0.1.0 was set in the source when PR #1 merged but never tagged; its section carries the marker, so a
+        # v0.1.0 tag fails the release workflow's validate job. The next version gets its own section.
         with open(os.path.join(ROOT, "CHANGELOG.md"), encoding="utf-8") as handle:
             text = handle.read()
         self.assertIn("## [Unreleased]", text)
-        self.assertTrue(release_check.changelog_section(text, __version__).strip())
+        self.assertIn(release_check.UNTAGGED_MARKER, text)
+        with self.assertRaisesRegex(ReleaseError, "untagged historical entry"):
+            release_check.changelog_section(text, "0.1.0")
 
 
 class DistTest(unittest.TestCase):
@@ -154,12 +172,85 @@ class DistTest(unittest.TestCase):
             "content type": METADATA.replace("text/markdown", "text/x-rst"),
             "urls": METADATA.replace("Project-URL: Source, https://github.com/ferrum-edge/ferrum-migration\n", ""),
             "version": METADATA.replace("Version: {version}", "Version: 0.0.1"),
+            "dependency": METADATA.replace("Requires-Dist: PyYAML<7,>=6.0.1\n", ""),
         }
         for label, metadata in bad.items():
             with self.subTest(label), tempfile.TemporaryDirectory() as temp:
                 build_fake_dists(Path(temp), "1.2.3", metadata)
                 with self.assertRaises(ReleaseError):
                     release_check.check_dists(Path(temp), "1.2.3")
+
+
+
+def sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def pypi_json(version: str, files: dict) -> dict:
+    return {"info": {"version": version},
+            "urls": [{"filename": name, "digests": {"sha256": digest}} for name, digest in files.items()]}
+
+
+class PypiPlanTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.dir = Path(self.temp.name) / "dist"
+        self.dir.mkdir()
+        build_fake_dists(self.dir, "1.2.3")
+        self.sdist = self.dir / "ferrum_migration-1.2.3.tar.gz"
+        self.wheel = self.dir / "ferrum_migration-1.2.3-py3-none-any.whl"
+
+    def plan(self, release):
+        return release_check.pypi_upload_plan(self.dir, "1.2.3", release)
+
+    def test_nothing_published_uploads_everything(self):
+        self.assertEqual(self.plan(None), [self.wheel, self.sdist])
+        self.assertEqual(self.plan(pypi_json("1.2.3", {})), [self.wheel, self.sdist])
+
+    def test_partial_upload_retries_only_the_missing_file(self):
+        self.assertEqual(self.plan(pypi_json("1.2.3", {self.wheel.name: sha256(self.wheel)})), [self.sdist])
+
+    def test_complete_upload_needs_nothing(self):
+        files = {self.wheel.name: sha256(self.wheel), self.sdist.name: sha256(self.sdist)}
+        self.assertEqual(self.plan(pypi_json("1.2.3", files)), [])
+
+    def test_refuses_digest_mismatch_unexpected_files_and_bad_answers(self):
+        bad = {
+            "digest mismatch": pypi_json("1.2.3", {self.wheel.name: "0" * 64}),
+            "unexpected file": pypi_json("1.2.3", {"ferrum_migration-1.2.3-py3-none-manylinux.whl": "0" * 64}),
+            "other version": pypi_json("1.2.4", {}),
+            "malformed digest": pypi_json("1.2.3", {self.wheel.name: "not-a-digest"}),
+            "duplicate": {"info": {"version": "1.2.3"}, "urls": [
+                {"filename": self.wheel.name, "digests": {"sha256": sha256(self.wheel)}},
+                {"filename": self.wheel.name, "digests": {"sha256": sha256(self.wheel)}}]},
+        }
+        for label, release in bad.items():
+            with self.subTest(label), self.assertRaises(ReleaseError):
+                self.plan(release)
+
+    def test_command_copies_missing_files_and_reports_the_decision(self):
+        dist = Path(self.temp.name) / "current"
+        dist.mkdir()
+        build_fake_dists(dist, __version__)
+        wheel = dist / f"ferrum_migration-{__version__}-py3-none-any.whl"
+        upload = Path(self.temp.name) / "upload"
+        output = Path(self.temp.name) / "github-output"
+        published = pypi_json(__version__, {wheel.name: sha256(wheel)})
+        with mock.patch.object(release_check, "fetch_pypi_release", return_value=published) as fetch, \
+                contextlib.redirect_stdout(io.StringIO()):
+            code = release_check.main(["pypi-plan", "--dir", str(dist), "--upload-dir", str(upload),
+                                       "--github-output", str(output)])
+        self.assertEqual(code, 0)
+        fetch.assert_called_once()
+        self.assertEqual(sorted(path.name for path in upload.iterdir()), [f"ferrum_migration-{__version__}.tar.gz"])
+        self.assertEqual(output.read_text(encoding="utf-8"), "upload=true\n")
+
+        with mock.patch.object(release_check, "fetch_pypi_release", return_value=pypi_json(__version__, {
+                wheel.name: "0" * 64})), contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            code = release_check.main(["pypi-plan", "--dir", str(dist), "--upload-dir", str(Path(self.temp.name) / "u2")])
+        self.assertEqual(code, 1)
 
 
 if __name__ == "__main__":

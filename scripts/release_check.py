@@ -8,18 +8,29 @@ Used by CI (``package`` job) and by ``.github/workflows/release.yml``:
 * ``tag --tag vX.Y.Z`` requires the tag to be exactly ``v`` + the package version, both
   strict ``X.Y.Z`` (no prerelease or build suffix, no leading zeros).
 * ``notes --version X.Y.Z --out FILE`` writes the body of the ``## [X.Y.Z] - YYYY-MM-DD``
-  section of ``CHANGELOG.md`` (refuses a missing, undated or empty section).
+  section of ``CHANGELOG.md`` (refuses a missing, undated or empty section, and a section
+  carrying the ``UNTAGGED_MARKER`` comment, which marks a historical, never-tagged version).
 * ``dist --dir DIR`` requires exactly one sdist and one wheel for the package version and
-  checks their core metadata (name, version, license expression and files, entry point).
+  checks their core metadata (name, version, license expression and files, dependency, entry
+  point).
+* ``pypi-plan --dir DIR --upload-dir OUT`` makes re-running the PyPI publish job safe: it reads
+  the files PyPI already has for the package version (JSON API), refuses any published file whose
+  SHA-256 differs from the local one or that is not a local file, and copies only the missing
+  distributions into ``OUT``.
 """
 
 from __future__ import annotations
 
 import argparse
 import ast
+import hashlib
+import json
 import re
+import shutil
 import sys
 import tarfile
+import urllib.error
+import urllib.request
 import zipfile
 from email.parser import HeaderParser
 from pathlib import Path
@@ -31,6 +42,11 @@ FILE_STEM = "ferrum_migration"
 LICENSE_EXPRESSION = "PolyForm-Noncommercial-1.0.0"
 LICENSE_FILES = ("LICENSE", "LICENSE-COMMERCIAL.md")
 ENTRY_POINT = "ferrum-migrate = ferrum_migration.cli:main"
+REQUIRED_DEPENDENCY = re.compile(r"(?i)^pyyaml\b")
+PYPI_JSON = "https://pypi.org/pypi"
+#: A changelog section containing this comment documents a version that was never tagged
+#: (a historical entry); the release workflow refuses to release it.
+UNTAGGED_MARKER = "<!-- release-check: untagged historical entry; never released -->"
 
 _NUM = r"(?:0|[1-9][0-9]*)"
 VERSION_RE = re.compile(rf"{_NUM}\.{_NUM}\.{_NUM}")
@@ -94,6 +110,9 @@ def changelog_section(text: str, version: str) -> str:
     body = "\n".join(lines[start:end]).strip()
     if not body:
         raise ReleaseError(f"CHANGELOG.md section [{version}] is empty")
+    if UNTAGGED_MARKER in body:
+        raise ReleaseError(f"CHANGELOG.md section [{version}] is marked as an untagged historical entry; "
+                           "release a new version with its own section instead")
     return body + "\n"
 
 
@@ -119,6 +138,8 @@ def _check_metadata(meta, version: str, where: str) -> None:
         problems.append("Description-Content-Type is not text/markdown")
     if not meta.get_all("Project-URL"):
         problems.append("no Project-URL entries")
+    if not any(REQUIRED_DEPENDENCY.match(req) for req in meta.get_all("Requires-Dist") or []):
+        problems.append("Requires-Dist does not name PyYAML")
     if problems:
         raise ReleaseError(f"{where}: " + "; ".join(problems))
 
@@ -157,6 +178,63 @@ def check_dists(dist_dir: Path, version: str) -> list[str]:
     return [sdist, wheel]
 
 
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def fetch_pypi_release(version: str, base: str = PYPI_JSON, timeout: float = 30.0) -> dict | None:
+    """Return PyPI's JSON for ``DIST_NAME`` ``version``, or None when PyPI has no such release."""
+    url = f"{base}/{DIST_NAME}/{version}/json"
+    request = urllib.request.Request(url, headers={"Accept": "application/json", "Cache-Control": "no-cache"})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return json.load(response)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return None
+        raise ReleaseError(f"PyPI answered HTTP {exc.code} for {url}") from None
+
+
+def pypi_upload_plan(dist_dir: Path, version: str, release: dict | None) -> list[Path]:
+    """Return the local distributions PyPI does not have yet.
+
+    A file PyPI already has must be byte-identical to the local one (same SHA-256), and PyPI
+    must not have any file for this version that is not a local distribution.
+    """
+    local = {path.name: path for path in sorted(dist_dir.iterdir()) if path.is_file()}
+    if not local:
+        raise ReleaseError(f"{dist_dir}: no distributions")
+    published: dict[str, str] = {}
+    if release is not None:
+        info_version = (release.get("info") or {}).get("version")
+        if info_version is not None and info_version != version:
+            raise ReleaseError(f"PyPI answered for version {info_version!r}, expected {version!r}")
+        for entry in release.get("urls") or []:
+            name = entry.get("filename")
+            digest = (entry.get("digests") or {}).get("sha256")
+            if not isinstance(name, str) or not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+                raise ReleaseError("PyPI listed a file without a filename or a SHA-256 digest")
+            if name in published:
+                raise ReleaseError(f"PyPI listed {name} twice")
+            published[name] = digest
+    unexpected = sorted(set(published) - set(local))
+    if unexpected:
+        raise ReleaseError(f"PyPI has files for {version} that this run did not build: {unexpected}")
+    missing = []
+    for name, path in local.items():
+        if name in published:
+            actual = sha256_file(path)
+            if published[name] != actual:
+                raise ReleaseError(f"{name} on PyPI has SHA-256 {published[name]}, but this run built {actual}")
+        else:
+            missing.append(path)
+    return missing
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="command", required=True)
@@ -169,6 +247,11 @@ def main(argv: list[str] | None = None) -> int:
     notes.add_argument("--out", type=Path, required=True)
     dist = sub.add_parser("dist", help="check built sdist and wheel")
     dist.add_argument("--dir", type=Path, required=True)
+    plan = sub.add_parser("pypi-plan", help="copy the distributions PyPI does not have yet into --upload-dir")
+    plan.add_argument("--dir", type=Path, required=True)
+    plan.add_argument("--upload-dir", type=Path, required=True)
+    plan.add_argument("--github-output", type=Path, help="append upload=true|false to this file")
+    plan.add_argument("--index", default=PYPI_JSON, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
 
     try:
@@ -186,7 +269,19 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "dist":
             for name in check_dists(args.dir, version):
                 print(f"ok: {name}")
-    except (ReleaseError, OSError, KeyError, zipfile.BadZipFile, tarfile.TarError) as exc:
+        elif args.command == "pypi-plan":
+            check_dists(args.dir, version)
+            missing = pypi_upload_plan(args.dir, version, fetch_pypi_release(version, args.index))
+            args.upload_dir.mkdir(parents=True, exist_ok=False)
+            for path in missing:
+                shutil.copy2(path, args.upload_dir / path.name)
+            for path in sorted(args.dir.iterdir()):
+                state = "upload" if path in missing else "already on PyPI (SHA-256 matches)"
+                print(f"{path.name}: {state}")
+            if args.github_output is not None:
+                with args.github_output.open("a", encoding="utf-8") as handle:
+                    handle.write(f"upload={'true' if missing else 'false'}\n")
+    except (ReleaseError, OSError, KeyError, ValueError, zipfile.BadZipFile, tarfile.TarError) as exc:
         print(f"release check failed: {exc}", file=sys.stderr)
         return 1
     return 0
