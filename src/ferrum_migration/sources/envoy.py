@@ -1268,7 +1268,8 @@ class _Envoy:
                                 "path). Ferrum keeps one upstream with the first route's settings so the affinity "
                                 "stays shared; reconcile the cookie settings manually.")
         if key not in self.plan.upstreams:
-            spec = UpstreamSpec(key=key, name=name, ref=ref, targets=targets, tls=tls)
+            spec = UpstreamSpec(key=key, name=name, ref=ref, targets=targets, tls=tls,
+                                source_destinations={f"envoy:{name}"})
             policy = str(raw.get("lb_policy", "ROUND_ROBIN")).upper()
             spec.algorithm = {"ROUND_ROBIN": "round_robin", "LEAST_REQUEST": "least_connections",
                               "RANDOM": "random"}.get(policy, "round_robin")
@@ -1519,8 +1520,10 @@ class _Envoy:
             self.report.warning("envoy-weights", spec.ref, "Weighted split was rounded to integer target weights.")
         base = self.plan.upstreams[first["backend"].upstream_key]
         key = f"weighted:{spec.ref}"
+        destinations = set().union(*(self.plan.upstreams[r["backend"].upstream_key].source_destinations for r in live))
         self.plan.upstreams[key] = UpstreamSpec(key=key, name=f"{spec.name}-weighted", ref=spec.ref, targets=targets,
-                                                tls=base.tls, algorithm="weighted_round_robin")
+                                                tls=base.tls, algorithm="weighted_round_robin",
+                                                source_destinations=destinations)
         return {"problems": [], "backend": BackendRef(scheme=first["backend"].scheme, upstream_key=key),
                 "connect": first.get("connect")}
 

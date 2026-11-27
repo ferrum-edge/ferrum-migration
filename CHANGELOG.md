@@ -50,8 +50,13 @@ change report codes, exit codes, CLI flags and output layout (see
 
 - `--kubernetes-service-discovery` (Istio): in-cluster Service destinations use Ferrum's
   Kubernetes service discovery (EndpointSlices, one target per ready pod) instead of the
-  Service DNS name, with the port chosen from the Kubernetes `Service` objects in the
-  input; destinations that cannot be mapped exactly keep their DNS name and are reported.
+  Service DNS name, with the port chosen by name from the Kubernetes `Service` objects
+  in the input. Node-local or not-ready-publishing Services, missing or invalid Service
+  metadata and ambiguous ports keep their DNS name and are reported; non-TCP Service
+  ports refuse the route. The report states Ferrum's runtime needs, including trusting
+  the cluster CA through its outbound trust store.
+- An outlier detector is kept only when no other route, including a weighted split that
+  contains its destination, uses that destination.
 
 ### Changed
 

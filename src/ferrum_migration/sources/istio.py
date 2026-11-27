@@ -16,6 +16,7 @@ from __future__ import annotations
 import ipaddress
 import json
 import math
+import re
 from typing import Any
 
 from .. import matching, util
@@ -78,6 +79,8 @@ class _Istio:
             self.report.warning("istio-secret-ignored", ref, "Kubernetes Secret objects are never read or copied.")
             return
         if kind == "Service" and api == "v1" and self.ctx.kubernetes_service_discovery:
+            if (namespace, name) in self.services:
+                raise InputError("duplicate Kubernetes Service (the EndpointSlice port would depend on document order)")
             self.services[(namespace, name)] = obj  # selects the EndpointSlice port (--kubernetes-service-discovery)
             return
         if not api.startswith(ISTIO_GROUPS):
@@ -111,12 +114,6 @@ class _Istio:
         self._check_frontend_scopes()
         self._resolve_https_redirects()
         check_route_budget(len(self.plan.routes), self.ctx.limits)
-        if self.discovery_namespaces:
-            self.report.warning("istio-k8s-sd", "istio destinations",
-                                "Destinations use Ferrum's Kubernetes service discovery: run Ferrum inside the cluster "
-                                "(it reads the in-cluster API address and service-account token) with permission to "
-                                "list discovery.k8s.io EndpointSlices in namespace(s) "
-                                + ", ".join(sorted(safe_label(ns) for ns in self.discovery_namespaces)) + ".")
         return self.plan
 
     # ---------------------------------------------------------------- gateways
@@ -1071,7 +1068,11 @@ class _Istio:
                 spec.refuse("subset routing needs pod labels; use Ferrum's native Istio support in Kubernetes")
                 return
             fqdn = _fqdn(host.lower(), namespace)
-            port = util.parse_port(mapping(destination.get("port")).get("number"))
+            raw_port = mapping(destination.get("port")).get("number")
+            port = util.parse_port(raw_port)
+            if raw_port is not None and port is None:
+                spec.refuse("destination port is not a valid port number")
+                return
             result = self._backend(fqdn, port, gw_ns, spec.ref, allow_discovery=live_count <= 1)
             if result.get("problem"):
                 spec.refuse(result["problem"])
@@ -1113,7 +1114,9 @@ class _Istio:
         self.plan.upstreams[key] = UpstreamSpec(key=key, name=f"{spec.name}-weighted", ref=spec.ref, targets=targets,
                                                 tls=first.tls, algorithm="weighted_round_robin",
                                                 health_checks=dict(health) if health else None,
-                                                proxy_settings=dict(settings))
+                                                proxy_settings=dict(settings),
+                                                source_destinations=set().union(*(m.source_destinations
+                                                                                  for m in members)))
         spec.backend = BackendRef(scheme=resolved[0][1]["backend"].scheme, upstream_key=key)
 
     def _backend(self, fqdn: str, port: int | None, gw_ns: str, ref: str, allow_discovery: bool = True) -> dict:
@@ -1132,7 +1135,9 @@ class _Istio:
         if self.ctx.kubernetes_service_discovery and fqdn.endswith(".svc.cluster.local") \
                 and not self._has_service_entry(fqdn):
             if allow_discovery:
-                discovery, port = self._kubernetes_discovery(fqdn, port, ref)
+                discovery, port, problem = self._kubernetes_discovery(fqdn, port, ref)
+                if problem:
+                    return {"problem": problem}
             elif (fqdn, "weighted") not in self.discovery_reported:
                 self.discovery_reported.add((fqdn, "weighted"))
                 self.report.warning("istio-k8s-sd-weighted", ref,
@@ -1164,7 +1169,8 @@ class _Istio:
                                                     hash_on_cookie_config=cookie_config,
                                                     health_checks={"passive": passive} if passive else None,
                                                     proxy_settings=dict(pool_settings), outlier_scoped=bool(passive),
-                                                    service_discovery=discovery)
+                                                    service_discovery=discovery,
+                                                    source_destinations={f"istio:{fqdn}:{port}"})
         return {"backend": BackendRef(scheme=scheme, upstream_key=key), "targets": targets,
                 "tls_key": scheme + tls.key()}
 
@@ -1172,28 +1178,35 @@ class _Istio:
         return any(matching.host_cover(h, fqdn) for entry in self.service_entries
                    for h in [h.lower() for h in (str_list(mapping(entry.get("spec")).get("hosts")) or [])])
 
-    def _kubernetes_discovery(self, fqdn: str, port: int | None, ref: str) -> tuple[dict | None, int | None]:
-        """Ferrum Kubernetes service discovery for ``<name>.<namespace>.svc.cluster.local``, or (None, port).
+    def _kubernetes_discovery(self, fqdn: str, port: int | None,
+                              ref: str) -> tuple[dict | None, int | None, str | None]:
+        """Ferrum Kubernetes service discovery for ``<name>.<namespace>.svc.cluster.local``.
+
+        Returns ``(service_discovery, port, problem)``: a discovery block only where Ferrum reproduces Istio's
+        endpoint set exactly, otherwise ``None`` (the destination keeps its Service DNS name, reported), or a
+        ``problem`` that refuses the route.
 
         Ferrum's provider (Edge ``src/service_discovery/kubernetes.rs``) lists the EndpointSlices labelled
-        ``kubernetes.io/service-name=<name>`` and takes each ready endpoint with the slice port named
-        ``port_name`` (the first port when unset). Slice ports carry the Service port names, so the Service
-        object (in the input) maps the destination's Service port number to that name; without it the port
-        cannot be chosen safely and the destination keeps its DNS name.
+        ``kubernetes.io/service-name=<name>`` in the namespace, takes every non-terminating ready and serving
+        endpoint (``src/util/endpointslice.rs``) and uses the slice port whose name equals ``port_name`` (a
+        missing slice port name counts as ``""``; the first port when ``port_name`` is unset). Slice ports carry
+        the Service port names, so the Service object in the input maps the destination's port to that name.
         """
         labels = fqdn.split(".")
         if len(labels) != 5:
-            return None, port
+            return None, port, None
         name, namespace = labels[0], labels[1]
         reported = (fqdn, str(port))
 
-        def keep_dns(message: str) -> tuple[None, int | None]:
+        def keep_dns(message: str) -> tuple[None, int | None, None]:
             if reported not in self.discovery_reported:
                 self.discovery_reported.add(reported)
                 self.report.warning("istio-k8s-sd-port", ref, message + f" {safe_label(fqdn)} keeps its Service DNS "
                                     "name (the Service's cluster IP).")
-            return None, port
+            return None, port, None
 
+        if not (_DNS_LABEL.fullmatch(name) and _DNS_LABEL.fullmatch(namespace)):
+            return keep_dns("The Service name or namespace is not a valid Kubernetes DNS label.")
         service = self.services.get((namespace, name))
         if service is None:
             return keep_dns("The Kubernetes Service object is not in the input, so the EndpointSlice port cannot be "
@@ -1201,20 +1214,33 @@ class _Istio:
         spec = mapping(service.get("spec"))
         if str(spec.get("type", "ClusterIP")) == "ExternalName":
             return keep_dns("The Service is an ExternalName alias with no endpoints.")
+        if spec.get("internalTrafficPolicy") == "Local":
+            return keep_dns("The Service has internalTrafficPolicy: Local (node-local endpoints only), which Ferrum's "
+                            "discovery does not apply.")
+        if spec.get("publishNotReadyAddresses") is True:
+            return keep_dns("The Service publishes not-ready addresses (Istio routes to them; Ferrum's discovery takes "
+                            "only ready endpoints).")
         ports = [mapping(p) for p in seq(spec.get("ports"))]
         if port is None and len(ports) == 1:
             port = util.parse_port(ports[0].get("port"))
         matched = [p for p in ports if util.parse_port(p.get("port")) == port]
         if port is None or len(matched) != 1:
             return keep_dns("The destination port is not exactly one of the Service's ports.")
+        protocol = str(matched[0].get("protocol") or "TCP").upper()
+        if protocol != "TCP":
+            # Istio builds no outbound cluster for UDP Service ports; HTTP to a non-TCP port is never served.
+            return None, port, f"destination Service port {port} uses {safe_label(protocol, 8)}, not TCP"
         port_name = matched[0].get("name")
-        kubernetes: dict[str, Any] = {"namespace": namespace, "service_name": name}
-        if isinstance(port_name, str) and port_name:
-            kubernetes["port_name"] = port_name
-        elif len(ports) != 1:
-            return keep_dns("The Service port is unnamed in a multi-port Service.")
+        if port_name is None or port_name == "":
+            if len(ports) != 1:
+                return keep_dns("The Service port is unnamed in a multi-port Service.")
+            port_name = ""  # matches a slice port without a name, wherever it is listed
+        elif not (isinstance(port_name, str) and _PORT_NAME.fullmatch(port_name) and "--" not in port_name
+                  and any(ch.isalpha() for ch in port_name)):
+            return keep_dns("The Service port name is not a valid Kubernetes port name.")
         self.discovery_namespaces.add(namespace)
-        return {"provider": "kubernetes", "kubernetes": kubernetes}, port
+        return ({"provider": "kubernetes",
+                 "kubernetes": {"namespace": namespace, "service_name": name, "port_name": port_name}}, port, None)
 
     def _service_entry_targets(
         self, fqdn: str, port: int | None
@@ -1508,6 +1534,12 @@ def _is_ip_literal(value: str) -> bool:
     except ValueError:
         return False
     return True
+
+
+#: Kubernetes object names / namespaces (RFC 1123 label) and Service port names (IANA_SVC_NAME, at most 15
+#: characters); Ferrum's discovery copies them into the EndpointSlice query.
+_DNS_LABEL = re.compile(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?")
+_PORT_NAME = re.compile(r"[a-z0-9]([a-z0-9-]{0,13}[a-z0-9])?")
 
 
 def _fqdn(host: str, namespace: str) -> str:

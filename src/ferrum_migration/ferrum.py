@@ -2600,6 +2600,7 @@ class _Builder:
         upstreams = self._build_upstreams(candidates)
         proxies = [self._build_proxy(cand) for cand in candidates]
         self._scope_outlier_detection(upstreams, proxies)
+        self._report_kubernetes_discovery(upstreams, proxies)
         consumers = self._build_consumers()
         return {
             "version": "1",
@@ -2629,6 +2630,36 @@ class _Builder:
         entry["labels"] = self.labels(ref)
         return entry
 
+    def _report_kubernetes_discovery(self, upstreams: list[dict[str, Any]], proxies: list[dict[str, Any]]) -> None:
+        """What Ferrum needs at runtime for the Kubernetes service discovery the output actually uses.
+
+        Edge's provider (``src/service_discovery/kubernetes.rs``, started in ``src/service_discovery/mod.rs``) calls
+        ``https://$KUBERNETES_SERVICE_HOST:$KUBERNETES_SERVICE_PORT`` with the projected service-account token
+        through the gateway's shared outbound HTTP client. That client trusts the platform (OS) roots, or only
+        ``FERRUM_TLS_CA_BUNDLE_PATH`` when it is set (bundled webpki roots when gateway CRLs are configured
+        without a bundle; ``src/plugins/utils/http_client.rs``); it does not read the service account's
+        ``ca.crt``. Its egress policy (``FERRUM_BACKEND_ALLOW_IPS``) screens the API address and the pod targets.
+        """
+        used = {entry["id"] for entry in upstreams}
+        live = {proxy.get("upstream_id") for proxy in proxies if proxy.get("upstream_id")}
+        namespaces = sorted({entry["service_discovery"]["kubernetes"]["namespace"] for entry in upstreams
+                             if entry["id"] in used & live and entry.get("service_discovery", {}).get("kubernetes")})
+        if not namespaces:
+            return
+        self.report.warning(
+            "kubernetes-service-discovery", "service discovery",
+            "Upstreams use Ferrum's Kubernetes service discovery (EndpointSlices in namespace(s) "
+            + ", ".join(safe_label(ns) for ns in namespaces) + "). Run Ferrum inside the cluster: it reads "
+            "KUBERNETES_SERVICE_HOST/KUBERNETES_SERVICE_PORT and the projected service-account token, which needs "
+            "permission to list discovery.k8s.io EndpointSlices in those namespaces. Ferrum verifies the API server "
+            "with its outbound trust store, not the service account's ca.crt: either add the cluster CA "
+            "(/var/run/secrets/kubernetes.io/serviceaccount/ca.crt) to the container's system trust store, or set "
+            "FERRUM_TLS_CA_BUNDLE_PATH to a bundle that contains it and every other root Ferrum's outbound TLS needs "
+            "(the bundle then replaces the system roots for all outbound connections; with FERRUM_TLS_CRL_FILE_PATH "
+            "set, only the bundle works). FERRUM_BACKEND_ALLOW_IPS must allow the API server and pod addresses (the "
+            "default, both, does).",
+            "Grant the RBAC, install the cluster CA as described, then validate.")
+
     def _scope_outlier_detection(self, upstreams: list[dict[str, Any]], proxies: list[dict[str, Any]]) -> None:
         """Keep a translated outlier detector only where one proxy uses its upstream.
 
@@ -2639,18 +2670,26 @@ class _Builder:
         key_by_uid = {uid: key for key, uid in self.upstream_id_by_key.items()}
         users: dict[str, int] = {}
         for proxy in proxies:
-            if proxy.get("upstream_id"):
-                users[proxy["upstream_id"]] = users.get(proxy["upstream_id"], 0) + 1
+            uid = proxy.get("upstream_id")
+            spec = self.plan.upstreams.get(key_by_uid.get(uid, "")) if uid else None
+            if spec is None:
+                continue
+            # A merged weighted upstream also uses each member destination's detector in the source.
+            for destination in spec.source_destinations or {f"upstream:{uid}"}:
+                users[destination] = users.get(destination, 0) + 1
         for entry in upstreams:
             spec = self.plan.upstreams.get(key_by_uid.get(entry["id"], ""))
             checks = entry.get("health_checks") or {}
-            if spec is None or not spec.outlier_scoped or "passive" not in checks or users.get(entry["id"], 0) <= 1:
+            if spec is None or not spec.outlier_scoped or "passive" not in checks:
+                continue
+            count = max(users.get(d, 0) for d in (spec.source_destinations or {f"upstream:{entry['id']}"}))
+            if count <= 1:
                 continue
             checks.pop("passive")
             if not checks:
                 entry.pop("health_checks")
             self.report.warning("outlier-detection-scope", spec.ref,
-                                f"{users[entry['id']]} routes use this destination. The source counts each host's "
+                                f"{count} routes use this destination. The source counts each host's "
                                 "consecutive failures across all of them; Ferrum keeps one streak per route, so a host "
                                 "would need the full count on one route. Outlier detection was not migrated.")
 
