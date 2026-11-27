@@ -194,6 +194,31 @@ class EchoTests(unittest.TestCase):
         finally:
             backend.stop()
 
+    def test_faulting_backend_answers_its_status_and_still_records(self):
+        recorder = EchoRecorder()
+        backend = EchoBackend("a", recorder, 503).start()
+        try:
+            resp = probe.send(backend.port, "GET", "/f", "h.example.test", {PROBE_HEADER: "p2"}, 5)
+            self.assertEqual(resp["status"], 503)
+            self.assertEqual(len(recorder.for_probe("p2")), 1)
+        finally:
+            backend.stop()
+
+    def test_prime_probes_assert_nothing(self):
+        from harness.cases import Probe
+        from harness.runner import _evaluate_probe
+        prime = Probe(id="p", method="GET", path="/o", host="h", headers={}, forward_backend=None,
+                      forward_path=None, deny=False, statuses=[], ferrum_only=False, note="", prime=True)
+        for resp, records in (({"status": 503, "error": None}, [{"backend": "a", "path": "/o", "method": "GET"}]),
+                              ({"status": None, "error": "TimeoutError"}, [])):
+            self.assertEqual(_evaluate_probe(prime, resp, records)["outcome"], "pass")
+
+    def test_outlier_case_faults_backend_a(self):
+        cases = {case.id: case for case in load_cases(ROOT / "fixtures")}
+        case = cases["envoy-outlier-ejection"]
+        self.assertEqual(case.backend_faults, {"a": 503})
+        self.assertTrue(any(p.prime for p in case.probes) and any(p.positive for p in case.probes))
+
 
 # Runs fake_ferrum.py as __main__ in a child whose socket.getfqdn raises, so any
 # reverse-DNS lookup during fake gateway startup crashes the child before readiness.

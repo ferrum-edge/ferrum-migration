@@ -44,6 +44,9 @@ class UpstreamSpec:
     #: Per-proxy settings every proxy using this upstream carries (connection-pool overrides from the
     #: destination's policy, for example Istio DestinationRule connectionPool).
     proxy_settings: dict = field(default_factory=dict)
+    #: The passive health check reproduces a source outlier detector whose failure streak is per destination;
+    #: Ferrum keeps it per proxy, so the emitter keeps it only when one proxy uses this upstream.
+    outlier_scoped: bool = False
 
 
 @dataclass

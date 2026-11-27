@@ -1,0 +1,54 @@
+# Synthetic Envoy static v3 bootstrap. Loopback listener and STATIC clusters only.
+static_resources:
+  listeners:
+    - name: ingress_http
+      address:
+        socket_address:
+          address: 127.0.0.1
+          port_value: ${LISTEN_PORT}
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress_http
+                route_config:
+                  name: local_route
+                  virtual_hosts:
+                    - name: app
+                      domains: ["app.example.test"]
+                      routes:
+                        - match:
+                            prefix: "/"
+                          route:
+                            cluster: pool
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters:
+    - name: pool
+      type: STATIC
+      connect_timeout: 1s
+      lb_policy: ROUND_ROBIN
+      outlier_detection:
+        consecutive_5xx: 3
+        interval: 10s
+        base_ejection_time: 300s
+        max_ejection_time: 300s
+        max_ejection_percent: 50
+        enforcing_success_rate: 0
+      load_assignment:
+        cluster_name: pool
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: ${ECHO_A_PORT}
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: ${ECHO_B_PORT}

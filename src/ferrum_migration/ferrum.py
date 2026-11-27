@@ -2599,6 +2599,7 @@ class _Builder:
             self.plugin_configs.append(self._plugin_entry(pid, plugin.name, plugin.config, "global", None, plugin.ref))
         upstreams = self._build_upstreams(candidates)
         proxies = [self._build_proxy(cand) for cand in candidates]
+        self._scope_outlier_detection(upstreams, proxies)
         consumers = self._build_consumers()
         return {
             "version": "1",
@@ -2627,6 +2628,31 @@ class _Builder:
         entry["config"] = copy.deepcopy(config)
         entry["labels"] = self.labels(ref)
         return entry
+
+    def _scope_outlier_detection(self, upstreams: list[dict[str, Any]], proxies: list[dict[str, Any]]) -> None:
+        """Keep a translated outlier detector only where one proxy uses its upstream.
+
+        The source counts a host's failure streak once per cluster/destination, across every route. Ferrum keeps
+        passive health state per proxy (Edge ``src/health_check.rs``, keyed by namespace and proxy id), so two
+        proxies sharing the upstream would each need the full streak.
+        """
+        key_by_uid = {uid: key for key, uid in self.upstream_id_by_key.items()}
+        users: dict[str, int] = {}
+        for proxy in proxies:
+            if proxy.get("upstream_id"):
+                users[proxy["upstream_id"]] = users.get(proxy["upstream_id"], 0) + 1
+        for entry in upstreams:
+            spec = self.plan.upstreams.get(key_by_uid.get(entry["id"], ""))
+            checks = entry.get("health_checks") or {}
+            if spec is None or not spec.outlier_scoped or "passive" not in checks or users.get(entry["id"], 0) <= 1:
+                continue
+            checks.pop("passive")
+            if not checks:
+                entry.pop("health_checks")
+            self.report.warning("outlier-detection-scope", spec.ref,
+                                f"{users[entry['id']]} routes use this destination. The source counts each host's "
+                                "consecutive failures across all of them; Ferrum keeps one streak per route, so a host "
+                                "would need the full count on one route. Outlier detection was not migrated.")
 
     def _build_upstreams(self, candidates: list[_Cand]) -> list[dict[str, Any]]:
         result: list[dict[str, Any]] = []

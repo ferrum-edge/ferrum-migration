@@ -36,7 +36,7 @@ class EchoRecorder:
             return [dict(r) for r in self._records]
 
 
-def _make_handler(tag: str, recorder: EchoRecorder):
+def _make_handler(tag: str, recorder: EchoRecorder, fault_status: "int | None" = None):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
         server_version = "acceptance-echo"
@@ -64,7 +64,8 @@ def _make_handler(tag: str, recorder: EchoRecorder):
             body = json.dumps(
                 {"backend": tag, "method": self.command, "path": self.path, "probe": record["probe"]}
             ).encode()
-            self.send_response(200)
+            # A faulting backend (case backend_faults) answers every request with its 5xx status.
+            self.send_response(fault_status or 200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
@@ -87,9 +88,9 @@ class EchoBackend:
     The server never reverse-resolves its address (see ``harness.loopback``).
     """
 
-    def __init__(self, tag: str, recorder: EchoRecorder) -> None:
+    def __init__(self, tag: str, recorder: EchoRecorder, fault_status: "int | None" = None) -> None:
         self.tag = tag
-        self.server = LoopbackThreadingHTTPServer(("127.0.0.1", 0), _make_handler(tag, recorder))
+        self.server = LoopbackThreadingHTTPServer(("127.0.0.1", 0), _make_handler(tag, recorder, fault_status))
         self.server.daemon_threads = True
         self.port: int = self.server.server_address[1]
         self._thread = threading.Thread(

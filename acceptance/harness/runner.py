@@ -175,6 +175,9 @@ def _evaluate_probe(p: Probe, resp: dict, records: list[dict]) -> dict:
     observed = [{"backend": r["backend"], "path": r["path"], "method": r["method"]} for r in records]
     out = {"probe": p.id, "method": p.method, "path": p.path, "host": p.host,
            "status": resp["status"], "transport_error": resp["error"], "observed": observed}
+    if p.prime:
+        out["outcome"] = "pass"  # drives state only (recorded, not asserted)
+        return out
     if p.positive:
         out["expected"] = {"backend": p.forward_backend, "path": p.forward_path, "status": p.statuses}
         if records:
@@ -260,7 +263,7 @@ def _run_case(case: Case, ctx: RunContext, canaries: SyntheticCanaries) -> dict:
     }
     sensitive = canaries.all_sensitive() + list(ctx.sensitive_extra)
     recorder = EchoRecorder()
-    backends = {tag: EchoBackend(tag, recorder).start() for tag in ("a", "b")}
+    backends = {tag: EchoBackend(tag, recorder, case.backend_faults.get(tag)).start() for tag in ("a", "b")}
     listen_hold: "PortHold | None" = PortHold()
     try:
         values = {

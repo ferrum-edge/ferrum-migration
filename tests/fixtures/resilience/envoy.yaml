@@ -17,19 +17,39 @@ static_resources:
                       domains: ["resilience.example.test"]
                       routes:
                         - {name: ejecting, match: {path_separated_prefix: "/ejecting"}, route: {cluster: ejecting}}
+                        - {name: growing, match: {path_separated_prefix: "/growing"}, route: {cluster: growing}}
+                        - {name: named, match: {path_separated_prefix: "/named"}, route: {cluster: named}}
                         - {name: partial, match: {path_separated_prefix: "/partial"}, route: {cluster: partial}}
                         - {name: disabled, match: {path_separated_prefix: "/disabled"}, route: {cluster: disabled}}
+                        - {name: shared-a, match: {path_separated_prefix: "/shared-a"}, route: {cluster: shared}}
+                        - {name: shared-b, match: {path_separated_prefix: "/shared-b"}, route: {cluster: shared}}
+                        - name: split
+                          match: {path_separated_prefix: "/split"}
+                          route:
+                            weighted_clusters:
+                              clusters:
+                                - {name: ejecting, weight: 50}
+                                - {name: named, weight: 50}
+                        - name: canary-off
+                          match: {path_separated_prefix: "/canary-off"}
+                          route:
+                            weighted_clusters:
+                              clusters:
+                                - {name: solo, weight: 100}
+                                - {name: named, weight: 0}
                 http_filters:
                   - name: envoy.filters.http.router
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
   clusters:
+    # Exact: individual IP hosts, constant ejection time (base >= max_ejection_time), one route.
     - name: ejecting
-      type: STRICT_DNS
+      type: STATIC
       outlier_detection:
         consecutive_5xx: 3
         interval: 5s
-        base_ejection_time: 60s
+        base_ejection_time: 300s
+        max_ejection_time: 300s
         max_ejection_percent: 50
         enforcing_success_rate: 0
       circuit_breakers:
@@ -39,21 +59,58 @@ static_resources:
         cluster_name: ejecting
         endpoints:
           - lb_endpoints:
-              - endpoint: {address: {socket_address: {address: ejecting-1.internal, port_value: 8080}}}
-              - endpoint: {address: {socket_address: {address: ejecting-2.internal, port_value: 8080}}}
-    - name: partial
+              - endpoint: {address: {socket_address: {address: 10.0.0.1, port_value: 8080}}}
+              - endpoint: {address: {socket_address: {address: 10.0.0.2, port_value: 8080}}}
+    # Ejection time grows with repeated ejections (base 60s < default max_ejection_time 300s).
+    - name: growing
+      type: STATIC
+      outlier_detection: {base_ejection_time: 60s, enforcing_success_rate: 0, always_eject_one_host: false}
+      load_assignment:
+        cluster_name: growing
+        endpoints:
+          - lb_endpoints:
+              - endpoint: {address: {socket_address: {address: 10.0.1.1, port_value: 8080}}}
+    # STRICT_DNS names: each resolved address is a host in Envoy.
+    - name: named
       type: STRICT_DNS
+      outlier_detection: {base_ejection_time: 300s, max_ejection_time: 300s, enforcing_success_rate: 0}
+      load_assignment:
+        cluster_name: named
+        endpoints:
+          - lb_endpoints:
+              - endpoint: {address: {socket_address: {address: named-1.internal, port_value: 8080}}}
+    - name: partial
+      type: STATIC
       outlier_detection: {enforcing_consecutive_5xx: 50}
       load_assignment:
         cluster_name: partial
         endpoints:
           - lb_endpoints:
-              - endpoint: {address: {socket_address: {address: partial-1.internal, port_value: 8080}}}
+              - endpoint: {address: {socket_address: {address: 10.0.2.1, port_value: 8080}}}
     - name: disabled
-      type: STRICT_DNS
+      type: STATIC
       outlier_detection: {consecutive_5xx: 0}
       load_assignment:
         cluster_name: disabled
         endpoints:
           - lb_endpoints:
-              - endpoint: {address: {socket_address: {address: disabled-1.internal, port_value: 8080}}}
+              - endpoint: {address: {socket_address: {address: 10.0.3.1, port_value: 8080}}}
+    # Exact in itself, but two routes share it (Ferrum keeps one failure streak per route).
+    - name: shared
+      type: STATIC
+      outlier_detection: {base_ejection_time: 300s, max_ejection_time: 300s, enforcing_success_rate: 0}
+      load_assignment:
+        cluster_name: shared
+        endpoints:
+          - lb_endpoints:
+              - endpoint: {address: {socket_address: {address: 10.0.4.1, port_value: 8080}}}
+              - endpoint: {address: {socket_address: {address: 10.0.4.2, port_value: 8080}}}
+    # The only live cluster of a weighted route keeps its own policy.
+    - name: solo
+      type: STATIC
+      outlier_detection: {base_ejection_time: 300s, max_ejection_time: 300s, enforcing_success_rate: 0}
+      load_assignment:
+        cluster_name: solo
+        endpoints:
+          - lb_endpoints:
+              - endpoint: {address: {socket_address: {address: 10.0.5.1, port_value: 8080}}}

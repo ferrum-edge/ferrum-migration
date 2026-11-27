@@ -1282,9 +1282,11 @@ class _Envoy:
                 self.report.warning("envoy-lb-policy", ref, "Load-balancing policy has no equivalent; round robin.")
             spec.health_checks = self._health(raw, ref)
             if isinstance(raw.get("outlier_detection"), dict):
-                passive = envoy_outlier_passive(raw["outlier_detection"], len(targets), self.report, ref)
+                passive = envoy_outlier_passive(raw["outlier_detection"], targets, cluster_type == "LOGICAL_DNS",
+                                                self.report, ref)
                 if passive:
                     spec.health_checks = {**(spec.health_checks or {}), "passive": passive}
+                    spec.outlier_scoped = True
             self._circuit_breakers(raw.get("circuit_breakers"), ref)
             self.plan.upstreams[key] = spec
         result["backend"] = BackendRef(scheme=scheme, upstream_key=key)
@@ -1474,6 +1476,7 @@ class _Envoy:
 
     def _weighted(self, weighted: dict, spec: RouteSpec, hash_on: str | None) -> dict:
         parts: list[tuple[int, list[Target]]] = []
+        live: list[dict] = []  # clusters that receive traffic
         keys = set()
         connects = set()
         problems: list[str] = []
@@ -1491,16 +1494,26 @@ class _Envoy:
             first = first or result
             keys.add(result["tls_key"])
             connects.add(result.get("connect"))
-            parts.append((util.as_int(child.get("weight")) or 0, result["targets"]))
+            weight = util.as_int(child.get("weight")) or 0
+            parts.append((weight, result["targets"]))
+            if weight > 0:
+                live.append(result)
         if len(keys) > 1:
             problems.append("weighted clusters differ in TLS settings")
         if len(connects) > 1:
             problems.append("weighted clusters differ in connect_timeout")
         if problems or first is None:
             return {"problems": problems or ["weighted clusters are empty"]}
+        if len(live) == 1:
+            # Only one cluster receives traffic: route to it as it is, with its own upstream policy.
+            return {"problems": [], "backend": live[0]["backend"], "connect": live[0].get("connect")}
         merged = merge_weighted_targets(parts)
         if merged is None:
             return {"problems": ["weighted clusters send no traffic anywhere"]}
+        if any((self.plan.upstreams[r["backend"].upstream_key].health_checks or {}).get("passive") for r in live):
+            self.report.warning("envoy-outlier-weighted", spec.ref,
+                                "The weighted clusters' outlier detection applies to each cluster's own hosts; Ferrum "
+                                "serves the split from one merged upstream, so it was not migrated for this route.")
         targets, approximate = merged
         if approximate:
             self.report.warning("envoy-weights", spec.ref, "Weighted split was rounded to integer target weights.")

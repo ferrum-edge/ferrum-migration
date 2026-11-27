@@ -156,3 +156,10 @@ Only add a claim when the request-target and backend are exactly determined by
 the source product's documented semantics. Name a converter assertion in
 `converter_assertions` only when the case's synthetic source is known to
 satisfy it; an assertion the converter profile does not map is an `ERROR`.
+
+To exercise behaviour that depends on backend failures (outlier detection), a case
+can make echo backends answer every request with a 5xx status while still recording
+it, for example `"backend_faults": {"a": 503}`, and send state-priming probes
+`{"expect": {"prime": true}}` whose outcome asserts nothing. At least one probe of a
+case must assert something; the assertions that follow the priming probes are the
+evidence (see `fixtures/envoy-outlier-ejection`).

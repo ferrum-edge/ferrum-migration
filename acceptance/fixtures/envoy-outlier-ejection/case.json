@@ -1,0 +1,125 @@
+{
+  "id": "envoy-outlier-ejection",
+  "adapter": "envoy",
+  "title": "Envoy outlier detection: a host failing 3 consecutive requests is ejected",
+  "source": "envoy.yaml",
+  "allow_rejection": false,
+  "backend_faults": {
+    "a": 503
+  },
+  "claims": [
+    "a round-robin STATIC cluster of two hosts with outlier_detection consecutive_5xx 3 and max_ejection_percent 50 ejects the host answering 503 after its third consecutive 503",
+    "after the ejection, requests reach only the healthy host for the base ejection time (300s, equal to max_ejection_time, so it does not grow)"
+  ],
+  "not_claimed": [
+    "re-admission timing (the source re-admits at its next interval sweep after the ejection time)",
+    "success-rate ejection (disabled here with enforcing_success_rate: 0)"
+  ],
+  "source_semantics": "Envoy outlier detection (source/common/upstream/outlier_detection_impl.cc): a host is ejected after consecutive_5xx consecutive 5xx responses when (ejected + 1) * 100 / hosts <= max_ejection_percent, for base_ejection_time times its ejection count, capped at max(base_ejection_time, max_ejection_time). Source-code-inferred unless the upstream differential runs.",
+  "probes": [
+    {
+      "id": "prime-1",
+      "path": "/o",
+      "expect": {
+        "prime": true
+      },
+      "note": "drives backend a's consecutive 503 streak"
+    },
+    {
+      "id": "prime-2",
+      "path": "/o",
+      "expect": {
+        "prime": true
+      },
+      "note": "drives backend a's consecutive 503 streak"
+    },
+    {
+      "id": "prime-3",
+      "path": "/o",
+      "expect": {
+        "prime": true
+      },
+      "note": "drives backend a's consecutive 503 streak"
+    },
+    {
+      "id": "prime-4",
+      "path": "/o",
+      "expect": {
+        "prime": true
+      },
+      "note": "drives backend a's consecutive 503 streak"
+    },
+    {
+      "id": "prime-5",
+      "path": "/o",
+      "expect": {
+        "prime": true
+      },
+      "note": "drives backend a's consecutive 503 streak"
+    },
+    {
+      "id": "prime-6",
+      "path": "/o",
+      "expect": {
+        "prime": true
+      },
+      "note": "drives backend a's consecutive 503 streak"
+    },
+    {
+      "id": "prime-7",
+      "path": "/o",
+      "expect": {
+        "prime": true
+      },
+      "note": "drives backend a's consecutive 503 streak"
+    },
+    {
+      "id": "prime-8",
+      "path": "/o",
+      "expect": {
+        "prime": true
+      },
+      "note": "drives backend a's consecutive 503 streak"
+    },
+    {
+      "id": "after-ejection-1",
+      "path": "/o?n=1",
+      "expect": {
+        "forward": {
+          "backend": "b",
+          "path": "/o?n=1"
+        }
+      }
+    },
+    {
+      "id": "after-ejection-2",
+      "path": "/o?n=2",
+      "expect": {
+        "forward": {
+          "backend": "b",
+          "path": "/o?n=2"
+        }
+      }
+    },
+    {
+      "id": "after-ejection-3",
+      "path": "/o?n=3",
+      "expect": {
+        "forward": {
+          "backend": "b",
+          "path": "/o?n=3"
+        }
+      }
+    },
+    {
+      "id": "after-ejection-4",
+      "path": "/o?n=4",
+      "expect": {
+        "forward": {
+          "backend": "b",
+          "path": "/o?n=4"
+        }
+      }
+    }
+  ]
+}
