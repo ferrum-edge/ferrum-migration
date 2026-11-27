@@ -1,0 +1,98 @@
+name: Edge release drift
+
+# Early warning, never a required check: runs the binary admission tests and the full
+# loopback runtime acceptance against Ferrum Edge's NEWEST published release (GitHub's
+# "latest" release, which excludes drafts and prereleases), instead of the exact pinned
+# release that ci.yml gates on. A failure here means the converter's output or the
+# harness's expectations drifted from a newer Edge, not that the pinned target broke.
+# The binary is verified against the release's .sha256 sidecar only: there is no digest
+# pinned here, because the release under test is not known in advance. No secrets are
+# used and nothing is uploaded (work dirs can hold per-run synthetic credentials).
+
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+  # Also when this workflow itself changes, so an edit is exercised before it merges.
+  pull_request:
+    paths:
+      - .github/workflows/edge-release-drift.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: edge-release-drift
+  cancel-in-progress: true
+
+jobs:
+  newest-edge-release:
+    name: newest ferrum-edge release admission + runtime acceptance (linux)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      FERRUM_EDGE_ASSET: ferrum-edge-linux-x86_64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-ci.txt
+          python -m pip install --no-deps -e .
+
+      - name: Resolve the newest published ferrum-edge release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="$(gh api repos/ferrum-edge/ferrum-edge/releases/latest --jq .tag_name)"
+          if ! printf '%s' "$tag" | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'; then
+            echo "::error::newest ferrum-edge release tag is not a strict vX.Y.Z tag"
+            exit 1
+          fi
+          echo "FERRUM_EDGE_VERSION=$tag" >> "$GITHUB_ENV"
+          echo "Newest ferrum-edge release: \`$tag\` (CI pins the version named in ci.yml)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fetch and verify the release binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/ferrum-edge"
+          mkdir -p "$dir"
+          cd "$dir"
+          base="https://github.com/ferrum-edge/ferrum-edge/releases/download/${FERRUM_EDGE_VERSION}"
+          curl --proto '=https' --tlsv1.2 -fsSL --retry 3 -o "$FERRUM_EDGE_ASSET" "$base/$FERRUM_EDGE_ASSET"
+          curl --proto '=https' --tlsv1.2 -fsSL --retry 3 -o "$FERRUM_EDGE_ASSET.sha256" "$base/$FERRUM_EDGE_ASSET.sha256"
+          sha256sum -c "$FERRUM_EDGE_ASSET.sha256"
+          chmod 0755 "$FERRUM_EDGE_ASSET"
+          ./"$FERRUM_EDGE_ASSET" version --json
+          echo "FERRUM_EDGE_BIN=$dir/$FERRUM_EDGE_ASSET" >> "$GITHUB_ENV"
+
+      - name: Converter output passes ferrum-edge validate (synthetic CA for operator-CA fixtures)
+        run: python -m unittest discover -s tests -p 'test_ferrum_reference.py' -v
+
+      - name: Runtime smoke gate (one working migration per source, loopback)
+        run: >-
+          python acceptance/run.py --ferrum-bin "$FERRUM_EDGE_BIN" --expect-ferrum-version "${FERRUM_EDGE_VERSION#v}"
+          --strict --require-behavioral
+          --converter-env "PYTHONPATH=$GITHUB_WORKSPACE/src" --work-root "$RUNNER_TEMP/acceptance-smoke"
+          --case kong-dbless-smoke --case kong-deck-smoke --case nginx-proxy-pass-uri
+          --case traefik-smoke --case envoy-smoke --case istio-smoke
+
+      - name: Full runtime acceptance (loopback)
+        run: >-
+          python acceptance/run.py --ferrum-bin "$FERRUM_EDGE_BIN" --expect-ferrum-version "${FERRUM_EDGE_VERSION#v}"
+          --converter-env "PYTHONPATH=$GITHUB_WORKSPACE/src" --work-root "$RUNNER_TEMP/acceptance-full"
+
+      - name: Remove work dirs (may hold per-run synthetic credentials)
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/acceptance-smoke" "$RUNNER_TEMP/acceptance-full" "$RUNNER_TEMP/ferrum-edge"

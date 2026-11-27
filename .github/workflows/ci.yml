@@ -5,6 +5,8 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  # The release workflow (release.yml) runs this whole workflow as its pre-publication gate.
+  workflow_call:
 
 permissions:
   contents: read
@@ -44,7 +46,7 @@ jobs:
           python -m pip install --no-deps -e .
 
       - name: Byte-compile
-        run: python -m compileall -q src tests acceptance
+        run: python -m compileall -q src tests acceptance scripts
 
       - name: Unit, fail-closed, CLI and load tests
         run: python -m unittest discover -s tests -v
@@ -69,12 +71,64 @@ jobs:
             fi
           done
 
+  package:
+    # Builds the sdist and the wheel exactly as the release workflow does, checks them with
+    # twine and scripts/release_check.py, and runs the installed wheel's console script.
+    name: package (sdist + wheel, twine check)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Install build tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-release.txt
+
+      - name: Build sdist, then the wheel from the sdist
+        run: python -m build --outdir dist .
+
+      - name: twine check
+        run: python -m twine check --strict dist/*
+
+      - name: Check names, version and core metadata
+        run: python scripts/release_check.py dist --dir dist
+
+      - name: Install the wheel into a clean venv and run it
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected="$(python scripts/release_check.py version)"
+          venv="$RUNNER_TEMP/wheel-venv"
+          python -m venv "$venv"
+          "$venv/bin/python" -m pip install -r requirements-ci.txt
+          "$venv/bin/python" -m pip install --no-deps dist/ferrum_migration-*-py3-none-any.whl
+          installed="$("$venv/bin/python" -c 'import importlib.metadata as m; print(m.version("ferrum-migration"))')"
+          test "$installed" = "$expected"
+          out="$("$venv/bin/ferrum-migrate" --version)"
+          case "$out" in
+            "ferrum-migration $expected "*) ;;
+            *) echo "::error::ferrum-migrate --version printed '$out', expected version $expected"; exit 1 ;;
+          esac
+          "$venv/bin/ferrum-migrate" platforms
+          "$venv/bin/ferrum-migrate" check tests/fixtures/nginx/nginx.conf --from nginx > /dev/null
+
   ferrum-runtime:
     # Real Ferrum Edge admission and loopback runtime acceptance against the pinned published
     # release. No secrets are used. The binary is fetched from the public release and verified
     # against the release's .sha256 sidecar AND a digest pinned here. Nothing is uploaded as an
     # artifact: failed-case work dirs can contain per-run synthetic credentials and are deleted.
-    name: ferrum-edge v0.9.21 admission + runtime acceptance (linux)
+    # The check name stays the same when the pin moves, so a branch ruleset that requires it
+    # does not need editing on every re-pin; the version is in FERRUM_EDGE_VERSION below.
+    name: ferrum-edge pinned release admission + runtime acceptance (linux)
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:

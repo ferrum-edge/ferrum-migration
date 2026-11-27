@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/ferrum_migration.png" alt="Ferrum Migration" width="400" />
+  <img src="https://raw.githubusercontent.com/ferrum-edge/ferrum-migration/main/docs/ferrum_migration.png" alt="Ferrum Migration" width="400" />
 </p>
 
 <h1 align="center">Ferrum Migration</h1>
@@ -7,6 +7,7 @@
 <p align="center"><b>Translate your config. Move to the Edge.</b></p>
 
 <p align="center">
+  <a href="#status"><img src="https://img.shields.io/badge/status-preview%20%280.x%29-yellow" alt="Status: preview (0.x)" /></a>
   <a href="https://github.com/ferrum-edge/ferrum-migration/actions/workflows/ci.yml"><img src="https://github.com/ferrum-edge/ferrum-migration/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI" /></a>
   <a href="https://github.com/ferrum-edge/ferrum-migration/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-PolyForm%20Noncommercial-blue" alt="License" /></a>
   <img src="https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13-blue?logo=python&logoColor=white" alt="Python 3.11, 3.12, 3.13" />
@@ -42,16 +43,39 @@ It writes, into a private output directory:
 
 Mappings were verified against Ferrum Edge `v0.9.21` at
 `f9915358c8032214f4034a17c28cdf72d14006c3` (config structs, plugin validators, and the settings
-inventory). See [docs/mappings.md](docs/mappings.md).
+inventory). See [docs/mappings.md](https://github.com/ferrum-edge/ferrum-migration/blob/main/docs/mappings.md).
 
 ## Install
 
-Python 3.11+ and PyYAML.
+Python 3.11+ and PyYAML. Ferrum Migration is a **preview** (see [Status](#status)).
+
+From a release tag (`vX.Y.Z`; see the
+[releases](https://github.com/ferrum-edge/ferrum-migration/releases) and the
+[changelog](https://github.com/ferrum-edge/ferrum-migration/blob/main/CHANGELOG.md)):
+
+```bash
+python -m pip install "ferrum-migration @ git+https://github.com/ferrum-edge/ferrum-migration@vX.Y.Z"
+ferrum-migrate --version
+```
+
+Each GitHub release also carries the wheel, the sdist, a `SHA256SUMS` file and GitHub build
+provenance attestations. To install a downloaded wheel after checking it:
+
+```bash
+sha256sum --ignore-missing -c SHA256SUMS      # macOS: shasum -a 256 --ignore-missing -c SHA256SUMS
+gh attestation verify ferrum_migration-X.Y.Z-py3-none-any.whl -R ferrum-edge/ferrum-migration
+python -m pip install ferrum_migration-X.Y.Z-py3-none-any.whl
+```
+
+From a checkout of this repository:
 
 ```bash
 python -m pip install .            # or: python -m pip install -e .
-ferrum-migrate --version
 ```
+
+PyPI: not published yet. Publishing is wired into the release workflow and stays off until
+the maintainers enable it ([docs/releasing.md](https://github.com/ferrum-edge/ferrum-migration/blob/main/docs/releasing.md));
+from then on, `python -m pip install ferrum-migration` installs the newest release.
 
 ## Use
 
@@ -269,7 +293,7 @@ rather than opening routes or downgrading security:
   tags are rejected, and multi-document input is accepted only for Istio. Includes are not
   followed. There is no network, database or subprocess use.
 
-See [docs/design.md](docs/design.md) for details and [SECURITY.md](SECURITY.md) for reporting issues.
+See [docs/design.md](https://github.com/ferrum-edge/ferrum-migration/blob/main/docs/design.md) for details and [SECURITY.md](https://github.com/ferrum-edge/ferrum-migration/blob/main/SECURITY.md) for reporting issues.
 
 ## Limitations (read before serving any traffic)
 
@@ -298,7 +322,7 @@ See [docs/design.md](docs/design.md) for details and [SECURITY.md](SECURITY.md) 
 * Host-level refusals (regex `server_name`, unrepresentable domains) only poison catch-all
   routes; the residual cross-scope risk is described in docs/design.md.
 * Some Ferrum behaviors could not be confirmed from source alone. They are listed under
-  "Open questions" in [docs/mappings.md](docs/mappings.md).
+  "Open questions" in [docs/mappings.md](https://github.com/ferrum-edge/ferrum-migration/blob/main/docs/mappings.md).
 
 ## Development
 
@@ -314,18 +338,42 @@ python acceptance/run.py --ferrum-bin /path/to/ferrum-edge --converter-env PYTHO
 ```
 
 The binary admission test generates a throwaway synthetic CA with `openssl` for fixtures that
-name operator-supplied backend CA files. See [acceptance/README.md](acceptance/README.md) for
+name operator-supplied backend CA files. See [acceptance/README.md](https://github.com/ferrum-edge/ferrum-migration/blob/main/acceptance/README.md) for
 the runtime harness. CI runs it on Linux against the pinned published v0.9.21 binary.
 
 Test fixtures under `tests/fixtures/` are original synthetic configurations; every credential
-in them is a fake test string. See [CONTRIBUTING.md](CONTRIBUTING.md).
+in them is a fake test string. See [CONTRIBUTING.md](https://github.com/ferrum-edge/ferrum-migration/blob/main/CONTRIBUTING.md).
 
-## Status and license
+## Status
 
-Early public build-out (v0.1.0).
+**Preview.** Ferrum Migration is offered alongside the Ferrum 1.0 product family (Ferrum Edge
+and its companion tools) as a preview: it stays on `0.x` and is **not** covered by the
+compatibility promises that Ferrum's 1.0 products make. It is young, and it has only been
+checked with synthetic fixtures, not against real deployments (see Limitations).
 
-Ferrum Migration is licensed under the [PolyForm Noncommercial License 1.0.0](LICENSE).
-For commercial use, see [LICENSE-COMMERCIAL.md](LICENSE-COMMERCIAL.md).
+* **No compatibility promise on `0.x`.** Any minor release (`0.x` to `0.y`) may change
+  report codes and the JSON report layout, exit codes, CLI flags and output files. Every
+  such change is recorded in the
+  [changelog](https://github.com/ferrum-edge/ferrum-migration/blob/main/CHANGELOG.md).
+  Pin an exact version in scripts.
+* **One target Edge release per version.** The output of this version targets Ferrum Edge
+  **v0.9.21** (`f9915358c8032214f4034a17c28cdf72d14006c3`). CI validates it against that
+  exact release binary, verified against the release's checksum and a digest pinned in CI:
+  every fixture's output must pass `ferrum-edge validate`, and the loopback runtime acceptance
+  suite serves it with that binary. Other Edge versions are not validated; output may use
+  settings or fields an older Edge lacks, and a newer Edge may behave differently. A weekly,
+  non-gating CI job runs the same checks against Edge's newest published release to detect
+  drift early.
+* `ferrum-migrate --version` and both reports name the tool version and the Ferrum Edge
+  commit the mappings were verified against.
+
+Releases are `vX.Y.Z` Git tags with GitHub releases; see
+[docs/releasing.md](https://github.com/ferrum-edge/ferrum-migration/blob/main/docs/releasing.md).
+
+## License
+
+Ferrum Migration is licensed under the [PolyForm Noncommercial License 1.0.0](https://github.com/ferrum-edge/ferrum-migration/blob/main/LICENSE).
+For commercial use, see [LICENSE-COMMERCIAL.md](https://github.com/ferrum-edge/ferrum-migration/blob/main/LICENSE-COMMERCIAL.md).
 Ferrum Edge is a separate product governed by its own license; the terms here cover
 Ferrum Migration only.
 

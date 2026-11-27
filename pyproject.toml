@@ -1,28 +1,54 @@
 [build-system]
-requires = ["setuptools>=69", "wheel"]
+# setuptools 77 is the first release with PEP 639 license metadata (an SPDX `license`
+# expression plus `license-files`, core metadata 2.4).
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "ferrum-migration"
-version = "0.1.0"
+# Single source: `__version__` in src/ferrum_migration/__init__.py (see [tool.setuptools.dynamic]).
+dynamic = ["version"]
 description = "Offline, best-effort, fail-closed translation of Kong, NGINX, Traefik, Envoy and Istio configuration into Ferrum Edge declarative config"
-readme = "README.md"
-license = {file = "LICENSE"}
+readme = {file = "README.md", content-type = "text/markdown"}
+# PEP 639: an SPDX license expression. PolyForm-Noncommercial-1.0.0 is on the SPDX license
+# list; there is no trove classifier for it, and setuptools refuses license classifiers next
+# to a license expression. Commercial licensing is offered separately (LICENSE-COMMERCIAL.md).
+license = "PolyForm-Noncommercial-1.0.0"
+license-files = ["LICENSE", "LICENSE-COMMERCIAL.md"]
 requires-python = ">=3.11"
 dependencies = ["PyYAML>=6.0.1,<7"]
+keywords = ["ferrum", "ferrum-edge", "api-gateway", "migration", "kong", "nginx", "traefik", "envoy", "istio"]
 classifiers = [
-    "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3 :: Only",
+    "Development Status :: 4 - Beta",
     "Environment :: Console",
     "Intended Audience :: System Administrators",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Internet :: Proxy Servers",
+    "Topic :: System :: Systems Administration",
 ]
+
+[project.urls]
+Homepage = "https://github.com/ferrum-edge/ferrum-migration"
+Documentation = "https://github.com/ferrum-edge/ferrum-migration/blob/main/docs/mappings.md"
+Source = "https://github.com/ferrum-edge/ferrum-migration"
+Issues = "https://github.com/ferrum-edge/ferrum-migration/issues"
+Changelog = "https://github.com/ferrum-edge/ferrum-migration/blob/main/CHANGELOG.md"
+"Ferrum Edge" = "https://github.com/ferrum-edge/ferrum-edge"
 
 [project.scripts]
 ferrum-migrate = "ferrum_migration.cli:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
+
+[tool.setuptools.dynamic]
+version = {attr = "ferrum_migration.__version__"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
