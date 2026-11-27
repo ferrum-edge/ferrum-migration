@@ -424,11 +424,58 @@ def evaluate_term(term: list[tuple]) -> dict | None:
     return {"hosts": hosts, "kind": kind, "path": path, "methods": methods, "extra": extra}
 
 
+def _traefik_forward(request: str, strip: str | None, force_slash: bool, add: str | None) -> str:
+    """The path Traefik v3 forwards (pkg/middlewares/stripprefix and addprefix, then the reverse proxy)."""
+    path = request
+    if strip is not None and request.startswith(strip):
+        rest = request[len(strip):]
+        if force_slash:
+            path = "/" + (rest[1:] if rest.startswith("/") else rest)
+        else:
+            path = rest if rest == "" or rest.startswith("/") else "/" + rest
+    if add is not None:
+        path = add + path  # ensureLeadingSlash(prefix + path); prefix starts with '/'
+    return path or "/"  # an empty path is sent as "/"
+
+
+def _ferrum_forward(request: str, listen: str, backend: str | None, strip: bool, exact: bool) -> str:
+    """The path Ferrum forwards (Edge ``with_backend_path_parts`` / ``backend_path_layout``)."""
+    remaining = ("" if exact else request[len(listen):]) if strip else request
+    backend = backend or ""
+    if not backend and not remaining:
+        return "/"
+    joined = backend + ("/" if backend and remaining and not backend.endswith("/")
+                        and not remaining.startswith("/") else "") + remaining
+    return joined if joined.startswith("/") else "/" + joined
+
+
+def _traefik_backend_path(kind: str, path: str | None, strip: str | None, force_slash: bool,
+                          add: str | None) -> str | None:
+    """The ``backend_path`` that reproduces Traefik's forwarding for this route (see the composition table)."""
+    added = add or ""
+    if strip is None:
+        return added or None
+    remainder = (path or "")[len(strip):]
+    if kind == "exact":
+        # Ferrum forwards backend_path alone; Traefik forwards add + the stripped route path.
+        if remainder:
+            stripped = remainder
+        else:
+            stripped = "/" if force_slash else ""
+        value = added + stripped if added else (stripped or None)
+        return value or None
+    if (path or "").endswith("/") and remainder.endswith("/"):
+        remainder = remainder[:-1]  # the listen path drops that slash, so the forwarded remainder keeps it
+    value = added + remainder
+    return value if value not in ("", "/") or added else None
+
+
 @dataclass
 class _Acc:
     plugins: list[PluginSpec] = field(default_factory=list)
     refusals: list[str] = field(default_factory=list)
     strip_prefixes: list[list[str]] = field(default_factory=list)
+    strip_force_slash: bool = False
     add_prefixes: list[str] = field(default_factory=list)
     path_ops: list[str] = field(default_factory=list)
     https_redirect: bool = False
@@ -832,9 +879,9 @@ class _Traefik:
             spec.refuse("addPrefix before stripPrefix cannot be reproduced in Ferrum")
             return
         path = spec.path if spec.kind in ("prefix", "exact") else None
+        chosen = None
         if acc.strip_prefixes:
             prefixes = acc.strip_prefixes[0]
-            chosen = None
             for prefix in prefixes:
                 if path is not None and path.startswith(prefix):
                     chosen = prefix
@@ -842,30 +889,28 @@ class _Traefik:
                 if path is None or prefix.startswith(path):
                     spec.refuse("stripPrefix only applies to some requests of this route")
                     return
-            if chosen is not None:
-                spec.strip = True
-                remainder = (path or "")[len(chosen):]
-                if remainder and not remainder.startswith("/"):
-                    spec.refuse("stripPrefix splits a path segment")
-                    return
-                # Traefik forwards "/" + (request path after the stripped prefix). Ferrum forwards backend_path +
-                # the request path after its listen path, which is the route path without one trailing '/', so
-                # after a route path ending in '/' the remainder keeps that slash and backend_path drops it.
-                if spec.kind == "prefix" and (path or "").endswith("/") and remainder.endswith("/"):
-                    remainder = remainder[:-1]
-                spec.backend_path = remainder if remainder not in ("", "/") else None
-        if acc.add_prefixes:
-            # addPrefix concatenates without adding or removing a slash (Traefik: prefix + path), as Ferrum does
-            # when the forwarded remainder starts with '/'.
-            added = acc.add_prefixes[0]
-            if spec.strip and not spec.backend_path and spec.kind == "prefix" and not (path or "/").endswith("/") \
-                    and not added.endswith("/"):
-                # A request for exactly the route path is stripped to "/" by Traefik (prefix + "/"), whereas
-                # Ferrum forwards the bare prefix.
-                self.report.warning("traefik-path-composition", spec.ref,
-                                    "A request for exactly the route path reaches the backend as the addPrefix value "
-                                    "without the trailing '/' Traefik sends (/v1 instead of /v1/).")
-            spec.backend_path = added + (spec.backend_path or "")
+            if chosen is not None and path[len(chosen):] and not path[len(chosen):].startswith("/"):
+                spec.refuse("stripPrefix splits a path segment")
+                return
+        added = acc.add_prefixes[0] if acc.add_prefixes else None
+        if chosen is None and added is None:
+            return
+        spec.strip = chosen is not None
+        spec.backend_path = _traefik_backend_path(spec.kind, path, chosen, acc.strip_force_slash, added)
+        # Compare both forwardings for the requests that reach this route in Ferrum: the route path itself (or,
+        # for a prefix ending in '/', that path, since the bare path without '/' gets a 404 guard) and a child.
+        if spec.kind in ("prefix", "exact") and path is not None:
+            listen = path[:-1] if spec.kind == "prefix" and path != "/" and path.endswith("/") else path
+            probes = [path] if spec.kind == "exact" else [path, path.rstrip("/") + "/x"]
+            for request in probes:
+                expected = _traefik_forward(request, chosen, acc.strip_force_slash, added)
+                actual = _ferrum_forward(request, listen, spec.backend_path, spec.strip, spec.kind == "exact")
+                if expected != actual:
+                    self.report.warning("traefik-path-composition", spec.ref,
+                                        f"A request for {safe_label(request, 60)} reaches the backend as "
+                                        f"{safe_label(actual, 60)} in Ferrum, but as {safe_label(expected, 60)} in "
+                                        "Traefik (stripPrefix/addPrefix composition, forceSlash).")
+                    break
 
     # ------------------------------------------------- TLS handshake policy
 
@@ -1090,7 +1135,9 @@ class _Traefik:
             if not prefixes:
                 acc.refusals.append("stripPrefix without prefixes")
             else:
-                acc.strip_prefixes.append(prefixes)
+                # Traefik trims each prefix (pkg/middlewares/stripprefix) and defaults forceSlash to false.
+                acc.strip_prefixes.append([prefix.strip() for prefix in prefixes])
+                acc.strip_force_slash = config.get("forceSlash") is True
                 acc.path_ops.append("strip")
         elif mw_type == "addPrefix":
             prefix = config.get("prefix")

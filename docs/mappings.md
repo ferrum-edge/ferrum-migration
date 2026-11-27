@@ -176,7 +176,7 @@ not exercise it.
 | `Gateway` servers (HTTP, HTTPS SIMPLE/MUTUAL with file paths) | ports, TLS-only, frontend cert/client CA | `credentialName` Secrets are never read (warning). `httpsRedirect: true` servers fold into TLS-only only when at least one live (unrefused) HTTPS route exists and no other main-port plaintext routes exist; otherwise a refused placeholder is emitted for the redirect server's host scope and overlapping main-port projections are refused (`istio-frontend-scope-conflict`). PASSTHROUGH/AUTO_PASSTHROUGH/ISTIO_MUTUAL, and MUTUAL without a `caCertificates` file path, cannot be projected: on the main TLS port the routes bound to such a server are refused (placeholders), elsewhere the server is skipped. MUTUAL servers with different `caCertificates` → affected routes refused (`frontend-client-ca-scope`), never concatenated. MUTUAL/OPTIONAL_MUTUAL with `subjectAltNames`, `verifyCertificateSpki`, `verifyCertificateHash` or `caCrl` → refused (`istio-client-ca`). A host bound by both a plaintext and an HTTPS server gets one route set that keeps the HTTPS server's client CA or refusal (`istio-shared-host-tls`); `match.port` routes in that shared set are refused. Host scopes that overlap through different names (a wildcard and a host it covers) with a stricter HTTPS server or `match.port` routes refuse both projections (`istio-shared-host-scope`). Across separate bindings (other VirtualServices or Gateways), overlapping hosts with a different frontend (plaintext vs HTTPS, client CA, refused frontend) refuse every projection involved (`istio-frontend-scope-conflict`). HTTP servers on a non-main port are **not migrated** (`extra-listener-refused`) |
 | `Server.bind` | `FERRUM_PROXY_BIND_ADDRESS` | only when every HTTP(S) server binds the same IP address; otherwise servers with a specific address or Unix socket are skipped (`istio-server-bind`), never exposed on Ferrum's shared address |
 | `VirtualService` bound to a Gateway; `gateways: [mesh]` | edge routes; mesh routes reported only | not translated |
-| `http[].match` uri exact/prefix/regex, method exact | exact/prefix/regex, `allowed_methods` | headers/query/authority/... refused + poisoning. A VirtualService `uri.prefix` is a string prefix (`/api` also matched `/apix`): never widened, `prefix-string-siblings` error when such siblings do not reach an equivalent route. `ignoreUriCase` (exact/prefix) keeps the exact-case path only; routes that could receive the case variants are refused |
+| `http[].match` uri exact/prefix/regex, method exact | exact/prefix/regex, `allowed_methods` | headers/query/authority/... refused + poisoning. A VirtualService `uri.prefix` is a string prefix (`/api` also matched `/apix`): never widened, `prefix-string-siblings` error when such siblings do not reach an equivalent route. In VirtualServices marked `internal.istio.io/route-semantics: ingress|gateway` it is a path-separated prefix instead (see "Resolved from Ferrum Edge source"), so `/api` and `/apix` are disjoint routes. `ignoreUriCase` (exact/prefix) keeps the exact-case path only; routes that could receive the case variants are refused |
 | ordered `http[]` | first-match analysis | |
 | destinations, weights, ports | upstream / merged weighted upstream | subsets refused (need pod labels) |
 | `ServiceEntry` static endpoints | upstream targets | resolution NONE refused |
@@ -234,8 +234,8 @@ source sets the `backend_path` that reproduces its own composition:
 
 | Source | Composition | `backend_path` |
 |---|---|---|
-| NGINX `proxy_pass` with a URI, Envoy `prefix_rewrite`, Istio `rewrite.uri` | the URI replaces the matched prefix, joined without adding or removing a slash (`/v1/` + `/x` = `/v1//x`) | the URI, minus one trailing `/` when the prefix ends in `/`. A prefix ending in `/` (or the root prefix) rewritten to a value without one is joined with no slash by the source (`/v1x`) but with one by Ferrum (`/v1/x`): `nginx-slash-mismatch`, `envoy-rewrite-slash`, `istio-rewrite-slash`. An exact match forwards exactly the URI. |
-| Traefik `stripPrefix` / `addPrefix` | `/` + the path after the stripped prefix, then `addPrefix` + path | the rest of the route path after the stripped prefix (minus one trailing `/` after a route path ending in `/`), prefixed with the `addPrefix` value as written. A request for exactly the route path, stripped to `/` and then prefixed with a value without a trailing `/`, gets no trailing `/` in Ferrum (`traefik-path-composition`). |
+| NGINX `proxy_pass` with a URI, Envoy `prefix_rewrite`, Istio `rewrite.uri` | the URI replaces the matched prefix, joined without adding or removing a slash (`/v1/` + `/x` = `/v1//x`) | the URI, minus one trailing `/` when the prefix ends in `/`. An empty Envoy `prefix_rewrite` or Istio `uri` is no rewrite (Envoy treats it as unset; Istio builds no rewrite), and an explicit empty Envoy `prefix: ""` prepends the rewrite to the whole path (no stripping). A prefix ending in `/` (or the root prefix) rewritten to a value without one is joined with no slash by the source (`/v1x`) but with one by Ferrum (`/v1/x`): `nginx-slash-mismatch`, `envoy-rewrite-slash`, `istio-rewrite-slash`. An exact match forwards exactly the URI. |
+| Traefik `stripPrefix` / `addPrefix` | `stripPrefix` removes the prefix and adds a leading `/` to a nonempty rest (an empty rest stays empty unless `forceSlash: true`, which makes it `/`); `addPrefix` prepends its value; an empty final path is sent as `/` (Traefik v3.8 `pkg/middlewares`) | the rest of the route path after the stripped prefix (minus one trailing `/` after a route path ending in `/`), prefixed with the `addPrefix` value as written; on an exact route, the stripped route path itself. Both forwardings are compared for the route path and a child path, and any difference is reported (`traefik-path-composition`), for example `forceSlash` with `addPrefix` on a bare route path. |
 | Kong `path_handling` v0 (default) | service path + stripped path, dropping a doubled `/`, keeping a trailing `/` only when the request had one (`get_upstream_uri_v0`) | the service path minus its trailing `/`. With `strip_path: false`, a request for `/` gets the bare service path in Kong but a trailing `/` in Ferrum (`kong-path-composition`). |
 
 ## Resolved from Ferrum Edge source
@@ -250,11 +250,19 @@ Checked at Edge `39cba7bd17` (and unchanged from v0.9.21 where noted):
 * `FERRUM_TRUSTED_PROXIES` is a comma-separated list of IP addresses or CIDRs, parsed strictly: one
   invalid or empty entry fails `ferrum-edge validate` and startup (`docs/configuration.md`). The NGINX
   translation suggests only IP/CIDR `set_real_ip_from` entries (normalized to their network) and reports
-  `unix:` and host names (`nginx-real-ip-source`). `FERRUM_REAL_IP_HEADER` accepts one field-line with one
-  IP, so it is not suggested for `real_ip_header X-Forwarded-For` (Ferrum already reads `X-Forwarded-For`
-  from trusted peers); `real_ip_header proxy_protocol` suggests the PROXY protocol settings instead.
-  `FERRUM_FRONTEND_PROXY_PROTOCOL_HTTP` / `_HTTPS` accept `off`, `v1`, `v2` or `auto`; the suggestion is
-  `auto` (NGINX and Envoy accept both versions) on each listener Ferrum opens.
+  `unix:` and host names (`nginx-real-ip-source`). Ferrum reads `FERRUM_REAL_IP_HEADER` (one field-line with
+  one IP) from trusted peers and otherwise walks `X-Forwarded-For` right to left skipping trusted addresses
+  (`docs/client_ip_resolution.md`). NGINX `real_ip_header X-Forwarded-For` therefore translates only with
+  `real_ip_recursive on`; with the default `off` NGINX takes the last address even when it is trusted, so
+  nothing is suggested (`nginx-real-ip-recursive`). Another header (NGINX's default is `X-Real-IP`) is
+  suggested as `FERRUM_REAL_IP_HEADER`, reporting that Ferrum falls back to the `X-Forwarded-For` walk when
+  it is absent where NGINX keeps the connection address (`nginx-real-ip-fallback`).
+  `real_ip_header proxy_protocol` suggests the PROXY protocol settings, with the `set_real_ip_from`
+  addresses as `FERRUM_FRONTEND_PROXY_PROTOCOL_TRUSTED_CIDRS`.
+  `FERRUM_FRONTEND_PROXY_PROTOCOL_HTTP` / `_HTTPS` accept `off`, `v1`, `v2` or `auto` and always require the
+  header. The suggestion is `auto` for NGINX (both versions, header required) and Envoy, or `v1`/`v2` when an
+  Envoy listener disallows the other version; an Envoy listener with
+  `allow_requests_without_proxy_protocol: true` gets no suggestion (`envoy-proxy-protocol-optional`).
 * Istio VirtualServices that Istio generates from Kubernetes Ingress or Gateway API resources carry
   `internal.istio.io/route-semantics: ingress|gateway`; Istio then matches a `uri.prefix` other than `/` as
   a path-separated prefix with one trailing `/` trimmed, and under `gateway` a rewrite to `/` keeps `/` plus

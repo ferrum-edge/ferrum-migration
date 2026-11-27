@@ -1,0 +1,59 @@
+# Synthetic Envoy static v3 bootstrap. Loopback listener and STATIC clusters only.
+static_resources:
+  listeners:
+    - name: ingress_http
+      address:
+        socket_address:
+          address: 127.0.0.1
+          port_value: ${LISTEN_PORT}
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress_http
+                route_config:
+                  name: local_route
+                  virtual_hosts:
+                    - name: edges
+                      domains: ["edges.example.test"]
+                      routes:
+                        - match:
+                            prefix: "/keep"
+                          route:
+                            cluster: svc_a
+                            prefix_rewrite: ""
+                        - match:
+                            prefix: ""
+                          route:
+                            cluster: svc_b
+                            prefix_rewrite: "/v1/"
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters:
+    - name: svc_a
+      type: STATIC
+      connect_timeout: 1s
+      load_assignment:
+        cluster_name: svc_a
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: ${ECHO_A_PORT}
+    - name: svc_b
+      type: STATIC
+      connect_timeout: 1s
+      load_assignment:
+        cluster_name: svc_b
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: ${ECHO_B_PORT}

@@ -99,6 +99,40 @@ class EnvoyPathTest(unittest.TestCase):
         self.assertEqual(compose("/raw", raw["backend_path"], "/raw/x"), "//x")  # Envoy: "/" + "/x"
         self.assertNotIn("envoy-exact-rewrite", codes(report))
 
+    def test_empty_rewrite_is_unset_and_empty_prefix_prepends(self):
+        doc = bootstrap_with_routes([
+            {"name": "keep", "match": {"prefix": "/keep"}, "route": {"cluster": "c", "prefix_rewrite": ""}},
+            {"name": "all", "match": {"prefix": ""}, "route": {"cluster": "c", "prefix_rewrite": "/v1/"}},
+        ])
+        result, _report, _plan = migrate("envoy", yaml.safe_dump(doc))
+        keep = one_proxy(self, result.config, "/keep", "app.example.test")
+        self.assertFalse(keep["strip_listen_path"])  # Envoy: an empty prefix_rewrite is unset
+        self.assertNotIn("backend_path", keep)
+        catch_all = one_proxy(self, result.config, "/", "app.example.test")
+        self.assertFalse(catch_all["strip_listen_path"])  # the empty matched prefix is replaced: no stripping
+        self.assertEqual(catch_all["backend_path"], "/v1/")
+        # Envoy: "/v1/" + "/x" = "/v1//x"; Ferrum appends the unstripped path to the backend path.
+        self.assertEqual(catch_all["backend_path"] + "/x", "/v1//x")
+
+    def test_proxy_protocol_options(self):
+        def listener_with(config):
+            doc = bootstrap_with_routes([{"name": "r", "match": {"prefix": "/"}, "route": {"cluster": "c"}}])
+            doc["static_resources"]["listeners"][0]["listener_filters"] = [{
+                "name": "envoy.filters.listener.proxy_protocol",
+                "typed_config": {"@type": "type.googleapis.com/envoy.extensions.filters.listener.proxy_protocol.v3."
+                                          "ProxyProtocol", **config}}]
+            result, report, plan = migrate("envoy", yaml.safe_dump(doc))
+            return render("file", "envoy", plan.settings, result.tls_only, result.basic_auth_used,
+                          "resources.yaml").splitlines(), report
+
+        lines, report = listener_with({"allow_requests_without_proxy_protocol": True})
+        self.assertFalse([line for line in lines if line.startswith("# FERRUM_FRONTEND_PROXY_PROTOCOL_HTTP=")])
+        self.assertIn("envoy-proxy-protocol-optional", codes(report))
+        lines, _report = listener_with({"disallowed_versions": ["V1"]})
+        self.assertIn("# FERRUM_FRONTEND_PROXY_PROTOCOL_HTTP=v2", lines)
+        lines, _report = listener_with({})
+        self.assertIn("# FERRUM_FRONTEND_PROXY_PROTOCOL_HTTP=auto", lines)
+
 
 class TraefikPathTest(unittest.TestCase):
     def convert(self, middlewares, rule):
@@ -120,10 +154,37 @@ class TraefikPathTest(unittest.TestCase):
         proxy = one_proxy(self, result.config, "/api")
         self.assertEqual(proxy["backend_path"], "/v1/")  # Traefik: "/v1/" + "/api/x" = "/v1//api/x"
 
-    def test_bare_route_path_after_strip_and_add_is_reported(self):
-        _result, report, _plan = self.convert({"strip": {"stripPrefix": {"prefixes": ["/api"]}},
-                                               "add": {"addPrefix": {"prefix": "/v1"}}}, "PathPrefix(`/api`)")
+    def test_strip_and_add_with_a_doubled_slash_is_representable(self):
+        # Traefik: /api/orders/x -> strip /api -> /orders/x -> add /v1/ -> /v1//orders/x. Edge appends the
+        # backend path verbatim, so the empty segment is emitted, not refused.
+        result, report, _plan = self.convert({"strip": {"stripPrefix": {"prefixes": ["/api"]}},
+                                              "add": {"addPrefix": {"prefix": "/v1/"}}}, "PathPrefix(`/api/orders`)")
+        proxy = one_proxy(self, result.config, "/api/orders")
+        self.assertEqual(proxy["labels"]["ferrum-migration/status"], "migrated")
+        self.assertEqual(proxy["backend_path"], "/v1//orders")
+        self.assertEqual(compose("/api/orders", proxy["backend_path"], "/api/orders/x"), "/v1//orders/x")
+        self.assertNotIn("traefik-path-composition", codes(report))
+
+    def test_bare_route_path_follows_force_slash(self):
+        middlewares = {"strip": {"stripPrefix": {"prefixes": ["/api"]}}, "add": {"addPrefix": {"prefix": "/v1"}}}
+        # forceSlash false (Traefik v3.8 default): /api strips to "" and /v1 + "" = /v1, exactly as Ferrum.
+        result, report, _plan = self.convert(middlewares, "PathPrefix(`/api`)")
+        proxy = one_proxy(self, result.config, "/api")
+        self.assertEqual(compose("/api", proxy["backend_path"], "/api"), "/v1")
+        self.assertEqual(compose("/api", proxy["backend_path"], "/api/x"), "/v1/x")
+        self.assertNotIn("traefik-path-composition", codes(report))
+        # forceSlash true: /api strips to "/" and Traefik sends /v1/, which Ferrum cannot (it sends /v1).
+        middlewares["strip"]["stripPrefix"]["forceSlash"] = True
+        _result, report, _plan = self.convert(middlewares, "PathPrefix(`/api`)")
         self.assertIn("traefik-path-composition", codes(report))
+
+    def test_force_slash_on_an_exact_route_is_exact(self):
+        middlewares = {"strip": {"stripPrefix": {"prefixes": ["/api"], "forceSlash": True}},
+                       "add": {"addPrefix": {"prefix": "/v1"}}}
+        result, report, _plan = self.convert(middlewares, "Path(`/api`)")
+        proxy = one_proxy(self, result.config, "=/api")
+        self.assertEqual(proxy["backend_path"], "/v1/")  # Traefik: /v1 + "/" (forceSlash)
+        self.assertNotIn("traefik-path-composition", codes(report))
 
 
 class KongPathTest(unittest.TestCase):
@@ -142,16 +203,30 @@ class KongPathTest(unittest.TestCase):
         self.assertEqual(compose("/orders", proxy["backend_path"], "/orders"), "/v1")
         self.assertEqual(compose("/orders", proxy["backend_path"], "/orders/x"), "/v1/x")
 
-    def test_unstripped_root_request_is_reported(self):
+    def kong(self, route):
         text = textwrap.dedent("""
             _format_version: "3.0"
             services:
               - name: s
                 url: http://s.internal:8080/v1
-                routes: [{name: r, paths: [/], strip_path: false}]
-            """)
-        _result, report, _plan = migrate("kong", text)
-        self.assertIn("kong-path-composition", codes(report))
+                routes: [ROUTE]
+            """).replace("ROUTE", route)
+        return migrate("kong", text)
+
+    def test_unstripped_root_request_is_reported(self):
+        # Kong v0 forwards "/" as /v1 wherever Ferrum would not strip the root slash (it sends /v1/).
+        for route in ("{name: r, paths: [/], strip_path: false}",
+                      "{name: r, hosts: [app.example.test]}",
+                      "{name: r, hosts: [app.example.test], strip_path: false}",
+                      '{name: r, paths: ["~^/$"], strip_path: false}'):
+            with self.subTest(route=route):
+                _result, report, _plan = self.kong(route)
+                self.assertIn("kong-path-composition", codes(report))
+
+    def test_stripped_root_route_is_exact(self):
+        # paths: [/] with strip: Kong and Ferrum both strip "/" and forward /v1 for "/".
+        _result, report, _plan = self.kong("{name: r, paths: [/]}")
+        self.assertNotIn("kong-path-composition", codes(report))
 
 
 class IstioRouteSemanticsTest(unittest.TestCase):
@@ -178,6 +253,26 @@ class IstioRouteSemanticsTest(unittest.TestCase):
         self.assertIn("/api", [p.get("listen_path") for p in result.config["proxies"]])
         self.assertNotIn("prefix-string-siblings", codes(report))
 
+    def test_disjoint_segment_prefixes_both_forward(self):
+        # /api before /apix: Istio's path-separated prefixes (and Ferrum's segments) never share a request.
+        docs = [
+            {"apiVersion": "networking.istio.io/v1", "kind": "Gateway", "metadata": {"name": "gw", "namespace": "default"},
+             "spec": {"servers": [{"port": {"number": 80, "name": "http", "protocol": "HTTP"},
+                                   "hosts": ["app.example.test"]}]}},
+            {"apiVersion": "networking.istio.io/v1", "kind": "VirtualService",
+             "metadata": {"name": "app", "namespace": "default",
+                          "annotations": {"internal.istio.io/route-semantics": "ingress"}},
+             "spec": {"hosts": ["app.example.test"], "gateways": ["gw"], "http": [
+                 {"name": "api", "match": [{"uri": {"prefix": "/api"}}],
+                  "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}]},
+                 {"name": "apix", "match": [{"uri": {"prefix": "/apix"}}],
+                  "route": [{"destination": {"host": "apix.default.svc.cluster.local", "port": {"number": 8080}}}]}]}},
+        ]
+        result, _report, _plan = migrate("istio", yaml.safe_dump_all(docs))
+        for path in ("/api", "/apix"):
+            proxy = one_proxy(self, result.config, path, "app.example.test")
+            self.assertEqual(proxy["labels"]["ferrum-migration/status"], "migrated", path)
+
     def test_ordinary_virtual_service_keeps_string_prefixes(self):
         _result, _report, plan = self.convert(None)
         api = [r for r in plan.routes if r.name == "api"][0]
@@ -198,12 +293,50 @@ class ClientIpSettingsTest(unittest.TestCase):
               set_real_ip_from unix:;
               set_real_ip_from proxy.example.test;
               real_ip_header X-Forwarded-For;
+              real_ip_recursive on;
               server { listen 80; server_name app.example.test; location / { proxy_pass http://a.internal:8080; } }
             }
             """)
         self.assertIn("# FERRUM_TRUSTED_PROXIES=10.0.0.1,192.168.1.0/24", conf.splitlines())
         self.assertNotIn("FERRUM_REAL_IP_HEADER", conf)
         self.assertIn("nginx-real-ip-source", codes(report))
+
+    def test_forwarded_for_without_recursion_is_not_suggested(self):
+        # real_ip_recursive off (default): NGINX uses the last XFF address even when trusted; Ferrum skips it.
+        conf, report = self.conf("""
+            http {
+              set_real_ip_from 10.0.0.0/8;
+              real_ip_header X-Forwarded-For;
+              server { listen 80; server_name app.example.test; location / { proxy_pass http://a.internal:8080; } }
+            }
+            """)
+        self.assertNotIn("FERRUM_TRUSTED_PROXIES=", conf)
+        self.assertIn("nginx-real-ip-recursive", codes(report))
+
+    def test_default_header_is_x_real_ip(self):
+        conf, report = self.conf("""
+            http {
+              set_real_ip_from 10.0.0.0/8;
+              server { listen 80; server_name app.example.test; location / { proxy_pass http://a.internal:8080; } }
+            }
+            """)
+        lines = conf.splitlines()
+        self.assertIn("# FERRUM_REAL_IP_HEADER=X-Real-IP", lines)
+        self.assertIn("# FERRUM_TRUSTED_PROXIES=10.0.0.0/8", lines)
+        self.assertIn("nginx-real-ip-fallback", codes(report))
+
+    def test_proxy_protocol_real_ip_source(self):
+        conf, _report = self.conf("""
+            http {
+              set_real_ip_from 10.0.0.0/8;
+              real_ip_header proxy_protocol;
+              server { listen 80 proxy_protocol; server_name app.example.test;
+                       location / { proxy_pass http://a.internal:8080; } }
+            }
+            """)
+        lines = conf.splitlines()
+        self.assertIn("# FERRUM_FRONTEND_PROXY_PROTOCOL_TRUSTED_CIDRS=10.0.0.0/8", lines)
+        self.assertNotIn("FERRUM_TRUSTED_PROXIES=", conf)
 
     def test_real_ip_header_and_proxy_protocol(self):
         conf, _report = self.conf("""
@@ -218,6 +351,18 @@ class ClientIpSettingsTest(unittest.TestCase):
         self.assertIn("# FERRUM_REAL_IP_HEADER=X-Real-IP", lines)
         self.assertIn("# FERRUM_FRONTEND_PROXY_PROTOCOL_HTTP=auto", lines)
         self.assertNotIn("# FERRUM_FRONTEND_PROXY_PROTOCOL_HTTP=true", lines)
+
+
+class StatusWordingTest(unittest.TestCase):
+    def test_preview_is_current_not_permanent(self):
+        import os
+        from helpers import ROOT
+        for name in ("README.md", os.path.join("docs", "releasing.md")):
+            with open(os.path.join(ROOT, name), encoding="utf-8") as handle:
+                text = handle.read()
+            with self.subTest(name=name):
+                self.assertNotIn("stays on `0.x`", text)
+                self.assertIn("currently a `0.x` preview", text)
 
 
 if __name__ == "__main__":

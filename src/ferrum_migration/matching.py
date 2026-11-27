@@ -286,20 +286,40 @@ def receives_case_variants(source, other) -> bool:
 
 
 def _segment_exact_disjoint(a, b) -> bool:
-    """A segment prefix (Envoy ``path_separated_prefix``) and a literal exact path that it provably never matches.
+    """A segment prefix (Envoy ``path_separated_prefix``, Istio route-semantics prefixes) and a literal route it
+    provably never shares a request with.
 
-    ``/api`` with segment semantics matches ``/api`` and ``/api/...`` only, in the source and in Ferrum alike,
-    so an exact ``/apix`` (or ``/ap``) is disjoint from it. Any other pair keeps the conservative string check.
+    ``/api`` with segment semantics matches ``/api`` and ``/api/...`` only, in the source and in Ferrum alike.
+    It is disjoint from an exact ``/apix`` (or ``/ap``), from another segment prefix ``/apix`` (neither is a
+    segment ancestor of the other), and from a string prefix ``/apix`` (every path it matches starts with
+    ``/apix``, which is neither ``/api`` nor under ``/api/``). Any other pair keeps the conservative string check.
     """
-    for seg, exact in ((a, b), (b, a)):
-        if seg.kind != "prefix" or getattr(seg, "prefix_semantics", "string") != "segment" or exact.kind != "exact":
+    for seg, other in ((a, b), (b, a)):
+        if seg.kind != "prefix" or getattr(seg, "prefix_semantics", "string") != "segment":
             continue
-        if seg.path is None or exact.path is None:
+        if other.kind not in ("exact", "prefix"):
+            continue
+        if not isinstance(seg.path, str) or not isinstance(other.path, str):
             return False
         base = seg.path.rstrip("/")
         if not base:
             return False  # a segment prefix of "/" matches every path
-        return not (exact.path == base or exact.path.startswith(base + "/"))
+
+        def under(path: str) -> bool:
+            return path == base or path.startswith(base + "/")
+
+        if other.kind == "exact":
+            return not under(other.path)
+        if getattr(other, "prefix_semantics", "string") == "segment":
+            other_base = other.path.rstrip("/")
+            if not other_base:
+                return False
+            return not (under(other_base) or base == other_base or base.startswith(other_base + "/"))
+        # A string prefix q: disjoint when q extends base inside one segment (/apix), or diverges from it.
+        q = other.path
+        if q.startswith(base):
+            return not under(q) and not q.startswith(base + "/") and len(q) > len(base) and q[len(base)] != "/"
+        return not base.startswith(q)
     return False
 
 

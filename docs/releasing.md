@@ -1,6 +1,6 @@
 # Releasing ferrum-migration
 
-Ferrum Migration is a preview on `0.x` (see the README's Status section). A release is a
+Ferrum Migration is currently a `0.x` preview (see the README's Status section). A release is a
 `vX.Y.Z` tag on `main` (strict `X.Y.Z`: no `-rc`, `-beta` or other suffix), a GitHub release
 with the sdist, the wheel, `SHA256SUMS` and build provenance attestations, and, once enabled,
 the same files on PyPI. Everything after the tag push is done by

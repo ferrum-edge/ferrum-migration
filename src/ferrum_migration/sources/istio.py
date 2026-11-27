@@ -807,7 +807,8 @@ class _Istio:
         rewrite = mapping(entry.get("rewrite"))
         if rewrite.get("uriRegexRewrite"):
             spec.refuse("uriRegexRewrite is not supported")
-        if isinstance(rewrite.get("uri"), str):
+        # Istio builds a URI rewrite only for a nonempty uri (route.go): "" leaves the path unchanged.
+        if isinstance(rewrite.get("uri"), str) and rewrite["uri"] != "":
             if spec.kind == "regex":
                 spec.refuse("uri rewrite on a regex match is not supported")
             else:

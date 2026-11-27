@@ -336,6 +336,8 @@ class _Nginx:
         self.http_directives = http
         self.http_scope = self.apply(_Scope(), [d for d in http if d.name not in ("server",)], "nginx http")
         servers = []
+        real_ip_header: str | None = None
+        real_ip_recursive = False  # NGINX default: off
         for directive in http:
             if directive.name == "upstream" and directive.args and directive.block is not None:
                 self.upstream_blocks[directive.args[0]] = directive
@@ -346,7 +348,10 @@ class _Nginx:
             elif directive.name == "set_real_ip_from" and directive.args:
                 self._trusted_proxy(directive.args[0])
             elif directive.name == "real_ip_header" and directive.args:
-                self._real_ip_header(directive.args[0])
+                real_ip_header = directive.args[0]
+            elif directive.name == "real_ip_recursive" and directive.args:
+                real_ip_recursive = directive.args[0].lower() == "on"
+        self._real_ip(real_ip_header, real_ip_recursive)
         if self.plan.settings.trusted_proxies or self.plan.settings.real_ip_header:
             self.report.warning("nginx-real-ip", "nginx http", "Client-IP resolution behind trusted proxies is only "
                                 "suggested in ferrum.conf; ip_restriction and rate limits use the socket peer until "
@@ -389,26 +394,51 @@ class _Nginx:
         if entry not in settings.trusted_proxies:
             settings.trusted_proxies.append(entry)
 
-    def _real_ip_header(self, value: str) -> None:
-        """``real_ip_header`` into Ferrum's client-IP settings.
+    def _real_ip(self, header: str | None, recursive: bool) -> None:
+        """``real_ip_header`` / ``real_ip_recursive`` into Ferrum's client-IP settings, only where they agree.
 
-        ``X-Forwarded-For`` is what Ferrum already reads from ``FERRUM_TRUSTED_PROXIES`` peers, and
-        ``FERRUM_REAL_IP_HEADER`` accepts only one field-line holding one IP, so it is not suggested for
-        it. ``proxy_protocol`` takes the client address from the PROXY header, which Ferrum configures with
-        its frontend PROXY protocol settings.
+        NGINX (ngx_http_realip_module) replaces the client address only for connections from a
+        ``set_real_ip_from`` address, from ``real_ip_header`` (default ``X-Real-IP``). With
+        ``real_ip_recursive off`` (the default) it takes the last address of the header, even a trusted
+        one; with ``on`` the last address that is not trusted.
+
+        Ferrum (``docs/client_ip_resolution.md``) reads ``FERRUM_REAL_IP_HEADER`` (one field-line holding one
+        address) from a trusted peer and, when that header is absent, walks ``X-Forwarded-For`` right to left
+        skipping trusted addresses. So ``X-Forwarded-For`` translates only with ``real_ip_recursive on``, and a
+        single-address header translates with a reported difference when it is missing.
         """
         settings = self.plan.settings
-        lowered = value.lower()
+        if not settings.trusted_proxies:
+            return  # without set_real_ip_from NGINX never replaces the client address
+        header = header or "X-Real-IP"
+        lowered = header.lower()
         if lowered == "x-forwarded-for":
+            if not recursive:
+                settings.trusted_proxies = []
+                self.report.warning("nginx-real-ip-recursive", "nginx http",
+                                    "real_ip_recursive is off: NGINX takes the last X-Forwarded-For address even when "
+                                    "it is a trusted proxy, whereas Ferrum skips trusted addresses. "
+                                    "FERRUM_TRUSTED_PROXIES is not suggested; configure client-IP resolution "
+                                    "manually.")
             return
         if lowered == "proxy_protocol":
+            # The address comes from the PROXY header of connections from the trusted addresses.
             settings.proxy_protocol = True
+            settings.proxy_protocol_trusted = list(settings.trusted_proxies)
+            settings.trusted_proxies = []
             return
-        if header_name_ok(value):
-            settings.real_ip_header = value
-        else:
+        if not header_name_ok(header):
+            settings.trusted_proxies = []
             self.report.warning("nginx-real-ip-source", "nginx http", "real_ip_header does not name an HTTP header; "
-                                "it was not suggested.")
+                                "client-IP resolution is not suggested.")
+            return
+        settings.real_ip_header = header
+        message = (f"When {safe_label(header, 40)} is absent, NGINX keeps the connection's address whereas Ferrum "
+                   "walks X-Forwarded-For from the trusted peer; have the proxies always send the header.")
+        if recursive:
+            message += (" real_ip_recursive on also lets NGINX read an address list in the header, whereas Ferrum "
+                        "accepts exactly one address.")
+        self.report.warning("nginx-real-ip-fallback", "nginx http", message)
 
     def _zone(self, directive: Directive) -> None:
         key = directive.args[0] if directive.args else ""

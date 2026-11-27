@@ -406,10 +406,9 @@ def _validate_route(route: RouteSpec, plan: Plan, options: EmitOptions, report: 
         # Kept as the source computed it, trailing slash included: Ferrum forwards backend_path followed by the
         # request path after the listen path, adding '/' only when neither side has one (each source derives
         # the value that reproduces its own path composition).
-        path = route.backend_path
-        problem = util.canonical_path_problem(path)
-        if problem or len(path) > util.MAX_BACKEND_PATH_LENGTH:
-            route.refuse(f"backend path is not representable ({problem or 'too long'})")
+        problem = util.backend_path_problem(route.backend_path)
+        if problem:
+            route.refuse(f"backend path is not representable ({problem})")
     elif route.backend_path == "":
         route.backend_path = None
     for attr in ("connect_timeout_ms", "read_timeout_ms", "write_timeout_ms"):

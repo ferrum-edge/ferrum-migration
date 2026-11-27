@@ -176,16 +176,22 @@ def render(run_mode: str, platform: str, settings: SettingsHints, tls_only: bool
         if settings.real_ip_header:
             out.suggest("FERRUM_REAL_IP_HEADER", settings.real_ip_header,
                         "SUGGESTED: the source read the client IP from this header.")
-        if settings.proxy_protocol:
-            # Ferrum accepts off|v1|v2|auto per listener; NGINX and Envoy accept both PROXY versions (auto).
-            # Once enabled the header is required, only from FERRUM_FRONTEND_PROXY_PROTOCOL_TRUSTED_CIDRS peers.
-            note = ("SUGGESTED: the source accepted PROXY protocol (v1 or v2). Enable it only on the listeners that "
-                    "receive it, and set the load balancers' CIDRs below (the header then becomes mandatory).")
+        if settings.proxy_protocol and settings.proxy_protocol_version:
+            # Ferrum accepts off|v1|v2|auto per listener and, once enabled, requires the header from
+            # FERRUM_FRONTEND_PROXY_PROTOCOL_TRUSTED_CIDRS peers. Sources whose header was optional, or whose
+            # listeners disagree on the version, are reported instead of suggested.
+            version = settings.proxy_protocol_version
+            note = (f"SUGGESTED: the source required PROXY protocol ({'v1 or v2' if version == 'auto' else version}). "
+                    "Enable it only on the listeners that receive it, and set the load balancers' CIDRs below.")
             if protocols != "https":
-                out.suggest("FERRUM_FRONTEND_PROXY_PROTOCOL_HTTP", "auto", note)
+                out.suggest("FERRUM_FRONTEND_PROXY_PROTOCOL_HTTP", version, note)
             if protocols != "http":
-                out.suggest("FERRUM_FRONTEND_PROXY_PROTOCOL_HTTPS", "auto", note)
-            out.lines.append("# FERRUM_FRONTEND_PROXY_PROTOCOL_TRUSTED_CIDRS=<load balancer CIDRs, comma-separated>")
+                out.suggest("FERRUM_FRONTEND_PROXY_PROTOCOL_HTTPS", version, note)
+            if settings.proxy_protocol_trusted:
+                out.suggest("FERRUM_FRONTEND_PROXY_PROTOCOL_TRUSTED_CIDRS", ",".join(settings.proxy_protocol_trusted),
+                            "SUGGESTED: the source accepted PROXY headers from these addresses.")
+            else:
+                out.lines.append("# FERRUM_FRONTEND_PROXY_PROTOCOL_TRUSTED_CIDRS=<load balancer CIDRs, comma-separated>")
         out.blank()
 
     if basic_auth_used and run_mode != "cp":
