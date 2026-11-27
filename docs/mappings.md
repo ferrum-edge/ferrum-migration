@@ -209,12 +209,15 @@ The resources file is `resources.yaml` or `resources.json`. Ferrum's spec discov
 write one format next to an existing file of the other format. The report's next steps always pass
 `--spec` explicitly.
 
+Resolved from source: `request_termination`'s `trigger.path_prefix` is a plain string prefix of
+the canonical request path (`Trigger::PathPrefix(prefix) => ctx.path.starts_with(prefix)` in
+`src/plugins/request_termination.rs`, unchanged between v0.9.21 and Edge `main` at
+`39cba7bd17`), which is what the prefix-sibling guards rely on.
+
 ## Open questions (not verifiable from source alone; review on first real run)
 
 * Exact composition of `backend_path` with a stripped path of `""` vs `"/"` (exact-match
   rewrites are flagged with a warning).
-* Whether `request_termination`'s `trigger.path_prefix` is a plain string prefix. The guard
-  logic assumes it is, as its name and validator suggest.
 * `FERRUM_TRUSTED_PROXIES` list syntax (only suggested, commented).
 * Istio VirtualServices that Istio itself generates from Kubernetes Ingress or Gateway API
   resources (marked with an internal route-semantics annotation) are understood to use
