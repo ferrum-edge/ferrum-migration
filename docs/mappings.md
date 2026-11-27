@@ -209,12 +209,30 @@ The resources file is `resources.yaml` or `resources.json`. Ferrum's spec discov
 write one format next to an existing file of the other format. The report's next steps always pass
 `--spec` explicitly.
 
+## Sticky sessions (consistent hashing)
+
+Ferrum admits `hash_on` only as `ip`, `header:<token>` or `cookie:<token>` (at most 255 bytes) and
+`hash_on_cookie_config` only with a `/`-rooted path without `;` or control characters, a
+`ttl_seconds` from 0 to 86400, a valid domain and `SameSite` `Strict`/`Lax`/`None`
+(`src/config/types.rs`); one invalid value rejects the whole resources file. Ferrum always issues
+its own sticky cookie (`Max-Age=<ttl_seconds>`, or none for `session_cookie`) to a client without one.
+
+| Source | Mapping |
+|---|---|
+| Kong `hash_on: cookie` | `cookie:<hash_on_cookie>`, `path` from `hash_on_cookie_path`, `session_cookie: true`, `http_only: true` (Kong's balancer writes a session cookie with `HttpOnly`; its misspelled `Same-Site` attribute is ignored by browsers, so no `SameSite`). Kong hashes any value it finds, while Ferrum replaces a value it did not issue, so a cookie the application sets itself must not be reused (`kong-hash-cookie`). A non-token name or unrepresentable path falls back to round robin (`kong-hash-on`). |
+| Traefik `sticky.cookie` | `maxAge` 0 (default) → `session_cookie`; negative → `ttl_seconds: 0` (Go sends `Max-Age=0`); above 86400 → clamped (`traefik-sticky-max-age`). `httpOnly`, `secure`, `sameSite` (matched case-insensitively, as Traefik does), `path`, `domain` carried over; a non-token name, invalid path, domain or sameSite is replaced with a warning (`traefik-sticky-cookie-*`). |
+| Envoy `hash_policy.cookie`, Istio `consistentHash.httpCookie` | With `ttl` (the proxy generates the cookie): whole seconds of `ttl` → `ttl_seconds` (zero and sub-second ttls are session cookies in Envoy → `session_cookie`; above 86400 clamped), `path` (absent → `/`, warning), `http_only: true`. Envoy routes that hash the same cookie into one cluster share one upstream with the first route's settings (`envoy-hash-cookie-conflict` when they differ). Without `ttl` the source only reads a cookie the application owns; Ferrum would overwrite it with its own binding, so cookie hashing is not migrated (round robin, warning). |
+| every source | a header or cookie name that is not an HTTP token falls back to round robin; the emitter re-checks every value and drops anything Ferrum would refuse (`hash-on-not-representable`, `hash-cookie-not-representable`). |
+
+Resolved from source: `request_termination`'s `trigger.path_prefix` is a plain string prefix of
+the canonical request path (`Trigger::PathPrefix(prefix) => ctx.path.starts_with(prefix)` in
+`src/plugins/request_termination.rs`, unchanged between v0.9.21 and Edge `main` at
+`39cba7bd17`), which is what the prefix-sibling guards rely on.
+
 ## Open questions (not verifiable from source alone; review on first real run)
 
 * Exact composition of `backend_path` with a stripped path of `""` vs `"/"` (exact-match
   rewrites are flagged with a warning).
-* Whether `request_termination`'s `trigger.path_prefix` is a plain string prefix. The guard
-  logic assumes it is, as its name and validator suggest.
 * `FERRUM_TRUSTED_PROXIES` list syntax (only suggested, commented).
 * Istio VirtualServices that Istio itself generates from Kubernetes Ingress or Gateway API
   resources (marked with an internal route-semantics annotation) are understood to use

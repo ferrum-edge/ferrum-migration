@@ -104,7 +104,8 @@ required reviewers.
    * `package (sdist + wheel, twine check)`
    * `ferrum-edge pinned release admission + runtime acceptance (linux)`
 
-   Do not require `Edge release drift`: it tracks Edge's newest release and is an early warning.
+   Do not require `Edge release drift` or `Edge main drift`: they track Edge's newest release
+   and Edge `main`, and are early warnings.
 4. **GitHub environment `pypi`** (required before PyPI). Settings, Environments, New
    environment `pypi`: under deployment branches and tags allow only the tag pattern `v*`, and
    add **required reviewers** (release maintainers; enable *Prevent self-review* if more than

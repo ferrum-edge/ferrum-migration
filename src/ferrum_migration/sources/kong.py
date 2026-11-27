@@ -19,7 +19,8 @@ from ..errors import InputError
 from ..model import BackendRef, ConsumerSpec, Plan, PluginSpec, RouteSpec, Target, TlsSpec, UpstreamSpec
 from ..redact import contains_secret_reference, safe_label
 from ..safe_load import load_structured
-from .common import (SourceContext, check_route_budget, correlation_id_header_ok, cors_config,
+from .common import (SourceContext, check_route_budget, cookie_path_ok, correlation_id_header_ok, cors_config,
+                     hash_on_value,
                      has_explicit_default_origin_port, has_leading_zero_origin_port, header_name_ok, header_value_ok,
                      is_canonical_http_origin, mapping, query_rule, request_header_rule, response_header_rule, seq,
                      str_list)
@@ -885,13 +886,23 @@ class _Kong:
         spec.algorithm = mapped
         if mapped == "consistent_hashing":
             hash_on = raw.get("hash_on") or "none"
+            header_key = hash_on_value("header", raw.get("hash_on_header")) if hash_on == "header" else None
+            cookie_key = hash_on_value("cookie", raw.get("hash_on_cookie")) if hash_on == "cookie" else None
+            cookie_path = raw.get("hash_on_cookie_path") or "/"
             if hash_on == "ip":
                 spec.hash_on = "ip"
-            elif hash_on == "header" and isinstance(raw.get("hash_on_header"), str):
-                spec.hash_on = f"header:{raw['hash_on_header'].lower()}"
-            elif hash_on == "cookie" and isinstance(raw.get("hash_on_cookie"), str):
-                spec.hash_on = f"cookie:{raw['hash_on_cookie']}"
-                spec.hash_on_cookie_config = {"path": raw.get("hash_on_cookie_path") or "/"}
+            elif header_key:
+                spec.hash_on = header_key
+            elif cookie_key and cookie_path_ok(cookie_path):
+                spec.hash_on = cookie_key
+                # Kong's balancer writes `<name>=<value>; Path=<path>; Same-Site=Lax; HttpOnly` with no Max-Age
+                # (kong/runloop/balancer/init.lua set_cookie): a browser session cookie. Its misspelled
+                # `Same-Site` attribute is ignored by browsers, so no SameSite is emitted either.
+                spec.hash_on_cookie_config = {"path": cookie_path, "session_cookie": True, "http_only": True}
+                self.report.warning("kong-hash-cookie", ref,
+                                    "Ferrum issues and resolves its own binding under this cookie name: a value it did "
+                                    "not issue (one the application sets itself, unlike Kong, which hashes any value "
+                                    "it finds) is replaced. Use a cookie name only the gateway sets.")
             else:
                 self.report.warning("kong-hash-on", ref,
                                     "hash_on source has no equivalent; using round robin (stickiness lost).")

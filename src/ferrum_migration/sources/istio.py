@@ -14,6 +14,7 @@ Secrets are never read.
 from __future__ import annotations
 
 import ipaddress
+import json
 import math
 from typing import Any
 
@@ -23,7 +24,8 @@ from ..model import BackendRef, HostScope, Plan, PluginSpec, RouteSpec, Target, 
 from ..redact import safe_label
 from ..safe_load import load_structured
 from .common import (SourceContext, apply_first_match_order, check_route_budget, choose_main_port, cors_config,
-                     cors_origin_star_probe, fault_injection_config, header_value_ok, literal_value, mapping,
+                     cors_origin_star_probe, envoy_cookie_hash, fault_injection_config, hash_on_value,
+                     header_value_ok, literal_value, mapping,
                      merge_weighted_targets, parse_percentage, request_header_rule, response_header_rule,
                      retry_from_policy, seq, str_list)
 
@@ -1063,17 +1065,20 @@ class _Istio:
         if problem:
             return {"problem": problem}
         rule = self._destination_rule(fqdn, gw_ns)
-        tls, scheme, algorithm, hash_on, problem = self._traffic_policy(rule, port, ref, se_sans)
+        tls, scheme, algorithm, hash_policy, problem = self._traffic_policy(rule, port, ref, se_sans)
         if problem:
             return {"problem": problem}
+        hash_on, cookie_config = hash_policy if hash_policy else (None, None)
         if rule is None and not self.no_dr_warned:
             self.no_dr_warned = True
             self.report.warning("istio-no-destination-rule", ref, "Destinations without a DestinationRule are reached "
                                 "over plaintext HTTP; workloads requiring mesh mTLS reject these requests (fail closed).")
-        key = f"{fqdn}:{port}|{scheme}|{tls.key()}|{algorithm}|{hash_on}"
+        key = (f"{fqdn}:{port}|{scheme}|{tls.key()}|{algorithm}|{hash_on}|"
+               f"{json.dumps(cookie_config, sort_keys=True) if cookie_config else ''}")
         if key not in self.plan.upstreams:
             self.plan.upstreams[key] = UpstreamSpec(key=key, name=f"{fqdn}-{port}", ref=f"istio destination {fqdn}:{port}",
-                                                    targets=targets, tls=tls, algorithm=algorithm, hash_on=hash_on)
+                                                    targets=targets, tls=tls, algorithm=algorithm, hash_on=hash_on,
+                                                    hash_on_cookie_config=cookie_config)
         return {"backend": BackendRef(scheme=scheme, upstream_key=key), "targets": targets,
                 "tls_key": scheme + tls.key()}
 
@@ -1185,16 +1190,26 @@ class _Istio:
         consistent = mapping(balancer.get("consistentHash"))
         if consistent:
             if consistent.get("httpHeaderName"):
-                algorithm, hash_on = "consistent_hashing", f"header:{str(consistent['httpHeaderName']).lower()}"
+                header_key = hash_on_value("header", consistent["httpHeaderName"])
+                if header_key is None:
+                    self.report.warning("istio-hash", ref, "consistentHash httpHeaderName is not an HTTP token Ferrum "
+                                        "accepts; round robin.")
+                else:
+                    algorithm, hash_on = "consistent_hashing", header_key
             elif mapping(consistent.get("httpCookie")).get("name"):
-                algorithm, hash_on = "consistent_hashing", f"cookie:{consistent['httpCookie']['name']}"
+                cookie_hash, cookie_config = envoy_cookie_hash(mapping(consistent["httpCookie"]), self.report,
+                                                               "istio-hash", ref)
+                if cookie_hash is not None:
+                    algorithm, hash_on = "consistent_hashing", (cookie_hash, cookie_config)
             elif consistent.get("useSourceIp"):
                 algorithm, hash_on = "consistent_hashing", "ip"
             else:
                 self.report.warning("istio-hash", ref, "consistentHash source has no equivalent; round robin.")
         if policy.get("outlierDetection") or policy.get("connectionPool"):
             self.report.warning("istio-resilience", ref, "outlierDetection/connectionPool are not migrated.")
-        return tls, scheme, algorithm, hash_on, None
+        # (hash_on, hash_on_cookie_config), or None without consistent hashing.
+        hash_policy = hash_on if isinstance(hash_on, tuple) else ((hash_on, None) if hash_on else None)
+        return tls, scheme, algorithm, hash_policy, None
 
 
 _GRPC_STATUS_NAMES = {

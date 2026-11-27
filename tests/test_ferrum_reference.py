@@ -3,7 +3,11 @@
 * ``FERRUM_EDGE_SRC`` (or a sibling ``../refs/ferrum-edge`` checkout): every key
   the tool emits must be a non-``serde(skip)`` field of the matching Ferrum struct,
   every plugin config key must appear in that plugin's source, and every
-  ``ferrum.conf`` key must be in Ferrum's public settings inventory.
+  ``ferrum.conf`` key must be in Ferrum's public settings inventory. The source is
+  read at the pinned ``FERRUM_EDGE_REFERENCE_COMMIT`` unless ``FERRUM_EDGE_SRC_COMMIT``
+  names another full commit (the Edge main drift workflow checks Edge ``main`` this way).
+* ``FERRUM_EDGE_REQUIRE_SYNTHETIC_CA`` (set by CI): failing to create the synthetic CA below fails the
+  admission test instead of skipping the fixture.
 * ``FERRUM_EDGE_BIN``: every fixture's generated resources must pass
   ``ferrum-edge validate -m file -c resources.yaml`` (Ferrum's real admission
   pipeline). The command runs in an empty temp directory with a minimal
@@ -38,7 +42,21 @@ from ferrum_migration.envprofile import KNOWN_SETTINGS, render
 
 CASES = [("kong", ("kong", "kong.yaml"), "yaml"), ("nginx", ("nginx", "nginx.conf"), "nginx"),
          ("traefik", ("traefik", "dynamic.yaml"), "yaml"), ("traefik", ("traefik", "dynamic.toml"), "toml"),
-         ("envoy", ("envoy", "envoy.yaml"), "yaml"), ("istio", ("istio", "istio.yaml"), "yaml")]
+         ("envoy", ("envoy", "envoy.yaml"), "yaml"), ("istio", ("istio", "istio.yaml"), "yaml"),
+         # Consistent hashing on cookies and headers, including values Ferrum would refuse as written (negative
+         # or oversized cookie ages, non-token names, invalid paths): every source that emits hash_on_cookie_config.
+         ("kong", ("sticky", "kong.yaml"), "yaml"), ("traefik", ("sticky", "traefik.yaml"), "yaml"),
+         ("envoy", ("sticky", "envoy.yaml"), "yaml"), ("istio", ("sticky", "istio.yaml"), "yaml")]
+
+
+def source_commit() -> str:
+    """The Edge commit whose source the schema checks read (the pinned reference by default)."""
+    override = os.environ.get("FERRUM_EDGE_SRC_COMMIT", "")
+    if override:
+        if not re.fullmatch(r"[0-9a-f]{40}", override):
+            raise AssertionError("FERRUM_EDGE_SRC_COMMIT must be a full 40-hex commit id")
+        return override
+    return FERRUM_EDGE_REFERENCE_COMMIT
 
 
 def ferrum_src():
@@ -85,30 +103,26 @@ class FerrumSourceSchemaTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.src = ferrum_src()
+        commit = source_commit()
         git = shutil.which("git")
         if not git or not cls.src or not os.path.isdir(cls.src):
             raise AssertionError(
-                f"FERRUM_EDGE_SRC ({cls.src!r}) must be a git repository containing pinned commit "
-                f"{FERRUM_EDGE_REFERENCE_COMMIT}"
+                f"FERRUM_EDGE_SRC ({cls.src!r}) must be a git repository containing commit {commit}"
             )
         check = subprocess.run(
-            [git, "-C", cls.src, "rev-parse", "--verify", f"{FERRUM_EDGE_REFERENCE_COMMIT}^{{commit}}"],
+            [git, "-C", cls.src, "rev-parse", "--verify", f"{commit}^{{commit}}"],
             capture_output=True, text=True, check=False,
         )
-        if check.returncode != 0 or check.stdout.strip() != FERRUM_EDGE_REFERENCE_COMMIT:
-            raise AssertionError(
-                f"FERRUM_EDGE_SRC ({cls.src}) does not contain pinned commit {FERRUM_EDGE_REFERENCE_COMMIT}"
-            )
+        if check.returncode != 0 or check.stdout.strip() != commit:
+            raise AssertionError(f"FERRUM_EDGE_SRC ({cls.src}) does not contain commit {commit}")
         blob = subprocess.run(
-            [git, "-C", cls.src, "cat-file", "-e", f"{FERRUM_EDGE_REFERENCE_COMMIT}:src/config/types.rs"],
+            [git, "-C", cls.src, "cat-file", "-e", f"{commit}:src/config/types.rs"],
             capture_output=True, text=True, check=False,
         )
         if blob.returncode != 0:
-            raise AssertionError(
-                f"FERRUM_EDGE_SRC ({cls.src}) cannot serve {FERRUM_EDGE_REFERENCE_COMMIT}:src/config/types.rs"
-            )
+            raise AssertionError(f"FERRUM_EDGE_SRC ({cls.src}) cannot serve {commit}:src/config/types.rs")
         cls.git = git
-        cls.pinned_commit = FERRUM_EDGE_REFERENCE_COMMIT
+        cls.pinned_commit = commit
         cls.types = cls.read_source("src/config/types.rs")
 
     @classmethod
@@ -124,12 +138,14 @@ class FerrumSourceSchemaTest(unittest.TestCase):
 
     def test_reference_commit(self):
         obj_type = subprocess.run(
-            [self.git, "-C", self.src, "cat-file", "-t", FERRUM_EDGE_REFERENCE_COMMIT],
+            [self.git, "-C", self.src, "cat-file", "-t", self.pinned_commit],
             capture_output=True, text=True, check=False,
         )
         self.assertEqual(obj_type.returncode, 0, obj_type.stderr)
         self.assertEqual(obj_type.stdout.strip(), "commit")
-        self.assertEqual(self.pinned_commit, FERRUM_EDGE_REFERENCE_COMMIT)
+        self.assertEqual(self.pinned_commit, source_commit())
+        if not os.environ.get("FERRUM_EDGE_SRC_COMMIT"):
+            self.assertEqual(self.pinned_commit, FERRUM_EDGE_REFERENCE_COMMIT)
 
     def test_emitted_keys_are_accepted_struct_fields(self):
         top = self.fields("GatewayConfig") | {"resource_counts"}
@@ -138,6 +154,7 @@ class FerrumSourceSchemaTest(unittest.TestCase):
         target, retry = self.fields("UpstreamTarget"), self.fields("RetryConfig")
         active, passive = self.fields("ActiveHealthCheck"), self.fields("PassiveHealthCheck")
         cookie, health = self.fields("HashOnCookieConfig"), self.fields("HealthCheckConfig")
+        association = self.fields("PluginAssociation")
         for platform, parts, result, _plan in outputs():
             config = result.config
             with self.subTest(fixture="/".join(parts)):
@@ -145,6 +162,8 @@ class FerrumSourceSchemaTest(unittest.TestCase):
                 for item in config["proxies"]:
                     self.assertLessEqual(set(item), proxy, item["id"])
                     self.assertLessEqual(set(item.get("retry", {})), retry)
+                    for link in item.get("plugins", []):
+                        self.assertLessEqual(set(link), association)
                 for item in config["consumers"]:
                     self.assertLessEqual(set(item), consumer)
                 for item in config["plugin_configs"]:
@@ -225,6 +244,30 @@ def make_synthetic_ca(directory: str) -> dict | None:
     return None
 
 
+def missing_synthetic_ca(case: unittest.TestCase, message: str) -> None:
+    """A fixture that needs the synthetic CA cannot be admitted: fail under CI, skip it locally."""
+    if os.environ.get("FERRUM_EDGE_REQUIRE_SYNTHETIC_CA"):
+        # CI and the drift workflows: a fixture that never reaches Edge admission is a failure, not a skip.
+        case.fail(message)
+    case.skipTest(message)
+
+
+class SyntheticCaPolicyTest(unittest.TestCase):
+    def test_required_in_ci_optional_locally(self):
+        probe = unittest.TestCase()
+        saved = os.environ.pop("FERRUM_EDGE_REQUIRE_SYNTHETIC_CA", None)
+        try:
+            with self.assertRaises(unittest.SkipTest):
+                missing_synthetic_ca(probe, "no CA")
+            os.environ["FERRUM_EDGE_REQUIRE_SYNTHETIC_CA"] = "1"
+            with self.assertRaises(AssertionError):
+                missing_synthetic_ca(probe, "no CA")
+        finally:
+            os.environ.pop("FERRUM_EDGE_REQUIRE_SYNTHETIC_CA", None)
+            if saved is not None:
+                os.environ["FERRUM_EDGE_REQUIRE_SYNTHETIC_CA"] = saved
+
+
 def with_synthetic_tls_files(config: dict, files: dict) -> dict:
     """Copy of ``config`` whose backend TLS file fields point at the synthetic files."""
     patched = copy.deepcopy(config)
@@ -256,8 +299,9 @@ class FerrumBinaryValidateTest(unittest.TestCase):
                 if operator_tls_files(config):
                     files = make_synthetic_ca(directory)
                     if files is None:
-                        self.skipTest("fixture names operator-supplied backend TLS files; openssl is needed to "
-                                      "create a synthetic CA for admission testing")
+                        message = ("fixture names operator-supplied backend TLS files; openssl is needed to create "
+                                   "a synthetic CA for admission testing")
+                        missing_synthetic_ca(self, message)
                     config = with_synthetic_tls_files(config, files)
                 completed = self.validate(binary, directory, config, result.basic_auth_used)
                 self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)

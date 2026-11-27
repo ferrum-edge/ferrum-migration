@@ -171,6 +171,8 @@ jobs:
           echo "FERRUM_EDGE_SRC=$src_dir" >> "$GITHUB_ENV"
 
       - name: Converter output passes ferrum-edge validate (synthetic CA for operator-CA fixtures)
+        env:
+          FERRUM_EDGE_REQUIRE_SYNTHETIC_CA: "1"
         run: python -m unittest discover -s tests -p 'test_ferrum_reference.py' -v
 
       - name: Runtime smoke gate (one working migration per source, loopback)
@@ -180,9 +182,9 @@ jobs:
           --case kong-dbless-smoke --case kong-deck-smoke --case nginx-proxy-pass-uri
           --case traefik-smoke --case envoy-smoke --case istio-smoke
 
-      - name: Full runtime acceptance (loopback)
+      - name: Full runtime acceptance (loopback; a case that could not run fails it)
         run: >-
-          python acceptance/run.py --ferrum-bin "$FERRUM_EDGE_BIN"
+          python acceptance/run.py --ferrum-bin "$FERRUM_EDGE_BIN" --strict
           --converter-env "PYTHONPATH=$GITHUB_WORKSPACE/src" --work-root "$RUNNER_TEMP/acceptance-full"
 
       - name: Remove work dirs (may hold per-run synthetic credentials)

@@ -55,9 +55,10 @@ from ..errors import InputError
 from ..model import BackendRef, Plan, PluginSpec, RouteSpec, Target, TlsSpec, UpstreamSpec
 from ..redact import safe_label
 from ..safe_load import load_structured
-from .common import (SourceContext, check_route_budget, compression_config, cors_config, literal_value, mapping,
-                     merge_weighted_targets, parse_percentage, request_header_rule, request_mirror_config,
-                     response_header_rule, seq, str_list)
+from .common import (MAX_COOKIE_TTL_SECONDS, SourceContext, check_route_budget, compression_config, cookie_domain_ok,
+                     cookie_path_ok, cors_config, hash_on_value, literal_value, mapping, merge_weighted_targets,
+                     parse_percentage, request_header_rule, request_mirror_config, response_header_rule, seq,
+                     str_list)
 
 PLATFORM = "traefik"
 REPRESENTABLE_MATCHERS = {"Host", "HostHeader", "Path", "PathPrefix", "Method"}
@@ -1695,24 +1696,76 @@ class _Traefik:
         if key not in self.plan.upstreams:
             spec = UpstreamSpec(key=key, name=name, ref=ref, targets=targets, tls=tls, health_checks=health)
             if lb.get("sticky") is not None:
-                cookie_name = sticky.get("name") or f"traefik-{util.slugify(name)}"
-                spec.algorithm = "consistent_hashing"
-                spec.hash_on = f"cookie:{cookie_name}"
-                cookie = {"path": sticky.get("path") or "/", "http_only": sticky.get("httpOnly", False) is True,
-                          "secure": sticky.get("secure", False) is True}
-                max_age = util.as_int(sticky.get("maxAge"))
-                if max_age:
-                    cookie["ttl_seconds"] = max_age
-                else:
-                    cookie["session_cookie"] = True
-                if sticky.get("sameSite") in ("none", "lax", "strict"):
-                    cookie["same_site"] = str(sticky["sameSite"]).capitalize()
-                spec.hash_on_cookie_config = cookie
-                self.report.warning("traefik-sticky", ref, "Sticky cookies map to consistent hashing on the cookie; "
-                                    "the cookie value format differs.")
+                self._sticky_cookie(spec, name, sticky, ref)
             self.plan.upstreams[key] = spec
         result["backend"] = BackendRef(scheme=scheme, upstream_key=key)
         return result
+
+    def _sticky_cookie(self, spec: UpstreamSpec, name: str, sticky: dict, ref: str) -> None:
+        """Traefik ``sticky.cookie`` into cookie consistent hashing with Ferrum's own sticky cookie.
+
+        Traefik writes the cookie through Go's ``http.Cookie``: ``maxAge`` 0 (the default) omits
+        ``Max-Age`` (a browser session cookie), a negative ``maxAge`` is sent as ``Max-Age=0`` (the
+        cookie expires immediately), and a positive one as ``Max-Age=<n>``. Ferrum writes
+        ``Max-Age=<ttl_seconds>`` unless ``session_cookie`` is set, and bounds ``ttl_seconds`` at
+        86400. Every value Ferrum would refuse at admission is replaced here, with a report finding.
+        """
+        default_name = f"traefik-{util.slugify(name)}"
+        raw_name = sticky.get("name")
+        hash_on = hash_on_value("cookie", raw_name) if raw_name else None
+        if raw_name and hash_on is None:
+            self.report.warning("traefik-sticky-cookie-name", ref,
+                                "The sticky cookie name is not an HTTP token Ferrum accepts; a generated name is "
+                                "used, so clients holding the old cookie are re-pinned once.")
+        spec.algorithm = "consistent_hashing"
+        spec.hash_on = hash_on or f"cookie:{default_name}"
+        raw_path = sticky.get("path")
+        path = "/"
+        if raw_path not in (None, ""):
+            if cookie_path_ok(raw_path):
+                path = raw_path
+            else:
+                self.report.warning("traefik-sticky-cookie-path", ref,
+                                    "The sticky cookie path is not representable in Ferrum (it must start with '/' "
+                                    "and contain no ';' or control characters); Path=/ is used.")
+        cookie: dict[str, Any] = {"path": path, "http_only": sticky.get("httpOnly", False) is True,
+                                  "secure": sticky.get("secure", False) is True}
+        raw_max_age = sticky.get("maxAge")
+        max_age = util.as_int(raw_max_age) if raw_max_age is not None else 0
+        if max_age is None:
+            self.report.warning("traefik-sticky-max-age", ref,
+                                "The sticky cookie maxAge is not an integer; a browser session cookie is used.")
+            cookie["session_cookie"] = True
+        elif max_age == 0:
+            cookie["session_cookie"] = True
+        elif max_age < 0:
+            # Go sends Max-Age=0: the browser drops the cookie at once. Ferrum's ttl_seconds 0 sends the same.
+            cookie["ttl_seconds"] = 0
+        elif max_age > MAX_COOKIE_TTL_SECONDS:
+            cookie["ttl_seconds"] = MAX_COOKIE_TTL_SECONDS
+            self.report.warning("traefik-sticky-max-age", ref,
+                                f"The sticky cookie maxAge exceeds Ferrum's {MAX_COOKIE_TTL_SECONDS}s limit and was "
+                                "clamped; clients are re-pinned after a day instead.")
+        else:
+            cookie["ttl_seconds"] = max_age
+        raw_domain = sticky.get("domain")
+        if raw_domain not in (None, ""):
+            if cookie_domain_ok(raw_domain):
+                cookie["domain"] = raw_domain
+            else:
+                self.report.warning("traefik-sticky-cookie-domain", ref,
+                                    "The sticky cookie domain is not a domain name Ferrum accepts; the cookie is "
+                                    "host-only.")
+        same_site = sticky.get("sameSite")
+        # Traefik lowercases the value before choosing the policy (pkg/server/service/loadbalancer/sticky.go).
+        if isinstance(same_site, str) and same_site.lower() in ("none", "lax", "strict"):
+            cookie["same_site"] = same_site.lower().capitalize()
+        elif same_site not in (None, ""):
+            self.report.warning("traefik-sticky-cookie-same-site", ref,
+                                "The sticky cookie sameSite value is not one Ferrum supports; SameSite is omitted.")
+        spec.hash_on_cookie_config = cookie
+        self.report.warning("traefik-sticky", ref, "Sticky cookies map to consistent hashing on the cookie; "
+                            "the cookie value format differs.")
 
     def _health(self, raw_health: Any, backend_scheme: str, ref: str) -> dict | None:
         if raw_health is None:

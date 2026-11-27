@@ -366,9 +366,13 @@ checked with synthetic fixtures, not against real deployments (see Limitations).
   exact release binary, verified against the release's checksum and a digest pinned in CI:
   every fixture's output must pass `ferrum-edge validate`, and the loopback runtime acceptance
   suite serves it with that binary. Other Edge versions are not validated; output may use
-  settings or fields an older Edge lacks, and a newer Edge may behave differently. A weekly,
-  non-gating CI job runs the same checks against Edge's newest published release to detect
-  drift early.
+  settings or fields an older Edge lacks, and a newer Edge may behave differently. Two weekly,
+  non-gating CI jobs detect drift early: one runs the same checks against Edge's newest
+  published release, the other against the newest signed Edge `main` image, where it also
+  checks the keys in every test fixture's output (one fixture set per source, including sticky
+  cookie hashing) against Edge `main`'s source and files a tracking issue labelled
+  `edge-main-drift` when anything fails. These key checks are fixture-based: they cover what
+  the fixtures exercise.
 * `ferrum-migrate --version` and both reports name the tool version and the Ferrum Edge
   commit the mappings were verified against.
 

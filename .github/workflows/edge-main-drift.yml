@@ -1,0 +1,425 @@
+name: Edge main drift
+
+# Early warning for changes on Ferrum Edge `main` that are not released yet. ci.yml gates on
+# the exact published Edge release this version targets; this workflow runs the same Edge
+# checks against the newest signed Edge `main` image instead:
+#
+#   * the schema checks of tests/test_ferrum_reference.py read Edge `main`'s source at the
+#     image's own revision (every emitted resource key must be a field of the matching Edge
+#     struct, every plugin config key must appear in that plugin's source, every ferrum.conf
+#     key must be in the public settings inventory);
+#   * every fixture's converter output (all five sources) goes through that binary's
+#     `ferrum-edge validate`, Edge's real admission pipeline;
+#   * the full loopback runtime acceptance suite (acceptance/) serves every acceptance
+#     fixture's output with that binary.
+#
+# It is never a required check and qualifies nothing. A failure on a scheduled or manual run
+# on the default branch opens or updates one issue labelled `edge-main-drift`; a clean run
+# closes it. Only the `issue` job can write issues; the job that runs the Edge binary holds
+# `contents: read`. Pull requests that change this workflow run the checks without touching
+# the issue.
+
+on:
+  schedule:
+    - cron: "37 6 * * 1"
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/edge-main-drift.yml
+      - tests/test_ferrum_reference.py
+
+permissions:
+  contents: read
+
+# Keyed by ref alone, so a scheduled and a manual run on the default branch queue behind each other
+# instead of filing the tracking issue concurrently; only pull request runs are cancelled.
+concurrency:
+  group: edge-main-drift-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  check:
+    name: Edge main drift check
+    runs-on: ubuntu-26.04
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    outputs:
+      outcome: ${{ steps.report.outputs.outcome }}
+      edge-commit: ${{ steps.edge.outputs.commit }}
+      report: ${{ steps.report.outputs.report }}
+    steps:
+      - name: Checkout
+        id: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        id: python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+
+      - name: Install
+        id: install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-ci.txt
+          python -m pip install --no-deps -e .
+
+      - name: Install Cosign
+        id: cosign
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+
+      # Edge's Main Latest Image workflow moves `latest` only to a main commit whose push CI
+      # passed, and signs the image keylessly. The tag is mutable: the digest is resolved once,
+      # its signature is verified against that workflow on `main`, and everything below uses
+      # that digest. The Edge commit is the linux/amd64 image's revision label, read from the
+      # registry by digest (each body is hashed against the digest that names it), and it must
+      # be on Edge main's history.
+      - name: Resolve the Ferrum Edge main image
+        id: edge
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          repository=ghcr.io/ferrum-edge/ferrum-edge
+          registry=https://ghcr.io/v2/ferrum-edge/ferrum-edge
+          work="$RUNNER_TEMP/edge-main"
+          mkdir -p "$work"
+          token=$(curl -fsS "https://ghcr.io/token?scope=repository:ferrum-edge/ferrum-edge:pull" | jq -er .token)
+          index_types="application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json"
+          manifest_types="application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json"
+          digest=$(curl -fsS --head -o /dev/null -D - \
+            -H "Authorization: Bearer $token" -H "Accept: $index_types" \
+            "$registry/manifests/latest" \
+            | tr -d '\r' | awk -F': ' 'tolower($1) == "docker-content-digest" { print $2 }')
+          if ! [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::Unexpected digest for $repository:latest: $digest"
+            exit 1
+          fi
+          image="$repository@$digest"
+          if ! cosign verify "$image" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --certificate-identity https://github.com/ferrum-edge/ferrum-edge/.github/workflows/main-latest-image.yml@refs/heads/main \
+            --certificate-github-workflow-repository ferrum-edge/ferrum-edge \
+            --certificate-github-workflow-ref refs/heads/main \
+            --certificate-github-workflow-trigger workflow_run \
+            > "$work/cosign-verify.json"; then
+            echo "::error::$image has no valid signature from Edge's Main Latest Image workflow"
+            exit 1
+          fi
+          # fetch <digest> <accept|blob> <file>: a registry object by digest, refused unless
+          # its bytes hash to that digest.
+          fetch() {
+            local kind=manifests
+            if [ "$2" = blob ]; then kind=blobs; fi
+            curl -fsSL -H "Authorization: Bearer $token" -H "Accept: $2" -o "$3" "$registry/$kind/$1"
+            if [ "sha256:$(sha256sum "$3" | cut -d' ' -f1)" != "$1" ]; then
+              echo "::error::$registry/$kind/$1 does not hash to its digest"
+              exit 1
+            fi
+          }
+          fetch "$digest" "$index_types" "$work/index.json"
+          platform=$(jq -er '[.manifests[] | select(.platform.os == "linux" and .platform.architecture == "amd64")][0].digest' "$work/index.json")
+          fetch "$platform" "$manifest_types" "$work/manifest.json"
+          config=$(jq -er .config.digest "$work/manifest.json")
+          fetch "$config" blob "$work/config.json"
+          commit=$(jq -r '.config.Labels["org.opencontainers.image.revision"] // ""' "$work/config.json")
+          if ! [[ "$commit" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::$image carries no readable revision label: $commit"
+            exit 1
+          fi
+          main_head=$(git ls-remote https://github.com/ferrum-edge/ferrum-edge refs/heads/main | cut -f1)
+          if ! [[ "$main_head" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Could not resolve Ferrum Edge main: $main_head"
+            exit 1
+          fi
+          compare=$(gh api "repos/ferrum-edge/ferrum-edge/compare/$commit...$main_head" --jq '"\(.status) \(.ahead_by)"')
+          read -r on_main behind <<< "$compare"
+          case "$on_main" in
+            ahead | identical) ;;
+            *)
+              echo "::error::$image names $commit, which is not on Ferrum Edge main's history ($on_main)"
+              exit 1
+              ;;
+          esac
+          # Whether the newest published Edge release already contains this commit. An unreadable
+          # release or comparison is reported as unknown, never as released or unreleased.
+          release_tag=$(gh api repos/ferrum-edge/ferrum-edge/releases/latest --jq .tag_name 2>/dev/null || true)
+          release_state=unknown
+          if [[ "$release_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            status=$(gh api "repos/ferrum-edge/ferrum-edge/compare/$release_tag...$commit" --jq .status 2>/dev/null || true)
+            case "$status" in
+              identical | behind) release_state=released ;;
+              ahead | diverged) release_state=unreleased ;;
+            esac
+          else
+            release_tag=""
+          fi
+          {
+            echo "image=$image"
+            echo "platform-digest=$platform"
+            echo "commit=$commit"
+            echo "main-head=$main_head"
+            echo "behind=$behind"
+            echo "release-tag=$release_tag"
+            echo "release-state=$release_state"
+          } >> "$GITHUB_OUTPUT"
+          echo "Checking Ferrum Edge main at $commit ($image), $behind commit(s) behind main $main_head."
+
+      # The linux/amd64 image of that verified index, by its own digest. The binary is copied
+      # out of the image and run directly on the runner (ubuntu-26.04 has the glibc the
+      # image's Debian 13 build needs), so the harness can manage it like a release binary.
+      - name: Extract the ferrum-edge binary from the image
+        id: binary
+        env:
+          EDGE_IMAGE: ${{ steps.edge.outputs.image }}
+          PLATFORM_DIGEST: ${{ steps.edge.outputs.platform-digest }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$EDGE_IMAGE" =~ ^ghcr\.io/ferrum-edge/ferrum-edge@sha256:[0-9a-f]{64}$ ]] \
+            || ! [[ "$PLATFORM_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::Unexpected image reference"
+            exit 1
+          fi
+          platform_image="ghcr.io/ferrum-edge/ferrum-edge@$PLATFORM_DIGEST"
+          docker pull --quiet "$platform_image"
+          container=$(docker create "$platform_image")
+          dir="$RUNNER_TEMP/edge-main/bin"
+          mkdir -p "$dir"
+          docker cp "$container:/app/ferrum-edge" "$dir/ferrum-edge"
+          docker rm "$container" > /dev/null
+          chmod 0755 "$dir/ferrum-edge"
+          if ! version_json=$("$dir/ferrum-edge" version --json); then
+            ldd "$dir/ferrum-edge" || true
+            echo "::error::the extracted ferrum-edge binary does not run on this runner"
+            exit 1
+          fi
+          echo "$version_json"
+          version=$(jq -er .version <<< "$version_json")
+          echo "FERRUM_EDGE_BIN=$dir/ferrum-edge" >> "$GITHUB_ENV"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch Ferrum Edge source at the image's commit
+        id: source
+        env:
+          EDGE_COMMIT: ${{ steps.edge.outputs.commit }}
+        run: |
+          set -euo pipefail
+          src_dir="$RUNNER_TEMP/edge-main/src"
+          mkdir -p "$src_dir"
+          git -C "$src_dir" init -q
+          git -C "$src_dir" fetch -q --depth 1 https://github.com/ferrum-edge/ferrum-edge.git "$EDGE_COMMIT"
+          git -C "$src_dir" checkout -q --detach FETCH_HEAD
+          test "$(git -C "$src_dir" rev-parse HEAD)" = "$EDGE_COMMIT"
+          echo "FERRUM_EDGE_SRC=$src_dir" >> "$GITHUB_ENV"
+          echo "FERRUM_EDGE_SRC_COMMIT=$EDGE_COMMIT" >> "$GITHUB_ENV"
+
+      - name: Schema checks against Edge main source, and ferrum-edge validate on every fixture's output
+        id: admission
+        continue-on-error: true
+        env:
+          FERRUM_EDGE_REQUIRE_SYNTHETIC_CA: "1"
+        run: python -m unittest discover -s tests -p 'test_ferrum_reference.py' -v
+
+      - name: Full runtime acceptance against Edge main (loopback)
+        id: acceptance
+        continue-on-error: true
+        env:
+          EDGE_VERSION: ${{ steps.binary.outputs.version }}
+        # --strict: a case that could not run (BLOCKED, SKIPPED, STATIC_ONLY) fails the step, so only PASS
+        # and the expected safe refusals (REJECTED_ACCEPTABLE) can make the report clean.
+        run: >-
+          python acceptance/run.py --ferrum-bin "$FERRUM_EDGE_BIN" --expect-ferrum-version "$EDGE_VERSION"
+          --strict --converter-env "PYTHONPATH=$GITHUB_WORKSPACE/src" --work-root "$RUNNER_TEMP/acceptance-main"
+          --results "$RUNNER_TEMP/acceptance-main-results.json"
+
+      - name: Summarize acceptance statuses
+        id: statuses
+        if: ${{ !cancelled() && steps.acceptance.outcome != 'skipped' }}
+        run: |
+          set -euo pipefail
+          results="$RUNNER_TEMP/acceptance-main-results.json"
+          if [ -s "$results" ]; then
+            summary=$(jq -r '.counts | to_entries | sort_by(.key) | map("\(.key)=\(.value)") | join(", ")' "$results")
+          else
+            summary="no results written"
+          fi
+          echo "summary=$summary" >> "$GITHUB_OUTPUT"
+
+      - name: Remove work dirs (may hold per-run synthetic credentials)
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/acceptance-main" "$RUNNER_TEMP/acceptance-main-results.json" "$RUNNER_TEMP/edge-main"
+
+      # Always, so a run that could not check anything still reaches the tracking issue as
+      # `error` instead of going silent.
+      - name: Write the report
+        id: report
+        if: ${{ !cancelled() }}
+        env:
+          REPOSITORY: ${{ github.repository }}
+          EDGE_REF: ${{ steps.edge.outputs.image }}
+          EDGE_COMMIT: ${{ steps.edge.outputs.commit }}
+          EDGE_VERSION: ${{ steps.binary.outputs.version }}
+          MAIN_HEAD: ${{ steps.edge.outputs.main-head }}
+          BEHIND: ${{ steps.edge.outputs.behind }}
+          ADMISSION: ${{ steps.admission.outcome }}
+          ACCEPTANCE: ${{ steps.acceptance.outcome }}
+          ACCEPTANCE_SUMMARY: ${{ steps.statuses.outputs.summary }}
+          RELEASE_TAG: ${{ steps.edge.outputs.release-tag }}
+          RELEASE_STATE: ${{ steps.edge.outputs.release-state }}
+          SETUP: >-
+            checkout=${{ steps.checkout.outcome }}
+            setup-python=${{ steps.python.outcome }}
+            install=${{ steps.install.outcome }}
+            install-cosign=${{ steps.cosign.outcome }}
+            resolve-edge-main-image=${{ steps.edge.outcome }}
+            extract-binary=${{ steps.binary.outcome }}
+            fetch-edge-source=${{ steps.source.outcome }}
+        run: |
+          set -euo pipefail
+          failed_setup=""
+          for entry in $SETUP; do
+            [ "${entry#*=}" = success ] || failed_setup="$failed_setup ${entry%%=*}"
+          done
+          verdict() { if [ "$1" = success ]; then echo pass; else echo "**FAIL**"; fi; }
+          outcome=clean
+          if [ -n "$failed_setup" ]; then
+            outcome=error
+          elif [ "$ADMISSION" != success ] || [ "$ACCEPTANCE" != success ]; then
+            outcome=drift
+          fi
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          report="$RUNNER_TEMP/edge-main-drift.md"
+          {
+            echo "<!-- edge-main-drift -->"
+            if [ "$outcome" = error ]; then
+              echo "The Edge main drift check could not run: \`${failed_setup# }\` did not succeed, so nothing was checked against Ferrum Edge \`main\`. See the run log; a clean scheduled run closes this issue."
+            elif [ "$outcome" = drift ]; then
+              case "$RELEASE_STATE" in
+                released) release_note="The newest published release, \`$RELEASE_TAG\`, already contains the checked commit, so users of that release can be affected now." ;;
+                unreleased) release_note="The checked commit is not contained in the newest published release${RELEASE_TAG:+ (\`$RELEASE_TAG\`)}, so the failing change may not be released yet." ;;
+                *) release_note="Whether a published Edge release contains the checked commit could not be determined." ;;
+              esac
+              echo "\`$REPOSITORY\` output fails checks against the signed Ferrum Edge \`main\` image. $release_note"
+            else
+              echo "\`$REPOSITORY\` output passes its checks against Ferrum Edge \`main\`."
+            fi
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Edge commit checked | [\`${EDGE_COMMIT:0:12}\`](https://github.com/ferrum-edge/ferrum-edge/commit/$EDGE_COMMIT) (version \`${EDGE_VERSION:-unknown}\`), image \`$EDGE_REF\` (signed by Edge's Main Latest Image workflow) |"
+            echo "| Edge \`main\` | \`${MAIN_HEAD:0:12}\`, ${BEHIND:-?} commit(s) after the checked commit |"
+            case "$RELEASE_STATE" in released) contains=yes ;; unreleased) contains=no ;; *) contains=unknown ;; esac
+            echo "| Newest published Edge release | \`${RELEASE_TAG:-unknown}\` (contains the checked commit: $contains) |"
+            echo "| Run | $run_url |"
+            if [ "$outcome" != error ]; then
+              echo
+              echo "| Check | Result |"
+              echo "|---|---|"
+              echo "| Schema checks against Edge \`main\` source, and \`ferrum-edge validate\` on every fixture's output (\`tests/test_ferrum_reference.py\`) | $(verdict "$ADMISSION") |"
+              echo "| Full loopback runtime acceptance (\`acceptance/run.py --strict\`; ${ACCEPTANCE_SUMMARY:-no results}) | $(verdict "$ACCEPTANCE") |"
+            fi
+            echo
+            echo "The run log names each failing test or case. A clean scheduled run closes this issue."
+          } > "$report"
+          cat "$report" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "outcome=$outcome"
+            echo "report=$(base64 -w0 "$report")"
+          } >> "$GITHUB_OUTPUT"
+          if [ "$outcome" != clean ]; then
+            echo "::error::Edge main drift check: $outcome"
+            exit 1
+          fi
+
+  # Runs whenever the check job ran (so a check that could not run is filed as `error`), never
+  # for pull requests or a dispatch from another branch. Only a clean run closes the issue.
+  issue:
+    name: Edge main drift issue
+    needs: check
+    if: >-
+      !cancelled() && needs.check.result != 'cancelled' && needs.check.result != 'skipped' &&
+      github.event_name != 'pull_request' &&
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    # One writer at a time, across every run of this workflow, so the single tracking issue is never
+    # created twice; queued runs are not cancelled.
+    concurrency:
+      group: edge-main-drift-issue
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Open, update or close the tracking issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CHECK_RESULT: ${{ needs.check.result }}
+          OUTCOME: ${{ needs.check.outputs.outcome }}
+          EDGE_COMMIT: ${{ needs.check.outputs.edge-commit }}
+          REPORT: ${{ needs.check.outputs.report }}
+        run: |
+          set -euo pipefail
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          label=edge-main-drift
+          marker='<!-- edge-main-drift -->'
+          title="Edge main drift: converter output fails checks against Ferrum Edge main"
+          report="$RUNNER_TEMP/report.md"
+          case "$OUTCOME" in
+            clean | drift | error) base64 -d <<< "$REPORT" > "$report" ;;
+            *)
+              OUTCOME=error
+              {
+                echo "$marker"
+                echo "The Edge main drift check did not finish (check job: \`$CHECK_RESULT\`), so it compared nothing against Ferrum Edge \`main\` this run. A clean scheduled run closes this issue."
+                echo
+                echo "Run: $run_url"
+              } > "$report"
+              ;;
+          esac
+          # Only an issue this workflow wrote (its body starts with the marker) is edited or
+          # closed; a human-labelled issue is left alone.
+          # One tracking issue: the lowest-numbered open issue this workflow wrote. Any other open one
+          # (left by an earlier concurrent run) is closed as a duplicate.
+          open_issues=$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues?state=open&labels=$label&per_page=100" \
+            --jq '.[] | select(.pull_request == null and ((.body // "") | startswith("<!-- edge-main-drift -->"))) | .number' \
+            | sort -n)
+          number=$(sed -n 1p <<< "$open_issues")
+          while read -r duplicate; do
+            [ -n "$duplicate" ] || continue
+            gh issue close "$duplicate" --repo "$GITHUB_REPOSITORY" --reason "not planned" \
+              --comment "Duplicate of #$number (one tracking issue is kept): $run_url"
+            echo "::notice::Closed duplicate tracking issue #$duplicate."
+          done < <(sed -n '2,$p' <<< "$open_issues")
+          case "$OUTCOME" in
+            drift | error)
+              if [ "$OUTCOME" = drift ]; then
+                note="Still failing against Ferrum Edge main at \`${EDGE_COMMIT:0:12}\`: $run_url"
+              else
+                note="The Edge main drift check could not run: $run_url"
+              fi
+              gh label create "$label" --repo "$GITHUB_REPOSITORY" --color B60205 \
+                --description "Fails its checks against unreleased Ferrum Edge main" --force
+              if [ -n "$number" ]; then
+                gh issue edit "$number" --repo "$GITHUB_REPOSITORY" --body-file "$report"
+                gh issue comment "$number" --repo "$GITHUB_REPOSITORY" --body "$note"
+                echo "::notice::Updated tracking issue #$number."
+              else
+                gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --label "$label" \
+                  --body-file "$report"
+                echo "::notice::Opened a tracking issue."
+              fi
+              exit 1
+              ;;
+            clean)
+              if [ -n "$number" ]; then
+                gh issue close "$number" --repo "$GITHUB_REPOSITORY" \
+                  --comment "Clean against Ferrum Edge main at \`${EDGE_COMMIT:0:12}\`: $run_url"
+                echo "::notice::Closed tracking issue #$number."
+              fi
+              ;;
+          esac

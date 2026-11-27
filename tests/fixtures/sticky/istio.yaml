@@ -1,0 +1,42 @@
+# Synthetic Istio resources with DestinationRule cookie consistent hashing for ferrum-migration tests.
+apiVersion: networking.istio.io/v1
+kind: Gateway
+metadata: {name: gw, namespace: edge}
+spec:
+  selector: {istio: ingressgateway}
+  servers:
+    - port: {number: 80, name: http, protocol: HTTP}
+      hosts: ["*/sticky.example.test"]
+---
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata: {name: sticky, namespace: shop}
+spec:
+  hosts: [sticky.example.test]
+  gateways: [edge/gw]
+  http:
+    - name: session
+      match: [{uri: {prefix: /session}}]
+      route: [{destination: {host: session.shop.svc.cluster.local, port: {number: 8080}}}]
+    - name: timed
+      route: [{destination: {host: timed.shop.svc.cluster.local, port: {number: 8080}}}]
+---
+apiVersion: networking.istio.io/v1
+kind: DestinationRule
+metadata: {name: session, namespace: shop}
+spec:
+  host: session.shop.svc.cluster.local
+  trafficPolicy:
+    loadBalancer:
+      consistentHash:
+        httpCookie: {name: session_affinity, ttl: 0s, path: /session}
+---
+apiVersion: networking.istio.io/v1
+kind: DestinationRule
+metadata: {name: timed, namespace: shop}
+spec:
+  host: timed.shop.svc.cluster.local
+  trafficPolicy:
+    loadBalancer:
+      consistentHash:
+        httpCookie: {name: timed_affinity, ttl: 0.5s}

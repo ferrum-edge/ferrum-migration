@@ -1,0 +1,45 @@
+# Synthetic Traefik sticky-cookie services for ferrum-migration tests (consistent hashing on a cookie).
+http:
+  routers:
+    expiring:
+      rule: "Host(`expiring.example.test`)"
+      service: expiring
+    long-lived:
+      rule: "Host(`long.example.test`)"
+      service: long-lived
+    session:
+      rule: "Host(`session.example.test`)"
+      service: session
+  services:
+    expiring:
+      loadBalancer:
+        sticky:
+          cookie:
+            name: expiring_affinity
+            maxAge: -1
+        servers:
+          - url: "http://expiring-1.internal:8080"
+          - url: "http://expiring-2.internal:8080"
+    long-lived:
+      loadBalancer:
+        sticky:
+          cookie:
+            name: "not a token"
+            maxAge: 604800
+            path: /app
+            domain: example.test
+            httpOnly: true
+            secure: true
+            sameSite: lax
+        servers:
+          - url: "http://long-1.internal:8080"
+          - url: "http://long-2.internal:8080"
+    session:
+      loadBalancer:
+        sticky:
+          cookie:
+            path: "/bad;path"
+            sameSite: Strict
+        servers:
+          - url: "http://session-1.internal:8080"
+          - url: "http://session-2.internal:8080"
