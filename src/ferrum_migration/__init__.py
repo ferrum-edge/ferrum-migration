@@ -6,6 +6,10 @@ profile and a migration report. It never performs network I/O, never follows
 includes outside the given input and never starts or deploys anything.
 """
 
+#: The package version, and its only source: pyproject.toml reads it as a dynamic
+#: version, ``ferrum-migrate --version`` prints it, and reports record it as
+#: ``tool_version``. A plain ``X.Y.Z`` literal; the release workflow requires the
+#: pushed ``vX.Y.Z`` tag to equal it.
 __version__ = "0.1.0"
 
 #: Ferrum Edge commit whose config structs, plugin validators and settings
