@@ -28,6 +28,7 @@ jobs:
       contents: read
     outputs:
       version: ${{ steps.tag.outputs.version }}
+      pypi_publish: ${{ steps.pypi.outputs.publish }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -63,6 +64,17 @@ jobs:
             echo "::error::release tags must point to a commit reachable from main"
             exit 1
           fi
+
+      - name: Read the PyPI opt-in (exactly `true`, case-sensitive)
+        # GitHub expression comparisons ignore case; this shell comparison does not, so only
+        # PYPI_PUBLISH=true (not TRUE or True) enables the pypi job.
+        id: pypi
+        env:
+          PYPI_PUBLISH: ${{ vars.PYPI_PUBLISH }}
+        run: |
+          if [ "${PYPI_PUBLISH:-}" = "true" ]; then publish=true; else publish=false; fi
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+          echo "PyPI publishing for this release: $publish"
 
       - name: Extract the release notes from CHANGELOG.md
         env:
@@ -120,6 +132,9 @@ jobs:
           python -m twine check --strict dist/*
           python scripts/release_check.py dist --dir dist
 
+      - name: Install the exact wheel to be released into a clean venv and run it
+        run: bash scripts/smoke-wheel.sh dist
+
       - name: Generate SHA256SUMS
         run: |
           set -euo pipefail
@@ -167,6 +182,9 @@ jobs:
           create-storage-record: false
 
   github-release:
+    # Idempotent: a re-run accepts a release that already exists for the tag only if its
+    # assets are exactly this run's files (SHA-256), so a retry after a lost job result can
+    # still reach the PyPI job.
     name: create GitHub release
     needs: [validate, attest]
     runs-on: ubuntu-24.04
@@ -174,6 +192,11 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Checkout (for scripts/release_check.py)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
       - name: Download the distributions
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -190,7 +213,7 @@ jobs:
         working-directory: artifacts/dist
         run: sha256sum --strict -c ../SHA256SUMS
 
-      - name: Create the release (only if the remote tag still names this run's commit)
+      - name: Create the release, or verify the existing one (only if the remote tag still names this run's commit)
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -209,11 +232,28 @@ jobs:
             echo "::error::tag ${RELEASE_TAG} now resolves to ${obj_type} ${obj_sha}, not ${GITHUB_SHA}; refusing to release"
             exit 1
           fi
-          gh release create "$RELEASE_TAG" \
-            --verify-tag \
-            --title "ferrum-migration ${RELEASE_VERSION} (preview)" \
-            --notes-file release-notes/RELEASE_NOTES.md \
-            artifacts/dist/* artifacts/SHA256SUMS
+          # This endpoint returns published releases only (never drafts).
+          lookup_status=0
+          gh api "repos/${GH_REPO}/releases/tags/${RELEASE_TAG}" --silent 2> "$RUNNER_TEMP/release-lookup.err" || lookup_status=$?
+          if [ "$lookup_status" -eq 0 ]; then
+            echo "A published release for ${RELEASE_TAG} already exists (re-run); comparing its assets with this run's files"
+            existing="$RUNNER_TEMP/existing-release-assets"
+            rm -rf "$existing"
+            mkdir -p "$existing"
+            gh release download "$RELEASE_TAG" --dir "$existing"
+            python3 -I scripts/release_check.py release-assets \
+              --dist artifacts/dist --sums artifacts/SHA256SUMS --downloaded "$existing"
+          elif grep -q 'HTTP 404' "$RUNNER_TEMP/release-lookup.err"; then
+            gh release create "$RELEASE_TAG" \
+              --verify-tag \
+              --title "ferrum-migration ${RELEASE_VERSION} (preview)" \
+              --notes-file release-notes/RELEASE_NOTES.md \
+              artifacts/dist/* artifacts/SHA256SUMS
+          else
+            cat "$RUNNER_TEMP/release-lookup.err" >&2
+            echo "::error::could not tell whether a release for ${RELEASE_TAG} exists"
+            exit 1
+          fi
 
   pypi:
     # Off until the owner has completed the one-time setup in docs/releasing.md (tag
@@ -222,8 +262,9 @@ jobs:
     # Safe to re-run: only files PyPI does not have yet are uploaded, and a published file
     # whose SHA-256 differs from this run's build fails the job.
     name: publish to PyPI
-    needs: github-release
-    if: ${{ vars.PYPI_PUBLISH == 'true' }}
+    needs: [validate, github-release]
+    # `pypi_publish` is the literal `true` or `false` written by the validate job.
+    if: ${{ needs.validate.outputs.pypi_publish == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     environment:

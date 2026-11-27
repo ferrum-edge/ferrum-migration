@@ -22,7 +22,9 @@ permissions:
   contents: read
 
 concurrency:
-  group: edge-release-drift
+  # Per event and ref: a newer run supersedes an older one of the same PR (or of the same
+  # schedule/dispatch on the same ref), but a PR run never cancels the scheduled main run.
+  group: edge-release-drift-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:

@@ -10,9 +10,12 @@ Used by CI (``package`` job) and by ``.github/workflows/release.yml``:
 * ``notes --version X.Y.Z --out FILE`` writes the body of the ``## [X.Y.Z] - YYYY-MM-DD``
   section of ``CHANGELOG.md`` (refuses a missing, undated or empty section, and a section
   carrying the ``UNTAGGED_MARKER`` comment, which marks a historical, never-tagged version).
-* ``dist --dir DIR`` requires exactly one sdist and one wheel for the package version and
-  checks their core metadata (name, version, license expression and files, dependency, entry
-  point).
+* ``dist --dir DIR`` requires exactly one sdist and one wheel for the package version, checks
+  their core metadata (name, version, license expression and files, dependency, entry point),
+  and requires both to contain exactly the package's modules under ``src/ferrum_migration``.
+* ``release-assets --dist DIR --sums FILE --downloaded DIR`` accepts an existing GitHub release
+  (a re-run of the release job) only if its downloaded assets are exactly this run's
+  distributions plus ``SHA256SUMS``, byte for byte (SHA-256).
 * ``pypi-plan --dir DIR --upload-dir OUT`` makes re-running the PyPI publish job safe: it reads
   the files PyPI already has for the package version (JSON API), refuses any published file whose
   SHA-256 differs from the local one or that is not a local file, and copies only the missing
@@ -23,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import datetime
 import hashlib
 import json
 import re
@@ -97,8 +101,13 @@ def changelog_section(text: str, version: str) -> str:
         if match and match.group("name") == version:
             if start is not None:
                 raise ReleaseError(f"CHANGELOG.md has more than one [{version}] section")
-            if not _DATE_RE.fullmatch(match.group("rest").rstrip()):
+            rest = match.group("rest").rstrip()
+            if not _DATE_RE.fullmatch(rest):
                 raise ReleaseError(f"CHANGELOG.md section [{version}] must be headed '## [{version}] - YYYY-MM-DD'")
+            try:
+                datetime.date.fromisoformat(rest[3:])
+            except ValueError:
+                raise ReleaseError(f"CHANGELOG.md section [{version}] has an impossible date {rest[3:]!r}") from None
             start = index + 1
     if start is None:
         raise ReleaseError(f"CHANGELOG.md has no [{version}] section")
@@ -144,7 +153,25 @@ def _check_metadata(meta, version: str, where: str) -> None:
         raise ReleaseError(f"{where}: " + "; ".join(problems))
 
 
-def check_dists(dist_dir: Path, version: str) -> list[str]:
+def source_modules(root: Path = ROOT) -> list[str]:
+    """The package's ``.py`` files, relative to ``src/`` (``ferrum_migration/cli.py``...)."""
+    src = root / "src"
+    modules = sorted(path.relative_to(src).as_posix() for path in (src / FILE_STEM).rglob("*.py")
+                     if "__pycache__" not in path.parts)
+    if not modules:
+        raise ReleaseError(f"no modules found under {src / FILE_STEM}")
+    return modules
+
+
+def _compare_modules(found: list[str], expected: list[str], where: str) -> None:
+    missing = sorted(set(expected) - set(found))
+    extra = sorted(set(found) - set(expected))
+    if missing or extra:
+        raise ReleaseError(f"{where}: modules differ from src/{FILE_STEM}: missing {missing}, unexpected {extra}")
+
+
+def check_dists(dist_dir: Path, version: str, root: Path = ROOT) -> list[str]:
+    expected_modules = source_modules(root)
     sdist = f"{FILE_STEM}-{version}.tar.gz"
     wheel = f"{FILE_STEM}-{version}-py3-none-any.whl"
     present = sorted(path.name for path in dist_dir.iterdir())
@@ -161,9 +188,8 @@ def check_dists(dist_dir: Path, version: str) -> list[str]:
         for name in LICENSE_FILES:
             if f"{info}/licenses/{name}" not in names:
                 raise ReleaseError(f"{wheel}: {info}/licenses/{name} is missing")
-        for module in ("__init__.py", "cli.py", "sources/__init__.py"):
-            if f"ferrum_migration/{module}" not in names:
-                raise ReleaseError(f"{wheel}: ferrum_migration/{module} is missing")
+        _compare_modules([name for name in names if name.startswith(f"{FILE_STEM}/") and name.endswith(".py")],
+                         expected_modules, wheel)
 
     with tarfile.open(dist_dir / sdist, "r:gz") as archive:
         prefix = f"{FILE_STEM}-{version}"
@@ -172,9 +198,13 @@ def check_dists(dist_dir: Path, version: str) -> list[str]:
             raise ReleaseError(f"{sdist}: PKG-INFO is missing")
         _check_metadata(_metadata(member.read()), version, sdist)
         names = set(archive.getnames())
-        for name in LICENSE_FILES + ("README.md", "pyproject.toml", "src/ferrum_migration/__init__.py"):
+        for name in LICENSE_FILES + ("README.md", "pyproject.toml"):
             if f"{prefix}/{name}" not in names:
                 raise ReleaseError(f"{sdist}: {name} is missing")
+        src_prefix = f"{prefix}/src/"
+        _compare_modules([name[len(src_prefix):] for name in names
+                          if name.startswith(f"{src_prefix}{FILE_STEM}/") and name.endswith(".py")],
+                         expected_modules, sdist)
     return [sdist, wheel]
 
 
@@ -235,6 +265,24 @@ def pypi_upload_plan(dist_dir: Path, version: str, release: dict | None) -> list
     return missing
 
 
+def check_release_assets(dist_dir: Path, sums: Path, downloaded: Path) -> list[str]:
+    """Require the assets of an existing GitHub release to equal this run's files exactly."""
+    expected = {path.name: path for path in dist_dir.iterdir() if path.is_file()}
+    if sums.name in expected:
+        raise ReleaseError(f"{dist_dir} must not contain {sums.name}")
+    expected[sums.name] = sums
+    actual = {path.name: path for path in downloaded.iterdir() if path.is_file()}
+    others = [path.name for path in downloaded.iterdir() if not path.is_file()]
+    if others or set(actual) != set(expected):
+        raise ReleaseError(f"existing release assets {sorted(actual) + sorted(others)} are not exactly "
+                           f"{sorted(expected)}")
+    for name in sorted(expected):
+        want, got = sha256_file(expected[name]), sha256_file(actual[name])
+        if want != got:
+            raise ReleaseError(f"existing release asset {name} has SHA-256 {got}, but this run built {want}")
+    return sorted(expected)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="command", required=True)
@@ -247,6 +295,10 @@ def main(argv: list[str] | None = None) -> int:
     notes.add_argument("--out", type=Path, required=True)
     dist = sub.add_parser("dist", help="check built sdist and wheel")
     dist.add_argument("--dir", type=Path, required=True)
+    assets = sub.add_parser("release-assets", help="compare an existing release's assets with this run's files")
+    assets.add_argument("--dist", type=Path, required=True)
+    assets.add_argument("--sums", type=Path, required=True)
+    assets.add_argument("--downloaded", type=Path, required=True)
     plan = sub.add_parser("pypi-plan", help="copy the distributions PyPI does not have yet into --upload-dir")
     plan.add_argument("--dir", type=Path, required=True)
     plan.add_argument("--upload-dir", type=Path, required=True)
@@ -269,6 +321,9 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "dist":
             for name in check_dists(args.dir, version):
                 print(f"ok: {name}")
+        elif args.command == "release-assets":
+            for name in check_release_assets(args.dist, args.sums, args.downloaded):
+                print(f"matches: {name}")
         elif args.command == "pypi-plan":
             check_dists(args.dir, version)
             missing = pypi_upload_plan(args.dir, version, fetch_pypi_release(version, args.index))

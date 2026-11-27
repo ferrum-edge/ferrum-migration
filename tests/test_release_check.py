@@ -57,21 +57,26 @@ Description-Content-Type: text/markdown
 """
 
 
-def build_fake_dists(directory: Path, version: str, metadata: str = METADATA) -> None:
+def build_fake_dists(directory: Path, version: str, metadata: str = METADATA, wheel_modules=None,
+                     sdist_modules=None) -> None:
+    modules = release_check.source_modules()
+    wheel_modules = modules if wheel_modules is None else wheel_modules
+    sdist_modules = modules if sdist_modules is None else sdist_modules
     info = f"ferrum_migration-{version}.dist-info"
     with zipfile.ZipFile(directory / f"ferrum_migration-{version}-py3-none-any.whl", "w") as wheel:
         wheel.writestr(f"{info}/METADATA", metadata.format(version=version))
         wheel.writestr(f"{info}/entry_points.txt", "[console_scripts]\nferrum-migrate = ferrum_migration.cli:main\n")
         for name in ("LICENSE", "LICENSE-COMMERCIAL.md"):
             wheel.writestr(f"{info}/licenses/{name}", "license\n")
-        for module in ("__init__.py", "cli.py", "sources/__init__.py"):
-            wheel.writestr(f"ferrum_migration/{module}", "")
+        for module in wheel_modules:
+            wheel.writestr(module, "")
     prefix = f"ferrum_migration-{version}"
     with tarfile.open(directory / f"{prefix}.tar.gz", "w:gz") as sdist:
         members = {"PKG-INFO": metadata.format(version=version)}
-        for name in ("LICENSE", "LICENSE-COMMERCIAL.md", "README.md", "pyproject.toml",
-                     "src/ferrum_migration/__init__.py"):
+        for name in ("LICENSE", "LICENSE-COMMERCIAL.md", "README.md", "pyproject.toml"):
             members[name] = "x\n"
+        for module in sdist_modules:
+            members[f"src/{module}"] = ""
         for name, text in members.items():
             data = text.encode("utf-8")
             entry = tarfile.TarInfo(f"{prefix}/{name}")
@@ -116,6 +121,8 @@ class ChangelogTest(unittest.TestCase):
             "missing": (CHANGELOG, "9.9.9"),
             "undated": ("## [1.0.0]\n\n- x\n", "1.0.0"),
             "bad date": ("## [1.0.0] - soon\n\n- x\n", "1.0.0"),
+            "impossible date": ("## [1.0.0] - 2026-02-30\n\n- x\n", "1.0.0"),
+            "month 13": ("## [1.0.0] - 2026-13-01\n\n- x\n", "1.0.0"),
             "empty": ("## [1.0.0] - 2026-01-01\n\n## [0.9.0] - 2025-01-01\n\n- x\n", "1.0.0"),
             "duplicate": ("## [1.0.0] - 2026-01-01\n\n- a\n\n## [1.0.0] - 2026-01-02\n\n- b\n", "1.0.0"),
             "unreleased": (CHANGELOG, "Unreleased"),
@@ -162,6 +169,21 @@ class DistTest(unittest.TestCase):
         (self.dir / "SHA256SUMS").write_text("", encoding="utf-8")
         with self.assertRaises(ReleaseError):
             release_check.check_dists(self.dir, "1.2.3")
+
+    def test_modules_must_match_the_source_package(self):
+        modules = release_check.source_modules()
+        self.assertIn("ferrum_migration/envprofile.py", modules)
+        self.assertIn("ferrum_migration/sources/kong.py", modules)
+        variants = {
+            "wheel misses a module": {"wheel_modules": [m for m in modules if m != "ferrum_migration/envprofile.py"]},
+            "wheel has an extra module": {"wheel_modules": modules + ["ferrum_migration/stray.py"]},
+            "sdist misses a module": {"sdist_modules": [m for m in modules if m != "ferrum_migration/sources/kong.py"]},
+        }
+        for label, kwargs in variants.items():
+            with self.subTest(label), tempfile.TemporaryDirectory() as temp:
+                build_fake_dists(Path(temp), "1.2.3", **kwargs)
+                with self.assertRaisesRegex(ReleaseError, "modules differ"):
+                    release_check.check_dists(Path(temp), "1.2.3")
 
     def test_rejects_wrong_metadata(self):
         bad = {
@@ -251,6 +273,42 @@ class PypiPlanTest(unittest.TestCase):
                 contextlib.redirect_stderr(io.StringIO()):
             code = release_check.main(["pypi-plan", "--dir", str(dist), "--upload-dir", str(Path(self.temp.name) / "u2")])
         self.assertEqual(code, 1)
+
+
+class ReleaseAssetsTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        base = Path(self.temp.name)
+        self.dist = base / "dist"
+        self.dist.mkdir()
+        build_fake_dists(self.dist, "1.2.3")
+        self.sums = base / "SHA256SUMS"
+        self.sums.write_text("".join(f"{sha256(p)}  {p.name}\n" for p in sorted(self.dist.iterdir())), encoding="utf-8")
+        self.downloaded = base / "downloaded"
+        self.downloaded.mkdir()
+        for path in list(self.dist.iterdir()) + [self.sums]:
+            (self.downloaded / path.name).write_bytes(path.read_bytes())
+
+    def check(self):
+        return release_check.check_release_assets(self.dist, self.sums, self.downloaded)
+
+    def test_accepts_identical_assets(self):
+        self.assertEqual(self.check(), sorted([p.name for p in self.dist.iterdir()] + ["SHA256SUMS"]))
+
+    def test_refuses_changed_missing_or_extra_assets(self):
+        wheel = self.downloaded / "ferrum_migration-1.2.3-py3-none-any.whl"
+        original = wheel.read_bytes()
+        wheel.write_bytes(original + b"x")
+        with self.assertRaisesRegex(ReleaseError, "SHA-256"):
+            self.check()
+        wheel.unlink()
+        with self.assertRaisesRegex(ReleaseError, "not exactly"):
+            self.check()
+        wheel.write_bytes(original)
+        (self.downloaded / "extra.txt").write_text("x", encoding="utf-8")
+        with self.assertRaisesRegex(ReleaseError, "not exactly"):
+            self.check()
 
 
 if __name__ == "__main__":

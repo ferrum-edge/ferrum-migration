@@ -21,7 +21,8 @@ the same files on PyPI. Everything after the tag push is done by
    * If the release targets a different Ferrum Edge release, re-pin it in the same or an
      earlier pull request (see "Changing the target Ferrum Edge release").
    * Merge once every CI check on the pull request's head is green.
-2. **Tag the merge commit on `main` and push the tag** (maintainers only):
+2. **Tag the merge commit on `main` and push the tag** (maintainers only; the two tag rulesets
+   in the one-time setup must exist before the first release tag is pushed):
 
    ```bash
    git fetch origin
@@ -39,13 +40,17 @@ the same files on PyPI. Everything after the tag push is done by
    * `ci`: the whole of `ci.yml` (unit and fail-closed tests on Linux and macOS, harness
      self-tests, packaging checks, and admission plus loopback runtime acceptance against the
      pinned Ferrum Edge binary).
-   * `build`: sdist, then the wheel from the sdist, `twine check --strict`, metadata checks,
-     `SHA256SUMS`.
+   * `build`: sdist, then the wheel from the sdist, `twine check --strict`, metadata checks
+     (including that both contain exactly the modules of `src/ferrum_migration`), the same
+     clean-venv install and CLI smoke test CI runs (`scripts/smoke-wheel.sh`) on the exact
+     wheel to be released, then `SHA256SUMS`.
    * `attest`: GitHub build provenance attestations for the sdist and the wheel.
    * `github-release`: re-resolves the remote tag and refuses to continue unless it still names
-     the run's commit, then creates the release with the files and the changelog section.
-   * `pypi`: runs only when the repository variable `PYPI_PUBLISH` is `true`, after a required
-     reviewer approves the `pypi` deployment. It reads which files PyPI already has for the
+     the run's commit, then creates the release with the files and the changelog section. If a
+     published release for the tag already exists (a re-run), it downloads its assets and
+     continues only if they are exactly this run's files with the same SHA-256 digests.
+   * `pypi`: runs only when the repository variable `PYPI_PUBLISH` is exactly `true` (compared
+     case-sensitively in `validate`), after a required reviewer approves the `pypi` deployment. It reads which files PyPI already has for the
      version (JSON API), fails if any of them differs in SHA-256 from this run's build or was
      not built by this run, and uploads only the missing ones with PyPI Trusted Publishing (no
      token).
@@ -54,8 +59,10 @@ the same files on PyPI. Everything after the tag push is done by
 
 A tag is never moved or reused. If the workflow fails because of the code or the changelog,
 fix it on `main` and release the next patch version. If it fails because of the runner or the
-network, re-run the failed jobs. If `pypi` failed, also after a partial upload, re-run that
-job: it uploads only the files PyPI does not have yet, from the run's already built and
+network, re-run the failed jobs; a re-run of `github-release` after the release was already
+published verifies the existing release instead of failing, so `pypi` can still run. If its
+assets differ from the run's files, stop: do not edit the release, release the next patch
+version. If `pypi` failed, also after a partial upload, re-run that job: it uploads only the files PyPI does not have yet, from the run's already built and
 attested artifacts. PyPI's JSON API can lag a fresh upload by a few minutes; if a re-run then
 fails with PyPI's "file already exists" error, wait and re-run it again. Never re-run with
 `skip-existing`: it would accept a published file without comparing its digest. A digest
@@ -64,8 +71,10 @@ mismatch means PyPI holds different bytes under that version, which cannot be re
 
 ## One-time owner setup
 
-These are repository and account settings that only the owner can make. Do them in this order;
-until the last step, releases go to GitHub only.
+These are repository and account settings that only the owner can make. Do them in this order.
+Steps 1 and 2 are required before the **first release tag** is pushed (a GitHub-only release
+included); steps 4 and 5 are required before PyPI; step 6 enables PyPI and comes last. Until
+then, releases go to GitHub only.
 
 Why the order matters: a workflow triggered by a tag push is loaded from the tagged revision,
 so anyone who can push a `v*` tag decides which `release.yml` runs, including its `validate`
@@ -75,14 +84,16 @@ controls that decide who can publish are therefore outside the workflow: the tag
 (who can create a `v*` tag, and that no tag can be moved) and the `pypi` environment's
 required reviewers.
 
-1. **Tag ruleset "release tags: creation"** (required before PyPI): target tags matching
+1. **Tag ruleset "release tags: creation"** (required before the first release): target tags matching
    `v*`, enforcement *Active*, rule *Restrict creations*, with only the release maintainers
    (a team or named users) in the bypass list.
-2. **Tag ruleset "release tags: immutable"** (required before PyPI): target tags matching `v*`,
-   enforcement *Active*, rules *Restrict updates* and *Restrict deletions*, and **no bypass
-   list**. Keep it separate from step 1: a bypass granted for creation would otherwise also
-   exempt maintainers from the update and deletion rules, and a moved tag could get artifacts
-   built from another commit (the workflow also re-checks the tag before creating the release).
+2. **Tag ruleset "release tags: immutable"** (required before the first release): target tags
+   matching `v*`, enforcement *Active*, rules *Restrict updates* and *Restrict deletions*, and
+   **no bypass list**. Keep it separate from step 1: a bypass granted for creation would
+   otherwise also exempt maintainers from the update and deletion rules. Without it, a tag
+   moved between the workflow's tag re-check and the release's creation would give a GitHub
+   release whose wheel comes from one commit and whose source archives come from another; the
+   re-check narrows that window but cannot close it, only tag immutability does.
 3. **Branch ruleset for `main`** (recommended; the repository has none). Require a pull request
    before merging, block force pushes and deletion, and require these status checks from the
    CI workflow:
@@ -106,8 +117,9 @@ required reviewers.
    on PyPI is acceptable to you under PyPI's terms of use; the package metadata declares
    `License-Expression: PolyForm-Noncommercial-1.0.0`.
 6. **Repository variable `PYPI_PUBLISH`, last.** Settings, Secrets and variables, Actions,
-   Variables: `PYPI_PUBLISH` = `true` only after steps 1, 2, 4 and 5. Any other value, or no
-   variable, skips the `pypi` job.
+   Variables: `PYPI_PUBLISH` = `true` only after steps 1, 2, 4 and 5. Any other value (`TRUE`
+   and `True` included: the workflow compares it case-sensitively), or no variable, skips the
+   `pypi` job.
 
 ## Changing the target Ferrum Edge release
 
