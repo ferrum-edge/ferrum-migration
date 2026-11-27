@@ -136,8 +136,8 @@ re-verification, not a version bump alone:
   `FERRUM_EDGE_SHA256` (the release asset's digest, cross-checked against the release's
   `.sha256` file) and the source commit fetched for the schema checks.
 * `README.md` (badge, the verified-against paragraph, Limitations, Development, Status) and
-  `docs/mappings.md`, after re-checking every mapping and "Open questions" entry against the
-  new release's source.
+  `docs/mappings.md`, after re-checking every mapping and every "Resolved from Ferrum Edge source"
+  entry against the new release's source.
 * Code comments, docstrings and report messages that cite the old Edge version (search for
   it, for example `rg -n '0\.9\.21'` while v0.9.21 is the pin).
 * A `CHANGELOG.md` entry.

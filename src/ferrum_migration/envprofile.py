@@ -171,15 +171,21 @@ def render(run_mode: str, platform: str, settings: SettingsHints, tls_only: bool
             out.suggest("FERRUM_ENABLE_HTTP3", "true", "The source enabled HTTP/3 (QUIC).")
         if settings.trusted_proxies:
             out.suggest("FERRUM_TRUSTED_PROXIES", ",".join(settings.trusted_proxies),
-                        "SUGGESTED (verify list syntax in Ferrum docs/client_ip_resolution.md): the source trusted "
-                        "these proxies for client-IP resolution.")
+                        "SUGGESTED: the source trusted these proxies (IP addresses or CIDRs, comma-separated) for "
+                        "client-IP resolution.")
         if settings.real_ip_header:
             out.suggest("FERRUM_REAL_IP_HEADER", settings.real_ip_header,
                         "SUGGESTED: the source read the client IP from this header.")
         if settings.proxy_protocol:
-            out.suggest("FERRUM_FRONTEND_PROXY_PROTOCOL_HTTP", "true",
-                        "SUGGESTED: the source accepted PROXY protocol; also set the trusted CIDRs below.")
-            out.lines.append("# FERRUM_FRONTEND_PROXY_PROTOCOL_TRUSTED_CIDRS=10.0.0.0/8")
+            # Ferrum accepts off|v1|v2|auto per listener; NGINX and Envoy accept both PROXY versions (auto).
+            # Once enabled the header is required, only from FERRUM_FRONTEND_PROXY_PROTOCOL_TRUSTED_CIDRS peers.
+            note = ("SUGGESTED: the source accepted PROXY protocol (v1 or v2). Enable it only on the listeners that "
+                    "receive it, and set the load balancers' CIDRs below (the header then becomes mandatory).")
+            if protocols != "https":
+                out.suggest("FERRUM_FRONTEND_PROXY_PROTOCOL_HTTP", "auto", note)
+            if protocols != "http":
+                out.suggest("FERRUM_FRONTEND_PROXY_PROTOCOL_HTTPS", "auto", note)
+            out.lines.append("# FERRUM_FRONTEND_PROXY_PROTOCOL_TRUSTED_CIDRS=<load balancer CIDRs, comma-separated>")
         out.blank()
 
     if basic_auth_used and run_mode != "cp":

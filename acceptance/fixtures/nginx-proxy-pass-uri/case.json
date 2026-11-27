@@ -19,6 +19,8 @@
   "probes": [
     {"id": "uri-replaced", "path": "/svc/x/y?q=1",
      "expect": {"forward": {"backend": "a", "path": "/inner/x/y?q=1"}}},
+    {"id": "uri-replaced-bare", "path": "/svc/",
+     "expect": {"forward": {"backend": "a", "path": "/inner/"}}},
     {"id": "uri-passthrough", "path": "/raw/z?k=v",
      "expect": {"forward": {"backend": "b", "path": "/raw/z?k=v"}}},
     {"id": "exact-hit", "path": "/exact",

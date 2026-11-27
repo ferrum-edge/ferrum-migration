@@ -831,9 +831,9 @@ class _Traefik:
         if "add" in acc.path_ops and "strip" in acc.path_ops and acc.path_ops.index("add") < acc.path_ops.index("strip"):
             spec.refuse("addPrefix before stripPrefix cannot be reproduced in Ferrum")
             return
+        path = spec.path if spec.kind in ("prefix", "exact") else None
         if acc.strip_prefixes:
             prefixes = acc.strip_prefixes[0]
-            path = spec.path if spec.kind in ("prefix", "exact") else None
             chosen = None
             for prefix in prefixes:
                 if path is not None and path.startswith(prefix):
@@ -848,9 +848,24 @@ class _Traefik:
                 if remainder and not remainder.startswith("/"):
                     spec.refuse("stripPrefix splits a path segment")
                     return
+                # Traefik forwards "/" + (request path after the stripped prefix). Ferrum forwards backend_path +
+                # the request path after its listen path, which is the route path without one trailing '/', so
+                # after a route path ending in '/' the remainder keeps that slash and backend_path drops it.
+                if spec.kind == "prefix" and (path or "").endswith("/") and remainder.endswith("/"):
+                    remainder = remainder[:-1]
                 spec.backend_path = remainder if remainder not in ("", "/") else None
         if acc.add_prefixes:
-            spec.backend_path = acc.add_prefixes[0].rstrip("/") + (spec.backend_path or "")
+            # addPrefix concatenates without adding or removing a slash (Traefik: prefix + path), as Ferrum does
+            # when the forwarded remainder starts with '/'.
+            added = acc.add_prefixes[0]
+            if spec.strip and not spec.backend_path and spec.kind == "prefix" and not (path or "/").endswith("/") \
+                    and not added.endswith("/"):
+                # A request for exactly the route path is stripped to "/" by Traefik (prefix + "/"), whereas
+                # Ferrum forwards the bare prefix.
+                self.report.warning("traefik-path-composition", spec.ref,
+                                    "A request for exactly the route path reaches the backend as the addPrefix value "
+                                    "without the trailing '/' Traefik sends (/v1 instead of /v1/).")
+            spec.backend_path = added + (spec.backend_path or "")
 
     # ------------------------------------------------- TLS handshake policy
 

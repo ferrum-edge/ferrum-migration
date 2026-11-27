@@ -224,26 +224,53 @@ its own sticky cookie (`Max-Age=<ttl_seconds>`, or none for `session_cookie`) to
 | Envoy `hash_policy.cookie`, Istio `consistentHash.httpCookie` | With `ttl` (the proxy generates the cookie): whole seconds of `ttl` → `ttl_seconds` (zero and sub-second ttls are session cookies in Envoy → `session_cookie`; above 86400 clamped), `path` (absent → `/`, warning), `http_only: true`. Envoy routes that hash the same cookie into one cluster share one upstream with the first route's settings (`envoy-hash-cookie-conflict` when they differ). Without `ttl` the source only reads a cookie the application owns; Ferrum would overwrite it with its own binding, so cookie hashing is not migrated (round robin, warning). |
 | every source | a header or cookie name that is not an HTTP token falls back to round robin; the emitter re-checks every value and drops anything Ferrum would refuse (`hash-on-not-representable`, `hash-cookie-not-representable`). |
 
-Resolved from source: `request_termination`'s `trigger.path_prefix` is a plain string prefix of
-the canonical request path (`Trigger::PathPrefix(prefix) => ctx.path.starts_with(prefix)` in
-`src/plugins/request_termination.rs`, unchanged between v0.9.21 and Edge `main` at
-`39cba7bd17`), which is what the prefix-sibling guards rely on.
+## Forwarded path composition
 
-## Open questions (not verifiable from source alone; review on first real run)
+Ferrum forwards `backend_path` followed by the request path after the listen path, inserting `/`
+only when neither side has one, and `/` when both are empty (`with_backend_path_parts` and
+`backend_path_layout` in Edge `src/proxy/mod.rs`). A source prefix ending in `/` becomes a listen
+path without it (plus an exact 404 for the bare path), so its remainder keeps that slash. Each
+source sets the `backend_path` that reproduces its own composition:
 
-* Exact composition of `backend_path` with a stripped path of `""` vs `"/"` (exact-match
-  rewrites are flagged with a warning).
-* `FERRUM_TRUSTED_PROXIES` list syntax (only suggested, commented).
-* Istio VirtualServices that Istio itself generates from Kubernetes Ingress or Gateway API
-  resources (marked with an internal route-semantics annotation) are understood to use
-  path-separated prefixes. This was inferred from Istio's implementation, not its API docs. The
-  tool treats every `uri.prefix` as a string prefix, so such input gets extra guards and possibly
-  an unnecessary `prefix-string-siblings` error. That errs on the stricter side.
-* Behavior of the placeholder backend host `ferrum-migration-refused.invalid` during DNS/pool
-  warm-up. Placeholders never dial, because termination runs first, but warm-up may log.
-* Whether Ferrum v0.9.21 normalizes proxy names (case, whitespace) before its duplicate-name check.
-  Emitted names are unique even after trimming and case folding, so either answer is safe.
-* Whether Ferrum's HTTPS listener can reject handshakes without SNI or for names its certificate does not
-  cover. The tool assumes it cannot and refuses routes under Traefik `sniStrict`, so either answer is safe.
-* Whether the reference source's single-listener `listen_port` remap exists in v0.9.21. The tool
-  emits no `listen_port`, so the answer does not change the output.
+| Source | Composition | `backend_path` |
+|---|---|---|
+| NGINX `proxy_pass` with a URI, Envoy `prefix_rewrite`, Istio `rewrite.uri` | the URI replaces the matched prefix, joined without adding or removing a slash (`/v1/` + `/x` = `/v1//x`) | the URI, minus one trailing `/` when the prefix ends in `/`. A prefix ending in `/` (or the root prefix) rewritten to a value without one is joined with no slash by the source (`/v1x`) but with one by Ferrum (`/v1/x`): `nginx-slash-mismatch`, `envoy-rewrite-slash`, `istio-rewrite-slash`. An exact match forwards exactly the URI. |
+| Traefik `stripPrefix` / `addPrefix` | `/` + the path after the stripped prefix, then `addPrefix` + path | the rest of the route path after the stripped prefix (minus one trailing `/` after a route path ending in `/`), prefixed with the `addPrefix` value as written. A request for exactly the route path, stripped to `/` and then prefixed with a value without a trailing `/`, gets no trailing `/` in Ferrum (`traefik-path-composition`). |
+| Kong `path_handling` v0 (default) | service path + stripped path, dropping a doubled `/`, keeping a trailing `/` only when the request had one (`get_upstream_uri_v0`) | the service path minus its trailing `/`. With `strip_path: false`, a request for `/` gets the bare service path in Kong but a trailing `/` in Ferrum (`kong-path-composition`). |
+
+## Resolved from Ferrum Edge source
+
+Checked at Edge `39cba7bd17` (and unchanged from v0.9.21 where noted):
+
+* `request_termination`'s `trigger.path_prefix` is a plain string prefix of the canonical request path
+  (`Trigger::PathPrefix(prefix) => ctx.path.starts_with(prefix)` in `src/plugins/request_termination.rs`,
+  unchanged since v0.9.21), which is what the prefix-sibling guards rely on.
+* `backend_path` composition: see "Forwarded path composition" above. An exact listen path forwards
+  `backend_path` with an empty remainder, so exact-match rewrites are exact (no warning).
+* `FERRUM_TRUSTED_PROXIES` is a comma-separated list of IP addresses or CIDRs, parsed strictly: one
+  invalid or empty entry fails `ferrum-edge validate` and startup (`docs/configuration.md`). The NGINX
+  translation suggests only IP/CIDR `set_real_ip_from` entries (normalized to their network) and reports
+  `unix:` and host names (`nginx-real-ip-source`). `FERRUM_REAL_IP_HEADER` accepts one field-line with one
+  IP, so it is not suggested for `real_ip_header X-Forwarded-For` (Ferrum already reads `X-Forwarded-For`
+  from trusted peers); `real_ip_header proxy_protocol` suggests the PROXY protocol settings instead.
+  `FERRUM_FRONTEND_PROXY_PROTOCOL_HTTP` / `_HTTPS` accept `off`, `v1`, `v2` or `auto`; the suggestion is
+  `auto` (NGINX and Envoy accept both versions) on each listener Ferrum opens.
+* Istio VirtualServices that Istio generates from Kubernetes Ingress or Gateway API resources carry
+  `internal.istio.io/route-semantics: ingress|gateway`; Istio then matches a `uri.prefix` other than `/` as
+  a path-separated prefix with one trailing `/` trimmed, and under `gateway` a rewrite to `/` keeps `/` plus
+  the rest of the path (Istio `pilot/pkg/networking/core/route/route.go`). Such VirtualServices are
+  translated with segment prefixes (no string-prefix guards).
+* The placeholder backend host `ferrum-migration-refused.invalid` is part of Ferrum's startup and reload
+  DNS warm-up (`src/modes/file.rs`, `DnsCache::warmup` in `src/dns/mod.rs`). Its lookup fails, which logs
+  one `DNS warmup failed` warning per load and does not stop startup; placeholders never dial.
+* Proxy names are compared byte for byte, without case or whitespace normalization
+  (`GatewayConfig::validate_unique_proxy_names`). Emitted names are unique even after trimming and case
+  folding, so they also stay unique under case-insensitive database collations.
+* File-mode HTTPS serves one certificate whatever the SNI, and accepts handshakes without SNI or for
+  names the certificate does not cover (`FixedServerCert` in `src/tls/mod.rs`; SNI selection exists
+  only for Gateway-API-delivered certificates, `src/tls/multi_cert.rs`). Routes under Traefik `sniStrict`
+  are therefore refused, as before.
+* A proxy's `listen_port` scopes an HTTP route to that frontend port (Edge `openapi.yaml` `ProxyCreate`).
+  The tool emits no `listen_port`, so this does not change the output.
+
+There are no open questions left; behaviour that differs from a source is reported where it occurs.

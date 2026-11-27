@@ -1100,7 +1100,17 @@ class _Kong:
                 for problem in backend_info["problems"]:
                     spec.refuse(problem)
                 spec.backend = backend_info.get("backend")
-                spec.backend_path = backend_info.get("path")
+                # Kong path_handling v0 (kong/router/utils.lua get_upstream_uri_v0) joins the service path and the
+                # stripped request path dropping a doubled '/', and keeps a trailing '/' only when the request had
+                # one; Ferrum reproduces that with the service path minus its trailing '/'.
+                service_path = backend_info.get("path")
+                spec.backend_path = (service_path[:-1] if service_path and service_path.endswith("/")
+                                     else service_path) or None
+                if service_path and not service_path.endswith("/") and not strip and path in (None, "/"):
+                    self.report.warning("kong-path-composition", spec.ref,
+                                        "With strip_path false, Kong forwards a request for '/' to the bare service "
+                                        "path, whereas Ferrum appends the request's '/' (for example /v1/ instead "
+                                        "of /v1).")
                 spec.connect_timeout_ms = backend_info.get("connect")
                 spec.read_timeout_ms = backend_info.get("read")
                 spec.write_timeout_ms = backend_info.get("write")

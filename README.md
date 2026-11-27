@@ -326,8 +326,9 @@ See [docs/design.md](https://github.com/ferrum-edge/ferrum-migration/blob/main/d
   Ferrum host.
 * Host-level refusals (regex `server_name`, unrepresentable domains) only poison catch-all
   routes; the residual cross-scope risk is described in docs/design.md.
-* Some Ferrum behaviors could not be confirmed from source alone. They are listed under
-  "Open questions" in [docs/mappings.md](https://github.com/ferrum-edge/ferrum-migration/blob/main/docs/mappings.md).
+* Every Ferrum behavior the mappings rely on is cited to Ferrum Edge source in
+  [docs/mappings.md](https://github.com/ferrum-edge/ferrum-migration/blob/main/docs/mappings.md)
+  ("Resolved from Ferrum Edge source" and "Forwarded path composition").
 
 ## Development
 

@@ -22,8 +22,8 @@ from ..redact import safe_label
 from ..safe_load import load_structured
 from .common import (SourceContext, apply_first_match_order, check_route_budget, choose_main_port, compression_config,
                      cors_config, cors_origin_star_probe, envoy_cookie_hash, fault_injection_config, hash_on_value,
-                     header_value_ok, literal_value, mapping, merge_weighted_targets, request_header_rule,
-                     response_header_rule, retry_from_policy, seq, split_csv, str_list)
+                     header_value_ok, literal_value, mapping, merge_weighted_targets, replaced_prefix_backend_path,
+                     request_header_rule, response_header_rule, retry_from_policy, seq, split_csv, str_list)
 
 PLATFORM = "envoy"
 _REDIRECT_CODES = {"MOVED_PERMANENTLY": 301, "FOUND": 302, "SEE_OTHER": 303, "TEMPORARY_REDIRECT": 307,
@@ -871,10 +871,11 @@ class _Envoy:
                 spec.refuse("prefix_rewrite on a regex route")
             else:
                 spec.strip = True
-                spec.backend_path = rewrite if rewrite not in ("", "/") else None
-                if spec.kind == "exact":
-                    self.report.warning("envoy-exact-rewrite", ref, "prefix_rewrite on an exact path: verify the "
-                                        "forwarded path.")
+                spec.backend_path, exact = replaced_prefix_backend_path(spec.kind, spec.path, rewrite)
+                if not exact:
+                    self.report.warning("envoy-rewrite-slash", ref, "The prefix ends with '/' but prefix_rewrite does "
+                                        "not: Envoy joins the rest of the path without a slash (/v1 + x = /v1x), "
+                                        "whereas Ferrum inserts one (/v1/x).")
         if action.get("regex_rewrite") or action.get("path_rewrite_policy"):
             spec.refuse("regex/path rewrite policies are not supported")
         if action.get("host_rewrite_header") or action.get("host_rewrite_path_regex"):
