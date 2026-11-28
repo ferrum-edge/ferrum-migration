@@ -48,7 +48,9 @@ CASES = [("kong", ("kong", "kong.yaml"), "yaml"), ("nginx", ("nginx", "nginx.con
          ("kong", ("sticky", "kong.yaml"), "yaml"), ("traefik", ("sticky", "traefik.yaml"), "yaml"),
          ("envoy", ("sticky", "envoy.yaml"), "yaml"), ("istio", ("sticky", "istio.yaml"), "yaml"),
          # Outlier detection, circuit breakers and connection pools: passive health and pool overrides.
-         ("envoy", ("resilience", "envoy.yaml"), "yaml"), ("istio", ("resilience", "istio.yaml"), "yaml")]
+         ("envoy", ("resilience", "envoy.yaml"), "yaml"), ("istio", ("resilience", "istio.yaml"), "yaml"),
+         # --kubernetes-service-discovery: Kubernetes service discovery upstreams.
+         ("istio", ("discovery", "istio.yaml"), "yaml", {"kubernetes_service_discovery": True})]
 
 
 def source_commit() -> str:
@@ -94,9 +96,9 @@ def outputs():
     # with the operator's statement (as with --assert-traefik-input-includes-effective-controls); the default refusal
     # output is admitted separately (test_traefik_default_refusal_passes_ferrum_validate), and so are the TLS options
     # scope and sniStrict refusals (test_traefik_tls_option_refusals_pass_ferrum_validate).
-    for platform, parts, fmt in CASES:
+    for platform, parts, fmt, *options in CASES:
         result, _report, plan = migrate(platform, read_fixture(*parts), fmt=fmt, include_secrets=False,
-                                        traefik_controls_asserted=platform == "traefik")
+                                        traefik_controls_asserted=platform == "traefik", **(options[0] if options else {}))
         yield platform, parts, result, plan
 
 
@@ -179,6 +181,9 @@ class FerrumSourceSchemaTest(unittest.TestCase):
                     self.assertLessEqual(set(checks.get("active", {})), active)
                     self.assertLessEqual(set(checks.get("passive", {})), passive)
                     self.assertLessEqual(set(item.get("hash_on_cookie_config", {})), cookie)
+                    discovery = item.get("service_discovery", {})
+                    self.assertLessEqual(set(discovery), self.fields("ServiceDiscoveryConfig"))
+                    self.assertLessEqual(set(discovery.get("kubernetes", {})), self.fields("KubernetesConfig"))
 
     def test_plugin_config_keys_appear_in_plugin_source(self):
         cache = {}

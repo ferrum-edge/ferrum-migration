@@ -32,7 +32,8 @@ def read_fixture(*parts: str) -> str:
 
 
 def migrate(platform: str, text: str, fmt: str = "yaml", include_secrets: bool = False, tls_only: bool = False,
-            limits: Limits | None = None, traefik_controls_asserted: bool = False):
+            limits: Limits | None = None, traefik_controls_asserted: bool = False,
+            kubernetes_service_discovery: bool = False):
     """Translate and emit like the CLI. ``traefik_controls_asserted`` mirrors
     ``--assert-traefik-input-includes-effective-controls``: pass it only for synthetic Traefik inputs that stand for a
     (notional) deployment whose every effective routing, TLS and access control within the converted scope is in the
@@ -40,7 +41,8 @@ def migrate(platform: str, text: str, fmt: str = "yaml", include_secrets: bool =
     outside it); by default Traefik routes that would forward are refused."""
     report = Report(platform, "test-input")
     context = SourceContext(report=report, limits=limits or Limits(), include_secrets=include_secrets,
-                            traefik_controls_asserted=traefik_controls_asserted)
+                            traefik_controls_asserted=traefik_controls_asserted,
+                            kubernetes_service_discovery=kubernetes_service_discovery)
     plan = SOURCES[platform].translate(text, fmt, context)
     result = emit(plan, EmitOptions(include_secrets=include_secrets, tls_only=tls_only), report)
     return result, report, plan

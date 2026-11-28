@@ -16,6 +16,7 @@ from __future__ import annotations
 import ipaddress
 import json
 import math
+import re
 from typing import Any
 
 from .. import matching, util
@@ -57,7 +58,11 @@ class _Istio:
         self.no_dr_warned = False
         # internal.istio.io/route-semantics of the VirtualService being translated ("ingress", "gateway" or None).
         self.route_semantics: str | None = None
-        self.resilience_cache: dict[tuple[int, int | None], tuple[dict | None, dict]] = {}
+        self.resilience_cache: dict[tuple, tuple[dict | None, dict]] = {}
+        # --kubernetes-service-discovery: Kubernetes Service objects from the input, by (namespace, name).
+        self.services: dict[tuple[str, str], dict] = {}
+        self.discovery_namespaces: set[str] = set()
+        self.discovery_reported: set[tuple[str, str]] = set()
         self.shared_bind: str | None = None
         # One entry per emitted projection (VirtualService x Gateway binding x frontend group), checked together
         # once every binding is known (see _check_frontend_scopes).
@@ -72,6 +77,11 @@ class _Istio:
         ref = f"{kind or 'object'} {safe_label(namespace)}/{safe_label(name)}"
         if kind == "Secret":
             self.report.warning("istio-secret-ignored", ref, "Kubernetes Secret objects are never read or copied.")
+            return
+        if kind == "Service" and api == "v1" and self.ctx.kubernetes_service_discovery:
+            if (namespace, name) in self.services:
+                raise InputError("duplicate Kubernetes Service (the EndpointSlice port would depend on document order)")
+            self.services[(namespace, name)] = obj  # selects the EndpointSlice port (--kubernetes-service-discovery)
             return
         if not api.startswith(ISTIO_GROUPS):
             self.report.info("istio-object-ignored", ref, "Non-Istio object ignored.")
@@ -1043,6 +1053,8 @@ class _Istio:
 
     def _destinations(self, spec: RouteSpec, destinations: list[dict], namespace: str, gw_ns: str) -> None:
         resolved = []
+        live_count = sum(1 for raw in destinations
+                         if (util.as_int(mapping(raw).get("weight")) or (100 if len(destinations) == 1 else 0)) > 0)
         for raw in destinations:
             if raw.get("headers"):
                 spec.refuse("per-destination header operations are not migrated")
@@ -1056,8 +1068,12 @@ class _Istio:
                 spec.refuse("subset routing needs pod labels; use Ferrum's native Istio support in Kubernetes")
                 return
             fqdn = _fqdn(host.lower(), namespace)
-            port = util.parse_port(mapping(destination.get("port")).get("number"))
-            result = self._backend(fqdn, port, gw_ns, spec.ref)
+            raw_port = mapping(destination.get("port")).get("number")
+            port = util.parse_port(raw_port)
+            if raw_port is not None and port is None:
+                spec.refuse("destination port is not a valid port number")
+                return
+            result = self._backend(fqdn, port, gw_ns, spec.ref, allow_discovery=live_count <= 1)
             if result.get("problem"):
                 spec.refuse(result["problem"])
                 return
@@ -1098,33 +1114,133 @@ class _Istio:
         self.plan.upstreams[key] = UpstreamSpec(key=key, name=f"{spec.name}-weighted", ref=spec.ref, targets=targets,
                                                 tls=first.tls, algorithm="weighted_round_robin",
                                                 health_checks=dict(health) if health else None,
-                                                proxy_settings=dict(settings))
+                                                proxy_settings=dict(settings),
+                                                source_destinations=set().union(*(m.source_destinations
+                                                                                  for m in members)))
         spec.backend = BackendRef(scheme=resolved[0][1]["backend"].scheme, upstream_key=key)
 
-    def _backend(self, fqdn: str, port: int | None, gw_ns: str, ref: str) -> dict:
+    def _backend(self, fqdn: str, port: int | None, gw_ns: str, ref: str, allow_discovery: bool = True) -> dict:
+        if port is None and self.ctx.kubernetes_service_discovery and fqdn.endswith(".svc.cluster.local") \
+                and not self._has_service_entry(fqdn):
+            # Istio takes the port of a single-port Service; the Service object in the input supplies it.
+            labels = fqdn.split(".")
+            service = self.services.get((labels[1], labels[0])) if len(labels) == 5 else None
+            ports = [mapping(p) for p in seq(mapping((service or {}).get("spec")).get("ports"))]
+            if len(ports) == 1:
+                port = util.parse_port(ports[0].get("port"))
         targets, port, se_sans, problem = self._service_entry_targets(fqdn, port)
         if problem:
             return {"problem": problem}
+        discovery = None
+        if self.ctx.kubernetes_service_discovery and fqdn.endswith(".svc.cluster.local") \
+                and not self._has_service_entry(fqdn):
+            if allow_discovery:
+                discovery, port, problem = self._kubernetes_discovery(fqdn, port, ref)
+                if problem:
+                    return {"problem": problem}
+            elif (fqdn, "weighted") not in self.discovery_reported:
+                self.discovery_reported.add((fqdn, "weighted"))
+                self.report.warning("istio-k8s-sd-weighted", ref,
+                                    "A weighted split over several destinations is served from one merged Ferrum "
+                                    "upstream, which cannot combine service-discovery providers; "
+                                    f"{safe_label(fqdn)} keeps its Service DNS name for this route.")
         rule = self._destination_rule(fqdn, gw_ns)
         tls, scheme, algorithm, hash_policy, problem = self._traffic_policy(rule, port, ref, se_sans)
         if problem:
             return {"problem": problem}
+        if discovery is not None:
+            targets = []
+            if scheme == "https" and not tls.sni:
+                # Discovered targets are pod addresses: keep verifying the backend certificate against the Service
+                # name, as the DNS target did.
+                tls.sni = fqdn
         hash_on, cookie_config = hash_policy if hash_policy else (None, None)
-        passive, pool_settings = self._resilience(rule, port, f"istio destination {safe_label(fqdn)}:{port}", targets)
+        passive, pool_settings = self._resilience(rule, port, f"istio destination {safe_label(fqdn)}:{port}", targets,
+                                                  discovered=discovery is not None)
         if rule is None and not self.no_dr_warned:
             self.no_dr_warned = True
             self.report.warning("istio-no-destination-rule", ref, "Destinations without a DestinationRule are reached "
                                 "over plaintext HTTP; workloads requiring mesh mTLS reject these requests (fail closed).")
         key = (f"{fqdn}:{port}|{scheme}|{tls.key()}|{algorithm}|{hash_on}|"
-               f"{json.dumps([cookie_config, passive, pool_settings], sort_keys=True)}")
+               f"{json.dumps([cookie_config, passive, pool_settings, discovery], sort_keys=True)}")
         if key not in self.plan.upstreams:
             self.plan.upstreams[key] = UpstreamSpec(key=key, name=f"{fqdn}-{port}", ref=f"istio destination {fqdn}:{port}",
                                                     targets=targets, tls=tls, algorithm=algorithm, hash_on=hash_on,
                                                     hash_on_cookie_config=cookie_config,
                                                     health_checks={"passive": passive} if passive else None,
-                                                    proxy_settings=dict(pool_settings), outlier_scoped=bool(passive))
+                                                    proxy_settings=dict(pool_settings), outlier_scoped=bool(passive),
+                                                    service_discovery=discovery,
+                                                    source_destinations={f"istio:{fqdn}:{port}"})
         return {"backend": BackendRef(scheme=scheme, upstream_key=key), "targets": targets,
                 "tls_key": scheme + tls.key()}
+
+    def _has_service_entry(self, fqdn: str) -> bool:
+        return any(matching.host_cover(h, fqdn) for entry in self.service_entries
+                   for h in [h.lower() for h in (str_list(mapping(entry.get("spec")).get("hosts")) or [])])
+
+    def _kubernetes_discovery(self, fqdn: str, port: int | None,
+                              ref: str) -> tuple[dict | None, int | None, str | None]:
+        """Ferrum Kubernetes service discovery for ``<name>.<namespace>.svc.cluster.local``.
+
+        Returns ``(service_discovery, port, problem)``: a discovery block only where Ferrum reproduces Istio's
+        endpoint set exactly, otherwise ``None`` (the destination keeps its Service DNS name, reported), or a
+        ``problem`` that refuses the route.
+
+        Ferrum's provider (Edge ``src/service_discovery/kubernetes.rs``) lists the EndpointSlices labelled
+        ``kubernetes.io/service-name=<name>`` in the namespace, takes every non-terminating ready and serving
+        endpoint (``src/util/endpointslice.rs``) and uses the slice port whose name equals ``port_name`` (a
+        missing slice port name counts as ``""``; the first port when ``port_name`` is unset). Slice ports carry
+        the Service port names, so the Service object in the input maps the destination's port to that name.
+        """
+        labels = fqdn.split(".")
+        if len(labels) != 5:
+            return None, port, None
+        name, namespace = labels[0], labels[1]
+        reported = (fqdn, str(port))
+
+        def keep_dns(message: str) -> tuple[None, int | None, None]:
+            if reported not in self.discovery_reported:
+                self.discovery_reported.add(reported)
+                self.report.warning("istio-k8s-sd-port", ref, message + f" {safe_label(fqdn)} keeps its Service DNS "
+                                    "name (the Service's cluster IP).")
+            return None, port, None
+
+        if not (_DNS_LABEL.fullmatch(name) and _DNS_LABEL.fullmatch(namespace)):
+            return keep_dns("The Service name or namespace is not a valid Kubernetes DNS label.")
+        service = self.services.get((namespace, name))
+        if service is None:
+            return keep_dns("The Kubernetes Service object is not in the input, so the EndpointSlice port cannot be "
+                            "selected.")
+        spec = mapping(service.get("spec"))
+        if str(spec.get("type", "ClusterIP")) == "ExternalName":
+            return keep_dns("The Service is an ExternalName alias with no endpoints.")
+        if spec.get("internalTrafficPolicy") == "Local":
+            return keep_dns("The Service has internalTrafficPolicy: Local (node-local endpoints only), which Ferrum's "
+                            "discovery does not apply.")
+        if spec.get("publishNotReadyAddresses") is True:
+            return keep_dns("The Service publishes not-ready addresses (Istio routes to them; Ferrum's discovery takes "
+                            "only ready endpoints).")
+        ports = [mapping(p) for p in seq(spec.get("ports"))]
+        if port is None and len(ports) == 1:
+            port = util.parse_port(ports[0].get("port"))
+        matched = [p for p in ports if util.parse_port(p.get("port")) == port]
+        if port is None or len(matched) != 1:
+            return keep_dns("The destination port is not exactly one of the Service's ports.")
+        protocol = str(matched[0].get("protocol") or "TCP").upper()
+        if protocol != "TCP":
+            # Istio builds no outbound cluster for UDP Service ports; HTTP to a non-TCP port is never served.
+            return None, port, f"destination Service port {port} uses {safe_label(protocol, 8)}, not TCP"
+        port_name = matched[0].get("name")
+        if port_name is None or port_name == "":
+            if len(ports) != 1:
+                return keep_dns("The Service port is unnamed in a multi-port Service.")
+            port_name = ""  # matches a slice port without a name, wherever it is listed
+        elif not (isinstance(port_name, str) and _PORT_NAME.fullmatch(port_name) and "--" not in port_name
+                  and any(ch.isalpha() for ch in port_name)):
+            return keep_dns("The Service port name is not a valid Kubernetes port name.")
+        self.discovery_namespaces.add(namespace)
+        return ({"provider": "kubernetes",
+                 "kubernetes": {"namespace": namespace, "service_name": name, "port_name": port_name}}, port, None)
 
     def _service_entry_targets(
         self, fqdn: str, port: int | None
@@ -1188,17 +1304,21 @@ class _Istio:
                 return {k: v for k, v in level.items() if k != "port"}
         return policy
 
-    def _resilience(self, rule: dict | None, port: int | None, ref: str, targets: list) -> tuple[dict | None, dict]:
-        """(passive health check, per-proxy pool settings) from outlierDetection and connectionPool."""
+    def _resilience(self, rule: dict | None, port: int | None, ref: str, targets: list,
+                    discovered: bool = False) -> tuple[dict | None, dict]:
+        """(passive health check, per-proxy pool settings) from outlierDetection and connectionPool.
+
+        Discovered targets are individual pods, the hosts Istio's outlier detection ejects."""
         if rule is None:
             return None, {}
-        cache_key = (id(rule), port)
+        cache_key = (id(rule), port, discovered)
         if cache_key in self.resilience_cache:  # one report per destination, however many routes use it
             return self.resilience_cache[cache_key]
         policy = self._effective_policy(rule, port)
         passive = None
         if isinstance(policy.get("outlierDetection"), dict):
-            passive = istio_outlier_passive(policy["outlierDetection"], endpoints_are_hosts(targets), self.report, ref)
+            passive = istio_outlier_passive(policy["outlierDetection"], discovered or endpoints_are_hosts(targets),
+                                            self.report, ref)
         settings = {}
         if isinstance(policy.get("connectionPool"), dict):
             settings = istio_connection_pool(policy["connectionPool"], self.report, ref)
@@ -1414,6 +1534,12 @@ def _is_ip_literal(value: str) -> bool:
     except ValueError:
         return False
     return True
+
+
+#: Kubernetes object names / namespaces (RFC 1123 label) and Service port names (IANA_SVC_NAME, at most 15
+#: characters); Ferrum's discovery copies them into the EndpointSlice query.
+_DNS_LABEL = re.compile(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?")
+_PORT_NAME = re.compile(r"[a-z0-9]([a-z0-9-]{0,13}[a-z0-9])?")
 
 
 def _fqdn(host: str, namespace: str) -> str:

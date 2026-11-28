@@ -35,10 +35,32 @@ class EnvoyOutlierTest(unittest.TestCase):
         self.result, self.report, _plan = migrate("envoy", read_fixture("resilience", "envoy.yaml"))
 
     def test_exact_detector_becomes_a_passive_streak(self):
-        upstream = upstream_for(self.result.config, "10.0.0.1")
+        import yaml
+
+        envoy = yaml.safe_load(read_fixture("resilience", "envoy.yaml"))
+        vhost = envoy["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0][
+            "typed_config"]["route_config"]["virtual_hosts"][0]
+        routes = vhost["routes"]
+        filtered = [route for route in routes if route.get("name") != "split"]
+        self.assertEqual(len(filtered), len(routes) - 1)
+        vhost["routes"] = filtered
+
+        result, _report, _plan = migrate("envoy", yaml.safe_dump(envoy))
+        upstream = upstream_for(result.config, "10.0.0.1")
         self.assertEqual(upstream["health_checks"]["passive"], {
             "unhealthy_status_codes": FIVE_XX, "consecutive_error_mode": True, "unhealthy_threshold": 3,
             "unhealthy_window_seconds": 5, "healthy_after_seconds": 300, "max_ejection_percent": 50})
+
+    def test_shared_direct_and_weighted_cluster_skips_health_checks_and_warns(self):
+        upstream = upstream_for(self.result.config, "10.0.0.1")
+        self.assertNotIn("health_checks", upstream)
+        warnings = [
+            c for c in self.report.caveats
+            if c.code == "outlier-detection-scope"
+            and c.severity == "warning"
+            and c.ref == "envoy cluster 'ejecting'"
+        ]
+        self.assertEqual(len(warnings), 1)
 
     def test_growing_ejection_time_is_reported_not_approximated(self):  # base 60s < max_ejection_time 300s
         self.assertNotIn("health_checks", upstream_for(self.result.config, "10.0.1.1"))

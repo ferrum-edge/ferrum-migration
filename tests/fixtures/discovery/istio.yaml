@@ -1,0 +1,67 @@
+# Synthetic Istio resources and Kubernetes Services for --kubernetes-service-discovery tests.
+apiVersion: networking.istio.io/v1
+kind: Gateway
+metadata: {name: gw, namespace: edge}
+spec:
+  selector: {istio: ingressgateway}
+  servers:
+    - port: {number: 80, name: http, protocol: HTTP}
+      hosts: ["*/discovery.example.test"]
+---
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata: {name: discovery, namespace: shop}
+spec:
+  hosts: [discovery.example.test]
+  gateways: [edge/gw]
+  http:
+    - name: orders
+      match: [{uri: {prefix: /orders}}]
+      route: [{destination: {host: orders, port: {number: 8080}}}]
+    - name: payments
+      match: [{uri: {prefix: /payments}}]
+      route: [{destination: {host: payments.shop.svc.cluster.local}}]
+    - name: secure
+      match: [{uri: {prefix: /secure}}]
+      route: [{destination: {host: secure.shop.svc.cluster.local, port: {number: 8443}}}]
+    - name: missing
+      match: [{uri: {prefix: /missing}}]
+      route: [{destination: {host: missing.shop.svc.cluster.local, port: {number: 8080}}}]
+    - name: split
+      match: [{uri: {prefix: /split}}]
+      route:
+        - {destination: {host: orders.shop.svc.cluster.local, port: {number: 8080}}, weight: 50}
+        - {destination: {host: payments.shop.svc.cluster.local, port: {number: 80}}, weight: 50}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: orders, namespace: shop}
+spec:
+  selector: {app: orders}
+  ports:
+    - {name: http, port: 8080, targetPort: 8000}
+    - {name: metrics, port: 9090}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: payments, namespace: shop}
+spec:
+  selector: {app: payments}
+  ports:
+    - {port: 80, targetPort: 8080}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: secure, namespace: shop}
+spec:
+  selector: {app: secure}
+  ports:
+    - {name: https, port: 8443}
+---
+apiVersion: networking.istio.io/v1
+kind: DestinationRule
+metadata: {name: secure, namespace: shop}
+spec:
+  host: secure.shop.svc.cluster.local
+  trafficPolicy:
+    tls: {mode: SIMPLE, caCertificates: /etc/certs/internal-ca.pem}

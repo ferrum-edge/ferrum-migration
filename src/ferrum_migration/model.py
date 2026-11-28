@@ -47,6 +47,11 @@ class UpstreamSpec:
     #: The passive health check reproduces a source outlier detector whose failure streak is per destination;
     #: Ferrum keeps it per proxy, so the emitter keeps it only when one proxy uses this upstream.
     outlier_scoped: bool = False
+    #: Ferrum ``service_discovery`` block (targets then come from the provider, not ``targets``).
+    service_discovery: dict | None = None
+    #: The source destinations (Envoy clusters, Istio host:port) whose traffic this upstream carries; a merged
+    #: weighted upstream carries several. A source outlier detector is shared by every route to its destination.
+    source_destinations: set[str] = field(default_factory=set)
 
 
 @dataclass

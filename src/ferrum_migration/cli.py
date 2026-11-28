@@ -65,6 +65,12 @@ def build_parser() -> argparse.ArgumentParser:
                              help="Ferrum operating mode the ferrum.conf profile targets (default: file)")
         command.add_argument("--tls-only", action="store_true",
                              help="disable Ferrum's plaintext listener so HTTPS-only source routes can be migrated")
+        command.add_argument(K8S_SD_FLAG, dest="kubernetes_service_discovery", action="store_true",
+                             help="Istio only. Resolve destinations that are in-cluster Kubernetes Services through "
+                                  "Ferrum's Kubernetes service discovery (EndpointSlices, one target per ready pod, "
+                                  "as Istio's gateway does) instead of the Service DNS name. Needs the Service "
+                                  "objects in the input to select the port, and Ferrum running in the cluster with "
+                                  "permission to list EndpointSlices.")
         command.add_argument(CONTROLS_ASSERTION_FLAG, dest="traefik_controls_asserted", action="store_true",
                              help="Traefik only. Your scoped statement, made after verifying the Traefik deployment, "
                                   "that the input includes every effective routing, TLS and access control that "
@@ -163,6 +169,8 @@ INSECURE_TLS_REFUSAL = ("ferrum-migrate: --allow-insecure-backend-tls is not sup
                         "backend_tls_server_ca_cert_path instead. Nothing was written.")
 
 
+K8S_SD_FLAG = "--kubernetes-service-discovery"
+K8S_SD_SCOPE = (f"ferrum-migrate: {K8S_SD_FLAG} applies only to --from istio. Nothing was written.")
 CONTROLS_ASSERTION_SCOPE = (f"ferrum-migrate: {CONTROLS_ASSERTION_FLAG} applies only to --from traefik "
                             "(controls outside Traefik dynamic configuration); it changes nothing for other sources. "
                             "Nothing was written.")
@@ -176,6 +184,9 @@ def _run(args: argparse.Namespace) -> int:
         # Refused rather than ignored, so the statement is never mistaken for one about another source.
         print(CONTROLS_ASSERTION_SCOPE, file=sys.stderr)
         return EXIT_USAGE
+    if args.kubernetes_service_discovery and args.platform != "istio":
+        print(K8S_SD_SCOPE, file=sys.stderr)
+        return EXIT_USAGE
     if args.max_input_bytes <= 0 or args.max_input_bytes > ABSOLUTE_MAX_INPUT_BYTES:
         print(f"ferrum-migrate: --max-input-bytes must be between 1 and {ABSOLUTE_MAX_INPUT_BYTES}", file=sys.stderr)
         return EXIT_USAGE
@@ -186,7 +197,8 @@ def _run(args: argparse.Namespace) -> int:
     fmt = _detect_format(args.input, args.platform, args.input_format)
     text = read_input(args.input, limits)
     context = SourceContext(report=report, limits=limits, include_secrets=include_secrets,
-                            traefik_controls_asserted=args.traefik_controls_asserted)
+                            traefik_controls_asserted=args.traefik_controls_asserted,
+                            kubernetes_service_discovery=args.kubernetes_service_discovery)
     plan = SOURCES[args.platform].translate(text, fmt, context)
     options = EmitOptions(include_secrets=include_secrets, tls_only=args.tls_only)
     result = emit(plan, options, report)
